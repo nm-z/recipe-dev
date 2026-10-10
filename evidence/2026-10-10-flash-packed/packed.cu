@@ -444,7 +444,7 @@ template<int T,int N>static __device__ __forceinline__ void prepare_stream_pairs
 }
 static __device__ __forceinline__ void iq3_group(const uint8_t *row,u32 block,u32 (&grids)[4],u32 &sign,float &d){
 	const uint8_t *p=row+(block/8)*98;u32 g=block%8,a,b;
-	asm("ld.global.u16 %0,[%2];ld.global.u16 %1,[%2+2];":"=r"(a),"=r"(b):"l"(p+66+4*g));sign=a|(b<<16);d=half_at(p)*0.25f;
+	asm("ld.global.u16 %0,[%2];ld.global.u16 %1,[%2+2];":"=r"(a),"=r"(b):"l"(p+66+4*g));sign=a|(b<<16);d=half_at(p);
 	asm("ld.global.nc.u16 %0,[%4];ld.global.nc.u16 %1,[%4+2];ld.global.nc.u16 %2,[%4+4];ld.global.nc.u16 %3,[%4+6];":"=r"(grids[0]),"=r"(grids[1]),"=r"(grids[2]),"=r"(grids[3]):"l"(p+2+8*g));
 }
 template<int T,int N>static __device__ __forceinline__ void decode_stream_pairs(const uint8_t *row,u32 block,u32 sub,u32 (&words)[4],float &d,float &scale,const u32 *scratch,const u32 (&group_grids)[4],u32 group_sign){
@@ -455,12 +455,12 @@ template<int T,int N>static __device__ __forceinline__ void decode_stream_pairs(
 		words[0]=values.x;words[1]=values.y;words[2]=values.z;words[3]=values.w;
 	}else{
 		constexpr int SIG=N==1?1792:3840;
-		u32 a=group_sign;scale=1+2*(a>>28);
+		u32 a=group_sign;scale=fmaf(float(a>>28),0.5f,0.25f);
 		u32 offsets=fused_shared_word(base+SIG*4+(((a>>(7*sub))&127)<<2)),grids=group_grids[sub];
 		u32 codes=__byte_perm(grids,0,0x4140)|offsets,c0=codes&65535,c1=codes>>16;uint2 v0,v1;
 		if constexpr(N==1){
 			u32 table=base+8192;
-			asm("{.reg .b16 lo,hi;.reg .b32 a,b;mov.b32 {lo,hi},%4;mad.wide.u16 a,lo,8,%5;mad.wide.u16 b,hi,8,%5;ld.shared.v2.b32 {%0,%1},[a];ld.shared.v2.b32 {%2,%3},[b];}":"=r"(v0.x),"=r"(v0.y),"=r"(v1.x),"=r"(v1.y):"r"(codes),"r"(table));
+			asm("{.reg .b32 a,b;bfi.b32 a,%4,0,3,12;shr.u32 b,%4,13;add.u32 a,a,%5;add.u32 b,b,%5;ld.shared.v2.b32 {%0,%1},[a];ld.shared.v2.b32 {%2,%3},[b];}":"=r"(v0.x),"=r"(v0.y),"=r"(v1.x),"=r"(v1.y):"r"(codes),"r"(table));
 		}
 		else{v0=__ldg(packed_iq3+c0);v1=__ldg(packed_iq3+c1);}
 		words[0]=v0.x;words[1]=v0.y;words[2]=v1.x;words[3]=v1.y;
@@ -481,6 +481,7 @@ template<int T,int N,int NW,int LW>static __device__ __forceinline__ void fused_
 	__syncthreads();
 	for(int base=index;base<m;base+=count*(NT/LW)){
 		int row=base+(tid/LW)*count;const uint8_t *rp=W+u32(row<m?row:0)*u32((k/Format<T>::block)*Format<T>::bytes),*up=U+u32(row<m?row:0)*u32((k/Format<T>::block)*Format<T>::bytes);float gate[N]={},upper[N]={};
+		#pragma unroll (T==18&&N==1?2:1)
 		for(u32 b=u32(l);b<NB;b+=LW){
 			int gi0[N]={},gi1[N]={},ui0[N]={},ui1[N]={};float dg=0,du=0,sg0=0,sg1=0,su0=0,su1=0;
 			u32 gg[4]={},ug[4]={},gs=0,us=0;if constexpr(T==18){iq3_group(rp,b,gg,gs,dg);iq3_group(up,b,ug,us,du);}

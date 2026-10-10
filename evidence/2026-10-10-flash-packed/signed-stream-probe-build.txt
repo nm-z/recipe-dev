@@ -1,24 +1,21 @@
-mkdir -p /home/nate/codex/cx-fl-kern-build/iq-signed-canonical
 bash evidence/2026-10-10-flash-packed/select-source.sh evidence/2026-10-10-flash-packed/packed.cu evidence/2026-10-10-flash-packed/winners.tsv /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected-configs.txt
-cc -O2 -Wall -Wextra -I/home/nate/llama.cpp-master/ggml/src evidence/2026-10-10-flash-packed/codebooks.c -o /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/codebooks
-/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/codebooks > /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/codebooks.inc.partial && mv /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/codebooks.inc.partial /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/codebooks.inc
 mkdir -p /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/tmp
 TMPDIR=/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/tmp /opt/cuda/bin/nvcc -Wno-deprecated-gpu-targets -arch=sm_52 -I/home/nate/llama.cpp-master/ggml/src -I/home/nate/codex/cx-fl-kern-build/iq-signed-canonical -ptx /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu -o /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.ptx
-/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(592): warning #128-D: loop is not reachable
+/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(593): warning #128-D: loop is not reachable
   extern "C" __attribute__((device)) __attribute__((noinline)) void packed_g_20_1_8_2_8(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(20==20&&2==2&&1<=2&&8==8&&(8==8||8==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(8*32/8))group32_fast<20,1,8,8,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(8*32/8))group32<20,1,8,8,(2==1),(2==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ^
 
 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
 
-/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(593): warning #128-D: loop is not reachable
+/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(594): warning #128-D: loop is not reachable
   extern "C" __attribute__((device)) __attribute__((noinline)) void packed_g_20_1_16_2_8(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(20==20&&2==2&&1<=2&&8==8&&(16==8||16==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(16*32/8))group32_fast<20,1,16,8,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(16*32/8))group32<20,1,16,8,(2==1),(2==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
 
-/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(594): warning #128-D: loop is not reachable
+/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(595): warning #128-D: loop is not reachable
   extern "C" __attribute__((device)) __attribute__((noinline)) void packed_g_20_2_8_2_8(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(20==20&&2==2&&2<=2&&8==8&&(8==8||8==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(8*32/8))group32_fast<20,2,8,8,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(8*32/8))group32<20,2,8,8,(2==1),(2==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ^
 
-/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(595): warning #128-D: loop is not reachable
+/home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected.cu(596): warning #128-D: loop is not reachable
   extern "C" __attribute__((device)) __attribute__((noinline)) void packed_g_20_2_16_2_8(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(20==20&&2==2&&2<=2&&8==8&&(16==8||16==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(16*32/8))group32_fast<20,2,16,8,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(16*32/8))group32<20,2,16,8,(2==1),(2==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
 
@@ -44,7 +41,7 @@ ptxas info    : 1632424 bytes gmem
 ptxas info    : Compiling entry function 'packed_gate_up_probe' for 'sm_52'
 ptxas info    : Function properties for packed_gate_up_probe
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 96 registers, 400 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Used 100 registers, 400 bytes cmem[0], 32 bytes cmem[2]
 ptxas info    : Function properties for packed_gate_up
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Function properties for packed_gate_up_17_1_16_16
@@ -98,7 +95,7 @@ ptxas info    : Function properties for packed_gate_up_18_2_16_8
 ptxas info    : Compiling entry function 'pair_probe_18_2_16_16' for 'sm_52'
 ptxas info    : Function properties for pair_probe_18_2_16_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 80 registers, 384 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Used 78 registers, 384 bytes cmem[0], 32 bytes cmem[2]
 ptxas info    : Function properties for packed_gate_up_18_2_16_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Compiling entry function 'pair_probe_17_1_16_16' for 'sm_52'
@@ -110,7 +107,7 @@ ptxas info    : Function properties for packed_gate_up_17_1_16_16
 ptxas info    : Compiling entry function 'pair_probe_18_1_16_8' for 'sm_52'
 ptxas info    : Function properties for pair_probe_18_1_16_8
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 52 registers, 384 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Used 74 registers, 384 bytes cmem[0], 32 bytes cmem[2]
 ptxas info    : Function properties for packed_gate_up_18_1_16_8
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Compiling entry function 'pair_probe_17_2_8_16' for 'sm_52'
@@ -122,13 +119,13 @@ ptxas info    : Function properties for packed_gate_up_17_2_8_16
 ptxas info    : Compiling entry function 'pair_probe_18_1_16_16' for 'sm_52'
 ptxas info    : Function properties for pair_probe_18_1_16_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 54 registers, 384 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Used 101 registers, 384 bytes cmem[0], 32 bytes cmem[2]
 ptxas info    : Function properties for packed_gate_up_18_1_16_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Compiling entry function 'pair_probe_18_1_8_16' for 'sm_52'
 ptxas info    : Function properties for pair_probe_18_1_8_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 54 registers, 384 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Used 101 registers, 384 bytes cmem[0], 32 bytes cmem[2]
 ptxas info    : Function properties for packed_gate_up_18_1_8_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Compiling entry function 'pair_probe_17_1_8_16' for 'sm_52'
@@ -140,7 +137,7 @@ ptxas info    : Function properties for packed_gate_up_17_1_8_16
 ptxas info    : Compiling entry function 'pair_probe_18_2_8_16' for 'sm_52'
 ptxas info    : Function properties for pair_probe_18_2_8_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 80 registers, 384 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Used 78 registers, 384 bytes cmem[0], 32 bytes cmem[2]
 ptxas info    : Function properties for packed_gate_up_18_2_8_16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Compiling entry function 'packed_probe_wide' for 'sm_52'

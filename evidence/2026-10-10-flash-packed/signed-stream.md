@@ -4,7 +4,7 @@ This source update replaces the 12 typed `packed_gate_up_17_*` and `packed_gate_
 
 ## Source and layout
 
-IQ2_XS loads four signed int16 pairs from the existing `packed_iq2` table. IQ3_XXS capacity 1 copies the existing signed `packed_iq3` table into shared memory; capacity 2 uses cached global loads from that table. IQ3 gathers four adjacent grid words using one address, builds packed pair indices, and accumulates integer dot products directly across subgroups.
+IQ2_XS loads four signed int16 pairs from the existing `packed_iq2` table. IQ3_XXS capacity 1 copies the existing signed `packed_iq3` table into shared memory; capacity 2 uses cached global loads from that table. IQ3 gathers four adjacent grid words using one address, builds packed pair indices, and accumulates integer dot products directly across subgroups. Capacity 1 unrolls two input groups per inner iteration. The 12-bit pair indices form shared byte offsets using a bitfield insert and a shift. IQ3 folds the quarter factor into the group scale; the CPU check verifies bit-identical scaled FP16 values for every finite half and all 16 group scales.
 
 Both helpers cache the full 2560-value packed input before processing rows. Shared byte intervals are half-open:
 
@@ -17,20 +17,20 @@ The nine-input typed fused ABI, fourteen-input generic dispatcher ABI, supported
 
 ## Static instruction counts
 
-These counts use CUDA 12.9 PTX, version 7.4, and CUDA 11.4 ptxas for sm_52. The capacity-1, 512-thread, 16-row-lane probe uses default optimized ptxas compilation. One complete inner iteration processes 32 input values through gate and up, or 64 matrix weights. Counts exclude NOPs and include address updates and the back branch. Input/table staging, outer row setup, reductions, and SiLU are outside these counts.
+These counts use CUDA 12.9 PTX, version 7.4, and CUDA 11.4 ptxas for sm_52. The capacity-1, 512-thread, 16-row-lane probe uses default optimized ptxas compilation. One complete IQ2 inner iteration processes 32 input values through gate and up, or 64 matrix weights. One IQ3 inner iteration processes two groups, or 128 matrix weights. Counts exclude NOPs and include address updates and the back branch. Input/table staging, outer row setup, the peeled first IQ3 group, reductions, and SiLU are outside these counts.
 
-| Format | Prior cached-address candidate | Signed-stream candidate | Instructions per weight | Registers | Probe stack/spills |
+| Format | Prior cached-address candidate per 64 weights | Signed-stream candidate | Instructions per weight | Registers | Probe stack/spills |
 |---|---:|---:|---:|---:|---|
-| IQ2_XS | 277 | 189, loop 0x1198..0x1970 | 2.953125 | 89 | 0/0 |
-| IQ3_XXS | 315 | 205, loop 0x12b8..0x1b38 | 3.203125 | 54 | 0/0 |
+| IQ2_XS | 277 | 189 / 64 weights, loop 0x1198..0x1970 | 2.953125 | 89 | 0/0 |
+| IQ3_XXS | 315 | 384 / 128 weights, loop 0x1b80..0x2b78 | 3.000000 | 101 | 0/0 |
 
-The comparison baseline is an earlier CPU candidate, not llama.cpp or the prior released helper. IQ3 remains above the 2-3 target. Static counts do not establish bandwidth or model speed.
+The comparison baseline is an earlier CPU candidate, not llama.cpp or the prior released helper. Both optimized inner loops fall within 2-3 instructions per weight under this scope. IQ3 increases register use from 54 to 101 compared with the initial signed-stream handoff. This register and instruction tradeoff needs live-worker measurement. The whole routine, including the peeled group and other excluded work, does not have this ratio. Static counts do not establish bandwidth or model speed. The 256-thread, 16-row-lane IQ3 probe has the same loop count and register use.
 
-Earlier issue counts 305/208 and 348/268 were wrong because AWK compared associative address keys as strings. `count-backward-loops.awk` uses explicit numeric conversion. It lists every backward loop; divide only the matrix loop count above by 64. It does not assign weight counts to setup loops.
+Earlier issue counts 305/208 and 348/268 were wrong because AWK compared associative address keys as strings. `count-backward-loops.awk` uses explicit numeric conversion. It lists every backward loop; divide only the matrix loop count above by its corresponding weight count. It does not assign weight counts to setup loops.
 
 ## CPU validation and build
 
-`check-signed-pairs.c` compares all signed table entries with canonical GGML grid/sign values and checks packed IQ3 indices and shared addresses. It reports 262144 IQ2 pair checks, 131072 IQ3 pair checks, and 16777216 IQ3 index checks with zero mismatches.
+`check-signed-pairs.c` compares all signed table entries with canonical GGML grid/sign values and checks packed IQ3 indices, shared addresses, and folded scales. It reports 262144 IQ2 pair checks, 131072 IQ3 pair checks, 16777216 IQ3 index checks, and 1015808 IQ3 scale checks with zero mismatches.
 
 The shipped library assembles separately with `-O1 --disable-optimizer-constants`. All 12 typed fused functions have zero frame and spill bytes; the generic dispatcher has an 8-byte frame and zero spills. This does not establish resources or instruction counts for the linked persistent worker.
 
@@ -38,7 +38,7 @@ Run these CPU-only commands on archy from the kernel checkout:
 
 ```bash
 make BUILD=/home/nate/codex/cx-fl-kern-build/iq-signed-canonical /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/selected-probes.cubin
-cc -O2 -Wall -Wextra -I/home/nate/llama.cpp-master/ggml/src -I/home/nate/codex/cx-fl-kern-build/iq-signed-canonical evidence/2026-10-10-flash-packed/check-signed-pairs.c -o /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/check-signed-pairs
+cc -O2 -Wall -Wextra -ffp-contract=off -I/home/nate/llama.cpp-master/ggml/src -I/home/nate/codex/cx-fl-kern-build/iq-signed-canonical evidence/2026-10-10-flash-packed/check-signed-pairs.c -lm -o /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/check-signed-pairs
 /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/check-signed-pairs
 /opt/cuda-11.4/bin/ptxas -c -arch=sm_52 -O1 --disable-optimizer-constants -v packed.ptx -o /home/nate/codex/cx-fl-kern-build/iq-signed-canonical/packed-device.cubin
 ```
