@@ -38,3 +38,20 @@ The packed demo has two warmup tokens and eight measured tokens. Its timing incl
 `publish`, `wait_word`, `Packet`, and the `layer` entry show the reusable flag contract. Keep the receiver's flag local, preserve every writer's system fence, and publish only after all writers have completed. Production multi-CTA layers need an on-die completion scheme before one CTA publishes a sequence. This one-CTA demo does not provide that completion scheme or change Recipe's runtime scheduling.
 
 The owned `packed.cuh` helper comes from `8118be62cb9ac7189439b0e7b38663d764914a10`, the #1091 evidence branch. It preserves packed weights and uses signed 16-bit XMAD with integer accumulation, then applies floating-point block scales. cx-flash can integrate this contract alongside the full packed-kernel track, expert split, and MTP from PR #942.
+
+## Measured result
+
+The final run on October 10, 2026, from 10:59:13 to 10:59:16 UTC exits 0 and passes both requested gates. The assigned dies have 113 W caps applied by cx-flash. Full raw measurements are in `results.txt`; `initial/` retains the first run that failed the gate. The initial source and PTX are preserved in commit `bd50443f`.
+
+| 16 KB path | Hops per token | Machine us per token | Machine us per hop | Die A device us per hop |
+|---|---:|---:|---:|---:|
+| Flag relay | 7 | 64.359 | 9.194 | 7.501 |
+| Flag relay | 100 | 693.454 | 6.935 | 6.806 |
+| cudaMemcpyPeer and destination sync | 7 | 82.153 | 11.736 | |
+| cudaMemcpyPeer and destination sync | 100 | 1152.409 | 11.524 | |
+
+The flag relay's p99 token times are 66.010 us for seven hops and 702.378 us for 100 hops. One hop, including two launches and final completion, costs 24.122 us. The gate applies to the requested seven-hop and 100-hop cases. The four-KB copy comparison measures 9.773 and 9.713 us per hop, respectively; it does not reproduce the historical 6.2 us under this synchronization boundary.
+
+The vector relay uses 128-bit volatile loads and peer stores and retains each received vector in registers for its next publication. Disassembly contains `LDG.E.CV.128`, `STG.E.WT.128`, and system fences, with no atomics. It uses 46 registers and 1,048 shared bytes without spills. Delayed publication passes; missing publication reaches both device deadlines.
+
+The repeated packed two-layer demo averages 3,074.133 us per token. All eight measured tokens pass the independent algebra check. Maximum absolute errors are 9.5e-7 on die A and 1.2e-7 on die B. Weight allocations remain resident across all ten demo tokens, including warmups. The demo establishes no Flash-Next token rate or final-logit result.
