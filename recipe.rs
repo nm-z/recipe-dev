@@ -19511,6 +19511,7 @@ fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Grap
 }
 fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
 	if std::env::var("RECIPE_DENSE_SPLIT").as_deref()!=Ok("1") { return Ok(()); }
+	let minimum=std::env::var("RECIPE_DENSE_SPLIT_MIN_BYTES").ok().map(|value|value.parse::<usize>().map_err(|_|RecipeError::new("dense split minimum bytes must be a nonnegative integer"))).transpose()?.unwrap_or(8_000_000);
 	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
 	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;
 	for (index,planes) in nodes.into_iter().zip(&binding.nodes) {
@@ -19520,6 +19521,9 @@ fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Res
 		if tensors.is_empty() || !tensors.iter().all(|tensor|tensor.shape.len()==2 && tensor.shape[0] as usize==node.input.channels) {continue;}
 		if tensors.iter().map(GgufTensor::elements).sum::<usize>()!=node.weights() {continue;}
 		if tensors.iter().map(|tensor|tensor.shape[1] as usize).sum::<usize>()!=node.output.channels {continue;}
+		// QKV's ready mapped planes share one input and one transport point.
+		let bytes=tensors.iter().try_fold(0usize,|bytes,tensor|checked_add(bytes,tensor.bytes,"dense matrix bytes"))?;
+		if bytes<=minimum {continue;}
 		require(tensors.iter().map(|tensor|&tensor.name).collect::<std::collections::HashSet<_>>().len()<=16 && tensors.iter().all(|tensor|matches!(tensor.kind,0|8|12|13|14|17|18|20|30) && tensor.shape[0]<=10240 && (matches!(tensor.kind,0|30) || tensor.shape[0]%32==0)),format!("dense row split needs supported types, aligned quantized widths, and at most sixteen source matrices: {tensors:?}"))?;
 		let layer=node.block_index;let last_only=node.output.length==1;
 		graph.nodes[index].block_kind="split_dense";graph.nodes[index].precision=Compute::FP32;graph.nodes[index].acc=Compute::FP32;graph.nodes[index].argument[8]=1.0;
