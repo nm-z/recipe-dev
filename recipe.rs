@@ -19510,7 +19510,12 @@ fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Grap
 	Ok(())
 }
 fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
-	if std::env::var("RECIPE_DENSE_SPLIT").as_deref()!=Ok("1") { return Ok(()); }
+	match std::env::var("RECIPE_DENSE_SPLIT").as_deref().unwrap_or("1") {
+		"0"=>return Ok(()),
+		"1"=>{},
+		_=>return Err(RecipeError::new("dense split must be 0 or 1")),
+	}
+	let minimum=std::env::var("RECIPE_DENSE_SPLIT_MIN_BYTES").ok().map(|value|value.parse::<usize>().map_err(|_|RecipeError::new("dense split minimum bytes must be a nonnegative integer"))).transpose()?.unwrap_or(8_000_000);
 	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
 	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;
 	for (index,planes) in nodes.into_iter().zip(&binding.nodes) {
@@ -19520,6 +19525,9 @@ fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Res
 		if tensors.is_empty() || !tensors.iter().all(|tensor|tensor.shape.len()==2 && tensor.shape[0] as usize==node.input.channels) {continue;}
 		if tensors.iter().map(GgufTensor::elements).sum::<usize>()!=node.weights() {continue;}
 		if tensors.iter().map(|tensor|tensor.shape[1] as usize).sum::<usize>()!=node.output.channels {continue;}
+		// QKV's ready mapped planes share one input and one transport point.
+		let bytes=tensors.iter().try_fold(0usize,|bytes,tensor|checked_add(bytes,tensor.bytes,"dense matrix bytes"))?;
+		if bytes<=minimum {continue;}
 		require(tensors.iter().map(|tensor|&tensor.name).collect::<std::collections::HashSet<_>>().len()<=16 && tensors.iter().all(|tensor|matches!(tensor.kind,0|8|12|13|14|17|18|20|30) && tensor.shape[0]<=10240 && (matches!(tensor.kind,0|30) || tensor.shape[0]%32==0)),format!("dense row split needs supported types, aligned quantized widths, and at most sixteen source matrices: {tensors:?}"))?;
 		let layer=node.block_index;let last_only=node.output.length==1;
 		graph.nodes[index].block_kind="split_dense";graph.nodes[index].precision=Compute::FP32;graph.nodes[index].acc=Compute::FP32;graph.nodes[index].argument[8]=1.0;
@@ -19712,9 +19720,26 @@ impl ExpertExecution {
 	fn finish(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<Vec<OperationReport>> {
 		let phases=(end-begin).div_ceil(capacity) as usize*layers;
 		let mut observations=Vec::new();
+		let status=self.control.download_range::<u32>(6,2)?;
+		let mut receipts=Vec::new();
 		for worker in &self.workers {
 			worker.gpu.synchronize()?;
 			let reports=worker.reports.download_range::<u32>(0,phases*32)?;
+			receipts.push((worker,reports));
+		}
+		if status[0]!=0 || receipts.iter().any(|(_,reports)|reports.chunks_exact(32).any(|report|report[16..32].iter().any(|status|*status!=1))) {
+			let control=self.control.download::<u8>(self.control.bytes)?;
+			let path=self.pick_path.with_extension("failure-control.bin");
+			if let Err(error)=fs::write(&path,&control) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
+			for (worker,reports) in &receipts {
+				let path=self.pick_path.with_extension(format!("failure-die{}.bin",worker.die));
+				let bytes=reports.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+				if let Err(error)=fs::write(&path,&bytes) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
+			}
+			if let Err(error)=self.export_picks() {eprintln!("cannot export expert picks after failure: {error}");}
+		}
+		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}; worker receipts use {}",status[0],status[1],self.pick_path.display()))?;
+		for (worker,reports) in receipts {
 			for (phase,report) in reports.chunks_exact(32).enumerate() {
 				for (cta,status) in report[16..32].iter().enumerate() {
 					require(*status==1,format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16]))?;
@@ -19729,9 +19754,6 @@ impl ExpertExecution {
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 			}
 		}
-		let status=self.control.download_range::<u32>(24,2)?;
-		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}",status[0],status[1]))?;
-
 		Ok(observations)
 	}
 	fn export_picks(&self)->Result<()> {
@@ -35618,12 +35640,15 @@ entry_chunk:
 entry_layer:
 	add.u32 r9,r0,r8; mul.wide.u32 a2,r9,192; add.u64 a3,a0,a2; ld.global.u64 a4,[a3+120]; mul.wide.u32 a5,r6,128; add.u64 a4,a4,a5;
 	add.u32 r10,r2,r6; add.u32 r10,r10,1;
-	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1; st.param.u32 [cols],r13; ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
-	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); bra entry_result;
+	ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1;
+	ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r13;
+	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
+	bra entry_result;
 entry_dense:
-	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report);
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r13;
+	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
 entry_result:
-	ld.param.u32 r11,[ok]; }
 	setp.ne.u32 p0,r11,1; @p0 ret; add.u32 r6,r6,1; add.u32 r8,r8,1; setp.lt.u32 p0,r8,r1; @p0 bra entry_layer;
 	add.u32 r5,r5,r4; bra entry_chunk;
 }

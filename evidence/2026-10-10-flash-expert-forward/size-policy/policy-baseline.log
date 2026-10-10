@@ -1,0 +1,29 @@
+warning: unused imports: `cached`, `input`, `mtp`, `out`, `pp`, `tg`, and `time`
+ --> /home/nate/codex/cx-fl-dense-build/plan-dense.rs:2:21
+  |
+2 | use recipe::infer::{cached, input, mtp, out, pp, tg, time};
+  |                     ^^^^^^  ^^^^^  ^^^  ^^^  ^^  ^^  ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: 1 warning emitted
+
+| Physical die | Role | Free bytes | KV/scratch reserve | Assigned weight bytes | Expert bundles | Remaining bytes |
+|---:|---|---:|---:|---:|---:|---:|
+| 0 | experts | 6113460224 | 134217728 | 5978035200 | 3003 | 1207296 |
+| 1 | experts | 8450998272 | 134217728 | 8316697600 | 4249 | 82944 |
+| 3 | experts | 7915765760 | 134217728 | 7780377600 | 4530 | 1170432 |
+| 4 | main | 8450998272 | 1430938826 | 7019217920 | 4530 | 841526 |
+| 5 | experts | 8450998272 | 134217728 | 8315699200 | 4529 | 1081344 |
+| 7 | experts | 8450998272 | 134217728 | 8315699200 | 4247 | 1081344 |
+
+| Physical die | Target dense read bytes/position | MTP dense read bytes/position | Resident expert bytes | RAM expert bytes | RAM bundles | Reference selected expert bytes, all recorded picks |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 0 | 5978035200 | 0 | 0 | 1163264000 |
+| 1 | 0 | 0 | 8316697600 | 0 | 0 | 16097459200 |
+| 3 | 0 | 0 | 7780377600 | 1059609600 | 567 | 7929804800 |
+| 4 | 0 | 0 | 2706022400 | 5759641600 | 3082 | 0 |
+| 5 | 0 | 0 | 8315699200 | 527001600 | 282 | 16059008000 |
+| 7 | 0 | 0 | 8315699200 | 0 | 0 | 16041984000 |
+
+Unplaced expert bundles: 0; unplaced packed bytes: 0; pinned RAM expert bytes: 7346252800; complete placement fit: true.
