@@ -25077,7 +25077,9 @@ impl NativeTape {
 		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
 		if let Some(request) = request.as_ref() {
 			let positions = if self.output.length == 1 { 1 } else { request.positions };
-			return request.output.download_float_bytes(0, self.output.channels * positions, self.program.artifact.layout.output_precision);
+			let values = request.output.download_float_bytes(0, self.output.channels * positions, self.program.artifact.layout.output_precision)?;
+			self.trace_output_values(&values)?;
+			return Ok(values);
 		}
 		drop(request);
 		self.output(0, self.rows as usize * self.output.elements())
@@ -25095,22 +25097,7 @@ impl NativeTape {
 		}
 		Ok(saved.clone())
 	}
-	/// A run of `count` output values from element `first` of the output arena.
-	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		if let Some(request) = request.as_ref() {
-			let (length, begin) = if self.output.length == 1 { (1, 0) } else { (request.positions, request.begin as usize) };
-			let position = first % self.output.length;
-			require(length == self.output.length || position >= begin && position + count <= begin + length, "output read is outside the request window")?;
-			let offset = (first / self.output.length) * length + position - begin;
-			let precision = self.program.artifact.layout.output_precision;
-			return request.output.download_float_bytes(checked_mul(offset, precision.bytes(), "request output offset")?, count, precision);
-		}
-		drop(request);
-		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let output_precision = self.program.artifact.layout.output_precision;
-		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
-		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+	fn trace_output_values(&self, values: &[f64]) -> Result<()> {
 		// A traced run shows the head of every node's values once, at the first
 		// output, and again if a later output went nonfinite.
 		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -25184,6 +25171,27 @@ impl NativeTape {
 				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
+		Ok(())
+	}
+	/// Read `count` output values starting at `first`.
+	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
+		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
+		if let Some(request) = request.as_ref() {
+			let (length, begin) = if self.output.length == 1 { (1, 0) } else { (request.positions, request.begin as usize) };
+			let position = first % self.output.length;
+			require(length == self.output.length || position >= begin && position + count <= begin + length, "output read is outside the request window")?;
+			let offset = (first / self.output.length) * length + position - begin;
+			let precision = self.program.artifact.layout.output_precision;
+			let values = request.output.download_float_bytes(checked_mul(offset, precision.bytes(), "request output offset")?, count, precision)?;
+			self.trace_output_values(&values)?;
+			return Ok(values);
+		}
+		drop(request);
+		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let output_precision = self.program.artifact.layout.output_precision;
+		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
+		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+		self.trace_output_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn capture_tensors(&self, begin: u32, end: u32) -> Result<Vec<TensorObservation>> {
