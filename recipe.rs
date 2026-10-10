@@ -8325,6 +8325,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
+	if matches!(target, BackendTarget::Nvidia { .. }) { parts.push(MtpBatch::ptx().as_bytes()); }
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
@@ -8693,6 +8694,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
 				validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
 			}
+			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
+			ptx_source.push_str(MtpBatch::ptx());
+			fs::write(output, ptx_source).map_err(|error| RecipeError::new(format!("cannot append MTP PTX: {error}")))?;
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
@@ -15966,6 +15970,7 @@ pub struct Bound {
 struct MtpHead {
 	bound: Bound,
 	embedding: StoredWeight,
+	lookup_hash: Option<RowHash>,
 	width: usize,
 	lanes: usize,
 	tokens: usize,
@@ -15977,7 +15982,7 @@ impl MtpHead {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("MTP architecture is not a string"))?;
 		require(matches!(architecture, "qwen35" | "qwen4exp"), format!("MTP binding does not support architecture {architecture:?}"))?;
 		require(target.value("general.architecture").and_then(GgufValue::text) == Some(architecture), "MTP and main-model architectures differ")?;
-		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default() };
 		require(builder.integer("nextn_predict_layers")? == 1, "Qwen MTP requires one prediction layer")?;
 		let layer = builder.integer("block_count")?.checked_sub(1).ok_or_else(|| RecipeError::new("MTP block count is zero"))?;
 		require(target.integer_at(&format!("{architecture}.block_count"))? == layer, "MTP layer does not follow the main model's layers")?;
@@ -16053,14 +16058,16 @@ impl MtpHead {
 		if let Some(scale) = builder.optional("output_norm.weight") {
 			require(scale.shape == [width as u64], "MTP checkpoint output_norm has an invalid shape")?;
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
+		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("MTP tensors have no binding: {}", unread.join(", ")))?;
-		let tensors = builder.consumed.len();
+		let tensors = builder.plan.tensors.len();
 		let plan = builder.plan;
-		let tokens = natural("MTP draft tokens", env!("RECIPE_MTP_TOKENS"))?;
+		let tokens = std::env::var("RECIPE_MTP_DRAFTS").ok().map(|value| count("MTP draft tokens", &value)).transpose()?.unwrap_or(natural("MTP draft tokens", env!("RECIPE_MTP_TOKENS"))?);
+		require(tokens <= 4, "MTP draft tokens must be in 0..=4")?;
 		let probs = env!("RECIPE_MTP_PROBS").parse::<f64>().map_err(|_| RecipeError::new("MTP probability is invalid"))?;
 		let embedding = if shared { target.embedding_stored(&embedding)? } else { file.embedding_stored(&embedding)? };
-		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, width, lanes, tokens, probs })
+		let lookup_hash = MtpLookup::new(target)?.hash;
+		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, lookup_hash, width, lanes, tokens, probs })
 	}
 	fn graph(&self, positions: usize, device: &'static Gpu) -> Result<Graph> {
 		let stream = checked_mul(self.lanes, self.width, "MTP hidden stream")?;
@@ -16235,8 +16242,134 @@ impl MtpCheckpoint {
 		Ok(())
 	}
 }
+/// One token position and its selected-expert slot in a speculative target batch.
+#[derive(Clone, Copy, Debug)]
+pub struct MtpColumn {
+	pub position: usize,
+	pub slot: usize,
+	pub coefficient: f32,
+}
+/// All target columns routed to one expert. Read that expert's weights once per matvec.
+#[derive(Clone, Debug)]
+pub struct MtpExpertGroup {
+	pub expert: usize,
+	pub columns: Vec<MtpColumn>,
+	pub capacity: usize,
+}
+/// The grouping contract shared by the native persistent step and packed helpers.
+#[derive(Clone, Debug)]
+pub struct MtpBatch {
+	pub positions: usize,
+	pub top_k: usize,
+	pub experts: usize,
+	pub groups: Vec<MtpExpertGroup>,
+}
+impl MtpBatch {
+	/// Selected records are `[count, expert IDs...]` with stride `top_k + 1`.
+	/// Router coefficients are FP32 `[expert * positions + position]`.
+	pub fn from_selected(selected: &[i32], coefficients: &[f32], positions: usize, top_k: usize, experts: usize) -> Result<Self> {
+		require((1..=5).contains(&positions), "MTP target batch requires 1..=5 positions")?;
+		require(top_k > 0 && top_k <= experts, "MTP selected-expert count is invalid")?;
+		let stride = checked_add(top_k, 1, "MTP selected-expert stride")?;
+		require(selected.len() == checked_mul(positions, stride, "MTP selected-expert records")?, "MTP selected-expert record size differs")?;
+		require(coefficients.len() == checked_mul(experts, positions, "MTP router coefficients")?, "MTP router coefficient size differs")?;
+		let mut groups = BTreeMap::<usize, Vec<MtpColumn>>::new();
+		for position in 0..positions {
+			let record = &selected[position * stride..(position + 1) * stride];
+			let count = usize::try_from(record[0]).map_err(|_| RecipeError::new("MTP selected-expert count is negative"))?;
+			require(count <= top_k, "MTP selected-expert count exceeds top-k")?;
+			let mut seen = BTreeSet::new();
+			for (slot, expert) in record[1..1 + count].iter().enumerate() {
+				let expert = usize::try_from(*expert).map_err(|_| RecipeError::new("MTP selected expert is negative"))?;
+				require(expert < experts && seen.insert(expert), "MTP selected expert is outside its table or repeated")?;
+				let coefficient = coefficients[expert * positions + position];
+				require(coefficient.is_finite(), "MTP router coefficient is nonfinite")?;
+				groups.entry(expert).or_default().push(MtpColumn { position, slot, coefficient });
+			}
+		}
+		let groups = groups.into_iter().map(|(expert, columns)| {
+			let capacity = columns.len().next_power_of_two();
+			MtpExpertGroup { expert, columns, capacity }
+		}).collect();
+		Ok(Self { positions, top_k, experts, groups })
+	}
+	/// Linkable device functions, without a second PTX module header.
+	pub fn ptx() -> &'static str {
+		let source = include_str!("mtp.ptx");
+		&source[source.find("// All threads").expect("MTP PTX function boundary is absent")..]
+	}
+	/// Global grouping storage per expert: count, padding word, and eight position/slot pairs.
+	pub const fn map_bytes() -> usize { 72 }
+}
+impl MtpExpertGroup {
+	/// The exact map the PTX grouping helper writes, including inactive padding.
+	pub fn map(&self) -> [u32; 18] {
+		let mut words = [0; 18];
+		words[0] = self.columns.len() as u32;
+		for column in 0..8 {
+			words[2 + 2 * column] = self.columns.get(column).map_or(u32::MAX, |value| value.position as u32);
+			words[3 + 2 * column] = self.columns.get(column).map_or(0, |value| value.slot as u32);
+		}
+		words
+	}
+}
+/// Verified successors indexed by the model's n-gram rows and the exact token context.
+/// PLE rows contain embeddings; the successor IDs come only from committed tokens.
+#[derive(Clone, Default)]
+struct MtpLookup {
+	hash: Option<RowHash>,
+	entries: BTreeMap<(Vec<usize>, Vec<u32>), u32>,
+	observed: usize,
+}
+impl MtpLookup {
+	fn new(file: &Gguf) -> Result<Self> {
+		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
+		let hash = if file.value("ngram.heads").is_some() || file.value(&format!("{architecture}.ple.ngram_size")).is_some() {
+			Some(Ngram::new(file)?.hash().clone())
+		} else { None };
+		Ok(Self { hash, ..Self::default() })
+	}
+	fn clear(&mut self) { self.entries.clear(); self.observed = 0; }
+	fn order(&self) -> usize { self.hash.as_ref().map_or(8, |hash| hash.ngram.max(2)) }
+	fn key(&self, ids: &[u32], end: usize, order: usize) -> (Vec<usize>, Vec<u32>) {
+		let context = ids[end - order..end].to_vec();
+		let rows = self.hash.as_ref().filter(|_| order >= 2).map_or_else(Vec::new, |hash| {
+			let rows = hash.rows_at(ids, end - 1);
+			let first = (order - 2) * hash.per_order;
+			rows[first..first + hash.per_order].to_vec()
+		});
+		(rows, context)
+	}
+	fn observe(&mut self, ids: &[u32], stop: &[u32]) {
+		if ids.len() < self.observed { self.clear(); }
+		for successor in self.observed.max(1)..ids.len() {
+			for order in 2..=self.order().min(successor) {
+				if ids[successor - order..successor].iter().any(|id| stop.contains(id)) { break; }
+				self.entries.insert(self.key(ids, successor, order), ids[successor]);
+			}
+		}
+		self.observed = ids.len();
+	}
+	fn propose(&self, ids: &[u32], limit: usize, stop: &[u32], suppressed: &[u32]) -> Vec<u32> {
+		let mut context = ids.to_vec();
+		let begin = context.len();
+		while context.len() - begin < limit {
+			let next = (2..=self.order().min(context.len())).rev().find_map(|order| {
+				let suffix = &context[context.len() - order..];
+				if suffix.iter().any(|id| stop.contains(id)) { return None; }
+				self.entries.get(&self.key(&context, context.len(), order)).copied().filter(|id| !suppressed.contains(id))
+			});
+			let Some(next) = next else { break; };
+			context.push(next);
+			if stop.contains(&next) { break; }
+		}
+		context[begin..].to_vec()
+	}
+}
 struct MtpRuntime {
 	head: MtpHead,
+	lookup: MtpLookup,
+	lookup_enabled: bool,
 	placed: Placed,
 	samples: Vec<f64>,
 	hidden: Vec<Vec<f64>>,
@@ -16249,18 +16382,26 @@ struct MtpRuntime {
 }
 impl MtpRuntime {
 	fn place(head: MtpHead, sequence: usize, devices: &'static [&'static Gpu]) -> Result<Self> {
+		let lookup = MtpLookup { hash: head.lookup_hash.clone(), ..MtpLookup::default() };
+		let lookup_enabled = match std::env::var("RECIPE_MTP_LOOKUP").ok().as_deref() {
+			None | Some("1") => true,
+			Some("0") => false,
+			Some(_) => return Err(RecipeError::new("RECIPE_MTP_LOOKUP must be 0 or 1")),
+		};
+		let devices = &devices[..1];
 		let mut graph = head.graph(sequence, devices[0])?;
 		retain_mtp_hidden(&mut graph)?;
 		let (split, ranges, resident, movement, moved) = place_ranges(&graph, &[], devices, Config::load()?.precision, &[])?;
 		let samples = Vec::new();
 		let placed = Placed { source: PlacedSource::Bound(graph.input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved };
-		Ok(Self { head, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false })
+		Ok(Self { head, lookup, lookup_enabled, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false })
 	}
 	fn clear(&mut self) {
 		self.ids.clear();
 		self.logits.clear();
 		self.hidden.clear();
 		self.hidden_released = 0;
+		self.lookup.clear();
 		self.head_valid = 0;
 		self.placed.clear();
 	}
@@ -16296,14 +16437,14 @@ impl MtpRuntime {
 			Ok(head) => head,
 			Err(error) => { self.poisoned = true; target.restore(main)?; return Err(error); }
 		};
-		let saved = (self.samples.clone(), self.hidden.clone(), self.hidden_released, self.ids.clone(), self.logits.clone(), self.head_valid);
+		let saved = (self.samples.clone(), self.hidden.clone(), self.hidden_released, self.ids.clone(), self.logits.clone(), self.head_valid, self.lookup.clone());
 		match self.decode_inner(main, prompt, sampler, stop, budget, progress, emit) {
 			Ok(generation) => Ok(generation),
 			Err(error) => {
 				self.poisoned = true;
 				let target_result = target.restore(main);
 				let head_result = head.restore(&self.placed);
-				(self.samples, self.hidden, self.hidden_released, self.ids, self.logits, self.head_valid) = saved;
+				(self.samples, self.hidden, self.hidden_released, self.ids, self.logits, self.head_valid, self.lookup) = saved;
 				target_result?; head_result?;
 				Err(error)
 			}
@@ -16329,6 +16470,7 @@ impl MtpRuntime {
 		}
 		if budget > 0 { self.refresh(prompt, self.head_valid.min(cached.saturating_sub(1)), prompt.len() - 1)?; }
 		self.ids = prompt.to_vec();
+		if self.lookup_enabled { self.lookup.observe(prompt, stop); }
 		let boundary = Instant::now();
 		if let Some(progress) = progress { progress.prefilled(prompt.len()); progress.phase(if budget > 0 { "tg" } else { "done" }, boundary); }
 		let mut generation = Generation { ids: prompt.to_vec(), logits: self.logits.clone(), cached, prefill_seconds: boundary.duration_since(started).as_secs_f64(), generation_seconds: 0.0, mtp: MtpReport::default(), reference: ReferenceReport::default() };
@@ -16339,6 +16481,7 @@ impl MtpRuntime {
 		let mut next = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&self.logits, &generation.ids));
 		let mut stopped = None;
 		while generation.ids.len() - prompt.len() < budget && !INTERRUPTED.load(Ordering::Acquire) {
+			let step_started = Instant::now();
 			let base = generation.ids.len();
 			generation.ids.push(next);
 			emit(next)?;
@@ -16346,11 +16489,17 @@ impl MtpRuntime {
 			if let Some(progress) = progress { progress.generated(true); }
 			let remaining = budget - (generation.ids.len() - prompt.len());
 			if remaining == 0 { break; }
-			let limit = self.head.tokens.min(remaining.saturating_sub(1));
+			let limit = self.head.tokens.min(remaining);
+			let draft_started = Instant::now();
+			let lookup = if self.lookup_enabled { self.lookup.propose(&generation.ids, limit, stop, &sampler.suppressed) } else { Vec::new() };
+			let from_lookup = !lookup.is_empty();
+			if !from_lookup && limit > 0 { self.refresh(&generation.ids, self.head_valid, base - 1)?; }
 			let mut proposed = vec![next];
-			let mut hidden = self.hidden[base - 1].clone();
+			proposed.extend(lookup);
+			let mut hidden
+ = self.hidden[base - 1].clone();
 			let mut head_checkpoint = None;
-			for offset in 0..limit {
+			for offset in 0..if from_lookup { 0 } else { limit } {
 				let position = base + offset - 1;
 				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
 				self.input(0, 1, proposed[offset], &hidden)?;
@@ -16373,11 +16522,14 @@ impl MtpRuntime {
 			}
 			for (slot, id) in samples[base..].iter_mut().zip(&proposed) { *slot = f64::from(*id); }
 			let end = base + proposed.len();
+			let draft_seconds = draft_started.elapsed().as_secs_f64();
+			let verify_started = Instant::now();
 			let predictions = main.run_window(&samples, base as u32, end as u32)?;
 			generation.mtp.drafted += proposed.len() - 1;
 			generation.mtp.verifications += 1;
 			self.hidden.resize_with(end, Vec::new);
 			for (slot, hidden) in self.hidden[base..end].iter_mut().zip(mtp_hidden(main, base, end)?) { *slot = hidden; }
+			let verify_seconds = verify_started.elapsed().as_secs_f64();
 			let output_tape = main.tapes[0].last().unwrap();
 			let mut accepted = 1;
 			for offset in 0..proposed.len() {
@@ -16398,17 +16550,37 @@ impl MtpRuntime {
 			generation.mtp.rejected += proposed.len() - accepted;
 			let committed = base + accepted - usize::from(terminal);
 			if committed < end { main.commit_mtp_prefix(committed as u32)?; }
+			let ran_head = head_checkpoint.is_some();
 			if let Some(checkpoint) = head_checkpoint { checkpoint.restore(&self.placed)?; }
 			self.ids = generation.ids[..committed.min(generation.ids.len())].to_vec();
 			self.hidden.truncate(committed);
-			if let Some(progress) = progress { progress.mtp(generation.mtp); }
+			if self.lookup_enabled { self.lookup.observe(&generation.ids, stop); }
 			generation.logits = self.logits.clone();
 			if terminal {
 				self.logits = output_tape.logits_at(&predictions, committed - 1)?;
-				break;
+			} else if ran_head {
+				// Replace speculative head inputs with the verified main-model states.
+				self.refresh(&generation.ids, base, base + accepted - 1)?;
 			}
-			// Replace speculative head inputs with the verified main-model states.
-			self.refresh(&generation.ids, if limit > 0 { base } else { base - 1 }, base + accepted - 1)?;
+			let drafts = proposed.len() - 1;
+			let accepted_drafts = accepted - 1;
+			let step_seconds = step_started.elapsed().as_secs_f64();
+			generation.mtp.draft_seconds += draft_seconds;
+			generation.mtp.verify_seconds += verify_seconds;
+			generation.mtp.step_seconds += step_seconds;
+			if from_lookup {
+				generation.mtp.lookup_drafted += drafts;
+				generation.mtp.lookup_accepted += accepted_drafts;
+			} else { generation.mtp.head_drafted += drafts; }
+			let observation = &mut generation.mtp.batches[drafts];
+			observation.verifications += 1;
+			observation.positions += proposed.len();
+			observation.accepted += accepted_drafts;
+			observation.verify_seconds += verify_seconds;
+			observation.step_seconds += step_seconds;
+			if let Some(progress) = progress { progress.mtp(generation.mtp); }
+			if terminal { break; }
+
 		}
 		let ended = stopped.unwrap_or_else(Instant::now);
 		generation.generation_seconds = if budget > 0 { ended.duration_since(boundary).as_secs_f64() } else { 0.0 };
@@ -16418,11 +16590,33 @@ impl MtpRuntime {
 		Ok(generation)
 	}
 }
+/// A target and its main-die MTP head, kept resident across requests and draft-cap sweeps.
+pub struct MtpPlaced {
+	main: Placed,
+	runtime: MtpRuntime,
+}
+impl MtpPlaced {
+	/// Change draft count without replacing either placement or reloading weights.
+	pub fn decode(&mut self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, drafts: usize, lookup: bool, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		require(drafts <= 4, "MTP draft tokens must be in 0..=4")?;
+		self.runtime.head.tokens = drafts;
+		self.runtime.lookup_enabled = lookup;
+		self.runtime.decode(&self.main, prompt, sampler, stop, budget, None, emit)
+	}
+	/// Clear carried state and lookup successors while retaining both weight allocations.
+	pub fn clear(&mut self) { self.main.clear(); self.runtime.clear(); }
+	pub fn main(&self) -> &Placed { &self.main }
+	pub fn head(&self) -> &Placed { &self.runtime.placed }
+	pub fn memory(&self) -> Vec<DeviceMemory> {
+		let mut memory = self.main.memory();
+		memory.extend(self.runtime.placed.memory());
+		memory
+	}
+}
 /// Walks the standard metadata and tensor names of one file, emitting the
 /// Recipe blocks and, beside every block, the plan entries its weighted nodes
 /// take, in the order the lowering pushes those nodes.
 struct Builder<'a> {
-	consumed: BTreeSet<String>,
 	file: &'a Gguf,
 	architecture: &'a str,
 	rope: RopePairs,
@@ -16471,7 +16665,7 @@ impl<'a> Builder<'a> {
 			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: BTreeSet::new() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -17268,6 +17462,18 @@ impl Infer {
 		self.mtp = Some(path.as_ref().to_path_buf());
 		self
 	}
+	/// Keep target and MTP placements resident while decoding with 0..=4 drafts per request.
+	pub fn place_mtp(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Result<MtpPlaced> {
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("MTP placement requires GGUF data"))?;
+		let path = self.mtp.as_ref().ok_or_else(|| RecipeError::new("MTP placement requires an MTP checkpoint"))?;
+		require(positions > 0, "MTP placement has no context positions")?;
+		let head = MtpHead::open(path, file, model)?;
+		let bound = explicit_bound(file, model, false)?;
+		let devices = selected_gpus()?;
+		let runtime = MtpRuntime::place(head, positions, devices)?;
+		let main = place_bound_observed(&bound, positions, split, devices, 5, tensor_observation_mask(&self.log))?;
+		Ok(MtpPlaced { main, runtime })
+	}
 	/// Keep the explicit Model+Data declaration resident for full forwards,
 	/// incremental decode, or serving through the same persistent stepper.
 	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
@@ -17573,7 +17779,7 @@ fn visit_attention(blocks: &[Block], visit: &mut impl FnMut(&AttentionBlock)) {
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -17932,12 +18138,38 @@ impl Sampler {
 }
 /// What `decode` produced: the prompt followed by the generated ids, the logits
 /// of the last forward, and elapsed seconds for prefill and generation.
+/// Totals for target verification batches with one fixed number of draft tokens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MtpBatchReport {
+	pub verifications: usize,
+	pub positions: usize,
+	pub accepted: usize,
+	pub verify_seconds: f64,
+	pub step_seconds: f64,
+}
+impl MtpBatchReport {
+	pub fn tokens_per_step(&self) -> f64 { if self.verifications == 0 { 0.0 } else { (self.verifications + self.accepted) as f64 / self.verifications as f64 } }
+	pub fn verify_seconds_per_step(&self) -> f64 { if self.verifications == 0 { 0.0 } else { self.verify_seconds / self.verifications as f64 } }
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MtpReport {
 	pub drafted: usize,
 	pub accepted: usize,
 	pub rejected: usize,
 	pub verifications: usize,
+	pub head_drafted: usize,
+	pub lookup_drafted: usize,
+	pub lookup_accepted: usize,
+	pub draft_seconds: f64,
+	pub verify_seconds: f64,
+	pub step_seconds: f64,
+	/// Index is the actual draft count, 0..=4; each verification also evaluates its leading token.
+	pub batches: [MtpBatchReport; 5],
+}
+impl MtpReport {
+	pub fn acceptance_rate(&self) -> f64 { if self.drafted == 0 { 0.0 } else { self.accepted as f64 / self.drafted as f64 } }
+	pub fn tokens_per_step(&self) -> f64 { if self.verifications == 0 { 0.0 } else { (self.verifications + self.accepted) as f64 / self.verifications as f64 } }
+	pub fn lookup_acceptance_rate(&self) -> f64 { if self.lookup_drafted == 0 { 0.0 } else { self.lookup_accepted as f64 / self.lookup_drafted as f64 } }
 }
 pub struct Generation {
 	pub mtp: MtpReport,
@@ -18911,7 +19143,6 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 		retain_mtp_hidden(&mut graph)?;
 		for node in &mut graph.nodes {
 			if node.op == Primitive::Delta { node.argument[5] = checkpoints as f64; }
-			require(node.op != Primitive::Attention || attention_blocks(node) == 0, "MTP rollback does not support indexed attention")?;
 		}
 	}
 	let input = graph.input;
@@ -19251,13 +19482,19 @@ impl Placed {
 	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		require(begin <= end, "window begins after its end")?;
-		let token_window = tokens.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		let packed_input = samples.len() != first.input.elements();
+		let positions = (end - begin) as usize;
+		let token_begin = if packed_input && tokens.len() != first.input.length && tokens.len() != first.input.elements() { 0 } else { begin as usize };
+		let token_window = tokens.get(token_begin..token_begin + positions).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+
 		for tape in tapes {
 			require(end <= tape.positions, "token window exceeds a persistent range")?;
 		}
 		for (start, count) in first.input_runs(begin, end) {
-			require(start.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
+			let source = if packed_input { (start / first.input.length) * positions + start % first.input.length - begin as usize } else { start };
+			require(source.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
 		}
+
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
@@ -19266,15 +19503,6 @@ impl Placed {
 		for tape in tapes {
 			tape.prepare_request(window.0, window.1)?;
 			window = tape.output_window(window.0, window.1)?;
-		}
-		for (start, count) in first.input_runs(begin, end) {
-			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
-		}
-		let packed_input = samples.len() != first.input.elements();
-		if tapes.iter().any(|tape| !tape.lookups.is_empty()) {
-			let start = if packed_input { 0 } else { begin as usize };
-			let token_window = samples.get(start..start + (end - begin) as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
-			tapes.iter().try_for_each(|tape| tape.write_tokens(begin as usize, token_window))?;
 		}
 		if packed_input && first.program.artifact.layout.request_control.is_some() {
 			first.write_samples(begin as usize, samples)?;

@@ -1,0 +1,340 @@
+.version 7.4
+.target sm_52
+.address_size 64
+
+// All threads of a CTA call with the same expert and a CTA-owned global map.
+// Map: count and one padding word, then eight (position, selected-slot) pairs. Padding uses position -1.
+.visible .func (.param .b32 result) mtp_group_expert(
+	.param .b64 selected, .param .b64 map, .param .b32 positions,
+	.param .b32 top_k, .param .b32 expert)
+{
+	.reg .pred %p<4>;
+	.reg .b32 %r<16>;
+	.reg .b64 %d<8>;
+	ld.param.u64 %d0, [selected];
+	ld.param.u64 %d1, [map];
+	ld.param.u32 %r0, [positions];
+	ld.param.u32 %r1, [top_k];
+	ld.param.u32 %r2, [expert];
+	mov.u32 %r3, %tid.x;
+	setp.ne.u32 %p0, %r3, 0;
+	@%p0 bra GROUP_WAIT;
+	mov.u32 %r4, 0;
+	mov.u32 %r14, 0xffffffff;
+	mov.u32 %r15, 0;
+GROUP_CLEAR:
+	mul.wide.u32 %d2, %r4, 8;
+	add.u64 %d2, %d2, %d1;
+	add.u64 %d2, %d2, 8;
+	st.global.v2.u32 [%d2], {%r14, %r15};
+	add.u32 %r4, %r4, 1;
+	setp.lt.u32 %p0, %r4, 8;
+	@%p0 bra GROUP_CLEAR;
+	mov.u32 %r4, 0;
+	mov.u32 %r5, 0;
+	add.u32 %r6, %r1, 1;
+GROUP_POSITION:
+	setp.ge.u32 %p0, %r4, %r0;
+	@%p0 bra GROUP_DONE;
+	mul.lo.u32 %r7, %r4, %r6;
+	mul.wide.u32 %d2, %r7, 4;
+	add.u64 %d2, %d0, %d2;
+	ld.global.u32 %r8, [%d2];
+	mov.u32 %r9, 0;
+GROUP_SLOT:
+	setp.ge.u32 %p0, %r9, %r8;
+	@%p0 bra GROUP_ADVANCE;
+	add.u32 %r10, %r9, 1;
+	mul.wide.u32 %d3, %r10, 4;
+	add.u64 %d3, %d2, %d3;
+	ld.global.u32 %r11, [%d3];
+	setp.eq.u32 %p1, %r11, %r2;
+	@!%p1 bra GROUP_NEXT_SLOT;
+	mul.wide.u32 %d3, %r5, 8;
+	add.u64 %d3, %d1, %d3;
+	add.u64 %d3, %d3, 8;
+	st.global.v2.u32 [%d3], {%r4, %r9};
+	add.u32 %r5, %r5, 1;
+	bra GROUP_ADVANCE;
+GROUP_NEXT_SLOT:
+	add.u32 %r9, %r9, 1;
+	bra GROUP_SLOT;
+GROUP_ADVANCE:
+	add.u32 %r4, %r4, 1;
+	bra GROUP_POSITION;
+GROUP_DONE:
+	st.global.u32 [%d1], %r5;
+GROUP_WAIT:
+	bar.sync 0;
+	ld.global.u32 %r5, [%d1];
+	st.param.b32 [result], %r5;
+	ret;
+}
+
+// Gather already-packed columns. Strides are uint32 pairs and float2 scales.
+// Each destination column reads one mapped position; padded columns are zero.
+.visible .func mtp_gather_packed(
+	.param .b64 packed_x, .param .b64 scales, .param .b64 map,
+	.param .b64 gathered_x, .param .b64 gathered_scales,
+	.param .b32 pairs_per_column, .param .b32 scales_per_column,
+	.param .b32 capacity)
+{
+	.reg .pred %p<4>;
+	.reg .b32 %r<20>;
+	.reg .b64 %d<16>;
+	ld.param.u64 %d0, [packed_x];
+	ld.param.u64 %d1, [scales];
+	ld.param.u64 %d2, [map];
+	ld.param.u64 %d3, [gathered_x];
+	ld.param.u64 %d4, [gathered_scales];
+	ld.param.u32 %r0, [pairs_per_column];
+	ld.param.u32 %r1, [scales_per_column];
+	ld.param.u32 %r2, [capacity];
+	add.u32 %r3, %r0, %r1;
+	mul.lo.u32 %r4, %r3, %r2;
+	mov.u32 %r5, %tid.x;
+	mov.u32 %r6, %ntid.x;
+GATHER_LOOP:
+	setp.ge.u32 %p0, %r5, %r4;
+	@%p0 bra GATHER_DONE;
+	div.u32 %r7, %r5, %r3;
+	rem.u32 %r8, %r5, %r3;
+	mul.wide.u32 %d5, %r7, 8;
+	add.u64 %d5, %d5, %d2;
+	add.u64 %d5, %d5, 8;
+	ld.global.u32 %r9, [%d5];
+	setp.eq.u32 %p1, %r9, 0xffffffff;
+	setp.ge.u32 %p2, %r8, %r0;
+	@%p2 bra GATHER_SCALE;
+	mad.lo.u32 %r10, %r7, %r0, %r8;
+	mul.wide.u32 %d6, %r10, 4;
+	add.u64 %d6, %d6, %d3;
+	mov.u32 %r11, 0;
+	@%p1 bra GATHER_STORE_X;
+	mad.lo.u32 %r10, %r9, %r0, %r8;
+	mul.wide.u32 %d7, %r10, 4;
+	add.u64 %d7, %d7, %d0;
+	ld.global.u32 %r11, [%d7];
+GATHER_STORE_X:
+	st.global.u32 [%d6], %r11;
+	bra GATHER_NEXT;
+GATHER_SCALE:
+	sub.u32 %r8, %r8, %r0;
+	mad.lo.u32 %r10, %r7, %r1, %r8;
+	mul.wide.u32 %d6, %r10, 8;
+	add.u64 %d6, %d6, %d4;
+	mov.u64 %d8, 0;
+	@%p1 bra GATHER_STORE_SCALE;
+	mad.lo.u32 %r10, %r9, %r1, %r8;
+	mul.wide.u32 %d7, %r10, 8;
+	add.u64 %d7, %d7, %d1;
+	ld.global.u64 %d8, [%d7];
+GATHER_STORE_SCALE:
+	st.global.u64 [%d6], %d8;
+GATHER_NEXT:
+	add.u32 %r5, %r5, %r6;
+	bra GATHER_LOOP;
+GATHER_DONE:
+	bar.sync 0;
+	ret;
+}
+
+// Store each expert's weighted down result in its distinct selected-slot plane.
+// The caller converts router coefficients to FP32 before entering this helper.
+.visible .func mtp_scatter_expert(
+	.param .b64 down, .param .b64 router_f32, .param .b64 map,
+	.param .b64 partials, .param .b32 expert, .param .b32 positions,
+	.param .b32 top_k, .param .b32 rows)
+{
+	.reg .pred %p<2>;
+	.reg .b32 %r<16>;
+	.reg .b64 %d<12>;
+	.reg .f32 %f<4>;
+	ld.param.u64 %d0, [down];
+	ld.param.u64 %d1, [router_f32];
+	ld.param.u64 %d2, [map];
+	ld.param.u64 %d3, [partials];
+	ld.param.u32 %r0, [expert];
+	ld.param.u32 %r1, [positions];
+	ld.param.u32 %r2, [top_k];
+	ld.param.u32 %r3, [rows];
+	ld.global.u32 %r4, [%d2];
+	mul.lo.u32 %r4, %r4, %r3;
+	mov.u32 %r5, %tid.x;
+	mov.u32 %r6, %ntid.x;
+SCATTER_LOOP:
+	setp.ge.u32 %p0, %r5, %r4;
+	@%p0 bra SCATTER_DONE;
+	div.u32 %r7, %r5, %r3;
+	rem.u32 %r8, %r5, %r3;
+	mul.wide.u32 %d4, %r7, 8;
+	add.u64 %d4, %d4, %d2;
+	add.u64 %d4, %d4, 8;
+	ld.global.v2.u32 {%r9, %r10}, [%d4];
+	mad.lo.u32 %r11, %r0, %r1, %r9;
+	mul.wide.u32 %d5, %r11, 4;
+	add.u64 %d5, %d5, %d1;
+	ld.global.f32 %f0, [%d5];
+	mul.wide.u32 %d5, %r5, 4;
+	add.u64 %d5, %d5, %d0;
+	ld.global.f32 %f1, [%d5];
+	mul.f32 %f2, %f0, %f1;
+	mad.lo.u32 %r11, %r9, %r2, %r10;
+	mad.lo.u32 %r11, %r11, %r3, %r8;
+	mul.wide.u32 %d5, %r11, 4;
+	add.u64 %d5, %d5, %d3;
+	st.global.f32 [%d5], %f2;
+	add.u32 %r5, %r5, %r6;
+	bra SCATTER_LOOP;
+SCATTER_DONE:
+	ret;
+}
+
+// Call after the existing grid completion barrier. Output is column-major.
+.visible .func mtp_combine_experts(
+	.param .b64 selected, .param .b64 partials, .param .b64 output,
+	.param .b32 positions, .param .b32 top_k, .param .b32 rows)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<16>;
+	.reg .b64 %d<10>;
+	.reg .f32 %f<3>;
+	ld.param.u64 %d0, [selected];
+	ld.param.u64 %d1, [partials];
+	ld.param.u64 %d2, [output];
+	ld.param.u32 %r0, [positions];
+	ld.param.u32 %r1, [top_k];
+	ld.param.u32 %r2, [rows];
+	mul.lo.u32 %r3, %r0, %r2;
+	mov.u32 %r4, %tid.x;
+	mov.u32 %r5, %ntid.x;
+	mov.u32 %r6, %ctaid.x;
+	mov.u32 %r7, %nctaid.x;
+	mad.lo.u32 %r4, %r6, %r5, %r4;
+	mul.lo.u32 %r5, %r5, %r7;
+COMBINE_LOOP:
+	setp.ge.u32 %p0, %r4, %r3;
+	@%p0 bra COMBINE_DONE;
+	div.u32 %r6, %r4, %r2;
+	rem.u32 %r7, %r4, %r2;
+	add.u32 %r8, %r1, 1;
+	mul.lo.u32 %r8, %r6, %r8;
+	mul.wide.u32 %d3, %r8, 4;
+	add.u64 %d3, %d3, %d0;
+	ld.global.u32 %r8, [%d3];
+	mov.u32 %r9, 0;
+	mov.f32 %f0, 0f00000000;
+COMBINE_SLOT:
+	setp.ge.u32 %p1, %r9, %r8;
+	@%p1 bra COMBINE_STORE;
+	mad.lo.u32 %r10, %r6, %r1, %r9;
+	mad.lo.u32 %r10, %r10, %r2, %r7;
+	mul.wide.u32 %d3, %r10, 4;
+	add.u64 %d3, %d3, %d1;
+	ld.global.f32 %f1, [%d3];
+	add.f32 %f0, %f0, %f1;
+	add.u32 %r9, %r9, 1;
+	bra COMBINE_SLOT;
+COMBINE_STORE:
+	mul.wide.u32 %d3, %r4, 4;
+	add.u64 %d3, %d3, %d2;
+	st.global.f32 [%d3], %f0;
+	add.u32 %r4, %r4, %r5;
+	bra COMBINE_LOOP;
+COMBINE_DONE:
+	ret;
+}
+// Warp-local routing. Every warp calls collectively with the same expert.
+// Selected records have stride top_k+1. Positions <=5 and top_k <=16.
+// Result mask bits name source positions; four slot bits belong to each position.
+.visible .func (.param .b64 routing) mtp_group_warp(
+	.param .b64 selected, .param .b32 positions, .param .b32 top_k,
+	.param .b32 expert)
+{
+	.reg .pred %p<4>;
+	.reg .b32 %r<18>;
+	.reg .b64 %d<5>;
+	ld.param.u64 %d0, [selected];
+	ld.param.u32 %r0, [positions];
+	ld.param.u32 %r1, [top_k];
+	ld.param.u32 %r2, [expert];
+	mov.u32 %r3, %tid.x;
+	and.b32 %r3, %r3, 31;
+	mov.u32 %r4, 0;
+	mov.u32 %r5, 0;
+	setp.lt.u32 %p0, %r3, %r0;
+	@!%p0 bra WARP_JOIN;
+	add.u32 %r6, %r1, 1;
+	mul.lo.u32 %r6, %r6, %r3;
+	mul.wide.u32 %d1, %r6, 4;
+	add.u64 %d1, %d1, %d0;
+	ld.global.u32 %r7, [%d1];
+WARP_SLOT:
+	setp.ge.u32 %p0, %r5, %r7;
+	@%p0 bra WARP_JOIN;
+	add.u32 %r8, %r5, 1;
+	mul.wide.u32 %d2, %r8, 4;
+	add.u64 %d2, %d2, %d1;
+	ld.global.u32 %r9, [%d2];
+	setp.eq.u32 %p1, %r9, %r2;
+	@%p1 bra WARP_FOUND;
+	add.u32 %r5, %r5, 1;
+	bra WARP_SLOT;
+WARP_FOUND:
+	mov.u32 %r4, 1;
+	mul.lo.u32 %r8, %r3, 4;
+	shl.b32 %r4, %r5, %r8;
+	mov.u32 %r5, 1;
+	bra WARP_REDUCE;
+WARP_JOIN:
+	mov.u32 %r4, 0;
+	mov.u32 %r5, 0;
+WARP_REDUCE:
+	setp.ne.u32 %p0, %r5, 0;
+	vote.ballot.b32 %r10, %p0;
+	shfl.bfly.b32 %r11, %r4, 16, 31;
+	or.b32 %r4, %r4, %r11;
+	shfl.bfly.b32 %r11, %r4, 8, 31;
+	or.b32 %r4, %r4, %r11;
+	shfl.bfly.b32 %r11, %r4, 4, 31;
+	or.b32 %r4, %r4, %r11;
+	shfl.bfly.b32 %r11, %r4, 2, 31;
+	or.b32 %r4, %r4, %r11;
+	shfl.bfly.b32 %r11, %r4, 1, 31;
+	or.b32 %r4, %r4, %r11;
+	cvt.u64.u32 %d3, %r10;
+	cvt.u64.u32 %d4, %r4;
+	shl.b64 %d4, %d4, 32;
+	or.b64 %d3, %d3, %d4;
+	st.param.b64 [routing], %d3;
+	ret;
+}
+
+// Call from the packed matvec's activation load, rather than copying columns.
+// UINT_MAX means an inactive padded column, whose activation and scale are zero.
+.visible .func (.param .b32 position) mtp_column_position(
+	.param .b32 position_mask, .param .b32 column)
+{
+	.reg .pred %p<2>;
+	.reg .b32 %r<7>;
+	ld.param.u32 %r0, [position_mask];
+	ld.param.u32 %r1, [column];
+	mov.u32 %r2, 0;
+COLUMN_SKIP:
+	setp.ge.u32 %p0, %r2, %r1;
+	@%p0 bra COLUMN_FIND;
+	sub.u32 %r3, %r0, 1;
+	and.b32 %r0, %r0, %r3;
+	add.u32 %r2, %r2, 1;
+	bra COLUMN_SKIP;
+COLUMN_FIND:
+	setp.eq.u32 %p0, %r0, 0;
+	mov.u32 %r4, 0xffffffff;
+	@%p0 bra COLUMN_RETURN;
+	brev.b32 %r3, %r0;
+	bfind.u32 %r3, %r3;
+	sub.u32 %r4, 31, %r3;
+COLUMN_RETURN:
+	st.param.b32 [position], %r4;
+	ret;
+}
