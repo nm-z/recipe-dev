@@ -4276,6 +4276,9 @@ impl NativeModelIr {
 			if plan.node.block_kind == "recur_body" {
 				continue;
 			}
+			let state_projection = !reverse && !training && index + 1 == self.plans.len()
+				&& plan.node.op == Primitive::Contraction && self.graph.nodes.iter().any(|node| node.retain_output);
+			if state_projection { ir.push_str("br i1 %state.only, label %state.projection.done, label %state.projection.run\nstate.projection.run:\n"); }
 			// Keep position propagation in the caller. Operation-local values do
 			// not need to remain live across later operations in the same kernel.
 			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: plan.node.output.length.to_string() } } else { self.emit_node_window(index, &plan.node, &mut ir)? };
@@ -5555,6 +5558,7 @@ impl NativeModelIr {
 				functions.push_str(&format!("define internal void @recipe_operation_n{index}({arguments}) #3 {{\nentry:\n{operation}ret void\n}}\n"));
 				ir.push_str(&format!("call void @recipe_operation_n{index}({arguments})\n"));
 			}
+			if state_projection { ir.push_str("br label %state.projection.done\nstate.projection.done:\n"); }
 		}
 		Ok(ir)
 	}
@@ -6925,6 +6929,7 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		for (index, plan) in self.plans.iter().enumerate().filter(|(index, plan)| *index + 1 == self.plans.len() || plan.node.retain_output) {
 			let name = if index + 1 == self.plans.len() { "output" } else { "hidden" };
+			if name == "output" { ir.push_str("br i1 %state.only, label %request.output.skipped, label %request.output.run\nrequest.output.run:\n"); }
 			let prefix = format!("request.{name}.export");
 			let ty = self.node_precision(&plan.node).model_type;
 			let shape = plan.node.output;
@@ -6938,6 +6943,7 @@ impl NativeModelIr {
 				}
 				ir.push_str(&format!("%{prefix}.from = getelementptr {ty}, {pointer} %{prefix}.source, i64 {wide}\n%{prefix}.value = load {ty}, {pointer} %{prefix}.from, align {align}\n%{prefix}.to = getelementptr {ty}, {pointer} %request.{name}, i64 %{prefix}.index\nstore {ty} %{prefix}.value, {pointer} %{prefix}.to, align {align}\n", align = alignment(ty)));
 			})?;
+			if name == "output" { ir.push_str("br label %request.output.skipped\nrequest.output.skipped:\n"); }
 		}
 		ir.push_str(barrier(backend));
 		Ok(())
@@ -7568,17 +7574,17 @@ impl NativeModelIr {
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
 		let bounded = self.layout.window_positions < self.graph.input.length;
 		if bounded {
-			body.push_str(&format!("define internal void @recipe_model_inference_chunk({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&format!("define internal void @recipe_model_inference_chunk({forward_args}, i1 %state.only) #1 {{\nentry:\n%tid = {thread}\n"));
 			self.emit_request_begin(backend, &mut body)?;
 			body.push_str(&inference_forward);
 			self.emit_request_end(backend, &mut body)?;
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}, i1 %state.only) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
 		if bounded {
 			let chunk_args = forward_args.replace("i32 %begin", "i32 %window.begin").replace("i32 %end", "i32 %window.end");
-			body.push_str(&format!("br label %window.loop\nwindow.loop:\n%window.begin = phi i32 [ %begin, %timing.inference.start.done ], [ %window.end, %window.next ]\n%window.more = icmp ult i32 %window.begin, %end\nbr i1 %window.more, label %window.run, label %window.done\nwindow.run:\n%window.remaining = sub i32 %end, %window.begin\n%window.full = icmp ugt i32 %window.remaining, {capacity}\n%window.span = select i1 %window.full, i32 {capacity}, i32 %window.remaining\n%window.end = add i32 %window.begin, %window.span\ncall void @recipe_model_inference_chunk({chunk_args})\n", capacity = self.layout.window_positions));
+			body.push_str(&format!("br label %window.loop\nwindow.loop:\n%window.begin = phi i32 [ %begin, %timing.inference.start.done ], [ %window.end, %window.next ]\n%window.more = icmp ult i32 %window.begin, %end\nbr i1 %window.more, label %window.run, label %window.done\nwindow.run:\n%window.remaining = sub i32 %end, %window.begin\n%window.full = icmp ugt i32 %window.remaining, {capacity}\n%window.span = select i1 %window.full, i32 {capacity}, i32 %window.remaining\n%window.end = add i32 %window.begin, %window.span\ncall void @recipe_model_inference_chunk({chunk_args}, i1 %state.only)\n", capacity = self.layout.window_positions));
 			body.push_str(barrier(backend));
 			body.push_str("br label %window.next\nwindow.next:\nbr label %window.loop\nwindow.done:\n");
 		} else {
@@ -7599,13 +7605,13 @@ impl NativeModelIr {
 			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
 			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
-			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
+			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%state.only = icmp eq i32 %training, 2\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args}, i1 %state.only)\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
 		}
 		if loss.is_some() {
-			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%state.only = icmp eq i32 %training, 2\n%forward.training = icmp eq i32 %training, 1\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args}, i1 %state.only)\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
 			body.push_str(&format!(
-				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%state.only = icmp eq i32 %training, 2\ncall void @recipe_model_inference_forward_body({forward_args}, i1 %state.only)\nret void\n}}\n"
 			));
 		}
 		if let Some(loss) = loss.filter(|_| epoch) {
@@ -7623,7 +7629,7 @@ impl NativeModelIr {
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
 			body.push_str(&format!(
-				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.forward.entry:\ncall void @recipe_model_inference_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.entry:\n",
+				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.forward.entry:\ncall void @recipe_model_inference_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions}, i1 false)\nbr label %metrics.entry\nmetrics.entry:\n",
 				positions = graph_positions(&self.graph)
 			));
 			let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
@@ -16542,7 +16548,7 @@ impl MtpRuntime {
 		let positions = end - begin;
 		self.samples.resize(checked_mul(self.head.width * self.head.lanes + 1, positions, "MTP request input")?, 0.0);
 		for position in begin..end { self.input(position - begin, positions, ids[position + 1], &self.hidden[position].clone())?; }
-		self.placed.run_window(&self.samples, begin as u32, end as u32)?;
+		self.placed.run_state_window(&self.samples, begin as u32, end as u32)?;
 		self.head_valid = end;
 		self.release_hidden(end)?;
 		Ok(())
@@ -20288,42 +20294,73 @@ impl Placed {
 	}
 	/// Commit an evaluated speculative prefix without replaying model arithmetic.
 	fn commit_mtp_prefix(&self, end: u32) -> Result<()> {
-		let mut images = Vec::new();
+		let mut copies = Vec::new();
+		let mut clears = Vec::new();
+		let mut writes = Vec::new();
 		for tape in self.tapes.iter().flatten() {
-			let mut contexts = tape.contexts.download::<u8>(tape.contexts.bytes)?;
-			let mut values = tape.values.download::<u8>(tape.values.bytes)?;
-			tape.commit_index_prefix(&mut contexts, &mut values, end)?;
+			require(end <= tape.reached.load(Ordering::Acquire), "MTP prefix exceeds evaluated positions")?;
+			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
+				let layout = attention_index_layout(node, tape.rows as usize)?;
+				let buffer = if tape.program.artifact.layout.contexts_in_values[index] { &tape.values } else { &tape.contexts };
+				let base = tape.program.artifact.layout.contexts[index];
+				require(base + layout.bytes <= buffer.bytes, "MTP indexer context exceeds its buffer")?;
+				let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
+				let row_bytes = checked_mul(width, node.precision.bytes(), "MTP indexer row bytes")?;
+				let count_at = base + layout.counts;
+				let mut counts = buffer.download_range::<u64>(count_at / 8, tape.rows as usize * blocks)?;
+				let mut changed = false;
+				for row in 0..tape.rows as usize {
+					for b in 0..blocks {
+						let start = b * block;
+						let count = (end as usize).saturating_sub(start).min(block);
+						let slot = row * blocks + b;
+						require(counts[slot] <= block.min(node.output.length - start) as u64 && counts[slot] >= count as u64, "MTP indexer count was not evaluated")?;
+						if counts[slot] == count as u64 { continue; }
+						changed = true;
+						let destination = base + layout.sums + slot * row_bytes;
+						if count == 0 { clears.push((buffer, destination, row_bytes)); }
+						else {
+							let position = row * node.output.length + start + count - 1;
+							copies.push((buffer, base + layout.prefix_sums + position * row_bytes, destination, row_bytes));
+						}
+						counts[slot] = count as u64;
+					}
+				}
+				if changed { writes.push((buffer, count_at, counts.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>())); }
+			}
 			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Delta) {
 				let slots = integer_argument(node.argument[5], "delta checkpoint slots")? as usize;
 				require(slots != 0, "MTP delta prefix has no checkpoint slots")?;
+				let reached = tape.reached.load(Ordering::Acquire);
+				require(end == 0 || (reached - end) < slots as u32, "MTP delta prefix checkpoint was overwritten")?;
 				let (_, keys, heads, width) = delta_extent(node)?;
 				let cells = checked_mul(keys as usize, width as usize, "MTP delta state cells")?;
 				let bytes = checked_mul(cells, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "MTP delta state bytes")?;
 				let pairs = checked_mul(tape.rows as usize, heads as usize, "MTP delta state pairs")?;
 				let live = checked_mul(pairs, bytes, "MTP delta live bytes")?;
 				let base = tape.program.artifact.layout.contexts[index];
-				let image = if tape.program.artifact.layout.contexts_in_values[index] { &mut values } else { &mut contexts };
+				let buffer = if tape.program.artifact.layout.contexts_in_values[index] { &tape.values } else { &tape.contexts };
 				let extent = checked_mul(live, checked_add(slots, 1, "MTP delta slots")?, "MTP delta checkpoint extent")?;
-				require(checked_add(base, extent, "MTP delta checkpoint end")? <= image.len(), "MTP delta checkpoint exceeds its image")?;
-				if end == 0 { image[base..base + live].fill(0); continue; }
+				require(checked_add(base, extent, "MTP delta checkpoint end")? <= buffer.bytes, "MTP delta checkpoint exceeds its buffer")?;
+				if end == 0 { clears.push((buffer, base, live)); continue; }
 				let slot = (end as usize - 1) % slots;
 				for pair in 0..pairs {
 					let cell = checked_add(checked_mul(pair, slots, "MTP delta checkpoint pair")?, slot, "MTP delta checkpoint slot")?;
 					let source = checked_add(checked_add(base, live, "MTP delta checkpoint region")?, checked_mul(cell, bytes, "MTP delta checkpoint offset")?, "MTP delta checkpoint address")?;
 					let target = checked_add(base, checked_mul(pair, bytes, "MTP delta live offset")?, "MTP delta live address")?;
-					image.copy_within(source..source + bytes, target);
+					copies.push((buffer, source, target, bytes));
 				}
 			}
-			images.push((tape, contexts, values));
+
 		}
-		// All images pass their layout and prefix checks before the first device write.
-		for (tape, contexts, values) in &images {
-			tape.contexts.write_bytes(0, contexts)?; tape.values.write_bytes(0, values)?;
-			tape.program.gpu.synchronize()?;
-		}
-		for (tape, _, _) in images { tape.reached.store(end, Ordering::Release); }
+		// Validate the complete prefix before the first state mutation.
+		for (buffer, source, destination, bytes) in copies { buffer.copy_within(source, destination, bytes)?; }
+		for (buffer, destination, bytes) in clears { buffer.clear_range(destination, bytes)?; }
+		for (buffer, destination, bytes) in writes { buffer.write_bytes(destination, &bytes)?; }
+		for tape in self.tapes.iter().flatten() { tape.program.gpu.synchronize()?; tape.reached.store(end, Ordering::Release); }
 		Ok(())
 	}
+
 	fn take_operations(&self, model: &str) -> Vec<OperationReport> {
 		self.tapes.iter().flatten().flat_map(|tape| {
 			std::mem::take(&mut *tape.operations.lock().unwrap()).into_iter().map(|mut observation| {
@@ -20631,7 +20668,20 @@ impl Placed {
 	}
 	/// Every part receives the original token IDs, independently of transformed
 	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
+	fn run_state_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<()> {
+		let PlacedSource::Bound(input, _) = &self.source else { return Err(RecipeError::new("MTP state refresh requires a bound head")); };
+		let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("MTP head has no ranges"))?;
+		require(ranges.len() == 1 && ranges[0].nodes.last().is_some_and(|node| node.op == Primitive::Contraction)
+			&& ranges[0].nodes.iter().any(|node| node.retain_output), "MTP state refresh requires a retained hidden stream and vocabulary projection")?;
+		require(begin <= end && end as usize <= input.length && samples.len() == input.channels * (end - begin) as usize, "MTP state refresh input window is invalid")?;
+		self.forward_window_mode(ranges, samples, samples, 0, begin, end, None, ForwardMode::StateOnly)?;
+		Ok(())
+	}
 	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+		self.forward_window_mode(tapes, samples, tokens, token_begin, begin, end, progress, ForwardMode::Inference)
+	}
+	fn forward_window_mode(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>, mode: ForwardMode) -> Result<Vec<f64>> {
+
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		require(begin <= end, "window begins after its end")?;
 		let packed_input = samples.len() != first.input.elements();
@@ -20666,7 +20716,7 @@ impl Placed {
 		let input_end = end;
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
-			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
+			tape.forward_window_observed(tape.samples.pointer, begin, end, mode, &mut |reached, _| {
 				// A token has completed prefill only after the final placed range.
 				if index + 1 == tapes.len() && let Some(progress) = progress {
 					progress.prefilled(if reached == end { input_end } else { reached } as usize);
@@ -20682,7 +20732,7 @@ impl Placed {
 				}
 			}
 		}
-		last.predictions()
+		if matches!(mode, ForwardMode::StateOnly) { Ok(Vec::new()) } else { last.predictions() }
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24028,6 +24078,7 @@ impl NativeRequest {
 enum ForwardMode {
 	Inference,
 	Training,
+	StateOnly,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24450,61 +24501,7 @@ impl NativeTape {
 	/// invocation. Preflight every span before changing the saved image. The
 	/// caller restores the image with its other accepted state and poisons the
 	/// transaction if restoration fails.
-	fn commit_index_prefix(&self, contexts: &mut [u8], values: &mut [u8], end: u32) -> Result<()> {
-		require(contexts.len() == self.contexts.bytes && values.len() == self.values.bytes, "indexer prefix image has the wrong capacity")?;
-		let end = end as usize;
-		require(end <= self.reached.load(Ordering::Acquire) as usize, "indexer prefix exceeds evaluated positions")?;
-		let mut patches = Vec::new();
-		for (index, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
-			require(end <= node.output.length, "indexer prefix exceeds its sequence")?;
-			let layout = attention_index_layout(node, self.rows as usize)?;
-			let in_values = self.program.artifact.layout.contexts_in_values[index];
-			let base = self.program.artifact.layout.contexts[index];
-			let image = if in_values { &*values } else { &*contexts };
-			require(checked_add(base, layout.bytes, "indexer prefix context")? <= image.len(), "indexer prefix context exceeds its buffer")?;
-			let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
-			let bytes = checked_mul(width, node.precision.bytes(), "indexer sum row bytes")?;
-			let count_at = checked_add(base, layout.counts, "indexer count address")?;
-			let count_bytes = checked_mul(checked_mul(self.rows as usize, blocks, "indexer count rows")?, size_of::<u64>(), "indexer count bytes")?;
-			let mut counts = image[count_at..count_at + count_bytes].to_vec();
-			for row in 0..self.rows as usize {
-				for b in 0..blocks {
-					let start = checked_mul(b, block, "indexer prefix block start")?;
-					let count = end.saturating_sub(start).min(block);
-					let slot = checked_add(checked_mul(row, blocks, "indexer count row")?, b, "indexer count slot")?;
-					let at = checked_mul(slot, size_of::<u64>(), "indexer count offset")?;
-					let saved = u64::from_le_bytes(counts[at..at + size_of::<u64>()].try_into().unwrap());
-					require(saved <= block.min(node.output.length - start) as u64 && saved >= count as u64, "indexer prefix count is invalid or was not evaluated")?;
-					if saved != count as u64 {
-						let destination = checked_add(base, checked_add(layout.sums, checked_mul(slot, bytes, "indexer sum slot")?, "indexer sum local")?, "indexer sum address")?;
-						let sum = if count == 0 {
-							encode_floats(&vec![0.0; width], node.precision)
-						} else {
-							let position = checked_add(
-								checked_mul(row, node.output.length, "indexer prefix row")?,
-								checked_add(start, count - 1, "indexer prefix last")?,
-								"indexer prefix position",
-							)?;
-							let source = checked_add(
-								base,
-								checked_add(layout.prefix_sums, checked_mul(position, bytes, "indexer prefix row offset")?, "indexer prefix local")?,
-								"indexer prefix address",
-							)?;
-							image[source..source + bytes].to_vec()
-						};
-						patches.push((in_values, destination, sum));
-					}
-					counts[at..at + size_of::<u64>()].copy_from_slice(&(count as u64).to_le_bytes());
-				}
-			}
-			patches.push((in_values, count_at, counts));
-		}
-		for (in_values, destination, bytes) in patches {
-			let image = if in_values { &mut *values } else { &mut *contexts };
-			image[destination..destination + bytes.len()].copy_from_slice(&bytes);
-		}
-		Ok(())
-	}
+
 	/// Applies a runtime contraction schedule to both the host description and
 	/// the words read by the native kernels.
 	fn apply_contraction_schedule(&mut self, contractions: Vec<Option<NativeContractionTiles>>) -> Result<()> {
@@ -24671,7 +24668,7 @@ impl NativeTape {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let mut thread_count = threads;
-		let single = matches!(mode, ForwardMode::Inference) && end - begin == 1;
+		let single = matches!(mode, ForwardMode::Inference | ForwardMode::StateOnly) && end - begin == 1;
 		#[cfg(amd)]
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		#[cfg(nvidia)]
@@ -24680,12 +24677,16 @@ impl NativeTape {
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
 		let machine_started = Instant::now();
 		let mut expert_guard = self.expert_execution.as_ref().map(|execution| execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))).transpose()?;
-		if let Some(execution) = expert_guard.as_mut() { execution.start(self.expert_first, self.expert_count, begin, end, capacity)?; }
+		let expert_count = if mode == ForwardMode::StateOnly as i32 && expert_guard.as_ref().is_some_and(|execution|
+			execution.layers.get(self.expert_first + self.expert_count.saturating_sub(1)).is_some_and(|layer| layer.node + 1 == self.nodes.len()))
+		{ self.expert_count.saturating_sub(1) } else { self.expert_count };
+		if let Some(execution) = expert_guard.as_mut() { execution.start(self.expert_first, expert_count, begin, end, capacity)?; }
+
 		if let Err(error)=self.program.launch_forward(&mut call,single).and_then(|_|self.program.gpu.synchronize()) {
 			if let Some(execution)=expert_guard.as_mut() {execution.abort();} return Err(RecipeError::new(format!("forward: {error}")));
 		}
 		if let Some(execution)=expert_guard.as_mut() {
-			match execution.finish(self.expert_first,self.expert_count,begin,end,capacity) {
+			match execution.finish(self.expert_first,expert_count,begin,end,capacity) {
 				Ok(records)=>self.operations.lock().map_err(|_|RecipeError::new("expert operation reports are poisoned"))?.extend(records),
 				Err(error)=>{execution.abort();return Err(error);},
 			}
@@ -26165,6 +26166,35 @@ struct Buffer {
 /// The largest host buffer a zero fill stages at once, so an arena of any size
 /// clears without a host copy of its own size.
 const ZERO_FILL_BYTES: usize = 64 << 20;
+impl Gpu {
+	fn copy_device(&self, destination: u64, source: u64, bytes: usize) -> Result<()> {
+		self.activate()?;
+		unsafe {
+			match &self.driver {
+				Driver::Cpu => { ptr::copy(source as *const u8, destination as *mut u8, bytes); Ok(()) }
+				#[cfg(nvidia)]
+				Driver::Cuda(driver) => {
+					self.status((driver.copy_device)(destination, source, bytes), "device copy")
+				}
+				#[cfg(amd)]
+				Driver::Hsa(driver) => self.status((driver.copy)(destination as Ptr, source as *const c_void, bytes), "device copy"),
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_DEVICE_COPY)?; channel.write_u64(destination)?; channel.write_u64(source)?; channel.write_u64(bytes as u64)?; channel.flush()?;
+					channel.read_status("device copy")
+				}
+			}
+		}
+	}
+}
+impl Buffer {
+	fn copy_within(&self, source: usize, destination: usize, bytes: usize) -> Result<()> {
+		require(checked_add(source, bytes, "device copy source")? <= self.bytes && checked_add(destination, bytes, "device copy destination")? <= self.bytes, "device copy exceeds its buffer")?;
+		if bytes == 0 || source == destination { return Ok(()); }
+		require(source + bytes <= destination || destination + bytes <= source, "device copy regions overlap")?;
+		self.runtime.copy_device(self.pointer + destination as u64, self.pointer + source as u64, bytes)
+	}
+}
 impl Buffer {
 	/// Copy bytes after the caller has synchronized the completed pass.
 	fn download_completed_bytes(&self, offset: usize, count: usize) -> Result<Vec<u8>> {
@@ -26488,6 +26518,7 @@ impl Kernel {
 }
 #[cfg(nvidia)]
 struct Cuda {
+	copy_device: unsafe extern "C" fn(u64, u64, usize) -> i32,
 	host_alloc: unsafe extern "C" fn(*mut Ptr,usize,u32)->i32,
 	host_device_pointer: unsafe extern "C" fn(*mut u64,Ptr,u32)->i32,
 	host_free: unsafe extern "C" fn(Ptr)->i32,
@@ -26579,6 +26610,7 @@ const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
 const REMOTE_MEMORY: u8 = 8;
 const REMOTE_CLEAR: u8 = 9;
+const REMOTE_DEVICE_COPY: u8 = 10;
 const REMOTE_NATIVE_EPOCH: u8 = 1;
 const REMOTE_NATIVE_STEP: u8 = 2;
 struct Wire<R: Read, W: Write> {
@@ -28347,6 +28379,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				copy_device: runtime.function(b"cuMemcpyDtoD_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
@@ -28478,7 +28511,14 @@ pub fn worker_serve(name: &str) -> Result<()> {
 					wire.write_bytes(&data)?;
 				}
 			}
-			REMOTE_SYNCHRONIZE => wire.status(&gpu.synchronize())?,
+			REMOTE_DEVICE_COPY => {
+				let destination = wire.read_u64()?;
+				let source = wire.read_u64()?;
+				let bytes = wire.read_u64()? as usize;
+				wire.status(&gpu.copy_device(destination, source, bytes))?;
+			}
+			REMOTE_SYNCHRONIZE =>
+ wire.status(&gpu.synchronize())?,
 			REMOTE_MEMORY => {
 				let free = gpu.free_bytes();
 				wire.status(&free.as_ref().map(|_| ()).map_err(Clone::clone))?;
