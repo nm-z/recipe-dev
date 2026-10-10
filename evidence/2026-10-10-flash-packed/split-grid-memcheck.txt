@@ -1,0 +1,46 @@
+Production split_grid argument repair, 2026-10-10
+Physical die: 1, GPU-ccb8b3a3-f45d-8962-215b-c2b140e4bb28, only visible CUDA device.
+CUDA driver 470; CUDA 11.4 ptxas/nvlink; Compute Sanitizer 2021.2.1.
+
+Fixture invokes the unmodified expert_split_worker entry from root fused-worker.ptx.
+Real layer-0 IQ2_XS gate/up: 2560 inputs, 640 rows; IQ4_NL down: 640 inputs, 2560 rows.
+Two experts, two columns, unequal active-column masks. Packed weights: 3737600 bytes.
+192-byte production descriptors, original scratch sizes and group offsets,
+16 CTAs x 256 threads, 40960 dynamic shared bytes. No full-model load or other-die context.
+
+Original source, debug metadata only:
+Memcheck exit 86, 257 recorded errors, 3840 dropped records.
+Invalid 4-byte global read in p2p_wait at failed-worker-source.ptx line 15.
+Example misaligned address: 0xf00000001. No returned output or successful CTA receipt.
+The first preparation attempt lacked a cubin and stopped at CUDA API error 301;
+that attempt is excluded from the memory-fault receipt.
+
+Repair:
+split_grid now gives p2p_publish and p2p_wait separate call parameter blocks.
+The wait arguments are freshly stored from registers after the publication call.
+The published receipt is checked, and failure returns before waiting.
+No function ABI, matrix body, pointer layout, cap, clock, or hardware state changes.
+
+Patched source, same fixture:
+Run 12:23:55 PDT, exit 0. Memcheck ERROR SUMMARY: 0 errors.
+All 16 CTA statuses equal 1. Response sequence equals 1.
+All 8192 returned packet words are finite, including padded rows.
+Context and allocations are released; NVML reports die 1 at 0 MiB used.
+No new NVRM/Xid appears in the instrumented interval.
+
+Original worker source SHA256:
+300038bfb40ea51b047ba606ccddff9fb85ceaf4c88336d2d02faf97c45d679e
+Only split_grid changes in the fixed module; .file/.loc add debug metadata.
+Removing debug directives reproduces the corresponding original/fixed source exactly.
+Both worker modules assemble/link with 252 registers, 504 stack bytes, 16 static shared bytes.
+Cargo check --lib: exit 0, with five existing warnings.
+
+This reproduces and fixes the one-layer protocol fault. It does not establish
+full-model execution, output accuracy against llama.cpp, or 60/80 tok/s.
+The ordinary Contraction declaration/link-policy repair remains the earlier b10a9f2 commit.
+
+Source and logs: archy:/home/nate/codex/cx-fl-kern-build/
+worker-layer-memcheck.c, worker-lineinfo.awk, failed-worker-source.ptx,
+fixed-worker-source.ptx, fixed-worker-lineinfo.cubin,
+worker-memcheck-original-iq2.log, worker-memcheck-iq2.log,
+worker-memcheck-iq2-output.log, worker-memcheck.state, worker-memcheck-kernel.log.
