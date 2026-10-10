@@ -18954,7 +18954,7 @@ fn adds_bos_token(file: &Gguf) -> bool {
 fn token_groups(coder: &Tokenizer, ids: &[u32]) -> Result<Vec<Vec<u32>>> {
 	let groups = coder.encode_words(&coder.decode(ids));
 	let encoded = groups.concat();
-	let reproduced = encoded == ids || coder.bos().is_some_and(|bos| ids.first() == Some(&bos) && encoded.get(1..) == Some(ids) && encoded.first() == Some(&bos));
+	let reproduced = encoded == ids || coder.bos().is_some_and(|bos| encoded.get(1..) == Some(ids) && encoded.first() == Some(&bos));
 	require(reproduced, "token ids do not round-trip through the tokenizer; pass the text instead")?;
 	Ok(if encoded == ids { groups } else { groups.into_iter().skip(1).collect() })
 }
@@ -19756,11 +19756,12 @@ impl TextScore {
 		let ids = groups.concat();
 		require(ids.len() >= 2, "scoring needs at least two tokens")?;
 		require(ids.len() <= positions, format!("{} scored tokens exceed {positions} output positions", ids.len()))?;
-		require(logits.len() >= channels * positions, format!("native output has {} values, expected at least {}", logits.len(), channels * positions))?;
+		let values = channels.checked_mul(positions).ok_or_else(|| RecipeError::new("scoring output dimensions overflow"))?;
+		require(logits.len() >= values, format!("native output has {} values, expected at least {values}", logits.len()))?;
+		require(ids.iter().all(|id| (*id as usize) < channels), format!("token ids exceed the {channels} output channels"))?;
 		let mut tokens = Vec::with_capacity(ids.len() - 1);
 		for position in 0..ids.len() - 1 {
 			let id = ids[position + 1];
-			require((id as usize) < channels, format!("token id {id} is outside the {channels} output channels"))?;
 			let column = (0..channels).map(|channel| logits[channel * positions + position]).collect::<Vec<_>>();
 			require(column.iter().all(|value| value.is_finite()), format!("nonfinite logit at position {position}"))?;
 			let max = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -19769,7 +19770,7 @@ impl TextScore {
 			tokens.push(TokenScore {
 				id,
 				piece: text(&ids[position + 1..position + 2]),
-				logprob: target - (max + sum.ln()),
+				logprob: (target - max) - sum.ln(),
 				rank: 1 + column.iter().filter(|value| **value > target).count(),
 			});
 		}

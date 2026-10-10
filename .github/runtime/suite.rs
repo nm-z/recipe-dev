@@ -156,7 +156,7 @@ fn write_stepper_checkpoint(path: &Path) {
 	}
 	gguf_text(&mut metadata, "tokenizer.ggml.add_bos_token");
 	metadata.extend_from_slice(&7u32.to_le_bytes());
-	metadata.push(0);
+	metadata.push(1);
 	for (name, values) in [("tokenizer.ggml.tokens", &["a", "b"][..]), ("tokenizer.ggml.merges", &[][..])] {
 		gguf_text(&mut metadata, name);
 		metadata.extend_from_slice(&9u32.to_le_bytes());
@@ -341,6 +341,33 @@ fn main() {
 	//    prefill followed by single steps must produce the same logits bits.
 	let stepper = work.join("stepper.gguf");
 	write_stepper_checkpoint(&stepper);
+	let score_model = recipe.model().no(bias).embed(2, 1).fp(64).layer(2).fp(64).scale(100.0).fp(64);
+	let score_data = recipe.data(stepper.to_str().expect("score path is not UTF-8"));
+	let scored = recipe.infer().score_ids([0, 1, 0, 1]).run(&score_model, &score_data);
+	let score = scored.score.as_ref().expect("scoring returned no score");
+	let expected = [-200.0, 0.0, -200.0];
+	let token_error = worst_absolute(&score.tokens.iter().map(|token| token.logprob).collect::<Vec<_>>(), &expected);
+	let words_sum = score.words.iter().map(|word| word.logprob).sum::<f64>();
+	let underflows = (-200.0_f32).exp() == 0.0 && score.tokens[0].logprob.is_finite();
+	let metadata = score.tokens.iter().map(|token| (token.id, token.piece.as_str(), token.rank)).collect::<Vec<_>>() == [(1, "b", 2), (0, "a", 1), (1, "b", 2)];
+	let word = score.words.len() == 1 && score.words[0].text == "abab" && score.words[0].tokens == 3;
+	let aggregate = score.logprob == -400.0 && words_sum == score.logprob && score.perplexity == (400.0_f64 / 3.0).exp();
+	report.record("teacher_forced_score", token_error < 1e-12 && metadata && word && aggregate && underflows && scored.requests == 0,
+		format!("tokens={} max_logprob_error={token_error:.3e} word_sum={words_sum} f32_underflow={underflows} requests={}", score.tokens.len(), scored.requests));
+	let without_bos = recipe.infer().score_ids([1, 0, 1]).run(&score_model, &score_data).score.expect("token ids without BOS could not be scored");
+	let without_bos_ok = without_bos.tokens.len() == 2 && without_bos.tokens[0].id == 0 && without_bos.tokens[1].id == 1 && without_bos.logprob == -200.0;
+	report.record("score_ids_without_bos", without_bos_ok, format!("tokens={} logprob={}", without_bos.tokens.len(), without_bos.logprob));
+	let grouped = TextScore::from_logits(&[100.0, 200.0, 100.0, 0.0, -100.0, -200.0, -100.0, 0.0], 2, 4,
+		&[vec![0], vec![1, 0], vec![1]], |ids| ids.iter().map(|id| if *id == 0 { 'a' } else { 'b' }).collect()).expect("word groups could not be scored");
+	let grouped_ok = grouped.words.len() == 2 && grouped.words[0].text == "ba" && grouped.words[0].tokens == 2 && grouped.words[0].logprob == -200.0
+		&& grouped.words[1].text == "b" && grouped.words[1].tokens == 1 && grouped.words[1].logprob == -200.0 && grouped.logprob == -400.0;
+	report.record("score_word_groups", grouped_ok, format!("words={} logprob={}", grouped.words.len(), grouped.logprob));
+	let offset_score = TextScore::from_logits(&[1e16; 6], 2, 3, &[vec![0, 1, 0]], |_| String::new()).expect("constant logits could not be scored");
+	let offset_error = offset_score.tokens.iter().map(|token| (token.logprob + 2.0_f64.ln()).abs()).fold(0.0_f64, f64::max);
+	report.record("score_logit_offset", offset_error == 0.0, format!("offset=1e16 max_logprob_error={offset_error:.3e}"));
+	let dimensions = TextScore::from_logits(&[], usize::MAX, 2, &[vec![0, 1]], |_| String::new()).is_err();
+	let invalid_id = TextScore::from_logits(&[0.0; 4], 2, 2, &[vec![2, 0]], |_| String::new()).is_err();
+	report.record("score_invalid_input", dimensions && invalid_id, format!("dimension_overflow={dimensions} invalid_first_id={invalid_id}"));
 	let file = recipe.gguf(stepper.to_str().expect("stepper path is not UTF-8"));
 	let table = file.ngram();
 	let gate = layer(1).fp(64).silu().fp(64);

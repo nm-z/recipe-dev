@@ -253,6 +253,15 @@ place(path, &[blocks])
 	.memory()[]
 ```
 
+```rust
+let report = recipe.infer().score().run(&model, &data);
+let score = report.score.as_ref().unwrap();
+score.tokens[] // id, piece, logprob, rank
+score.words[] // text, tokens, logprob
+score.logprob|score.tokens.len()|score.perplexity
+recipe.infer().score_ids(&ids).run(&model, &data)
+```
+
 ## GGUF tensors
 
 A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, a hyper-connection block its gate projections and head mixer, a per-layer embedding block its projections, scales and taps, and a normalization its scale.

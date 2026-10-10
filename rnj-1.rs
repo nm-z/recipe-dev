@@ -11,16 +11,16 @@ fn main() {
 
 	let mut model = recipe.model()
 		.no(bias)
-		.embed(tokenizer.ggml.tokens, gemma3.embedding_length).fp(16)
-		.scale(gemma3.embedding_length.sqrt()).fp(16);
+		.embed(tokenizer.ggml.tokens, gemma3.embedding_length)
+		.scale(gemma3.embedding_length.sqrt());
 
 	for _ in 0..gemma3.block_count {
 		model = model
 			.res([
-				norm(rms).fp(16),
-				attn(gemma3.attention.head_count).int(8)
-					.kv(gemma3.attention.head_count_kv).fp(16)
-					.qk(rms).fp(16)
+				norm(rms),
+				attn(gemma3.attention.head_count)
+					.kv(gemma3.attention.head_count_kv)
+					.qk(rms)
 					.rope(
 						neox,
 						gemma3.attention.key_length,
@@ -31,24 +31,24 @@ fn main() {
 						gemma3.rope.scaling.original_context_length,
 						YARN_FAST,
 						gemma3.rope.scaling.yarn_beta_slow
-					).fp(32),
-				norm(rms).fp(16),
-			]).fp(16)
+					),
+				norm(rms),
+			])
 			.res([
-				norm(rms).fp(16),
-				layer(gemma3.feed_forward_length).int(8).gelu().fp(16)
-					* layer(gemma3.feed_forward_length).int(8),
-				layer(gemma3.embedding_length).int(8),
-				norm(rms).fp(16),
-			]).fp(16);
+				norm(rms),
+				layer(gemma3.feed_forward_length).gelu()
+					* layer(gemma3.feed_forward_length),
+				layer(gemma3.embedding_length),
+				norm(rms),
+			]);
 	}
 
 	model = model
-		.norm(rms).fp(16)
-		.layer(tokenizer.ggml.tokens).int(8)
-		.scale(1.0 / gemma3.final_logit_softcapping).fp(16)
-		.tanh().fp(16)
-		.scale(gemma3.final_logit_softcapping).fp(16);
+		.norm(rms)
+		.layer(tokenizer.ggml.tokens)
+		.scale(1.0 / gemma3.final_logit_softcapping)
+		.tanh()
+		.scale(gemma3.final_logit_softcapping);
 
 	let infer = recipe.infer();
 	let report = if std::env::var_os("RECIPE_SCORE").is_some() {
