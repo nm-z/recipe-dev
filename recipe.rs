@@ -14706,19 +14706,9 @@ pub(crate) struct StorageSpec {
 
 /// A weight's block bytes: owned by the graph, or a view of the mapped file they
 /// were read from, which the view keeps mapped.
-struct ResidentLookupBytes {
-	data: Vec<u8>,
-	_source: StoredBytes,
-}
-impl Drop for ResidentLookupBytes {
-	fn drop(&mut self) {
-		#[cfg(unix)] unsafe { munlock(self.data.as_ptr().cast_mut().cast(), self.data.len()); }
-	}
-}
 #[derive(Clone)]
 enum StoredSegment {
 	Owned(Vec<u8>),
-	Resident(Arc<ResidentLookupBytes>),
 	Mapped(Arc<gguf::Mapping>, usize, usize),
 	/// Bytes the load kernel writes on the device: they take their place in the
 	/// run but exist on no host page.
@@ -14728,7 +14718,6 @@ impl StoredSegment {
 	fn length(&self) -> usize {
 		match self {
 			Self::Owned(bytes) => bytes.len(),
-			Self::Resident(bytes) => bytes.data.len(),
 			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
 		}
 	}
@@ -14738,7 +14727,6 @@ impl std::ops::Deref for StoredSegment {
 	fn deref(&self) -> &[u8] {
 		match self {
 			Self::Owned(bytes) => bytes,
-			Self::Resident(bytes) => &bytes.data,
 			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
 			Self::Absent(_) => &[],
 		}
@@ -14751,26 +14739,6 @@ impl std::ops::Deref for StoredSegment {
 #[derive(Clone)]
 pub(crate) struct StoredBytes(Arc<Vec<StoredSegment>>);
 impl StoredBytes {
-	fn resident_lookup(&self) -> Result<Self> {
-		if self.0.iter().all(|segment| matches!(segment, StoredSegment::Resident(_))) { return Ok(self.clone()); }
-		#[cfg(not(unix))] { return Err(RecipeError::new("resident lookup locking requires Unix memory mappings")); }
-		#[cfg(unix)] {
-			static CACHE: OnceLock<Mutex<std::collections::HashMap<Vec<(usize, usize)>, std::sync::Weak<ResidentLookupBytes>>>> = OnceLock::new();
-			let key = self.runs().map(|(_, bytes)| (bytes.as_ptr() as usize, bytes.len())).collect::<Vec<_>>();
-			let mut cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().map_err(|_| RecipeError::new("resident lookup cache is poisoned"))?;
-			if let Some(bytes) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
-				return Ok(Self(Arc::new(vec![StoredSegment::Resident(bytes)])));
-			}
-			let data = self.to_vec()?;
-			require(!data.is_empty(), "resident lookup table is empty")?;
-			require(unsafe { mlock(data.as_ptr().cast_mut().cast(), data.len()) } == 0,
-				format!("cannot lock {} lookup bytes in machine RAM: {}", data.len(), std::io::Error::last_os_error()))?;
-			let bytes = Arc::new(ResidentLookupBytes { data, _source: self.clone() });
-			cache.insert(key, Arc::downgrade(&bytes));
-			Ok(Self(Arc::new(vec![StoredSegment::Resident(bytes)])))
-		}
-	}
-
 	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Mapped(mapping.clone(), at, length)]))
 	}
@@ -19542,6 +19510,7 @@ fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Grap
 	Ok(())
 }
 fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
+	if std::env::var("RECIPE_DENSE_SPLIT").as_deref()!=Ok("1") { return Ok(()); }
 	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
 	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;
 	for (index,planes) in nodes.into_iter().zip(&binding.nodes) {
@@ -19741,9 +19710,26 @@ impl ExpertExecution {
 	fn finish(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<Vec<OperationReport>> {
 		let phases=(end-begin).div_ceil(capacity) as usize*layers;
 		let mut observations=Vec::new();
+		let status=self.control.download_range::<u32>(6,2)?;
+		let mut receipts=Vec::new();
 		for worker in &self.workers {
 			worker.gpu.synchronize()?;
 			let reports=worker.reports.download_range::<u32>(0,phases*32)?;
+			receipts.push((worker,reports));
+		}
+		if status[0]!=0 || receipts.iter().any(|(_,reports)|reports.chunks_exact(32).any(|report|report[16..32].iter().any(|status|*status!=1))) {
+			let control=self.control.download::<u8>(self.control.bytes)?;
+			let path=self.pick_path.with_extension("failure-control.bin");
+			if let Err(error)=fs::write(&path,&control) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
+			for (worker,reports) in &receipts {
+				let path=self.pick_path.with_extension(format!("failure-die{}.bin",worker.die));
+				let bytes=reports.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+				if let Err(error)=fs::write(&path,&bytes) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
+			}
+			if let Err(error)=self.export_picks() {eprintln!("cannot export expert picks after failure: {error}");}
+		}
+		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}; worker receipts use {}",status[0],status[1],self.pick_path.display()))?;
+		for (worker,reports) in receipts {
 			for (phase,report) in reports.chunks_exact(32).enumerate() {
 				for (cta,status) in report[16..32].iter().enumerate() {
 					require(*status==1,format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16]))?;
@@ -19758,9 +19744,6 @@ impl ExpertExecution {
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 			}
 		}
-		let status=self.control.download_range::<u32>(24,2)?;
-		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}",status[0],status[1]))?;
-
 		Ok(observations)
 	}
 	fn export_picks(&self)->Result<()> {
@@ -20682,6 +20665,7 @@ impl Placed {
 		for (index, gpu) in self.devices.iter().enumerate() {
 			let mut bytes = [0_usize; 8];
 			let mut ram_tables = 0;
+			let (mut row_bytes, mut row_limit, mut row_hits, mut row_misses) = (0, 0, 0_u64, 0_u64);
 			for tape in self.tapes.iter().filter_map(|ranges| ranges.get(index)) {
 				let (input, output) = tape.request_bytes();
 				bytes[0] += tape.samples.bytes + input;
@@ -20693,12 +20677,20 @@ impl Placed {
 				bytes[6] += tape.moments.bytes + tape.variances.bytes;
 				bytes[7] += tape.program.artifact.storage.bytes;
 				ram_tables += tape.lookups.iter().map(|lookup| lookup.table.bytes.len()).sum::<usize>();
+				if let Some(cache) = &tape.lookup_rows {
+					let cache = cache.lock().map_err(|_| RecipeError::new("lookup row cache is poisoned"))?;
+					row_bytes += cache.bytes;
+					row_limit += LookupRows::LIMIT;
+					row_hits += cache.hits;
+					row_misses += cache.misses;
+				}
 			}
 			lines.push(format!(
 				"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
 				device_label(gpu)?, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
 			));
-			if ram_tables != 0 { lines.push(format!("{}  n-gram table: {ram_tables} bytes in owned RAM, outside device allocation total", device_label(gpu)?)); }
+			if ram_tables != 0 { lines.push(format!("{}  lookup tables: {ram_tables} source bytes, outside device allocation total", device_label(gpu)?)); }
+			if row_limit != 0 { lines.push(format!("{}  lookup row cache: {row_bytes} decoded bytes, {row_limit} byte limit, {row_hits} hits, {row_misses} misses in machine RAM", device_label(gpu)?)); }
 		}
 		Ok(ReportLines::new(lines))
 	}
@@ -21614,7 +21606,6 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
 		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
 		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
-		StoredSegment::Resident(bytes) => (bytes.data.as_ptr() as usize, 0, bytes.data.len()),
 		StoredSegment::Absent(length) => (0, 0, *length),
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -24218,6 +24209,45 @@ struct HostLookup {
 	width: usize,
 	length: usize,
 }
+#[derive(Default)]
+struct LookupRows {
+	rows: std::collections::HashMap<(usize, usize), (Vec<f64>, u64)>,
+	order: std::collections::BTreeMap<u64, (usize, usize)>,
+	bytes: usize,
+	clock: u64,
+	hits: u64,
+	misses: u64,
+}
+impl LookupRows {
+	const LIMIT: usize = 64 << 20;
+	fn append(&mut self, lookup: usize, table: &HostLookup, row: usize, output: &mut Vec<f64>) -> Result<()> {
+		let key = (lookup, row);
+		self.clock = self.clock.checked_add(1).ok_or_else(|| RecipeError::new("lookup row cache age overflows"))?;
+		if let Some((values, age)) = self.rows.get_mut(&key) {
+			self.order.remove(age);
+			*age = self.clock;
+			self.order.insert(*age, key);
+			self.hits += 1;
+			output.extend_from_slice(values);
+			return Ok(());
+		}
+		self.misses += 1;
+		// Decoding touches only this requested row in the original mapped table.
+		let values = ngram::table_row(&table.table, table.width, row)?;
+		let bytes = values.capacity() * size_of::<f64>();
+		output.extend_from_slice(&values);
+		if bytes > Self::LIMIT { return Ok(()); }
+		while self.bytes + bytes > Self::LIMIT {
+			let (_, oldest) = self.order.pop_first().ok_or_else(|| RecipeError::new("lookup row cache eviction order is empty"))?;
+			let (values, _) = self.rows.remove(&oldest).ok_or_else(|| RecipeError::new("lookup row cache eviction row is absent"))?;
+			self.bytes -= values.capacity() * size_of::<f64>();
+		}
+		self.bytes += bytes;
+		self.order.insert(self.clock, key);
+		self.rows.insert(key, (values, self.clock));
+		Ok(())
+	}
+}
 struct NativeTape {
 	expert_execution: Option<Arc<Mutex<ExpertExecution>>>,
 	expert_first: usize,
@@ -24232,6 +24262,7 @@ struct NativeTape {
 	contexts: Buffer,
 	context_resets: Vec<(usize, usize)>,
 	lookups: Vec<HostLookup>,
+	lookup_rows: Option<Mutex<LookupRows>>,
 	tokens: Mutex<Vec<f64>>,
 	adjoints: Buffer,
 	/// The node and value count of every saved batch normalization statistic.
@@ -24632,9 +24663,6 @@ impl NativeTape {
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: Some(RowHash::from_words(words)?), table, width: node.argument[1] as usize, length: node.output.length });
 			}
 		}
-		if inference && graph.expert_execution.is_some() {
-			for lookup in &mut lookups { lookup.table.bytes = lookup.table.bytes.resident_lookup()?; }
-		}
 		let context_resets = layout.context_resets.clone();
 		for (offset, region) in native_context_regions(graph, &layout, &weights, precision.model)? {
 			require(checked_add(offset, region.len(), "nearest index context")? <= contexts.bytes, "nearest index exceeds its context arena")?;
@@ -24679,6 +24707,7 @@ impl NativeTape {
 			contexts,
 			context_resets,
 			lookups,
+			lookup_rows: (inference && graph.expert_execution.is_some()).then(|| Mutex::new(LookupRows::default())),
 			tokens,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
@@ -24829,6 +24858,7 @@ impl NativeTape {
 	fn stage_lookups(&self, begin: u32, end: u32, mut request: Option<&mut NativeRequest>) -> Result<()> {
 		let (begin, end) = (begin as usize, end as usize);
 		let tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
+		let mut cache = self.lookup_rows.as_ref().map(|cache| cache.lock().map_err(|_| RecipeError::new("lookup row cache is poisoned"))).transpose()?;
 		for (index, lookup) in self.lookups.iter().enumerate() {
 			let bytes = lookup.precision.bytes();
 			let channels = lookup.hash.as_ref().map_or(1, RowHash::heads) * lookup.width;
@@ -24844,9 +24874,14 @@ impl NativeTape {
 				let mut staged = Vec::with_capacity((end - begin) * channels);
 				for position in begin..end {
 					if let Some(hash) = &lookup.hash {
-						for index in hash.rows_at(&ids, position) { staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?); }
+						for row in hash.rows_at(&ids, position) {
+							if let Some(cache) = cache.as_mut() { cache.append(index, lookup, row, &mut staged)?; }
+							else { staged.extend(ngram::table_row(&lookup.table, lookup.width, row)?); }
+						}
 					} else {
-						staged.extend(ngram::table_row(&lookup.table, lookup.width, ids[position] as usize)?);
+						let row = ids[position] as usize;
+						if let Some(cache) = cache.as_mut() { cache.append(index, lookup, row, &mut staged)?; }
+						else { staged.extend(ngram::table_row(&lookup.table, lookup.width, row)?); }
 					}
 				}
 				let slot = checked_mul(checked_add(checked_mul(row, length, "lookup row")?, first, "lookup slot")?, channels, "lookup staging offset")?;
@@ -28859,8 +28894,6 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
-	fn mlock(address: Ptr, length: usize) -> i32;
-	fn munlock(address: Ptr, length: usize) -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
