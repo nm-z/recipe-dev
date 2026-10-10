@@ -287,7 +287,59 @@ template<int T,int N,int NW,int LW,bool MAGIC,bool DICT>static __device__ __forc
 		if(l==0&&row<m&&c<active)out[c*m+row]=acc[c];
 	}
 }
+#ifdef PACKED_WORKER
+// The resident worker requires 256 threads. Retain each decoded group across columns.
+template<int T,int N,int LW,bool DICT>static __device__ __forceinline__ void group32_thin(const uint8_t *W,const u32 *x,const float2 *ds,float *out,int k,int m,int row_base,int active,u32 mask,u32 count,u32 *scratch){
+	constexpr int NT=256,TU=LW,YS=20,ACC=4096,WEIGHTS=6144,SOURCES=3072;
+	u32 (*ys)[TU*YS]=(u32 (*)[TU*YS])scratch;float2 (*scales)[TU]=(float2 (*)[TU])(scratch+N*TU*YS);int *table=(int*)(scales+N);
+	int tid=threadIdx.x,l=tid&(LW-1),row=row_base+(tid/LW)*count,nb=k/32,tiles=(nb+TU-1)/TU;
+	for(int c=0;c<N;c++)scratch[ACC+tid*N+c]=0;
+	const uint8_t *rp=W+size_t(row<m?row:0)*(k/Format<T>::block)*Format<T>::bytes;
+	for(int tile=0;tile<tiles;tile++){
+		for(int c=0;c<N;c++){
+			int source=int(scratch[SOURCES+c]);
+			for(int j=tid;j<TU*4;j+=NT){uint4 value=make_uint4(0,0,0,0);int offset=tile*TU*4+j;
+				if(source>=0&&offset<nb*4)value=__ldg((const uint4*)x+source*nb*4+offset);store_shared4(&ys[c][(j/4)*YS+(j%4)*4],value);}
+			for(int j=tid;j<TU;j+=NT){float2 value=make_float2(0,0);if(source>=0&&tile*TU+j<nb)value=__ldg(ds+source*nb+tile*TU+j);store_shared2(&scales[c][j],value);}
+		}
+		__syncthreads();int b=tile*TU+l;u32 weights[16];float d,s0,s1,mn;
+		decode32<T,(DICT&&T!=20)>(rp,b<nb?b:0,weights,d,s0,s1,mn,table);
+		u32 *cached=scratch+WEIGHTS+tid*16;
+		store_shared4(cached,make_uint4(weights[0],weights[1],weights[2],weights[3]));
+		store_shared4(cached+4,make_uint4(weights[4],weights[5],weights[6],weights[7]));
+		store_shared4(cached+8,make_uint4(weights[8],weights[9],weights[10],weights[11]));
+		store_shared4(cached+12,make_uint4(weights[12],weights[13],weights[14],weights[15]));
+		for(int c=0;c<active;c++){
+			if(row>=m||b>=nb)continue;int a0=0,a1=0;
+			#pragma unroll
+			for(int sub=0;sub<4;sub++){
+				uint4 values=load_shared4(&ys[c][l*YS+sub*4]),w=load_shared4(cached+sub*4);int sum=0;
+				sum=mad2(w.x,values.x,sum);sum=mad2(w.y,values.y,sum);sum=mad2(w.z,values.z,sum);sum=mad2(w.w,values.w,sum);
+				if(sub<2)a0+=sum;else a1+=sum;
+			}
+			float2 scale=load_shared2(&scales[c][l]);u32 *at=scratch+ACC+tid*N+c;
+			float sum=__uint_as_float(*at)+fmaf(d*scale.x,fmaf(s0,float(a0),s1*float(a1)),-mn*scale.y);*at=__float_as_uint(sum);
+		}
+		__syncthreads();
+	}
+	for(int c=0;c<active;c++){
+		float sum=__uint_as_float(scratch[ACC+tid*N+c]);
+		#pragma unroll
+		for(int step=LW/2;step;step>>=1)sum+=__shfl_xor_sync(0xffffffff,sum,step);
+		if(l==0&&row<m)out[c*m+row]=sum;
+	}
+}
+template<int T,int N,int LW>static __device__ __forceinline__ void prepare_thin_table(u32 *scratch,int active,u32 mask){
+	if constexpr(T==20){int *table=(int*)(scratch+N*LW*22);if(threadIdx.x<16)table[threadIdx.x]=kvalues_iq4nl[threadIdx.x];}
+	if(threadIdx.x==0){u32 bits=mask;for(int c=0;c<N;c++){scratch[3072+c]=u32(c>=active?-1:mask?__ffs(bits)-1:c);bits&=bits-1;}}
+	__syncthreads();
+}
+#endif
+#ifdef PACKED_WORKER
+#define G(T,N,W,L,K) extern "C" __device__ __noinline__ void packed_g_##T##_##N##_##W##_##K##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){prepare_thin_table<T,N,L>(scratch,active,mask);for(int base=cta_index;base<m;base+=cta_count*(256/L))group32_thin<T,N,L,(K==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#else
 #define G(T,N,W,L,K) extern "C" __device__ __noinline__ void packed_g_##T##_##N##_##W##_##K##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(T==20&&K==2&&N<=2&&L==8&&(W==8||W==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32_fast<T,N,W,L,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32<T,N,W,L,(K==1),(K==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#endif
 #define GK(T,N,W,L) G(T,N,W,L,0) G(T,N,W,L,1)
 #define GW(T,N,L) GK(T,N,2,L) GK(T,N,4,L) GK(T,N,8,L) GK(T,N,16,L)
 #define GN(T,N) GW(T,N,8) GW(T,N,16)
@@ -404,7 +456,11 @@ template<int T,int NW,int N,int LW>static __device__ __forceinline__ void k_widt
 		if(lane==0&&row<m&&c<active)out[c*m+row]=acc[c];
 	}
 }
+#ifdef PACKED_WORKER
+#define WIDTH(T,N,W,L) extern "C" __device__ __noinline__ void packed_h_##T##_##N##_##W##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){prepare_thin_table<T,N,L>(scratch,active,mask);for(int base=cta_index;base<m;base+=cta_count*(256/L))group32_thin<T,N,L,false>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#else
 #define WIDTH(T,N,W,L) extern "C" __device__ __noinline__ void packed_h_##T##_##N##_##W##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){for(int base=cta_index;base<m;base+=cta_count*(W*32/L))k_width<T,W,N,L>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#endif
 #define WIDTHW(T,N,L) WIDTH(T,N,2,L) WIDTH(T,N,4,L) WIDTH(T,N,8,L) WIDTH(T,N,16,L)
 #define WIDTHN(T,N) WIDTHW(T,N,8) WIDTHW(T,N,16)
 #define WIDTHT(T) WIDTHN(T,1) WIDTHN(T,2) WIDTHN(T,4) WIDTHN(T,8)
@@ -432,56 +488,70 @@ static __device__ __forceinline__ bool valid_packed(int type,int capacity,int ac
 		(type==8||type==12||type==13||type==14||type==17||type==18||type==20)&&!(k%(type==8||type==20?32:256))&&
 		(capacity==1||capacity==2||capacity==4||capacity==8)&&(!mask||__popc(mask)==active)&&blockDim.y==1&&blockDim.z==1;
 }
+static __device__ __forceinline__ u32 fused_shared_word(u32 a){u32 v;asm("ld.shared.b32 %0,[%1];":"=r"(v):"r"(a));return v;}
+template<int T,int N>static __device__ __forceinline__ void prepare_stream_pairs(u32 *scratch){
+	if constexpr(T==17){}
+	else{
+		constexpr int SIG=N==1?1792:3840;
+		for(int i=threadIdx.x;i<128;i+=blockDim.x){u32 sign=__ldg(ksigns_iq2xs+i);scratch[SIG+i]=((sign&15)<<8)|((sign>>4)<<24);}
+		if constexpr(N==1){for(int i=threadIdx.x;i<2048;i+=blockDim.x)store_shared4(scratch+2048+i*4,__ldg((const uint4*)packed_iq3+i));}
+	}
+	__syncthreads();
+}
+static __device__ __forceinline__ void iq3_group(const uint8_t *row,u32 block,u32 (&grids)[4],u32 &sign,float &d){
+	const uint8_t *p=row+(block/8)*98;u32 g=block%8,a,b;
+	asm("ld.global.u16 %0,[%2];ld.global.u16 %1,[%2+2];":"=r"(a),"=r"(b):"l"(p+66+4*g));sign=a|(b<<16);d=half_at(p);
+	asm("ld.global.nc.u16 %0,[%4];ld.global.nc.u16 %1,[%4+2];ld.global.nc.u16 %2,[%4+4];ld.global.nc.u16 %3,[%4+6];":"=r"(grids[0]),"=r"(grids[1]),"=r"(grids[2]),"=r"(grids[3]):"l"(p+2+8*g));
+}
+template<int T,int N>static __device__ __forceinline__ void decode_stream_pairs(const uint8_t *row,u32 block,u32 sub,u32 (&words)[4],float &d,float &scale,const u32 *scratch,const u32 (&group_grids)[4],u32 group_sign){
+	const uint8_t *p=row+(block/8)*Format<T>::bytes;u32 g=block%8,base=__cvta_generic_to_shared(scratch);
+	if constexpr(T==17){
+		d=half_at(p)*0.125f;scale=1+2*((p[66+g]>>(4*(sub/2)))&15);
+		u32 q=__ldg((const uint16_t*)(p+2+8*g+2*sub));uint4 values=__ldg(packed_iq2+q);
+		words[0]=values.x;words[1]=values.y;words[2]=values.z;words[3]=values.w;
+	}else{
+		constexpr int SIG=N==1?1792:3840;
+		u32 a=group_sign;scale=fmaf(float(a>>28),0.5f,0.25f);
+		u32 offsets=fused_shared_word(base+SIG*4+(((a>>(7*sub))&127)<<2)),grids=group_grids[sub];
+		u32 codes=__byte_perm(grids,0,0x4140)|offsets,c0=codes&65535,c1=codes>>16;uint2 v0,v1;
+		if constexpr(N==1){
+			u32 table=base+8192;
+			asm("{.reg .b32 a,b;bfi.b32 a,%4,0,3,12;shr.u32 b,%4,13;add.u32 a,a,%5;add.u32 b,b,%5;ld.shared.v2.b32 {%0,%1},[a];ld.shared.v2.b32 {%2,%3},[b];}":"=r"(v0.x),"=r"(v0.y),"=r"(v1.x),"=r"(v1.y):"r"(codes),"r"(table));
+		}
+		else{v0=__ldg(packed_iq3+c0);v1=__ldg(packed_iq3+c1);}
+		words[0]=v0.x;words[1]=v0.y;words[2]=v1.x;words[3]=v1.y;
+	}
+}
 // One shared-input walk produces SiLU(gate) * up in compact expert columns.
 template<int T,int N,int NW,int LW>static __device__ __forceinline__ void fused_pair(const uint8_t *W,const uint8_t *U,const u32 *x,const float2 *ds,float *product,int k,int m,int active,u32 mask,u32 index,u32 count,u32 *scratch){
-	constexpr int NT=NW*32,TU=LW,YS=20,NY=(TU*4+NT-1)/NT;
-	u32 (*ys)[2][TU*YS]=(u32 (*)[2][TU*YS])scratch;float2 (*dss)[2][TU]=(float2 (*)[2][TU])(scratch+N*2*TU*YS);
-	int tid=threadIdx.x,l=tid&(LW-1),nb=k/32,nt=(nb+TU-1)/TU,source[N];
-	prepare_iq_tables<T>(scratch);
+	constexpr int NT=NW*32,NB=80,YS=20;
+	u32 (*ys)[NB*YS]=(u32 (*)[NB*YS])scratch;float2 (*dss)[NB]=(float2 (*)[NB])(scratch+N*NB*YS);
+	int tid=threadIdx.x,l=tid&(LW-1),source[N];prepare_stream_pairs<T,N>(scratch);
 	#pragma unroll
 	for(int c=0;c<N;c++){u32 bits=mask;for(int j=0;j<c;j++)bits&=bits-1;source[c]=c>=active?-1:mask?__ffs(bits)-1:c;}
+	#pragma unroll
+	for(int c=0;c<N;c++){
+		for(int j=tid;j<NB*4;j+=NT){uint4 v=make_uint4(0,0,0,0);if(source[c]>=0)v=__ldg((const uint4*)x+source[c]*NB*4+j);store_shared4(&ys[c][(j/4)*YS+(j%4)*4],v);}
+		for(int b=tid;b<NB;b+=NT){float2 v=make_float2(0,0);if(source[c]>=0)v=__ldg(ds+source[c]*NB+b);store_shared2(&dss[c][b],v);}
+	}
+	__syncthreads();
 	for(int base=index;base<m;base+=count*(NT/LW)){
-		int row=base+(tid/LW)*count;const uint8_t *rp=W+size_t(row<m?row:0)*(k/Format<T>::block)*Format<T>::bytes,*up=U+size_t(row<m?row:0)*(k/Format<T>::block)*Format<T>::bytes;
-		uint4 yr[N][NY];float2 dr[N];
-		#pragma unroll
-		for(int c=0;c<N;c++){
-			#pragma unroll
-			for(int i=0;i<NY;i++){int ii=tid+i*NT;yr[c][i]=make_uint4(0,0,0,0);if(source[c]>=0&&ii<TU*4&&ii<nb*4)yr[c][i]=__ldg((const uint4*)x+source[c]*nb*4+ii);if(ii<TU*4)store_shared4(&ys[c][0][(ii/4)*YS+(ii%4)*4],yr[c][i]);}
-			dr[c]=make_float2(0,0);if(source[c]>=0&&tid<TU&&tid<nb)dr[c]=__ldg(ds+source[c]*nb+tid);if(tid<TU)store_shared2(&dss[c][0][tid],dr[c]);
-		}
-		__syncthreads();float gate[N]={},upper[N]={};
-		for(int tile=0;tile<nt;tile++){
-			int buf=tile&1;
-			if(tile+1<nt){
-				#pragma unroll
-				for(int c=0;c<N;c++){
-					#pragma unroll
-					for(int i=0;i<NY;i++){int ii=tid+i*NT;yr[c][i]=make_uint4(0,0,0,0);if(source[c]>=0&&ii<TU*4&&(tile+1)*TU*4+ii<nb*4)yr[c][i]=__ldg((const uint4*)x+source[c]*nb*4+(tile+1)*TU*4+ii);}
-					dr[c]=make_float2(0,0);if(source[c]>=0&&tid<TU&&(tile+1)*TU+tid<nb)dr[c]=__ldg(ds+source[c]*nb+(tile+1)*TU+tid);
-				}
-			}
-			int b=tile*TU+l;int gi0[N]={},gi1[N]={},ui0[N]={},ui1[N]={};float dg=0,du=0,sg0=0,sg1=0,su0=0,su1=0;
+		int row=base+(tid/LW)*count;const uint8_t *rp=W+u32(row<m?row:0)*u32((k/Format<T>::block)*Format<T>::bytes),*up=U+u32(row<m?row:0)*u32((k/Format<T>::block)*Format<T>::bytes);float gate[N]={},upper[N]={};
+		#pragma unroll (T==18&&N==1?2:1)
+		for(u32 b=u32(l);b<NB;b+=LW){
+			int gi0[N]={},gi1[N]={},ui0[N]={},ui1[N]={};float dg=0,du=0,sg0=0,sg1=0,su0=0,su1=0;
+			u32 gg[4]={},ug[4]={},gs=0,us=0;if constexpr(T==18){iq3_group(rp,b,gg,gs,dg);iq3_group(up,b,ug,us,du);}
 			#pragma unroll
 			for(int sub=0;sub<4;sub++){
-				u32 wg[4],wu[4];float sg,su;
-				decode_stream8<T,true>(rp,b<nb?b:0,sub,wg,dg,sg,nullptr,scratch,0);decode_stream8<T,true>(up,b<nb?b:0,sub,wu,du,su,nullptr,scratch,0);
+				u32 wg[4],wu[4];float sg,su;decode_stream_pairs<T,N>(rp,b,sub,wg,dg,sg,scratch,gg,gs);decode_stream_pairs<T,N>(up,b,sub,wu,du,su,scratch,ug,us);
 				if(sub==0){sg0=sg;su0=su;}if(sub==2){sg1=sg;su1=su;}
 				#pragma unroll
-				for(int c=0;c<N;c++){uint4 v=load_shared4(&ys[c][buf][l*YS+4*sub]);u32 xv[4]={v.x,v.y,v.z,v.w};int ag=0,au=0;
+				for(int c=0;c<N;c++){uint4 v=load_shared4(&ys[c][b*YS+4*sub]);u32 xv[4]={v.x,v.y,v.z,v.w};int ag=0,au=0;
 					#pragma unroll
-					for(int j=0;j<4;j++){ag=mad2(wg[j],xv[j],ag);au=mad2(wu[j],xv[j],au);}if constexpr(T==18){gi0[c]+=ag;ui0[c]+=au;}else{if(sub<2){gi0[c]+=ag;ui0[c]+=au;}else{gi1[c]+=ag;ui1[c]+=au;}}}
+					for(int j=0;j<4;j++){if constexpr(T==18){gi0[c]=mad2(wg[j],xv[j],gi0[c]);ui0[c]=mad2(wu[j],xv[j],ui0[c]);}else{ag=mad2(wg[j],xv[j],ag);au=mad2(wu[j],xv[j],au);}}if constexpr(T!=18){if(sub<2){gi0[c]+=ag;ui0[c]+=au;}else{gi1[c]+=ag;ui1[c]+=au;}}}
 			}
 			#pragma unroll
-			for(int c=0;c<N;c++){float q=load_shared2(&dss[c][buf][l]).x;if constexpr(T==18){gate[c]=fmaf(dg*sg0*q,float(gi0[c]),gate[c]);upper[c]=fmaf(du*su0*q,float(ui0[c]),upper[c]);}else{gate[c]=fmaf(dg*q,fmaf(sg0,float(gi0[c]),sg1*float(gi1[c])),gate[c]);upper[c]=fmaf(du*q,fmaf(su0,float(ui0[c]),su1*float(ui1[c])),upper[c]);}}
-			if(tile+1<nt){
-				#pragma unroll
-				for(int c=0;c<N;c++){
-					#pragma unroll
-					for(int i=0;i<NY;i++){int ii=tid+i*NT;if(ii<TU*4)store_shared4(&ys[c][buf^1][(ii/4)*YS+(ii%4)*4],yr[c][i]);}
-					if(tid<TU)store_shared2(&dss[c][buf^1][tid],dr[c]);
-				}
-			}
-			__syncthreads();
+			for(int c=0;c<N;c++){float q=load_shared2(&dss[c][b]).x;if constexpr(T==18){gate[c]=fmaf(dg*sg0*q,float(gi0[c]),gate[c]);upper[c]=fmaf(du*su0*q,float(ui0[c]),upper[c]);}else{gate[c]=fmaf(dg*q,fmaf(sg0,float(gi0[c]),sg1*float(gi1[c])),gate[c]);upper[c]=fmaf(du*q,fmaf(su0,float(ui0[c]),su1*float(ui1[c])),upper[c]);}}
 		}
 		#pragma unroll
 		for(int c=0;c<N;c++){
@@ -489,7 +559,6 @@ template<int T,int N,int NW,int LW>static __device__ __forceinline__ void fused_
 			for(int j=LW/2;j;j>>=1){gate[c]+=__shfl_xor_sync(0xffffffff,gate[c],j);upper[c]+=__shfl_xor_sync(0xffffffff,upper[c],j);}
 			if(l==0&&row<m&&c<active)product[c*m+row]=(gate[c]/(1.0f+expf(-gate[c])))*upper[c];
 		}
-		__syncthreads();
 	}
 }
 #define FUSED(T,N,W,L) extern "C" __device__ __noinline__ u32 packed_gate_up_##T##_##N##_##W##_##L(const uint8_t *g,const uint8_t *u,const u32 *x,const float2 *ds,float *out,int active,u32 mask,u32 index,u32 count){extern __shared__ __align__(16) u32 scratch[];if(active<0||active>N||!count||index>=count||(mask&&__popc(mask)!=active))return 0;if(active==0)return 1;fused_pair<T,N,W,L>(g,u,x,ds,out,2560,640,active,mask,index,count,scratch);return 1;}

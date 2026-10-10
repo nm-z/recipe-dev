@@ -19621,7 +19621,9 @@ impl ExpertExecution {
 		Ok(())
 	}
 	fn worker_source() -> String {
-		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
+		let source = format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions());
+		assert!(source.contains("packed_worker_g_"), "expert worker column helpers are absent");
+		expert_worker_partition_source(&expert_worker_inline_source(&source))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
@@ -35039,6 +35041,186 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+// Expand the owned worker control calls before separate assembly. Compute helpers
+// retain their module-local calls; only this entry uses the private partition ABI.
+fn expert_worker_source_stage(source: &str, program: &str, stage: &str) -> String {
+	let mut child = Command::new("awk").arg(program)
+		.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+		.spawn().expect("expert PTX expansion requires GNU awk");
+	std::io::Write::write_all(&mut child.stdin.take().expect("expert PTX expansion input"), source.as_bytes())
+		.expect("cannot write expert PTX expansion input");
+	let output = child.wait_with_output().expect("cannot finish expert PTX expansion");
+	assert!(output.status.success(), "expert PTX {stage}: {}", String::from_utf8_lossy(&output.stderr));
+	String::from_utf8(output.stdout).expect("expert PTX expansion is not UTF-8")
+}
+fn expert_worker_inline_source(source: &str) -> String {
+	expert_worker_source_stage(source, r##"
+function closing(text,start, left,right, i,depth,char){
+	depth=0;for(i=start;i<=length(text);i++){char=substr(text,i,1);if(char==left)depth++;if(char==right){depth--;if(!depth)return i}}
+	return 0
+}
+function parse_functions(text, pos,rest,m,open,end,header,body,signature,returns,name,params,n,i,p){
+	pos=1
+	while(match(substr(text,pos),/\.func[[:space:]]/,m)){
+		pos+=m[0,"start"]-1;rest=substr(text,pos);open=index(rest,"{");if(!open)break
+		header=substr(rest,1,open-1)
+		if(!match(header,/([A-Za-z_$][A-Za-z_0-9$]*)[[:space:]]*\(([^()]*)\)[[:space:]]*$/,signature)){pos+=6;continue}
+		name=signature[1];end=closing(rest,open,"{","}");if(!end){print "unclosed function "name >"/dev/stderr";exit 1}
+		bodies[name]=substr(rest,open+1,end-open-1);params=signature[2];n=split(params,p,",");argc[name]=n
+		for(i=1;i<=n;i++){if(match(p[i],/\.param[[:space:]]+\.([A-Za-z_0-9]+)[[:space:]]+([A-Za-z_$][A-Za-z_0-9$]*)/,m)){arg[name][i]=m[2]}else{print "unsupported parameter "p[i] >"/dev/stderr";exit 1}}
+		if(match(header,/\.func[[:space:]]*\([[:space:]]*\.param[[:space:]]+\.([A-Za-z_0-9]+)[[:space:]]+([A-Za-z_$][A-Za-z_0-9$]*)[[:space:]]*\)/,returns)){outtype[name]=returns[1];outname[name]=returns[2]}
+		pos+=end
+	}
+}
+function rename_body(body,prefix,map, m,tail,part,vars,v,n,i,j,base,count,key,result,pos,advance,previous,replace){
+	delete map;tail=body
+	while(match(tail,/\.(reg|param)[[:space:]]+\.[A-Za-z_0-9]+[[:space:]]+([^;]+);/,m)){
+		advance=RSTART+RLENGTH;vars=m[2];n=split(vars,v,",")
+		for(i=1;i<=n;i++)if(match(v[i],/%?([A-Za-z_$][A-Za-z_0-9$]*)(<([0-9]+)>)?/,m)){
+			base=m[1];map[base]=prefix base;if(m[3]!="")for(j=0;j<m[3];j++)map[base j]=prefix base j
+		}
+		tail=substr(tail,advance)
+	}
+	tail=body
+	while(match(tail,/(^|\n)[[:space:]]*([A-Za-z_$][A-Za-z_0-9$]*):/,m)){map[m[2]]=prefix m[2];tail=substr(tail,RSTART+RLENGTH)}
+	result="";pos=1
+	while(match(substr(body,pos),/[A-Za-z_$][A-Za-z_0-9$]*/,m)){
+		result=result substr(body,pos,m[0,"start"]-1);key=m[0];previous=substr(body,pos+m[0,"start"]-2,1);replace=key in map
+		if(previous=="."||(previous=="%"&&key~/^(tid|ctaid|ntid|nctaid|laneid|clock|clock64|globaltimer|warpid|smid|nwarpid|gridid)$/))replace=0
+		result=result (replace?map[key]:key);pos+=m[0,"start"]+m[0,"length"]-1
+	}
+	return result substr(body,pos)
+}
+function replace_inputs(body,name,saves,prefix, result,pos,m,key,statement){
+	result="";pos=1
+	while(match(substr(body,pos),/ld\.param\.([A-Za-z_0-9]+)[[:space:]]+([^,;]+),[[:space:]]*\[([^]]+)\];/,m)){
+		result=result substr(body,pos,m[0,"start"]-1);key=m[3];statement=m[0]
+		if(key in saves)statement="mov."m[1]" "m[2]","saves[key]";"
+		result=result statement;pos+=m[0,"start"]+m[0,"length"]-1
+	}
+	return result substr(body,pos)
+}
+function expand(body, depth, cursor,m,start,end,name,outs,args,n,a,i,j,id,prefix,before,after,tail,store,last,save,insertions,positions,sz,b,child,result,retvalue,rettype,out,load,saves,map,key,at,definition,vars,v,existing,marker){
+	if(depth>32){print "inline recursion limit" >"/dev/stderr";exit 1};cursor=1
+	while(match(substr(body,cursor),/call(\.uni)?[[:space:]]+(\(([^)]*)\),[[:space:]]*)?([A-Za-z_$][A-Za-z_0-9$]*),[[:space:]]*\(([^;]*)\);/,m)){
+		start=cursor+m[0,"start"]-1;end=start+m[0,"length"]-1;name=m[4];outs=m[3];args=m[5]
+		if(!(name in bodies)||name~/^packed_(g_|h_|gate_up_)/){cursor=end+1;continue}
+		id=++serial;prefix="inl"id"_";retvalue=prefix"return";rettype=outtype[name];out=outs;gsub(/[[:space:]]/,"",out)
+		n=split(args,a,",");if(n!=argc[name]){print "argument count "name >"/dev/stderr";exit 1}
+		before=substr(body,1,start-1);after=substr(body,end+1);delete saves;delete insertions;delete positions;sz=0
+		existing=0
+		if(out!=""){
+			tail=before;at=0;definition=1
+			while(match(tail,/\.param[[:space:]]+\.[A-Za-z_0-9]+[[:space:]]+([^;]+);/,store)){
+				vars=split(store[1],v,",");for(j=1;j<=vars;j++){gsub(/[[:space:]]/,"",v[j]);if(v[j]==out)definition=at+store[0,"start"]}
+				at+=store[0,"start"]+store[0,"length"]-1;tail=substr(before,at+1)
+			}
+			if(match(substr(before,definition),"// inline-output "out"=([A-Za-z_0-9]+)",marker)){retvalue=marker[1];existing=1}
+		}
+		for(i=1;i<=n;i++){
+			gsub(/[[:space:]]/,"",a[i]);tail=before;at=0;last=0
+			while(match(tail,"st\\.param\\.([A-Za-z_0-9]+)[[:space:]]*\\["a[i]"\\],[[:space:]]*([^;]+);",store)){
+				last=at+store[0,"start"];save=prefix"arg"i;insert=".reg ."store[1]" "save"; mov."store[1]" "save","store[2]";\n";at+=store[0,"start"]+store[0,"length"]-1;tail=substr(before,at+1)
+			}
+			if(!last){print "missing stored argument "name" "a[i] >"/dev/stderr";exit 1}
+			positions[++sz]=last;insertions[sz]=insert;saves[arg[name][i]]=save
+		}
+		for(i=1;i<=sz;i++)for(j=i+1;j<=sz;j++)if(positions[j]>positions[i]){at=positions[i];positions[i]=positions[j];positions[j]=at;save=insertions[i];insertions[i]=insertions[j];insertions[j]=save}
+		for(i=1;i<=sz;i++)before=substr(before,1,positions[i]-1)insertions[i]substr(before,positions[i])
+		child=replace_inputs(bodies[name],name,saves,prefix);child=rename_body(child,prefix,map)
+		if(out!=""){
+			key=outname[name];if(key in map)key=map[key]
+			gsub("st\\.param\\.([A-Za-z_0-9]+)[[:space:]]*\\["key"(\\+0)?\\],", "mov."rettype" "retvalue",",child)
+			if(match(after,"ld\\.param\\.([A-Za-z_0-9]+)[[:space:]]+([^,;]+),[[:space:]]*\\["out"\\];",load))after=substr(after,1,load[0,"start"]-1)"mov."load[1]" "load[2]","retvalue";"substr(after,load[0,"start"]+load[0,"length"])
+		}
+		gsub(/\<ret[[:space:]]*;/,"bra "prefix"done;",child);child=expand(child,depth+1)
+		result=(out!=""&&!existing?".reg ."rettype" "retvalue";\n// inline-output "out"="retvalue"\n":"")"{\n"child"\n"prefix"done:\n}\n"
+		body=before result after;cursor=length(before)+length(result)+1;inlined[name]++
+	}
+	return body
+}
+function strip_unused_parameters(body, used,tail,m,args,n,v,i,result,pos,keep,type,name){
+	delete used;tail=body
+	while(match(tail,/call(\.uni)?[[:space:]]+(\(([^)]*)\),[[:space:]]*)?([A-Za-z_$][A-Za-z_0-9$]*),[[:space:]]*\(([^;]*)\);/,m)){
+		args=m[3]","m[5];n=split(args,v,",");for(i=1;i<=n;i++){gsub(/[[:space:]]/,"",v[i]);if(v[i]!="")used[v[i]]=1};tail=substr(tail,RSTART+RLENGTH)
+	}
+	result="";pos=1
+	while(match(substr(body,pos),/\.param[[:space:]]+\.([A-Za-z_0-9]+)[[:space:]]+([^;]+);/,m)){
+		result=result substr(body,pos,m[0,"start"]-1);type=m[1];n=split(m[2],v,",");keep=""
+		for(i=1;i<=n;i++){gsub(/[[:space:]]/,"",v[i]);if(v[i] in used)keep=keep (keep==""?"":",")v[i]}
+		if(keep!="")result=result ".param ."type" "keep";";pos+=m[0,"start"]+m[0,"length"]-1
+	}
+	body=result substr(body,pos);result="";pos=1
+	while(match(substr(body,pos),/st\.param\.[A-Za-z_0-9]+[[:space:]]*\[([^]]+)\],[^;]+;/,m)){
+		result=result substr(body,pos,m[0,"start"]-1);name=m[1];sub(/\+0$/,"",name)
+		if(name in used)result=result m[0];pos+=m[0,"start"]+m[0,"length"]-1
+	}
+	return result substr(body,pos)
+}
+{ source=source $0 "\n" }
+END {
+	parse_functions(source)
+	if(!match(source,/\.visible[[:space:]]+\.entry[[:space:]]+expert_split_worker[[:space:]]*\([^)]*\)[[:space:]]*\{/,m)){print "missing worker entry" >"/dev/stderr";exit 1}
+	start=m[0,"start"]+m[0,"length"]-1;end=closing(source,start,"{","}");body=substr(source,start+1,end-start-1);body=expand(body,0);body=strip_unused_parameters(body)
+	printf "%s\n%s\n%s",substr(source,1,start),body,substr(source,end)
+	for(name in inlined)print "inlined "name" "inlined[name] >"/dev/stderr"
+}
+"##, "control expansion")
+}
+fn expert_worker_partition_source(source: &str) -> String {
+	expert_worker_source_stage(source, r##"
+function close_at(text,start, i,d,c){d=0;for(i=start;i<=length(text);i++){c=substr(text,i,1);if(c=="{")d++;if(c=="}"&&!--d)return i}return 0}
+function rewrite_entry(body, cursor,m,start,end,name,n,args,v,before,after,i,tail,store,last,at,val,saved,insert,positions,text,j,tmp,serial,used){
+	cursor=1
+	while(match(substr(body,cursor),/call(\.uni)?[[:space:]]+(\(([^)]*)\),[[:space:]]*)?(packed_(g_|h_|gate_up_)[A-Za-z_0-9]+),[[:space:]]*\(([^;]*)\);/,m)){
+		start=cursor+m[0,"start"]-1;end=start+m[0,"length"]-1;name="worker_"m[4];n=split(m[6],v,",")
+		if(n!=(name~/worker_packed_gate_up_/ ?9:10)){print "unexpected private arguments "name" "n >"/dev/stderr";exit 1}
+		before=substr(body,1,start-1);after=substr(body,end+1);serial++;delete positions;delete text
+		for(i=n-1;i<=n;i++){
+			gsub(/[[:space:]]/,"",v[i]);tail=before;at=0;last=0
+			while(match(tail,"st\\.param\\.([A-Za-z_0-9]+)[[:space:]]*\\["v[i]"(\\+0)?\\],[[:space:]]*([^;]+);",store)){
+				last=at+store[0,"start"];saved="partition"serial"_"i;insert=".reg .u32 "saved"; mov.u32 "saved","store[3]";\n";at+=store[0,"start"]+store[0,"length"]-1;tail=substr(before,at+1)
+			}
+			if(!last){print "missing private partition argument "name" "v[i] >"/dev/stderr";exit 1};positions[i]=last;text[i]=insert
+		}
+		if(positions[n]>positions[n-1]){j=n;i=n-1}else{j=n-1;i=n}
+		before=substr(before,1,positions[j]-1)text[j]substr(before,positions[j]);before=substr(before,1,positions[i]-1)text[i]substr(before,positions[i])
+		args="";for(i=1;i<=n-2;i++)args=args (i==1?"":",")v[i]
+		insert="{.reg .u32 partition_tid; .reg .pred partition_first; mov.u32 partition_tid,%tid.x; setp.eq.u32 partition_first,partition_tid,0; @partition_first st.shared.v2.u32 [worker_partition],{partition"serial"_"(n-1)",partition"serial"_"n"}; bar.sync 0;}\n"
+		insert=insert "call.uni "(m[2]!=""?"("m[3]"),":"")name",("args");"
+		body=before insert after;cursor=length(before)+length(insert)+1
+	}
+	return body
+}
+{source=source $0 "\n"}
+END{
+	gsub(/packed_worker_gate_up_/,"worker_packed_gate_up_",source);gsub(/packed_worker_g_/,"worker_packed_g_",source);gsub(/packed_worker_h_/,"worker_packed_h_",source)
+	sub(/\.address_size 64/,".address_size 64\n.shared .align 8 .b32 worker_partition[2];",source)
+	result="";pos=1
+	while(match(substr(source,pos),/\.func[[:space:]]/,m)){
+		start=pos+m[0,"start"]-1;rest=substr(source,start);open=index(rest,"{");header=substr(rest,1,open-1)
+		if(!match(header,/([A-Za-z_$][A-Za-z_0-9$]*)[[:space:]]*\(([^()]*)\)[[:space:]]*$/,signature)){print "unexpected function header" >"/dev/stderr";exit 1}
+		name=signature[1];end=close_at(rest,open);prefix_text=substr(source,pos,start-pos);if(name!~/^worker_packed_/)sub(/\.(visible|extern)[[:space:]]*$/,"",prefix_text);result=result prefix_text
+		if(name~/^worker_packed_/){
+			n=split(signature[2],v,",");match(v[n-1],/\.param[[:space:]]+\.[A-Za-z_0-9]+[[:space:]]+([A-Za-z_0-9]+)/,parameter);p1=parameter[1];match(v[n],/\.param[[:space:]]+\.[A-Za-z_0-9]+[[:space:]]+([A-Za-z_0-9]+)/,parameter);p2=parameter[1]
+			args="";for(i=1;i<=n-2;i++)args=args (i==1?"":",")v[i]
+			header=substr(header,1,signature[1,"start"]+length(name)-1)"("args")\n"
+			body=substr(rest,open+1,end-open-1)
+			body=gensub("ld\\.param\\.u32[[:space:]]+([^,;]+),[[:space:]]*\\["p1"\\]","ld.shared.u32 \\1,[worker_partition]","g",body)
+			body=gensub("ld\\.param\\.u32[[:space:]]+([^,;]+),[[:space:]]*\\["p2"\\]","ld.shared.u32 \\1,[worker_partition+4]","g",body)
+			result=result header"{"body"}\n";kept++
+		}
+		pos=start+end
+	}
+	result=result substr(source,pos)
+	if(!match(result,/\.visible[[:space:]]+\.entry[[:space:]]+expert_split_worker[[:space:]]*\([^)]*\)[[:space:]]*\{/,m)){print "missing worker entry" >"/dev/stderr";exit 1}
+	start=m[0,"start"]+m[0,"length"]-1;end=close_at(result,start);body=substr(result,start+1,end-start-1);body=rewrite_entry(body)
+	printf "%s\n.reqntid 256,1,1\n{\n%s\n%s",substr(result,1,start-1),body,substr(result,end)
+	print "private_helpers="kept >"/dev/stderr"
+}
+"##, "partition binding")
 }
 
 /// Owned worker module text for preassembly without allocating model weights.
