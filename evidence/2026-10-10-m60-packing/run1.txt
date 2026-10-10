@@ -1,0 +1,108 @@
+=== shape m=4096 k=14336 (4096x14336) ===
+  CORR stock vs f64(x f32)    max|err|/max|ref| = 6.661e-03   max elementwise rel err (|ref|>5% of max, n=3606) = 1.036e-01
+  CORR stock vs f64(x q8_1)   max|err|/max|ref| = 1.119e-07   max elementwise rel err (|ref|>5% of max, n=3606) = 1.263e-06
+  TIME stock(ggml mul_mat, 1-node graph)    306.28 us    107.8 GB/s
+  TIME stock(ggml mul_mat, 8-node graph/8)  324.26 us    101.9 GB/s
+  CORR A xmad nw=4 vs stock   max|err|/max|ref| = 1.678e-07   max elementwise rel err (|ref|>5% of max, n=3606) = 1.805e-06
+  TIME A xmad       nw=4  prep+kernel   242.57 us   136.2 GB/s | kernel only   237.49 us   139.1 GB/s | prep only 3.30 us
+  CORR A xmad nw=8 vs stock   max|err|/max|ref| = 1.678e-07   max elementwise rel err (|ref|>5% of max, n=3606) = 1.805e-06
+  TIME A xmad       nw=8  prep+kernel   239.16 us   138.1 GB/s | kernel only   235.61 us   140.2 GB/s | prep only 3.29 us
+  CORR A xmad nw=16 vs stock  max|err|/max|ref| = 1.678e-07   max elementwise rel err (|ref|>5% of max, n=3606) = 1.805e-06
+  TIME A xmad       nw=16 prep+kernel   241.52 us   136.8 GB/s | kernel only   237.99 us   138.8 GB/s | prep only 3.32 us
+  CORR B bins nw=4 vs stock   max|err|/max|ref| = 1.678e-07   max elementwise rel err (|ref|>5% of max, n=3606) = 1.805e-06
+  TIME B bins       nw=4  prep+kernel   837.08 us    39.5 GB/s | kernel only   833.31 us    39.6 GB/s | prep only 3.32 us
+  CORR B bins nw=8 vs stock   max|err|/max|ref| = 1.678e-07   max elementwise rel err (|ref|>5% of max, n=3606) = 1.805e-06
+  TIME B bins       nw=8  prep+kernel   766.54 us    43.1 GB/s | kernel only   763.12 us    43.3 GB/s | prep only 3.34 us
+  CORR C fp32-magic nw=4 vs stock max|err|/max|ref| = 1.084e-01   max elementwise rel err (|ref|>5% of max, n=3606) = 1.383e+00
+  TIME C fp32-magic nw=4  prep+kernel   247.68 us   133.4 GB/s | kernel only   247.81 us   133.3 GB/s | prep only 2.75 us
+  CORR C fp32-magic nw=8 vs stock max|err|/max|ref| = 1.084e-01   max elementwise rel err (|ref|>5% of max, n=3606) = 1.383e+00
+  TIME C fp32-magic nw=8  prep+kernel   246.28 us   134.1 GB/s | kernel only   242.04 us   136.5 GB/s | prep only 2.76 us
+c nw=16 vs stock max|err|/max|ref| = 1.084e-01   max elementwise rel err (|ref|>5% of max, n=3606) = 1.383e+00
+  TIME C fp32-magic nw=16 prep+kernel   247.42 us   133.5 GB/s | kernel only   245.12 us   134.8 GB/s | prep only 2.69 us
+  CORR C2 fp32+fadd nw=4 vs stock max|err|/max|ref| = 6.673e-03   max elementwise rel err (|ref|>5% of max, n=3606) = 1.327e-01
+  TIME C2 fp32+fadd nw=4  prep+kernel   254.95 us   129.6 GB/s | kernel only   254.00 us   130.0 GB/s | prep only 2.84 us
+  CORR C2 fp32+fadd nw=8 vs stock max|err|/max|ref| = 6.673e-03   max elementwise rel err (|ref|>5% of max, n=3606) = 1.327e-01
+  TIME C2 fp32+fadd nw=8  prep+kernel   249.77 us   132.2 GB/s | kernel only   245.33 us   134.6 GB/s | prep only 2.76 us
+  CORR C2 fp32+fadd nw=16 vs stock max|err|/max|ref| = 6.673e-03   max elementwise rel err (|ref|>5% of max, n=3606) = 1.327e-01
+  TIME C2 fp32+fadd nw=16 prep+kernel   253.60 us   130.2 GB/s | kernel only   251.09 us   131.5 GB/s | prep only 2.90 us
+=== shape m=7168 k=2048 (7168x2048) ===
+  CORR stock vs f64(x f32)    max|err|/max|ref| = 7.662e-03   max elementwise rel err (|ref|>5% of max, n=6057) = 1.070e-01
+  CORR stock vs f64(x q8_1)   max|err|/max|ref| = 1.328e-07   max elementwise rel err (|ref|>5% of max, n=6049) = 1.254e-06
+  TIME stock(ggml mul_mat, 1-node graph)    128.71 us     64.2 GB/s
+  TIME stock(ggml mul_mat, 8-node graph/8)  119.06 us     69.4 GB/s
+  CORR A xmad nw=4 vs stock   max|err|/max|ref| = 1.328e-07   max elementwise rel err (|ref|>5% of max, n=6049) = 1.848e-06
+  TIME A xmad       nw=4  prep+kernel    70.70 us   116.8 GB/s | kernel only    67.62 us   122.1 GB/s | prep only 2.93 us
+  CORR A xmad nw=8 vs stock   max|err|/max|ref| = 1.328e-07   max elementwise rel err (|ref|>5% of max, n=6049) = 1.848e-06
+  TIME A xmad       nw=8  prep+kernel    68.33 us   120.9 GB/s | kernel only    65.33 us   126.4 GB/s | prep only 3.02 us
+  CORR A xmad nw=16 vs stock  max|err|/max|ref| = 1.328e-07   max elementwise rel err (|ref|>5% of max, n=6049) = 1.848e-06
+  TIME A xmad       nw=16 prep+kernel    66.77 us   123.7 GB/s | kernel only    63.71 us   129.6 GB/s | prep only 2.92 us
+  CORR B bins nw=4 vs stock   max|err|/max|ref| = 1.328e-07   max elementwise rel err (|ref|>5% of max, n=6049) = 1.848e-06
+  TIME B bins       nw=4  prep+kernel   241.18 us    34.2 GB/s | kernel only   238.08 us    34.7 GB/s | prep only 2.89 us
+  CORR B bins nw=8 vs stock   max|err|/max|ref| = 1.328e-07   max elementwise rel err (|ref|>5% of max, n=6049) = 1.848e-06
+  TIME B bins       nw=8  prep+kernel   225.22 us    36.7 GB/s | kernel only   222.31 us    37.1 GB/s | prep only 2.95 us
+  CORR C fp32-magic nw=4 vs stock max|err|/max|ref| = 1.083e-01   max elementwise rel err (|ref|>5% of max, n=6049) = 1.302e+00
+  TIME C fp32-magic nw=4  prep+kernel    78.82 us   104.8 GB/s | kernel only    75.74 us   109.0 GB/s | prep only 2.49 us
+  CORR C fp32-magic nw=8 vs stock max|err|/max|ref| = 1.083e-01   max elementwise rel err (|ref|>5% of max, n=6049) = 1.302e+00
+  TIME C fp32-magic nw=8  prep+kernel    77.07 us   107.1 GB/s | kernel only    74.72 us   110.5 GB/s | prep only 2.50 us
+  CORR C fp32-magic nw=16 vs stock max|err|/max|ref| = 1.083e-01   max elementwise rel err (|ref|>5% of max, n=6049) = 1.302e+00
+  TIME C fp32-magic nw=16 prep+kernel    68.96 us   119.7 GB/s | kernel only    66.39 us   124.4 GB/s | prep only 2.92 us
+  CORR C2 fp32+fadd nw=4 vs stock max|err|/max|ref| = 7.643e-03   max elementwise rel err (|ref|>5% of max, n=6049) = 9.541e-02
+  TIME C2 fp32+fadd nw=4  prep+kernel    76.12 us   108.5 GB/s | kernel only    73.70 us   112.0 GB/s | prep only 2.49 us
+  CORR C2 fp32+fadd nw=8 vs stock max|err|/max|ref| = 7.643e-03   max elementwise rel err (|ref|>5% of max, n=6049) = 9.541e-02
+  TIME C2 fp32+fadd nw=8  prep+kernel    75.79 us   108.9 GB/s | kernel only    73.54 us   112.3 GB/s | prep only 2.75 us
+  CORR C2 fp32+fadd nw=16 vs stock max|err|/max|ref| = 7.643e-03   max elementwise rel err (|ref|>5% of max, n=6049) = 9.541e-02
+  TIME C2 fp32+fadd nw=16 prep+kernel    70.74 us   116.7 GB/s | kernel only    68.14 us   121.2 GB/s | prep only 2.52 us
+=== shape m=6144 k=2048 (6144x2048) ===
+  CORR stock vs f64(x f32)    max|err|/max|ref| = 9.391e-03   max elementwise rel err (|ref|>5% of max, n=5120) = 8.596e-02
+  CORR stock vs f64(x q8_1)   max|err|/max|ref| = 1.206e-07   max elementwise rel err (|ref|>5% of max, n=5122) = 1.369e-06
+  TIME stock(ggml mul_mat, 1-node graph)    114.81 us     61.6 GB/s
+  TIME stock(ggml mul_mat, 8-node graph/8)  103.98 us     68.1 GB/s
+  CORR A xmad nw=4 vs stock   max|err|/max|ref| = 1.689e-07   max elementwise rel err (|ref|>5% of max, n=5122) = 2.024e-06
+  TIME A xmad       nw=4  prep+kernel    61.33 us   115.4 GB/s | kernel only    58.18 us   121.7 GB/s | prep only 2.90 us
+  CORR A xmad nw=8 vs stock   max|err|/max|ref| = 1.689e-07   max elementwise rel err (|ref|>5% of max, n=5122) = 2.024e-06
+  TIME A xmad       nw=8  prep+kernel    59.42 us   119.1 GB/s | kernel only    56.57 us   125.1 GB/s | prep only 2.95 us
+  CORR A xmad nw=16 vs stock  max|err|/max|ref| = 1.689e-07   max elementwise rel err (|ref|>5% of max, n=5122) = 2.024e-06
+  TIME A xmad       nw=16 prep+kernel    58.52 us   120.9 GB/s | kernel only    55.45 us   127.6 GB/s | prep only 2.92 us
+  CORR B bins nw=4 vs stock   max|err|/max|ref| = 1.689e-07   max elementwise rel err (|ref|>5% of max, n=5122) = 2.024e-06
+  TIME B bins       nw=4  prep+kernel   208.86 us    33.9 GB/s | kernel only   210.75 us    33.6 GB/s | prep only 2.95 us
+  CORR B bins nw=8 vs stock   max|err|/max|ref| = 1.689e-07   max elementwise rel err (|ref|>5% of max, n=5122) = 2.024e-06
+  TIME B bins       nw=8  prep+kernel   194.66 us    36.4 GB/s | kernel only   191.66 us    36.9 GB/s | prep only 2.93 us
+  CORR C fp32-magic nw=4 vs stock max|err|/max|ref| = 1.346e-01   max elementwise rel err (|ref|>5% of max, n=5122) = 1.729e+00
+  TIME C fp32-magic nw=4  prep+kernel    68.20 us   103.8 GB/s | kernel only    65.91 us   107.4 GB/s | prep only 2.50 us
+  CORR C fp32-magic nw=8 vs stock max|err|/max|ref| = 1.346e-01   max elementwise rel err (|ref|>5% of max, n=5122) = 1.729e+00
+  TIME C fp32-magic nw=8  prep+kernel    67.33 us   105.1 GB/s | kernel only    64.91 us   109.0 GB/s | prep only 2.78 us
+  CORR C fp32-magic nw=16 vs stock max|err|/max|ref| = 1.346e-01   max elementwise rel err (|ref|>5% of max, n=5122) = 1.729e+00
+  TIME C fp32-magic nw=16 prep+kernel    60.36 us   117.3 GB/s | kernel only    58.08 us   121.9 GB/s | prep only 2.82 us
+  CORR C2 fp32+fadd nw=4 vs stock max|err|/max|ref| = 9.379e-03   max elementwise rel err (|ref|>5% of max, n=5122) = 1.430e-01
+  TIME C2 fp32+fadd nw=4  prep+kernel    66.58 us   106.3 GB/s | kernel only    64.33 us   110.0 GB/s | prep only 2.91 us
+  CORR C2 fp32+fadd nw=8 vs stock max|err|/max|ref| = 9.379e-03   max elementwise rel err (|ref|>5% of max, n=5122) = 1.430e-01
+  TIME C2 fp32+fadd nw=8  prep+kernel    70.18 us   100.9 GB/s | kernel only    63.77 us   111.0 GB/s | prep only 2.50 us
+  CORR C2 fp32+fadd nw=16 vs stock max|err|/max|ref| = 9.379e-03   max elementwise rel err (|ref|>5% of max, n=5122) = 1.430e-01
+  TIME C2 fp32+fadd nw=16 prep+kernel    61.80 us   114.5 GB/s | kernel only    59.40 us   119.1 GB/s | prep only 2.49 us
+=== shape m=2048 k=2048 (2048x2048) ===
+  CORR stock vs f64(x f32)    max|err|/max|ref| = 1.145e-02   max elementwise rel err (|ref|>5% of max, n=1765) = 1.219e-01
+  CORR stock vs f64(x q8_1)   max|err|/max|ref| = 1.504e-07   max elementwise rel err (|ref|>5% of max, n=1770) = 1.072e-06
+  TIME stock(ggml mul_mat, 1-node graph)     47.53 us     49.6 GB/s
+  TIME stock(ggml mul_mat, 8-node graph/8)   39.53 us     59.7 GB/s
+  CORR A xmad nw=4 vs stock   max|err|/max|ref| = 1.692e-07   max elementwise rel err (|ref|>5% of max, n=1770) = 1.523e-06
+  TIME A xmad       nw=4  prep+kernel    25.34 us    93.1 GB/s | kernel only    22.31 us   105.7 GB/s | prep only 2.90 us
+  CORR A xmad nw=8 vs stock   max|err|/max|ref| = 1.692e-07   max elementwise rel err (|ref|>5% of max, n=1770) = 1.523e-06
+  TIME A xmad       nw=8  prep+kernel    25.24 us    93.5 GB/s | kernel only    22.22 us   106.2 GB/s | prep only 2.87 us
+  CORR A xmad nw=16 vs stock  max|err|/max|ref| = 1.692e-07   max elementwise rel err (|ref|>5% of max, n=1770) = 1.523e-06
+  TIME A xmad       nw=16 prep+kernel    24.97 us    94.5 GB/s | kernel only    21.98 us   107.3 GB/s | prep only 2.87 us
+  CORR B bins nw=4 vs stock   max|err|/max|ref| = 1.692e-07   max elementwise rel err (|ref|>5% of max, n=1770) = 1.523e-06
+  TIME B bins       nw=4  prep+kernel    77.00 us    30.6 GB/s | kernel only    73.94 us    31.9 GB/s | prep only 2.95 us
+  CORR B bins nw=8 vs stock   max|err|/max|ref| = 1.692e-07   max elementwise rel err (|ref|>5% of max, n=1770) = 1.523e-06
+  TIME B bins       nw=8  prep+kernel    71.46 us    33.0 GB/s | kernel only    68.30 us    34.5 GB/s | prep only 2.94 us
+  CORR C fp32-magic nw=4 vs stock max|err|/max|ref| = 1.098e-01   max elementwise rel err (|ref|>5% of max, n=1770) = 1.429e+00
+  TIME C fp32-magic nw=4  prep+kernel    27.52 us    85.7 GB/s | kernel only    34.86 us    67.7 GB/s | prep only 3.02 us
+  CORR C fp32-magic nw=8 vs stock max|err|/max|ref| = 1.098e-01   max elementwise rel err (|ref|>5% of max, n=1770) = 1.429e+00
+  TIME C fp32-magic nw=8  prep+kernel    31.47 us    75.0 GB/s | kernel only    25.86 us    91.2 GB/s | prep only 2.76 us
+  CORR C fp32-magic nw=16 vs stock max|err|/max|ref| = 1.098e-01   max elementwise rel err (|ref|>5% of max, n=1770) = 1.429e+00
+  TIME C fp32-magic nw=16 prep+kernel    27.05 us    87.2 GB/s | kernel only    24.60 us    95.9 GB/s | prep only 2.53 us
+  CORR C2 fp32+fadd nw=4 vs stock max|err|/max|ref| = 1.142e-02   max elementwise rel err (|ref|>5% of max, n=1770) = 1.086e-01
+  TIME C2 fp32+fadd nw=4  prep+kernel    27.60 us    85.5 GB/s | kernel only    25.06 us    94.2 GB/s | prep only 2.51 us
+  CORR C2 fp32+fadd nw=8 vs stock max|err|/max|ref| = 1.142e-02   max elementwise rel err (|ref|>5% of max, n=1770) = 1.086e-01
+  TIME C2 fp32+fadd nw=8  prep+kernel    29.07 us    81.2 GB/s | kernel only    32.79 us    72.0 GB/s | prep only 2.84 us
+  CORR C2 fp32+fadd nw=16 vs stock max|err|/max|ref| = 1.142e-02   max elementwise rel err (|ref|>5% of max, n=1770) = 1.086e-01
+  TIME C2 fp32+fadd nw=16 prep+kernel    27.58 us    85.5 GB/s | kernel only    30.05 us    78.5 GB/s | prep only 2.84 us

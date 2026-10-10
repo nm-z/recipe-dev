@@ -1,0 +1,7 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8129 MiB):
+  Device 0: Tesla M60, compute capability 5.2, VMM: yes, VRAM: 8129 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| lfm2moe 8B.A1B Q4_K - Medium   |   4.70 GiB |     8.34 B | CUDA       |  99 |           tg128 |         64.00 ± 0.05 |
+
+build: unknown (0)
