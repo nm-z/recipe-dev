@@ -34878,6 +34878,9 @@ tuple_iq3:
 	setp.eq.u32 p,t,18; @!p bra tuple_q8;
 	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; setp.eq.u32 p,cap,8; @p mov.u32 lanes,8; bra tuple_ready;
 tuple_q8:
+	setp.eq.u32 p,t,20; @!p bra tuple_q8_type;
+	setp.le.u32 p,cap,2; @p mov.u32 kind,2; bra tuple_ready;
+tuple_q8_type:
 	setp.eq.u32 p,t,8; @!p bra tuple_ready;
 	setp.eq.u32 p,k,2560; @p mov.u32 lanes,16;
 tuple_ready:
@@ -34961,6 +34964,17 @@ wave_begin:
 	mul.wide.u32 a23,r30,40; add.u64 a30,a10,a23; ld.global.u64 a31,[a30]; ld.global.u64 a32,[a30+8]; ld.global.u64 a33,[a30+16];
 	ld.global.u32 r34,[a30+24]; ld.global.u32 r35,[a30+28]; ld.global.u32 r36,[a30+32];
 	mul.wide.u32 a23,r26,163840; add.u64 a34,a13,a23; add.u64 a35,a34,20480; add.u64 a36,a34,65536;
+	// The measured fused path writes the group's compact active product directly.
+	mov.u32 r43,0; setp.eq.u32 p3,r34,r35; setp.eq.u32 p4,r34,17; setp.eq.u32 p5,r34,18; or.pred p4,p4,p5; and.pred p3,p3,p4;
+	setp.le.u32 p4,r33,2; and.pred p3,p3,p4; @!p3 bra gate_up_separate;
+	mov.u32 r43,1; mul.lo.u32 r44,r3,8; mul.lo.u32 r44,r44,r26; mul.wide.u32 a39,r44,4; add.u64 a39,a18,a39;
+	{ .param .u32 ty,cap,active,lanes,mask,k,m,rank,count,ok; .param .u64 g,u,x,sc,o;
+	st.param.u32 [ty],r34; st.param.u32 [cap],r33; st.param.u32 [active],r32; mov.u32 r44,16; st.param.u32 [lanes],r44; st.param.u32 [mask],r31;
+	st.param.u64 [g],a31; st.param.u64 [u],a32; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a39;
+	st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [rank],r27; st.param.u32 [count],r28;
+	call.uni (ok),packed_gate_up,(ty,cap,active,lanes,mask,g,u,x,sc,o,k,m,rank,count); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,206; bra gate_up_complete;
+gate_up_separate:
 	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
 	st.param.u64 [w],a31; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a34; st.param.u64 [sh],a1;
 	st.param.u32 [ty],r34; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
@@ -34971,6 +34985,7 @@ wave_begin:
 	st.param.u32 [ty],r35; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
 	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
 	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,205;
+gate_up_complete:
 	// Full-die completion before consuming row partitions from other CTAs.
 	div.u32 r37,r24,r9; mad.lo.u32 r22,r0,64,2; mad.lo.u32 r22,r37,8,r22;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
@@ -34981,10 +34996,13 @@ wave_begin:
 product_loop:
 	setp.ge.u32 p1,r15,r38; @p1 bra product_done;
 	mov.f32 f0,0f00000000; setp.ge.u32 p2,r15,r39; @p2 bra product_store;
+	setp.ne.u32 p3,r43,0; @p3 bra product_next;
 	mul.wide.u32 a23,r15,4; add.u64 a24,a34,a23; add.u64 a25,a35,a23; ld.global.cg.f32 f1,[a24]; ld.global.cg.f32 f2,[a25];
 	mul.f32 f3,f1,0fbfb8aa3b; ex2.approx.f32 f3,f3; add.f32 f3,f3,0f3f800000; rcp.approx.f32 f3,f3; mul.f32 f0,f1,f3; mul.f32 f0,f0,f2;
 product_store:
-	mad.lo.u32 r17,r26,r38,r15; mul.wide.u32 a23,r17,4; add.u64 a24,a18,a23; st.global.f32 [a24],f0; add.u32 r15,r15,r16; bra product_loop;
+	mad.lo.u32 r17,r26,r38,r15; mul.wide.u32 a23,r17,4; add.u64 a24,a18,a23; st.global.f32 [a24],f0;
+product_next:
+	add.u32 r15,r15,r16; bra product_loop;
 product_done:
 	add.u32 r22,r22,1;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
