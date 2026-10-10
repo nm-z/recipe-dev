@@ -1,0 +1,14 @@
+/opt/cuda/bin/nvcc -Wno-deprecated-gpu-targets -arch=sm_52 -ptx -o barrier.ptx barrier.cu
+sed -i 's/^\.version .*/.version 7.4/' barrier.ptx
+sed -i '$ { /^$/d; }' barrier.ptx
+/opt/cuda-11.4/bin/ptxas -arch=sm_52 -v -o barrier.cubin barrier.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'layer' for 'sm_52'
+ptxas info    : Function properties for layer
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 68 registers, 13344 bytes smem, 392 bytes cmem[0], 28 bytes cmem[2]
+ptxas info    : Compiling entry function 'relay' for 'sm_52'
+ptxas info    : Function properties for relay
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 1048 bytes smem, 368 bytes cmem[0], 4 bytes cmem[2]
+rustc --edition=2024 -O -o bench bench.rs -l cuda -C link-arg=/home/nate/llama-cuda118-master-bin/libcudart.so.11.0 -C link-arg=-Wl,-rpath,/home/nate/llama-cuda118-master-bin/
