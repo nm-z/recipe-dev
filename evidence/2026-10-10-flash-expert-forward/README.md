@@ -23,3 +23,15 @@ The actual packed_matvec PTX uses 14 arguments and an extern dynamic shared buff
 - placement.md uses actual target/head headers and the actual lowered five-position layouts at context 128, on the a35d0b93 precision configuration. Main reserve is 2227327718 bytes, including request buffers and the 32 MiB execution reserve. It returns zero unplaced bytes and 1441382400 pinned-RAM bytes. The saved free-VRAM snapshot has no model allocations. The current root flash profile must recompute this table at startup.
 
 No GPU model invocation is claimed from these build and planning results. The die-memory sweep, combined root build, actual forward trace, timeout resolution, router-selected overhead, whole-model rate, and final-logit agreement remain runtime gates. cx-flash owns the coordinated restart. No GPU kernel is launched by this source track before that window.
+
+## Current integration port
+
+The current branch ports the connection onto d1a186a, preserving root's Result-based inference window, BF16 handling, mapped allocation reuse, and flash profile. It consumes the published 431203e 256-thread library and uses measured kind/row-lane tuples for the real expert types and capacities. Main and worker grids both use 256 threads; the expert module uses the forward entry for a single position as well as prefill. A separate 512-thread step is not compiled for this module.
+
+The selector may include capped die 2 or explicitly omit it. Omission creates no die-2 context, buffer, packet, or worker. It does not automatically recover a failed GPU or change the selected topology. Root retains that decision. Die 6 stays excluded.
+
+RECIPE_EXPERT_PICK_COUNTS is a read-only ranking seed. It accepts the root reference TSV (`layer, expert, picks, router_positions`, separated by tabs) or a target/head CSV. Reference seed counts are not added to the live Recipe counters. RECIPE_EXPERT_PICK_LOG selects a separate output path; absent that setting, actual Recipe picks go to router-picks.csv in the worker artifact directory. The reference file is preserved.
+
+`current/` records the current flash-profile CPU plans, using the real target/head lowering at context 128 and five positions. The main reserve is 1313660806 bytes. The seven-die plan spills 527462400 bytes; the plan explicitly excluding die 2 spills 6288128000 bytes. Both leave zero unplaced bundles/bytes. These are computed plans; live startup recomputes CUDA free bytes after context creation.
+
+The current library/CLI build and composed worker assembly/link pass. The retained worker reports 252 registers, 488 stack bytes, 16 static shared bytes, and zero local-memory bytes. No real GPU forward or rate is claimed. The original receipts remain historical snapshots, separate from these current receipts.
