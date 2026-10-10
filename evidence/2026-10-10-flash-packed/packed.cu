@@ -317,9 +317,10 @@ template<int T,int NW,int N,int LW>static __device__ __forceinline__ void k_widt
 WIDTHT(12) WIDTHT(13)
 WIDTH(12,1,32,8) WIDTH(12,1,32,16) WIDTH(12,2,32,8) WIDTH(12,2,32,16)
 WIDTH(13,1,32,8) WIDTH(13,1,32,16) WIDTH(13,2,32,8) WIDTH(13,2,32,16)
-extern "C" __device__ __noinline__ void packed_prepare(const float *x,u32 *p,float2 *ds,int k,int capacity,int active){
+extern "C" __device__ __noinline__ void packed_prepare(const float *x,u32 *p,float2 *ds,int k,int capacity,int active,u32 cta_index,u32 cta_count){
+	if(cta_count==0||cta_index>=cta_count)return;
 	int lane=threadIdx.x&31,warp=threadIdx.x>>5,warps=blockDim.x>>5;
-	for(int c=0;c<capacity;c++)for(int b=blockIdx.x*warps+warp;b<k/32;b+=gridDim.x*warps){
+	for(int c=0;c<capacity;c++)for(int b=cta_index*warps+warp;b<k/32;b+=cta_count*warps){
 		float v=c<active?x[c*k+b*32+lane]:0,a=fabsf(v);
 		#pragma unroll
 		for(int j=16;j;j>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,j));
@@ -331,7 +332,7 @@ extern "C" __device__ __noinline__ void packed_prepare(const float *x,u32 *p,flo
 		if(lane==0){float dh=__half2float(__float2half(d));ds[c*k/32+b]=make_float2(dh,dh*sum);}
 	}
 }
-extern "C" __global__ void packed_prepare_probe(const float *x,u32 *p,float2 *ds,int k,int n){packed_prepare(x,p,ds,k,n,n);}
+extern "C" __global__ void packed_prepare_probe(const float *x,u32 *p,float2 *ds,int k,int n){packed_prepare(x,p,ds,k,n,n,blockIdx.x,gridDim.x);}
 static __device__ __forceinline__ bool valid_packed(int type,int capacity,int active,int kind,int lanes,u32 mask,int k,int m,u32 cta_index,u32 cta_count,u32 *scratch){
 	return active>=0&&active<=capacity&&kind>=0&&kind<=2&&(kind!=2||type==17||type==18||type==20)&&(lanes==8||lanes==16)&&k>0&&m>0&&!(uintptr_t(scratch)&15)&&cta_count>0&&cta_count<=gridDim.x&&cta_index<cta_count&&
 		(type==8||type==12||type==13||type==14||type==17||type==18||type==20)&&!(k%(type==8||type==20?32:256))&&

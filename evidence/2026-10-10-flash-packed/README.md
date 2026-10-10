@@ -7,7 +7,7 @@ Root `packed.ptx` contains device functions and tables, with no launch entries. 
 All pointers are u64. Dimensions, selectors, and the receipt are u32. The shared pointer is a generic address obtained from `cvta.shared`, aligned to 16 bytes.
 
 ```text
-packed_prepare(x_f32, packed_x, scales, k, source_columns, active_source_columns) -> void
+packed_prepare(x_f32, packed_x, scales, k, source_columns, active_source_columns, cta_index, cta_count) -> void
 packed_matvec(type, capacity, active_columns, kind, row_lanes, position_mask,
 	weights, packed_x, scales, output_f32, k, m, cta_index, cta_count, shared) -> u32
 packed_matvec_wide(same parameters) -> u32
