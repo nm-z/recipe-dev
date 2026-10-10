@@ -1,0 +1,3 @@
+index, uuid, power.limit [W], clocks.current.graphics [MHz], clocks.current.memory [MHz], utilization.gpu [%], memory.used [MiB]
+1, GPU-ccb8b3a3-f45d-8962-215b-c2b140e4bb28, 113.00 W, 1177 MHz, 2505 MHz, 0 %, 1600 MiB
+2, GPU-c767d250-4454-d181-d648-8706b5f2fb64, 113.00 W, 405 MHz, 324 MHz, 0 %, 0 MiB

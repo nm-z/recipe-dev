@@ -1,0 +1,28 @@
+die=0 uuid_hex=ccb8b3a3f45d8962215bc2b140e4bb28
+die=1 uuid_hex=c767d2504454d181d6488706b5f2fb64
+relay bytes=16384 hops=1 trials=200 machine_total_us=4701.212 token_us=23.506 hop_us=23.506 device_token_us=11.894 device_hop_us=11.894 p50_token_us=22.960 p99_token_us=34.883 errors=0
+relay bytes=16384 hops=7 trials=200 machine_total_us=12762.661 token_us=63.813 hop_us=9.116 device_token_us=52.398 device_hop_us=7.485 p50_token_us=63.469 p99_token_us=74.264 errors=0
+relay bytes=16384 hops=100 trials=200 machine_total_us=138131.343 token_us=690.657 hop_us=6.907 device_token_us=678.733 device_hop_us=6.787 p50_token_us=690.234 p99_token_us=698.396 errors=0
+delay_publication_ns=5000 hops=7 errors=0
+missing_sequence die0_timeout=2 die1_timeout=1
+cudaMemcpyPeer bytes=4096 hops=1 trials=200 total_us=2826.126 token_us=14.131 hop_us=14.131 errors=0
+cudaMemcpyPeer bytes=4096 hops=7 trials=200 total_us=19093.284 token_us=95.466 hop_us=13.638 errors=0
+cudaMemcpyPeer bytes=4096 hops=100 trials=200 total_us=198841.234 token_us=994.206 hop_us=9.942 errors=0
+cudaMemcpyPeer bytes=16384 hops=1 trials=200 total_us=2452.809 token_us=12.264 hop_us=12.264 errors=0
+cudaMemcpyPeer bytes=16384 hops=7 trials=200 total_us=16710.182 token_us=83.551 hop_us=11.936 errors=0
+cudaMemcpyPeer bytes=16384 hops=100 trials=200 total_us=237329.364 token_us=1186.647 hop_us=11.866 errors=0
+gate_lt_10us=true
+layer die=0 shape=4096x4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 weights_bytes=9437184 device_us=3057.664 errors=0 timeout=0 max_abs=0.00000095 max_rel=0.00009374
+layer die=1 shape=4096x4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 weights_bytes=9437184 device_us=3060.992 errors=0 timeout=0 max_abs=0.00000012 max_rel=0.00000021
+layer_demo trials=8 weights_uploads=2 machine_total_us=24568.441 token_us=3071.055 launches_per_token=2 peer_payload_bytes=16384 cpu_between_layers=0
+symbol=p2p_grid_relay active_ctas_per_sm=8
+symbol=p2p_grid_relay active_ctas_per_sm=8
+grid_relay ctas_per_die=16 active_sms=16 bytes=16384 hops=100 trials=200 delay_cta7_ns=0 machine_total_us=824445.269 token_us=4122.226 hop_us=41.222 p99_token_us=6008.363 errors=0 timeouts=0 launches_per_token=2
+grid_relay ctas_per_die=16 active_sms=16 bytes=16384 hops=100 trials=20 delay_cta7_ns=5000 machine_total_us=84463.976 token_us=4223.199 hop_us=42.232 p99_token_us=6615.086 errors=0 timeouts=0 launches_per_token=2
+grid_missing_cta_slot=8 timeout_observed_on_both_dies=true
+symbol=p2p_layers active_ctas_per_sm=2
+symbol=p2p_layers active_ctas_per_sm=2
+
+thread 'main' (962745) panicked at evidence/2026-10-10-m60-p2p/bench.rs:306:5:
+Payload or packed arithmetic error
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,26 @@
+die=0 uuid_hex=ccb8b3a3f45d8962215bc2b140e4bb28
+die=1 uuid_hex=c767d2504454d181d6488706b5f2fb64
+relay bytes=16384 hops=1 trials=200 machine_total_us=4772.053 token_us=23.860 hop_us=23.860 device_token_us=11.822 device_hop_us=11.822 p50_token_us=23.654 p99_token_us=25.503 errors=0
+relay bytes=16384 hops=7 trials=200 machine_total_us=12940.193 token_us=64.701 hop_us=9.243 device_token_us=52.557 device_hop_us=7.508 p50_token_us=64.320 p99_token_us=70.864 errors=0
+relay bytes=16384 hops=100 trials=200 machine_total_us=138782.678 token_us=693.913 hop_us=6.939 device_token_us=681.457 device_hop_us=6.815 p50_token_us=693.391 p99_token_us=707.058 errors=0
+delay_publication_ns=5000 hops=7 errors=0
+missing_sequence die0_timeout=2 die1_timeout=1
+cudaMemcpyPeer bytes=4096 hops=1 trials=200 total_us=2012.213 token_us=10.061 hop_us=10.061 errors=0
+cudaMemcpyPeer bytes=4096 hops=7 trials=200 total_us=13117.799 token_us=65.589 hop_us=9.370 errors=0
+cudaMemcpyPeer bytes=4096 hops=100 trials=200 total_us=189393.350 token_us=946.967 hop_us=9.470 errors=0
+cudaMemcpyPeer bytes=16384 hops=1 trials=200 total_us=2432.058 token_us=12.160 hop_us=12.160 errors=0
+cudaMemcpyPeer bytes=16384 hops=7 trials=200 total_us=16407.039 token_us=82.035 hop_us=11.719 errors=0
+cudaMemcpyPeer bytes=16384 hops=100 trials=200 total_us=233651.947 token_us=1168.260 hop_us=11.683 errors=0
+gate_lt_10us=true
+layer die=0 shape=4096x4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 weights_bytes=9437184 device_us=3059.584 errors=0 timeout=0 max_abs=0.00000095 max_rel=0.00009374
+layer die=1 shape=4096x4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 weights_bytes=9437184 device_us=3063.296 errors=0 timeout=0 max_abs=0.00000012 max_rel=0.00000021
+layer_demo trials=8 weights_uploads=2 machine_total_us=25022.182 token_us=3127.773 launches_per_token=2 peer_payload_bytes=16384 cpu_between_layers=0
+symbol=p2p_grid_relay active_ctas_per_sm=8
+symbol=p2p_grid_relay active_ctas_per_sm=8
+grid_relay ctas_per_die=16 active_sms=16 bytes=16384 hops=100 trials=200 delay_cta7_ns=0 machine_total_us=193766.650 token_us=968.833 hop_us=9.688 p99_token_us=978.238 errors=0 timeouts=0 launches_per_token=2
+grid_relay ctas_per_die=16 active_sms=16 bytes=16384 hops=100 trials=20 delay_cta7_ns=5000 machine_total_us=24379.762 token_us=1218.988 hop_us=12.190 p99_token_us=3124.138 errors=0 timeouts=0 launches_per_token=2
+grid_missing_cta_slot=8 timeout_observed_on_both_dies=true
+symbol=p2p_layers active_ctas_per_sm=2
+symbol=p2p_layers active_ctas_per_sm=2
+multi_layer rows=2560 k=4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 ctas_per_die=16 active_sms=16 hops=100 trials=20 weights_bytes_per_die=5898240 weights_uploads=2 launches_per_token=2 cpu_between_layers=0 peer_bytes=16384 machine_total_us=209911.108 token_us=10495.555 hop_us=104.956 device_hop_us_a=104.741 device_hop_us_b=104.756 p99_token_us=10523.204 max_abs_a=0.000000238 max_abs_b=0.000000007 scalar_nonzero_hops=16 errors=0 timeouts=0
+multi_layer rows=10240 k=4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 ctas_per_die=16 active_sms=16 hops=100 trials=20 weights_bytes_per_die=23592960 weights_uploads=2 launches_per_token=2 cpu_between_layers=0 peer_bytes=16384 machine_total_us=671359.103 token_us=33567.955 hop_us=335.680 device_hop_us_a=335.396 device_hop_us_b=335.416 p99_token_us=33651.717 max_abs_a=0.000000238 max_abs_b=0.000000007 scalar_nonzero_hops=100 errors=0 timeouts=0
