@@ -16041,7 +16041,7 @@ pub(crate) struct StoredWeight {
 	pub(crate) segments: Vec<(StorageFormat, usize)>,
 }
 impl StoredWeight {
-	/// Every element decoded on the host, one source layout at a time.
+	/// Every element decoded into machine RAM, one source layout at a time.
 	fn decoded(&self) -> Result<Vec<f64>> {
 		let bytes = self.bytes.to_vec()?;
 		let (mut values, mut at) = (Vec::with_capacity(self.count), 0);
@@ -21951,7 +21951,7 @@ struct Graph {
 	/// Bound values by node, written into their spans once every lowering has
 	/// set its own initial parameters.
 	bound_values: Vec<(usize, Vec<f64>)>,
-	/// Whether a bound weight that trains decodes into its host span rather than staying packed for the device.
+	/// Whether a bound weight that trains decodes into its parameter span rather than staying packed for the device.
 	host_weights: bool,
 	/// Whether a weighted block allocates its bias. Set once from the model, so
 	/// every lowering below sees it without threading a flag through each one.
@@ -22108,7 +22108,6 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if data.target_width != 0 && (graph.output.channels != data.target_width || graph.output.length != 1) {
 		let length = graph.output.length;
 		// The projection onto the targets is not in the file, so it takes random weights even when the file binds every model node.
-		eprintln!("target projection {} -> {} takes fresh weights; the file has none for it", graph.output.channels, data.target_width);
 		let plan = graph.bound.take();
 		lower_conv(&mut graph, data.target_width, length)?;
 		graph.bound = plan;
@@ -22510,7 +22509,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 			match bound.weight {
 				// A bound contraction or expert decodes the mapped source layout;
 				// compute precision does not expand its stored table.
-				// A node that trains owns a host span, so a packed file weight decodes into it; a table is drawn once and stays packed.
+				// A node that trains owns a parameter span, so a packed file weight decodes into it; a table is drawn once and stays packed.
 				BoundWeight::Stored(weight) if graph.host_weights && !node.table() => {
 					graph.bound_values.push((index, weight.decoded()?));
 					None
@@ -37056,14 +37055,11 @@ impl Train {
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
 		}
-		// A GGUF file in the data binds the model's weights; its rows still come from the table sources.
+		// Bind and lower the same file-adapted definition that inference uses.
+		let file_model = data.file.as_ref().map(|file| model.for_file(file));
+		let model = file_model.as_ref().unwrap_or(model);
 		let bound = match &data.file {
-			Some(file) => {
-				let plan = conventional_plan(file, &model.for_file(file))?;
-				let head = plan.nodes.last().map_or_else(String::new, |planes| planes.iter().map(Plane::name).collect::<Vec<_>>().join(", "));
-				eprintln!("bound {} weighted nodes from {} tensors; the output head reads {head}", plan.nodes(), plan.tensors());
-				Some(file.bound(&plan)?)
-			}
+			Some(file) => Some(file.bound(&conventional_plan(file, model)?)?),
 			None => None,
 		};
 		let owned;

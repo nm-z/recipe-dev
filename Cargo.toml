@@ -204,7 +204,6 @@ step = 256
 
 [precision.stored]
 fp8 = "e4m3"
-train = "fp32"
 tolerance = 0.05
 exact-cpu = true
 sum = "fp32"

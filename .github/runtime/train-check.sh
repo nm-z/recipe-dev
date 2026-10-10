@@ -1,88 +1,92 @@
 #!/usr/bin/env bash
-# Trains the Qwen3-0.6B definition twice on a fixed 16-row table. Each run must
-# exit 0 and end with a final loss below its first-epoch loss.
-#
-# Usage: RECIPE_TRAIN_GGUF=/path/Qwen3-0.6B-Q8_0.gguf .github/runtime/train-check.sh
-# Set RECIPE_BIN to choose the binary. On a shared host, run this under the
-# model-run lock; the script itself does not take it.
+# Verifies the file's canonical model on token pairs from README.md. Vocabulary
+# targets retain its pretrained output head. MSE is measured over one-hot targets.
+# Usage: RECIPE_TRAIN_GGUF=/path/model.gguf .github/runtime/train-check.sh
 set -euo pipefail
 
-recipe=${RECIPE_BIN:-./target/release/recipe}
-gguf=${RECIPE_TRAIN_GGUF:?RECIPE_TRAIN_GGUF must name the Qwen3-0.6B Q8_0 GGUF file}
-epochs=4
-work=$(mktemp -d "${TMPDIR:-/tmp}/recipe-train-XXXXXX")
-trap 'rm -rf "$work"' EXIT
+root=$(cd "$(dirname "$0")/../.." && pwd)
+recipe=${RECIPE_BIN:-$root/target/release/recipe}
+gguf=${RECIPE_TRAIN_GGUF:?RECIPE_TRAIN_GGUF must name a GGUF file}
+work=${RECIPE_TRAIN_WORK:-$(mktemp -d /home/nate/codex/recipe-train-XXXXXX)}
+mkdir -p "$work"
+export RECIPE_TRAIN_GGUF="$gguf" RECIPE_TRAIN_WORK="$work" RECIPE_TRAIN_ROOT="$root"
 
-table="$work/rows.csv"
-{
-	echo "token,next"
-	for ((i = 0; i < 16; i++)); do
-		echo "$((1000 + i * 7)),$((1000 + (i + 1) * 7))"
-	done
-} > "$table"
-
-script="$work/qwen3-train.rs"
+script="$work/train.rs"
 cat > "$script" <<'RECIPE'
 use recipe::*;
-use recipe::log::{epoch, loss, time};
+use recipe::log::{epoch, loss};
+use std::io::Write;
 
 fn main() {
-	let gguf = std::env::var("RECIPE_TRAIN_GGUF").expect("RECIPE_TRAIN_GGUF names the Qwen3 GGUF file");
-	let table = std::env::var("RECIPE_TRAIN_TABLE").expect("RECIPE_TRAIN_TABLE names the CSV dataset");
-	let data = recipe.data(gguf).set(table).target("next");
-	let mut model = recipe.model().embed(tokenizer.ggml.tokens, qwen3.embedding_length);
-	for _ in 0..qwen3.block_count {
-		model = model
-			.res([
-				norm(rms),
-				attn(qwen3.attention.head_count).kv(qwen3.attention.head_count_kv).width(qwen3.attention.key_length)
-					.qk(rms).rope(neox, qwen3.attention.key_length, qwen3.rope.freq_base),
-			])
-			.res([
-				norm(rms),
-				layer(qwen3.feed_forward_length).silu() * layer(qwen3.feed_forward_length),
-				layer(qwen3.embedding_length),
-			]);
+	let path = std::env::var("RECIPE_TRAIN_GGUF").unwrap();
+	let work = std::env::var("RECIPE_TRAIN_WORK").unwrap();
+	let file = recipe.gguf(&path);
+	let bound = file.model();
+	let model = bound.model();
+	let vocabulary = bound.vocabulary();
+	let root = std::env::var("RECIPE_TRAIN_ROOT").unwrap();
+	let text = std::fs::read_to_string(format!("{root}/README.md")).unwrap();
+	let ids = file.tokenizer().encode(&text);
+	let pairs = ids.windows(2).take(16).collect::<Vec<_>>();
+	assert_eq!(pairs.len(), 16);
+	let columns = (0..vocabulary).map(|id| format!("next_{id}")).collect::<Vec<_>>();
+	let table = format!("{work}/rows.csv");
+	let mut rows = std::fs::File::create(&table).unwrap();
+	writeln!(rows, "token,{}", columns.join(",")).unwrap();
+	let mut reference = Vec::new();
+	let mut expected_loss = 0.0;
+	for pair in &pairs {
+		write!(rows, "{}", pair[0]).unwrap();
+		for id in 0..vocabulary {
+			write!(rows, ",{}", usize::from(id == pair[1] as usize)).unwrap();
+		}
+		writeln!(rows).unwrap();
+		let logits = bound.infer(&pair[..1]);
+		assert_eq!(logits.len(), vocabulary);
+		for (id, value) in logits.iter().enumerate() {
+			expected_loss += (value - f64::from(u8::from(id == pair[1] as usize))).powi(2);
+		}
+		reference.extend(logits);
 	}
-	let model = model.norm(rms).layer(tokenizer.ggml.tokens);
-	let trained = recipe.train().lr(0.001).epochs(4).log([time, epoch, loss]).run(&model, &data);
-	println!("final loss {}", trained.fnl.loss);
+	drop(rows);
+	expected_loss /= reference.len() as f64;
+	let data = recipe.data([path.clone(), table]).target(columns);
+	for line in model.binding(&data).unwrap().listing() {
+		println!("binding {line}");
+	}
+	let trained = recipe.train().lr(0.0001).stop(0.0).epochs(4).log([epoch, loss]).run(model, &data);
+	assert_eq!(trained.rows, pairs.len());
+	assert_eq!(trained.loss.len(), 4);
+	assert_eq!(trained.initial_predictions().len(), reference.len(), "training must retain the vocabulary head");
+	let mut initial = trained.initial_predictions().chunks_exact(vocabulary).collect::<Vec<_>>();
+	let mut reference = reference.chunks_exact(vocabulary).collect::<Vec<_>>();
+	let order = |left: &&[f64], right: &&[f64]| left.iter().zip(*right).map(|(a, b)| a.total_cmp(b)).find(|value| !value.is_eq()).unwrap_or(std::cmp::Ordering::Equal);
+	initial.sort_by(order);
+	reference.sort_by(order);
+	let maximum = initial.iter().flat_map(|row| row.iter()).zip(reference.iter().flat_map(|row| row.iter()))
+		.map(|(left, right)| (left - right).abs()).fold(0.0_f64, f64::max);
+	assert!(maximum < 0.001, "pretrained logit mismatch {maximum}");
+	assert!((trained.itl.loss - expected_loss).abs() < 0.001 * expected_loss.max(1.0), "initial loss differs from inference");
+	assert!(trained.fnl.loss.is_finite() && trained.fnl.loss < trained.itl.loss);
+	assert!(trained.fnl.loss < trained.loss[0][0], "loss must fall after the first epoch");
+	assert!(trained.initial_predictions().iter().zip(trained.predictions()).any(|(left, right)| left.to_bits() != right.to_bits()),
+		"the update must change predictions");
+	println!("pretrained MSE {expected_loss:.9}, initial MSE {:.9}, first-epoch MSE {:.9}, final MSE {:.9}, maximum logit error {maximum:.9}",
+		trained.itl.loss, trained.loss[0][0], trained.fnl.loss);
+	let numeric = recipe.data(format!("{root}/.github/runtime/data/linear.csv")).target("target");
+	let integer = recipe.model().layer(32).fp(32).layer(1).int(8);
+	let fallback = recipe.train().lr(0.001).stop(0.0).epochs(4).run(&integer, &numeric);
+	assert!(fallback.fnl.loss.is_finite() && fallback.fnl.loss < fallback.itl.loss);
+	println!("integer-checkpoint default: initial MSE {:.9}, final MSE {:.9}", fallback.itl.loss, fallback.fnl.loss);
+	println!("train-check passed: pretrained vocabulary logits agree, updates change predictions, and loss decreases");
 }
 RECIPE
 
-# Prints the loss after each epoch (stderr), then the final loss (stdout), for one run.
-losses() {
-	cat "$1.err" "$1.out" | sed 's/\x1b\[[0-9;]*m//g' | awk '
-		/ epoch / { print $NF }
-		/^final loss / { final = $3 }
-		END { if (final != "") print final }'
-}
-
-check_run() {
-	local name=$1 status=0 log="$work/$1"
-	RECIPE_TRAIN_GGUF="$gguf" RECIPE_TRAIN_TABLE="$table" "$recipe" run "$script" --device cpu > "$log.out" 2> "$log.err" || status=$?
-	if [ "$status" -ne 0 ]; then
-		echo "$name: exit $status" >&2
-		tail -n 20 "$log.err" >&2
-		return 1
+for run in 1 2; do
+	if ! (cd "$work" && RECIPE_FORCE_CPU=1 "$recipe" run "$script" --device cpu --cfg stored) > "$work/run-$run.log" 2>&1; then
+		tail -n 20 "$work/run-$run.log" >&2
+		exit 1
 	fi
-	mapfile -t values < <(losses "$log")
-	local count=$(( ${#values[@]} - 1 ))
-	if [ "$count" -ne "$epochs" ]; then
-		echo "$name: expected $epochs epoch losses, found $count" >&2
-		head -c 1500 "$log.out" >&2
-		tail -c 1200 "$log.err" >&2
-		return 1
-	fi
-	local first=${values[0]} final=${values[$count]}
-	echo "$name: first-epoch loss $first, final loss $final"
-	awk '/^(bound [0-9]+ weighted|target projection) /' "$log.err"
-	if ! awk -v final="$final" -v first="$first" 'BEGIN { exit !(final + 0 < first + 0) }'; then
-		echo "$name: final loss $final is not below first-epoch loss $first" >&2
-		return 1
-	fi
-}
-
-check_run run-1
-check_run run-2
-echo "train-check passed: both runs exited 0 with a final loss below the first-epoch loss"
+	tail -n 3 "$work/run-$run.log"
+	grep -q '^train-check passed:' "$work/run-$run.log"
+done

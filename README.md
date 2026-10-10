@@ -197,7 +197,7 @@ recipe.train()
 	.run(&model, &data);
 ```
 
-A GGUF file in the data sources binds the model's weights, and the table sources supply the rows. The projection onto the targets starts from random weights.
+A GGUF file in the data sources binds the model's weights, and the table sources supply the rows. A target width that differs from the model's output adds a projection with random weights.
 
 ---
 
