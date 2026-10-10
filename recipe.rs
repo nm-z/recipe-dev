@@ -9223,6 +9223,10 @@ impl FloatFormat {
 	fn unpack(self, bits: u64) -> f64 {
 		if self == Self::FP8 { return fp8::Encoding::E4M3.unpack(bits); }
 		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.unpack(bits); }
+		if self.arithmetic == self.storage && self.storage.exp == 8 && self.storage.man == 23 && bits >> 32 == 0 {
+			let value = f64::from(f32::from_bits(bits as u32));
+			return if value.is_nan() { f64::NAN.copysign(value) } else { value };
+		}
 		self.arithmetic.unpack(self.arithmetic.pack(self.storage.unpack(bits)))
 	}
 }
@@ -25093,6 +25097,12 @@ impl NativeTape {
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
+		self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?.push(OperationReport {
+			device: self.device_label()?, model: String::new(), block: 0, node: usize::MAX, operation: "ForwardWindow".to_owned(), begin, end,
+			positions: (end - begin) as usize, ticks: ticks[1].wrapping_sub(ticks[0]).max(0) as u64,
+			seconds: (self.program.gpu.backend != Backend::Cpu).then_some(seconds), selected_experts: 0, weight_bytes: 0, packed_calls: 0,
+			packed_fallbacks: [0; 4], fingerprints: Vec::new(), cache_fingerprints: Vec::new(), cache_channel_fingerprints: Vec::new(),
+		});
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
