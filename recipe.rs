@@ -4709,7 +4709,7 @@ impl NativeModelIr {
 						// accumulates; an inference layout holds none.
 						let block = integer_argument(node.argument[3], "indexer block")?;
 						let (first, count) = (format!("%n{index}.index.first"), format!("%n{index}.index.count"));
-						let end = format!("%n{index}.end");
+						let end = if compact { "%end".to_owned() } else { format!("%n{index}.end") };
 						ir.push_str(&format!(
 							"{first} = udiv i32 {begin}, {block}\n%n{index}.index.stop = add i32 {end}, {last}\n%n{index}.index.last = udiv i32 %n{index}.index.stop, {block}\n%n{index}.index.touched = sub i32 %n{index}.index.last, {first}\n%n{index}.index.empty = icmp eq i32 {span}, 0\n{count} = select i1 %n{index}.index.empty, i32 0, i32 %n{index}.index.touched\n",
 							last = block - 1
@@ -4721,7 +4721,8 @@ impl NativeModelIr {
 							));
 						})?;
 						ir.push_str(barrier(backend));
-						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
+						let selected = NodeWindow { begin: begin.to_owned(), span: window.span.clone() };
+						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &selected, |ir, _p, wide| {
 							ir.push_str(&format!(
 								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
 							));
