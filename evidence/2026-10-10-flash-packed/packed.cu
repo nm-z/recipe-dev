@@ -495,6 +495,26 @@ template<int T,int N,int NW,int LW>static __device__ __forceinline__ void fused_
 #define FUSED(T,N,W,L) extern "C" __device__ __noinline__ u32 packed_gate_up_##T##_##N##_##W##_##L(const uint8_t *g,const uint8_t *u,const u32 *x,const float2 *ds,float *out,int active,u32 mask,u32 index,u32 count){extern __shared__ __align__(16) u32 scratch[];if(active<0||active>N||!count||index>=count||(mask&&__popc(mask)!=active))return 0;if(active==0)return 1;fused_pair<T,N,W,L>(g,u,x,ds,out,2560,640,active,mask,index,count,scratch);return 1;}
 #define FUSEDN(T,N) FUSED(T,N,8,8) FUSED(T,N,8,16) FUSED(T,N,16,8) FUSED(T,N,16,16)
 FUSEDN(17,1) FUSEDN(17,2) FUSEDN(18,1) FUSEDN(18,2)
+extern "C" __device__ __noinline__ u32 packed_gate_up(int type,int capacity,int active,int lanes,u32 mask,const uint8_t *gate,const uint8_t *up,const u32 *x,const float2 *ds,float *product,int k,int m,u32 rank,u32 count){
+	if(k!=2560||m!=640)return 0;
+	if(blockDim.x==256&&lanes==16){
+		if(type==17&&capacity==1)return packed_gate_up_17_1_8_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==2)return packed_gate_up_17_2_8_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==1)return packed_gate_up_18_1_8_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==2)return packed_gate_up_18_2_8_16(gate,up,x,ds,product,active,mask,rank,count);
+	}
+	if(blockDim.x==512){
+		if(type==17&&capacity==1&&lanes==8)return packed_gate_up_17_1_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==1&&lanes==16)return packed_gate_up_17_1_16_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==2&&lanes==8)return packed_gate_up_17_2_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==2&&lanes==16)return packed_gate_up_17_2_16_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==1&&lanes==8)return packed_gate_up_18_1_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==1&&lanes==16)return packed_gate_up_18_1_16_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==2&&lanes==8)return packed_gate_up_18_2_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==2&&lanes==16)return packed_gate_up_18_2_16_16(gate,up,x,ds,product,active,mask,rank,count);
+	}
+	return 0;
+}
 extern "C" __device__ __noinline__ u32 packed_matvec_wide(int type,int capacity,int active,int kind,int lanes,u32 position_mask,const uint8_t *W,const u32 *x,const float2 *ds,float *out,int k,int m,u32 cta_index,u32 cta_count,u32 *scratch){
 	if(!valid_packed(type,capacity,active,kind,lanes,position_mask,k,m,cta_index,cta_count,scratch))return 0;
 	if(blockDim.x!=1024||capacity>2)return 0;
@@ -1501,3 +1521,4 @@ PAIR_PROBE(17,1,8,8) PAIR_PROBE(17,1,8,16) PAIR_PROBE(17,1,16,8) PAIR_PROBE(17,1
 PAIR_PROBE(17,2,8,8) PAIR_PROBE(17,2,8,16) PAIR_PROBE(17,2,16,8) PAIR_PROBE(17,2,16,16)
 PAIR_PROBE(18,1,8,8) PAIR_PROBE(18,1,8,16) PAIR_PROBE(18,1,16,8) PAIR_PROBE(18,1,16,16)
 PAIR_PROBE(18,2,8,8) PAIR_PROBE(18,2,8,16) PAIR_PROBE(18,2,16,8) PAIR_PROBE(18,2,16,16)
+extern "C" __global__ void __launch_bounds__(512,1) packed_gate_up_probe(const uint8_t *gate,const uint8_t *up,const u32 *x,const float2 *ds,float *product,int type,int capacity,int active,int lanes,u32 mask,int k,int m,u32 *status){u32 ok=packed_gate_up(type,capacity,active,lanes,mask,gate,up,x,ds,product,k,m,blockIdx.x,gridDim.x);if(threadIdx.x==0)status[blockIdx.x]=ok;}

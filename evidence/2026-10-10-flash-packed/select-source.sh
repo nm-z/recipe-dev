@@ -5,11 +5,12 @@ winners=$2
 output=$3
 scratch=$4
 awk -F'\t' '$1~/^[0-9]+$/{family=($1==12||$1==13)&&$6==0?"h":"g";name=family=="h"?sprintf("packed_h_%s_%s_%s_%s",$1,$4,$7,$8):sprintf("packed_g_%s_%s_%s_%s_%s",$1,$4,$7,$6,$8);if(!seen[name]++)print $1,$4,$7,$8,$6,family,name}' "$winners" "${winners%/*}/fixed-cta.tsv" "${winners%/*}/cta-256.tsv" "${winners%/*}/fused-down.tsv" > "$scratch"
-awk '/^extern "C" __device__ __noinline__ u32 packed_matvec_wide/{exit} /^(GT|WIDET|DT|WIDTHT|WIDTH|GW|DW|GK|G|FUSEDN|FUSED)\([0-9]/{next} {print}' "$source" > "$output"
+awk '/^extern "C" __device__ __noinline__ u32 packed_matvec_wide/{exit} /^extern "C" __device__ __noinline__ u32 packed_gate_up\(/{skip=1} skip&&/^\}/{skip=0;next} skip{next} /^(GT|WIDET|DT|WIDTHT|WIDTH|GW|DW|GK|G|FUSEDN|FUSED)\([0-9]/{next} {print}' "$source" > "$output"
 while read -r type cap warps lanes kind family symbol; do
 	if [[ $family == h ]]; then printf 'WIDTH(%s,%s,%s,%s)\n' "$type" "$cap" "$warps" "$lanes" >> "$output"; else printf 'G(%s,%s,%s,%s,%s)\n' "$type" "$cap" "$warps" "$lanes" "$kind" >> "$output"; fi
 done < "$scratch"
 awk -F '\t' '$1~/^[0-9]+$/{key=$1 "," $4 "," $6 "," $7;if(!seen[key]++)print "FUSED("key")"}' "${winners%/*}/fused-winners.tsv" >> "$output"
+awk '/^extern "C" __device__ __noinline__ u32 packed_gate_up\(/{copy=1} copy{print} copy&&/^\}/{exit}' "$source" >> "$output"
 cat >> "$output" <<'PART'
 extern "C" __device__ __noinline__ u32 packed_matvec(int type,int capacity,int active,int kind,int lanes,u32 position_mask,const uint8_t *W,const u32 *x,const float2 *ds,float *out,int k,int m,u32 cta_index,u32 cta_count,u32 *scratch){
 	if(!valid_packed(type,capacity,active,kind,lanes,position_mask,k,m,cta_index,cta_count,scratch))return 0;
@@ -28,3 +29,4 @@ extern "C" __device__ __noinline__ u32 packed_matvec_wide(int type,int capacity,
 PART
 awk '/^extern "C" __global__ void __launch_bounds__\(512,1\) packed_probe\(/{copy=1} /^#define PAIR_PROBE/{print;exit} copy{print}' "$source" >> "$output"
 awk -F '\t' '$1~/^[0-9]+$/{key=$1 "," $4 "," $6 "," $7;if(!seen[key]++)print "PAIR_PROBE("key")"}' "${winners%/*}/fused-winners.tsv" >> "$output"
+awk '/^extern "C" __global__ void __launch_bounds__\(512,1\) packed_gate_up_probe\(/{copy=1} copy{print}' "$source" >> "$output"
