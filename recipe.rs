@@ -4302,6 +4302,11 @@ impl NativeModelIr {
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
+					if node.block_kind=="split_dense" {
+						require(backend==Backend::Nvidia && node.precision==Compute::FP32,"dense row dispatch requires NVIDIA FP32 boundary values")?;
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1;  .reg .b64 z; mov.u64 z, 0; st.param.u64 [c], z; st.param.u64 [s], z; st.param.u64 [o], $2; st.param.u64 [h], $7; st.param.u32 [l], $3; st.param.u32 [b], $4; st.param.u32 [p], $5; st.param.u32 [t], $6; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n",weights=pointers.weights,source=pointers.source,out=pointers.value,length=node.output.length));
+						ir.push_str(barrier(backend));
+					} else {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					// Dense exact CPU inference uses one reduction order for prefill,
@@ -4330,6 +4335,7 @@ impl NativeModelIr {
 					);
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
+					}
 				}
 				(false, Primitive::Gather) => {
 					if self.inference {
@@ -4638,7 +4644,7 @@ impl NativeModelIr {
 					if external_expert(node) {
 						require(backend == Backend::Nvidia && node.precision == Compute::FP32, "expert dispatch requires NVIDIA FP32 expert boundaries")?;
 						let routing = self.emit_expert_selection(backend, index, node, &mut ir)?;
-						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\n%n{index}.split.shared = addrspacecast ptr addrspace(3) @contraction_tile to ptr\n%n{index}.split.shared.bits = ptrtoint ptr %n{index}.split.shared to i64\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 %n{index}.split.shared.bits)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
 						ir.push_str(barrier(backend));
 					} else {
 					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
@@ -8769,6 +8775,11 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			}
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
 			let expert_calls=ptx_source.contains("split_main_forward");
+			if expert_calls {
+				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
+				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
+			}
+
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
 			ptx_source.push_str(expert_split_functions());
@@ -8787,7 +8798,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				assembled?;
 				if separate {
 					let linker=Path::new(&native_nvidia_assembler(architecture).unwrap()).with_file_name("nvlink");
-					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used","recipe_model,expert_split_worker"]).arg("-o").arg(output).arg(&object);
+					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used","recipe_model_forward,recipe_model_load,expert_split_worker"]).arg("-o").arg(output).arg(&object);
 					native_command(command,"NVIDIA device linker",key)?;
 				}
 				return Ok(Vec::new());
@@ -17597,10 +17608,13 @@ impl Infer {
 		let bound=explicit_bound(file,model,head.is_none())?;
 		let (target,other)=expert_graphs(&bound,head.as_ref(),positions,if head.is_some(){5}else{0},0,shared_cpu_device()?)?;
 		let head_file=head.as_ref().map(|head|&head.bound.file);
+		let working=split_working_reserve(&target,other.as_ref());for budget in &mut budgets {budget.reserve_bytes=budget.reserve_bytes.max(working);}
 		budgets[4].reserve_bytes=expert_main_reserve(&target,other.as_ref(),file,head_file,Config::load()?.precision)?.0;
 		budgets[0].free_bytes=budgets[0].free_bytes.min(6_186_598_400);
-		budgets[2].free_bytes=0; budgets[6].free_bytes=0;
-		ExpertSplitPlan::new(file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets)
+		budgets[2].free_bytes=0;budgets[6].free_bytes=0;
+		let mut plan=ExpertSplitPlan::with_dense(file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets,&dense_names(&target,other.as_ref()))?;
+		validate_dense_plan(&mut plan,&target,other.as_ref(),file,head_file)?;
+		Ok(plan)
 	}
 	/// Select an MTP checkpoint on the machine executing inference.
 	pub fn mtp(mut self, path: impl AsRef<Path>) -> Self {
@@ -17743,6 +17757,7 @@ impl Infer {
 					continue;
 				}
 				if line.trim() == "/report" || line.trim().starts_with("/report ") {
+					if let Err(error)=placed.export_router_picks() {eprintln!("cannot export router picks: {error}");}
 					use std::fmt::Write as _;
 					let mut text = String::from("request\tinput\toutput\tcached\tprefill_seconds\tgeneration_seconds\ttok_per_second\tmtp_drafted\tmtp_accepted\tmtp_verify_seconds\tmtp_step_seconds\tmtp_draft_seconds\n");
 					for (index, request) in request_history.iter().enumerate() {
@@ -17864,6 +17879,7 @@ impl Infer {
 			memory = resident_memory(&placed, mtp.as_ref());
 			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
 			drop(progress);
+			if let Err(error)=placed.export_router_picks() {eprintln!("cannot export router picks: {error}");}
 			let reply = coder.decode(&ids);
 			let mut operations = placed.take_operations("main");
 			if let Some(mtp) = &mtp { operations.extend(mtp.placed.take_operations("mtp")); }
@@ -19164,8 +19180,9 @@ fn expert_graphs(bound:&Bound,head:Option<&MtpHead>,positions:usize,checkpoints:
 	target.observations=observations;
 	if checkpoints>0 {retain_mtp_hidden(&mut target)?;for node in &mut target.nodes {if node.op==Primitive::Delta {node.argument[5]=checkpoints as f64;}}}
 	wire_expert_graph(&mut target,&bound.plan,false,0)?;
+	wire_dense_graph(&mut target,&bound.plan,false,0)?;
 	let mut other=head.map(|head|head.graph(positions,gpu)).transpose()?;
-	if let (Some(head),Some(graph))=(head,&mut other) {retain_mtp_hidden(graph)?;wire_expert_graph(graph,&head.bound.plan,true,target.expert_layers.len())?;}
+	if let (Some(head),Some(graph))=(head,&mut other) {retain_mtp_hidden(graph)?;wire_expert_graph(graph,&head.bound.plan,true,target.expert_layers.len())?;wire_dense_graph(graph,&head.bound.plan,true,target.expert_layers.len())?;}
 	Ok((target,other))
 }
 fn expert_request_bytes(graph:&Graph,precision:Compute)->Result<usize> {
@@ -19182,11 +19199,27 @@ fn expert_request_bytes(graph:&Graph,precision:Compute)->Result<usize> {
 	}
 	Ok(bytes)
 }
+fn split_working_reserve(target:&Graph,head:Option<&Graph>)->usize {
+	let jobs=target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).collect::<Vec<_>>();
+	let rows=jobs.iter().filter(|job|job.dense()).flat_map(|job|job.tensors()).map(|tensor|(tensor.shape[1] as usize).div_ceil(6)).max().unwrap_or(0).max(10240);
+	let scratch=[5*10240*4,8*10240*2,8*10240/32*8,5*16*10240*4,5*rows*4,16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
+	let tables=jobs.iter().map(|job|if job.dense(){job.tensors().len()*32}else{512*40}).sum::<usize>();
+	let positions=target.input.length.max(head.map_or(0,|graph|graph.input.length));
+	let reports=positions*jobs.len()*128;
+	// Include modules, peer packets, main descriptors, counters, and synchronization storage.
+	(32<<20).max(scratch+tables+reports+jobs.len()*(192+112+6*48+512*4)+(8<<20))
+}
 fn expert_main_reserve(target:&Graph,head:Option<&Graph>,target_file:&Gguf,head_file:Option<&Gguf>,precision:Compute)->Result<(usize,usize,usize)> {
 	let native=part_bytes(target,precision)?+head.map(|graph|part_bytes(graph,precision)).transpose()?.unwrap_or(0);
 	let requests=expert_request_bytes(target,precision)?+head.map(|graph|expert_request_bytes(graph,precision)).transpose()?.unwrap_or(0);
-	let raw=target_file.tensors().iter().chain(head_file.into_iter().flat_map(Gguf::tensors)).filter(|tensor|!tensor.name.ends_with("_exps.weight") && !matches!(tensor.name.as_str(),"token_embd.weight"|"per_layer_token_embd.weight")).map(|tensor|tensor.bytes).sum::<usize>();
-	Ok((native.saturating_sub(raw)+requests+(32<<20)+placement_reserve_bytes()?,native,requests))
+	let dense=dense_names(target,head);
+	let raw=[(false,target_file),(true,head_file.unwrap_or(target_file))].into_iter().filter(|(mtp,_)|!*mtp || head_file.is_some()).flat_map(|(mtp,file)|file.tensors().iter().map(move|tensor|(mtp,tensor)))
+		.filter(|(mtp,tensor)|!dense.contains(&(*mtp,tensor.name.clone())) && !tensor.name.ends_with("_exps.weight") && !matches!(tensor.name.as_str(),"token_embd.weight"|"per_layer_token_embd.weight")).map(|(_,tensor)|tensor.bytes).sum::<usize>();
+	Ok((native.saturating_sub(raw)+requests+split_working_reserve(target,head)+placement_reserve_bytes()?,native,requests))
+}
+fn dense_names(target:&Graph,head:Option<&Graph>)->std::collections::HashSet<(bool,String)> {
+	target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).filter(|layer|layer.dense())
+		.flat_map(|layer|layer.tensors().iter().map(move|tensor|(layer.mtp,tensor.name.clone()))).collect()
 }
 
 fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, checkpoints: usize, observations: u8) -> Result<(Placed, Option<MtpRuntime>)> {
@@ -19199,7 +19232,7 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	if let Some(graph)=&head_graph {drop(main.native_program(graph,1,precision,None,false)?);}
 	let head_file=head.as_ref().map(|head|&head.bound.file);
 	let (reserve,native_bytes,requests)=expert_main_reserve(&target_graph,head_graph.as_ref(),&bound.file,head_file,precision)?;
-	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:32<<20};8];
+	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:split_working_reserve(&target_graph,head_graph.as_ref())};8];
 	for gpu in selected_gpus()? {
 		let die=gpu.name.strip_prefix("nv").and_then(|value|value.parse::<usize>().ok()).ok_or_else(||RecipeError::new("expert startup requires physical local NVIDIA names"))?;
 		require(die<8 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
@@ -19209,7 +19242,8 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 		}
 	}
 	budgets[4].reserve_bytes=reserve;
-	let plan=ExpertSplitPlan::new(bound.file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets)?;
+	let mut plan=ExpertSplitPlan::with_dense(bound.file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets,&dense_names(&target_graph,head_graph.as_ref()))?;
+	validate_dense_plan(&mut plan,&target_graph,head_graph.as_ref(),&bound.file,head_file)?;
 	println!("{}",plan.table());
 	require(plan.fits(),format!("expert forward resident placement failed; canonical target/head buffers {native_bytes} bytes, five-slot request reserve {requests} bytes\n{}",plan.table()))?;
 	let mut layers=target_graph.expert_layers.clone(); if let Some(graph)=&head_graph {layers.extend(graph.expert_layers.clone());}
@@ -19254,9 +19288,20 @@ fn expert_pick_seed()->Result<std::collections::BTreeMap<(bool,usize,u32),u64>> 
 	Ok(counts)
 }
 
-fn external_expert(node: &Node) -> bool { node.block_kind == "split_expert" }
+fn external_expert(node: &Node) -> bool { matches!(node.block_kind,"split_expert"|"split_dense") }
 #[derive(Clone)]
-struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, gate: GgufTensor, up: GgufTensor, down: GgufTensor }
+enum SplitWork { Expert([GgufTensor;3]), Dense(Vec<GgufTensor>) }
+#[derive(Clone)]
+struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, last_only: bool, work: SplitWork }
+impl ExpertLayer {
+	fn tensors(&self)->&[GgufTensor] {match &self.work {SplitWork::Expert(tensors)=>tensors,SplitWork::Dense(tensors)=>tensors}}
+	fn dense(&self)->bool {matches!(self.work,SplitWork::Dense(_))}
+	fn input_width(&self)->usize {self.tensors()[0].shape[0] as usize}
+	fn output_width(&self)->usize {match &self.work {SplitWork::Expert(tensors)=>tensors[2].shape[1] as usize,SplitWork::Dense(tensors)=>tensors.iter().map(|tensor|tensor.shape[1] as usize).sum()}}
+	fn hidden(&self)->usize {if self.dense(){0}else{self.tensors()[0].shape[1] as usize}}
+	fn expert_count(&self)->usize {if self.dense(){0}else{self.tensors()[0].shape[2] as usize}}
+	fn expert_bytes(&self)->usize {if self.dense(){0}else{self.tensors().iter().map(|tensor|tensor.bytes).sum::<usize>()/self.expert_count()}}
+}
 fn wire_expert_graph(graph: &mut Graph, binding: &Binding, mtp: bool, first: usize) -> Result<()> {
 	let tensors: Vec<GgufTensor> = binding.nodes.iter().filter_map(|planes| {
 		(planes.len() == 1).then(|| planes[0].mapped()).flatten().filter(|tensor| tensor.name.ends_with("_exps.weight")).cloned()
@@ -19278,8 +19323,70 @@ fn wire_expert_graph(graph: &mut Graph, binding: &Binding, mtp: bool, first: usi
 		graph.nodes[out].input = input;
 		graph.nodes[out].block_kind = "split_expert";
 		graph.nodes[out].argument[8] = (group + 1) as f64;
-		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, gate: tensors[0].clone(), up: tensors[1].clone(), down: tensors[2].clone() });
+		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, last_only:false, work:SplitWork::Expert([tensors[0].clone(),tensors[1].clone(),tensors[2].clone()]) });
 	}
+	Ok(())
+}
+// Measured 256-thread lane tuples. Row slicing retains the source shape's tuple.
+fn dense_lane_word(tensor:&GgufTensor)->u32 {
+	let (kind,k,m)=(tensor.kind,tensor.shape[0],tensor.shape[1]);
+	[1,2,4,8].into_iter().enumerate().fold(0,|word,(index,capacity)| {
+		let lanes=match kind {
+			8=>if k==2560 || k==10240 || (k==320 && capacity==2) {16}else{8},
+			13=>if (k==6144 && capacity==1) || (m==640 && capacity!=2) {16}else{8},
+			14=>if k==6144 || m==640 || (m==512 && capacity<=4) || capacity<=2 {16}else{8},
+			17|18=>16,
+			_=>8,
+		};word | (lanes << (index*8))
+	})
+}
+fn dense_row_map(tensors:&[GgufTensor],original:&GgufTensor,first:usize,rows:usize)->Result<Vec<u32>> {
+	let stride=original.bytes/original.shape[1] as usize;let mut map=vec![u32::MAX;rows];let mut output=0;
+	for plane in tensors {
+		if plane.name==original.name {
+			let skipped=plane.offset.checked_sub(original.offset).ok_or_else(||RecipeError::new("dense view precedes its source tensor"))?;
+			require(skipped%stride==0,"dense mapped plane cuts a packed row")?;let before=skipped/stride;
+			let start=first.max(before);let end=(first+rows).min(before+plane.shape[1] as usize);
+			for row in start..end {let destination=(output+row-before) as u32;let entry=&mut map[row-first];require(*entry==u32::MAX || *entry==destination,"dense matrix row is reused at distinct output channels")?;*entry=destination;}
+		}
+		output+=plane.shape[1] as usize;
+	}
+	Ok(map)
+}
+fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Graph>,target_file:&Gguf,head_file:Option<&Gguf>)->Result<()> {
+	for job in target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).filter(|job|job.dense()) {
+		let model=if job.mtp {head_file.ok_or_else(||RecipeError::new("dense head plan has no checkpoint"))?} else {target_file};
+		let mut covered=vec![false;job.output_width()];let mut names=std::collections::HashSet::new();
+		for tensor in job.tensors() {
+			if !names.insert(&tensor.name) {continue;}
+			let original=model.tensor(&tensor.name).ok_or_else(||RecipeError::new("dense plan source header is absent"))?;
+			for item in plan.placements.iter().filter(|item|item.mtp==job.mtp && item.tensor.name==tensor.name && item.row_start.is_some()) {
+				let map=dense_row_map(job.tensors(),original,item.row_start.unwrap(),item.tensor.shape[1] as usize)?;
+				if map.iter().any(|row|*row!=u32::MAX) {plan.dense_read_bytes[usize::from(job.mtp)][item.die]+=item.tensor.bytes;}
+				for row in map.into_iter().filter(|row|*row!=u32::MAX) {let entry=covered.get_mut(row as usize).ok_or_else(||RecipeError::new("dense output row exceeds its graph shape"))?;require(!*entry,"dense output row has overlapping die ownership")?;*entry=true;}
+			}
+		}
+		require(covered.iter().all(|row|*row),format!("dense node {} has uncovered output rows",job.node))?;
+	}
+	Ok(())
+}
+fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
+	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
+	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;
+	for (index,planes) in nodes.into_iter().zip(&binding.nodes) {
+		let node=&graph.nodes[index];
+		if node.op!=Primitive::Contraction || node.argument[0]>1.0 || node.argument[1]!=0.0 || node.argument[2]==0.0 {continue;}
+		let Some(tensors)=planes.iter().map(|plane|plane.mapped().cloned()).collect::<Option<Vec<_>>>() else {continue};
+		if tensors.is_empty() || !tensors.iter().all(|tensor|tensor.shape.len()==2 && tensor.shape[0] as usize==node.input.channels) {continue;}
+		if tensors.iter().map(GgufTensor::elements).sum::<usize>()!=node.weights() {continue;}
+		if tensors.iter().map(|tensor|tensor.shape[1] as usize).sum::<usize>()!=node.output.channels {continue;}
+		require(tensors.iter().map(|tensor|&tensor.name).collect::<std::collections::HashSet<_>>().len()<=16 && tensors.iter().all(|tensor|matches!(tensor.kind,0|8|12|13|14|17|18|20|30) && tensor.shape[0]<=10240 && (matches!(tensor.kind,0|30) || tensor.shape[0]%32==0)),format!("dense row split needs supported types, aligned quantized widths, and at most sixteen source matrices: {tensors:?}"))?;
+		let layer=node.block_index;let last_only=node.output.length==1;
+		graph.nodes[index].block_kind="split_dense";graph.nodes[index].precision=Compute::FP32;graph.nodes[index].acc=Compute::FP32;graph.nodes[index].argument[8]=1.0;
+		graph.expert_layers.push(ExpertLayer {node:index,global:0,mtp,layer,last_only,work:SplitWork::Dense(tensors)});
+	}
+	graph.expert_layers.sort_by_key(|layer|layer.node);
+	for (local,layer) in graph.expert_layers.iter_mut().enumerate() {layer.global=first+local;graph.nodes[layer.node].argument[8]=(local+1) as f64;}
 	Ok(())
 }
 fn expert_enabled(file: &Gguf, devices: &[&Gpu]) -> bool {
@@ -19294,7 +19401,7 @@ impl Drop for ExpertModule {
 		#[cfg(nvidia)] if let Driver::Cuda(driver) = &self.gpu.driver { let _ = self.gpu.activate(); unsafe { (driver.unload)(self.handle as Ptr); } }
 	}
 }
-struct ExpertWorker { die: usize, gpu: &'static Gpu, jobs: Buffer, reports: Buffer, scratch: Vec<Buffer>, module: Option<ExpertModule> }
+struct ExpertWorker { read_bytes:Vec<usize>, die: usize, gpu: &'static Gpu, jobs: Buffer, reports: Buffer, scratch: Vec<Buffer>, module: Option<ExpertModule> }
 struct ExpertExecution {
 	pick_counts: Buffer,
 	pick_path: PathBuf,
@@ -19315,7 +19422,7 @@ impl ExpertExecution {
 		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}", p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
-		require(layers.iter().all(|layer|layer.gate.shape[..2]==[2560,640] && layer.up.shape[..2]==[2560,640] && layer.down.shape[..2]==[640,2560]),"expert worker dimensions differ from the real Flash-Next 2560/640 matrices")?;
+		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
 		let main = device(Some("nv4"))?;
 		let source = Self::worker_source();
 		let key = native_artifact_key(&main.native_target, &source)?;
@@ -19345,7 +19452,8 @@ impl ExpertExecution {
 			let gpu = device(Some(&format!("nv{die}")))?;
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
-			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*10240*4, 16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
+			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
+			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
 			#[cfg(nvidia)] if die != 4 {
 				let Driver::Cuda(driver) = &gpu.driver else { return Err(RecipeError::new("expert worker is not CUDA")); };
@@ -19359,42 +19467,64 @@ impl ExpertExecution {
 					owned.function=function; module = Some(owned);
 				}
 			}
-			value.workers.push(ExpertWorker { die, gpu, jobs, reports, scratch, module });
+			value.workers.push(ExpertWorker { read_bytes:Vec::new(), die, gpu, jobs, reports, scratch, module });
 		}
 		for layer in &value.layers {
-			let mut channels = Vec::new();
-			for (channel, worker) in value.workers.iter().enumerate() {
-				let (request,response,route) = value.weights.channel(channel).ok_or_else(|| RecipeError::new("expert channel is absent"))?;
+			let mut channels=Vec::new();
+			for (channel,worker) in value.workers.iter_mut().enumerate() {
+				let (request,response,route)=value.weights.channel(channel).ok_or_else(||RecipeError::new("split channel is absent"))?;
 				channels.extend([request.address(),route,route+512,response.completion_address(),request.sequence_address(),worker.die as u64]);
-				let mut matrices = Vec::new();
-				for expert in 0..layer.gate.shape[2] as u32 {
-					let mut entry = [0u64;5];
-					for (slot,tensor) in [&layer.gate,&layer.up,&layer.down].into_iter().enumerate() {
-						if let Some((owner,address,_,kind)) = value.weights.weight_address(layer.mtp,&tensor.name,Some(expert)) {
-							if owner == worker.die { entry[slot]=address; entry[3+slot/2] |= (kind as u64) << (32*(slot%2)); }
+				let mut matrices=Vec::new();let mut read_bytes=0;let mut slices=0;
+				match &layer.work {
+					SplitWork::Expert(tensors)=> {
+						for expert in 0..layer.expert_count() as u32 {
+							let mut entry=[0u64;5];
+							for (slot,tensor) in tensors.iter().enumerate() {
+								if let Some((owner,address,_,kind))=value.weights.weight_address(layer.mtp,&tensor.name,Some(expert)) {
+									if owner==worker.die {entry[slot]=address;entry[3+slot/2]|=(kind as u64)<<(32*(slot%2));}
+								}
+							}
+							matrices.extend(entry);
 						}
-					}
-					matrices.extend(entry);
+						read_bytes=layer.expert_bytes();
+					},
+					SplitWork::Dense(tensors)=> {
+						let model=if layer.mtp {head.ok_or_else(||RecipeError::new("dense MTP rows require a checkpoint"))?} else {target};
+						let mut names=std::collections::HashSet::new();
+						for tensor in tensors {
+							if !names.insert(tensor.name.clone()) {continue;}
+							let original=model.tensor(&tensor.name).ok_or_else(||RecipeError::new("dense source header is absent"))?;
+							let Some((address,bytes,kind,first))=value.weights.dense_bindings.get(&(layer.mtp,tensor.name.clone(),worker.die)).copied() else {continue};
+							let stride=original.bytes/original.shape[1] as usize;let rows=bytes/stride;
+							let row_map=dense_row_map(tensors,original,first,rows)?;
+							if row_map.iter().all(|row|*row==u32::MAX) {continue;}
+							let map=Buffer::upload(worker.gpu,&row_map)?;
+							matrices.extend([address,(kind as u64)|((original.shape[0])<<32),rows as u64,dense_lane_word(original) as u64,map.pointer]);
+							value.channel_tables.push(map);read_bytes+=bytes;slices+=1;
+						}
+					},
 				}
-				let table = Buffer::upload(worker.gpu,&matrices)?;
-				let fields = [request.address(),request.sequence_address(),route,route+512,worker.scratch[0].pointer,worker.scratch[1].pointer,worker.scratch[2].pointer,table.pointer,
+				if matrices.is_empty() {matrices.push(0);}
+				let table=Buffer::upload(worker.gpu,&matrices)?;
+				worker.read_bytes.push(read_bytes);
+				let fields=[request.address(),request.sequence_address(),route,route+512,worker.scratch[0].pointer,worker.scratch[1].pointer,worker.scratch[2].pointer,table.pointer,
 					worker.scratch[3].pointer,worker.scratch[4].pointer,worker.scratch[5].pointer,request.completion_address(),request.sequence_address()+4,response.address(),response.sequence_address(),worker.reports.pointer];
-				let mut record = native_words(&fields);
-				for dimension in [layer.gate.shape[0] as u32,layer.gate.shape[1] as u32,layer.gate.shape[2] as u32,10] { record.extend(dimension.to_ne_bytes()); }
+				let mut record=native_words(&fields);
+				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
 				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
-				record.resize(192,0); worker.jobs.write_bytes(layer.global*192,&record)?;
-				// Keep each uploaded pointer table alive for every request.
+				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),layer.input_width().max(4096) as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
 				value.channel_tables.push(table);
 			}
-			let channels = Buffer::upload(main,&channels)?;
-			let local = value.workers.iter().find(|worker| worker.die==4).unwrap();
-			let owner = value.weights.owner_address(layer.layer).ok_or_else(|| RecipeError::new("expert owner map is absent"))?.0;
-			let fields = [value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
-			let mut record = native_words(&fields);
-			for dimension in [layer.global as u32,value.workers.len() as u32,layer.gate.shape[0] as u32,layer.gate.shape[2] as u32,10,layer.gate.shape[1] as u32] { record.extend(dimension.to_ne_bytes()); }
+			let channels=Buffer::upload(main,&channels)?;
+			let local=value.workers.iter().find(|worker|worker.die==4).unwrap();
+			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.mtp,layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
+			let fields=[value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
+			let mut record=native_words(&fields);
+			for dimension in [layer.global as u32,value.workers.len() as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
 			record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
-			value.main_descriptors.push(Buffer::upload(main,&record)?);
-			value.channel_tables.push(channels);
+			record.extend(u32::from(layer.dense()).to_ne_bytes());
+			value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
 		}
 		Ok(value)
 	}
@@ -19430,18 +19560,22 @@ impl ExpertExecution {
 				let ticks=clock(6).saturating_sub(clock(2));
 				let layer=&self.layers[first+phase%layers]; let experts=report[14] as usize;
 				let start=begin+(phase/layers) as u32*capacity; let stop=(start+capacity).min(end);
-				observations.push(OperationReport { selected_experts:experts,weight_bytes:experts*(layer.gate.bytes+layer.up.bytes+layer.down.bytes)/512,
-					device:device_label(worker.gpu)?,model:String::new(),block:layer.layer,node:layer.node,operation:"ExpertSplit".to_owned(),begin:start,end:stop,positions:(stop-start) as usize,
+				observations.push(OperationReport { selected_experts:if layer.dense(){0}else{experts},weight_bytes:if layer.dense(){worker.read_bytes[layer.global]}else{experts*worker.read_bytes[layer.global]},
+					device:device_label(worker.gpu)?,model:String::new(),block:layer.layer,node:layer.node,operation:if layer.dense(){"DenseRowSplit"}else{"ExpertSplit"}.to_owned(),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 			}
 		}
 		let status=self.control.download_range::<u32>(24,2)?;
 		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}",status[0],status[1]))?;
+
+		Ok(observations)
+	}
+	fn export_picks(&self)->Result<()> {
 		let counts=self.pick_counts.download_range::<u32>(0,self.layers.len()*512)?;
 		let mut text=String::from("model,layer,expert,picks\n");
-		for layer in &self.layers {for expert in 0..512 {text.push_str(&format!("{},{},{expert},{}\n",if layer.mtp {"mtp"} else {"target"},layer.layer,counts[layer.global*512+expert]));}}
+		for layer in self.layers.iter().filter(|layer|!layer.dense()) {for expert in 0..512 {text.push_str(&format!("{},{},{expert},{}\n",if layer.mtp {"mtp"} else {"target"},layer.layer,counts[layer.global*512+expert]));}}
 		fs::write(&self.pick_path,text).map_err(|error|RecipeError::new(format!("expert frequency write: {error}")))?;
-		Ok(observations)
+		Ok(())
 	}
 	fn abort(&mut self) {self.failed=true; for worker in &self.workers {let _=worker.gpu.synchronize();}}
 }
@@ -19455,6 +19589,7 @@ pub struct ExpertDieBudget {
 }
 #[derive(Clone, Debug)]
 pub struct ExpertWeightPlacement {
+	pub row_start: Option<usize>,
 	pub spilled: bool,
 	pub tensor: GgufTensor,
 	pub expert: Option<u32>,
@@ -19467,6 +19602,7 @@ pub struct ExpertWeightPlacement {
 /// their type and byte layout. Lookup tables remain in the caller's RAM mapping.
 #[derive(Clone, Debug)]
 pub struct ExpertSplitPlan {
+	pub dense_read_bytes:[[usize;8];2],
 	pub spill_bytes: usize,
 	pub main_die: usize,
 	pub budgets: [ExpertDieBudget; 8],
@@ -19480,9 +19616,12 @@ impl ExpertSplitPlan {
 	/// `head` contains unique MTP tensors; the holder decides whether its output
 	/// projection and token lookup share the target's quantized representation.
 	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; 8]) -> Result<Self> {
+		Self::with_dense(target,head,main_die,budgets,&std::collections::HashSet::new())
+	}
+	fn with_dense(target:&[GgufTensor],head:&[GgufTensor],main_die:usize,budgets:[ExpertDieBudget;8],dense:&std::collections::HashSet<(bool,String)>)->Result<Self> {
 		require(matches!(main_die,3|4), "expert split main die must be physical Archy die 3 or 4")?;
-		let mut budgets=budgets;for budget in &mut budgets {if budget.free_bytes==0 {budget.reserve_bytes=0;}}
-		let mut plan = Self { spill_bytes:0, main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
+		let mut budgets=budgets;budgets[2].free_bytes=0;budgets[6].free_bytes=0;for budget in &mut budgets {if budget.free_bytes==0 {budget.reserve_bytes=0;}}
+		let mut plan = Self { dense_read_bytes:[[0;8];2],spill_bytes:0, main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
 		let mut layers: std::collections::BTreeMap<(bool, usize), Vec<&GgufTensor>> = std::collections::BTreeMap::new();
 		let mut names = std::collections::HashSet::new();
 		let frequencies=expert_pick_seed()?;
@@ -19492,6 +19631,17 @@ impl ExpertSplitPlan {
 				require(tensor.bytes != 0, "expert split cannot place an empty tensor")?;
 				require(names.insert((mtp, tensor.name.clone())), format!("duplicate split tensor {}", tensor.name))?;
 				if matches!(tensor.name.as_str(), "token_embd.weight" | "per_layer_token_embd.weight") { continue; }
+				if dense.contains(&(mtp,tensor.name.clone())) {
+					require(tensor.shape.len()==2,"dense row placement needs a matrix")?;
+					let dies=(0..8).filter(|die|budgets[*die].free_bytes!=0).collect::<Vec<_>>();
+					let rows=tensor.shape[1] as usize;
+					for (rank,die) in dies.iter().copied().enumerate() {
+						let first=rows*rank/dies.len();let end=rows*(rank+1)/dies.len();if end==first {continue;}
+						let slice=tensor.rows(first,end-first)?;
+						plan.append(slice,None,die,mtp)?;plan.placements.last_mut().unwrap().row_start=Some(first);
+					}
+					continue;
+				}
 				if tensor.name.ends_with("_exps.weight") {
 					let layer = tensor.name.strip_prefix("blk.").and_then(|name| name.split('.').next()).and_then(|number| number.parse::<usize>().ok())
 						.ok_or_else(|| RecipeError::new(format!("expert tensor {} has no block index", tensor.name)))?;
@@ -19514,13 +19664,7 @@ impl ExpertSplitPlan {
 				bundles.push((mtp,layer,expert,slices));
 			}
 		}
-		let calibrated = !frequencies.is_empty();
-		// Missing observations are not zero picks. Keep unmeasured bundles in
-		// VRAM, then measured hot bundles, before assigning measured zero picks.
-		bundles.sort_by_key(|(mtp,layer,expert,_)| {
-			let picks = frequencies.get(&(*mtp,*layer,*expert as u32)).copied();
-			(!(calibrated && picks.is_none()), std::cmp::Reverse(picks.unwrap_or(0)), *mtp, *layer, *expert)
-		});
+		bundles.sort_by_key(|(mtp,layer,expert,_)| {let picks=frequencies.get(&(*mtp,*layer,*expert as u32)).copied();let cold=!*mtp && *layer!=47 && picks==Some(0);(cold,std::cmp::Reverse(picks.unwrap_or(0)),*layer,*expert)});
 		for (mtp,layer,expert,slices) in bundles {
 				let die = (0..8).filter(|die| *die != main_die && *die != 2 && *die != 6).filter_map(|die| {
 					let mut end = plan.weights[die];
@@ -19536,15 +19680,11 @@ impl ExpertSplitPlan {
 					for slice in slices { plan.append(slice, Some(expert as u32), die, mtp)?; }
 					plan.experts[die] += 1;
 				} else {
-					if calibrated && frequencies.get(&(mtp, layer, expert as u32)) != Some(&0) {
-						plan.unplaced_experts += 1;
-						for tensor in slices { plan.unplaced_bytes = checked_add(plan.unplaced_bytes, tensor.bytes, "unplaced noncold expert bytes")?; }
-						continue;
-					}
+					require(!mtp && layer!=47 && frequencies.get(&(mtp,layer,expert as u32)).copied()==Some(0),"resident capacity cannot keep a selected or MTP expert; cold spill requires a zero-pick target expert")?;
 					let die=[3,4,5].into_iter().min_by_key(|die|plan.experts[*die]).unwrap();
 					for tensor in slices {
 						let (offset,end)=Self::end(plan.spill_bytes,tensor.bytes)?; plan.spill_bytes=end;
-						plan.placements.push(ExpertWeightPlacement {spilled:true,tensor,expert:Some(expert as u32),die,offset,mtp});
+						plan.placements.push(ExpertWeightPlacement {row_start:None,spilled:true,tensor,expert:Some(expert as u32),die,offset,mtp});
 					}
 					plan.experts[die]+=1;
 				}
@@ -19558,7 +19698,7 @@ impl ExpertSplitPlan {
 	fn append(&mut self, tensor: GgufTensor, expert: Option<u32>, die: usize, mtp: bool) -> Result<()> {
 		let (offset, end) = Self::end(self.weights[die], tensor.bytes)?;
 		self.weights[die] = end;
-		self.placements.push(ExpertWeightPlacement { spilled:false,tensor, expert, die, offset, mtp });
+		self.placements.push(ExpertWeightPlacement { row_start:None,spilled:false,tensor, expert, die, offset, mtp });
 		Ok(())
 	}
 	pub fn fits(&self) -> bool {
@@ -19572,6 +19712,22 @@ impl ExpertSplitPlan {
 			let remaining = budget.free_bytes as i128 - budget.reserve_bytes as i128 - self.weights[die] as i128;
 			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if budget.free_bytes==0 {"excluded"} else if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
 		}
+		text.push_str("\n| Physical die | Target dense read bytes/position | MTP dense read bytes/position | Resident expert bytes | RAM expert bytes | RAM bundles | Reference selected expert bytes, all recorded picks |\n|---:|---:|---:|---:|---:|---:|---:|\n");
+		let frequencies=expert_pick_seed().unwrap_or_default();
+		for die in 0..8 {
+			if self.budgets[die].free_bytes==0 {continue;}
+			let dense=[self.dense_read_bytes[0][die],self.dense_read_bytes[1][die]];let mut resident=0;let mut spill=0;let mut cold=std::collections::HashSet::new();let mut reads=0u128;
+			for item in self.placements.iter().filter(|item|item.die==die) {
+
+				if let Some(expert)=item.expert {
+					if item.spilled {spill+=item.tensor.bytes;cold.insert((item.mtp,item.tensor.name.split('.').nth(1).unwrap_or(""),expert));} else {resident+=item.tensor.bytes;}
+					let layer=item.tensor.name.split('.').nth(1).and_then(|value|value.parse::<usize>().ok()).unwrap_or(usize::MAX);
+					reads+=item.tensor.bytes as u128*frequencies.get(&(item.mtp,layer,expert)).copied().unwrap_or(0) as u128;
+				}
+			}
+			text.push_str(&format!("| {die} | {} | {} | {resident} | {spill} | {} | {reads} |\n",dense[0],dense[1],cold.len()));
+		}
+
 		text.push_str(&format!("\nUnplaced expert bundles: {}; unplaced packed bytes: {}; pinned RAM expert bytes: {}; complete placement fit: {}.\n", self.unplaced_experts, self.unplaced_bytes,self.spill_bytes,self.fits()));
 		text
 	}
@@ -19619,6 +19775,7 @@ impl Drop for ExpertPinned {
 }
 
 pub struct ExpertSplitWeights {
+	dense_bindings:std::collections::HashMap<(bool,String,usize),(u64,usize,u32,usize)>,
 	bindings: std::collections::HashMap<(bool,String),Vec<Option<(usize,u64,usize,u32)>>>,
 	spill: Option<ExpertPinned>,
 	plan: ExpertSplitPlan,
@@ -19626,7 +19783,7 @@ pub struct ExpertSplitWeights {
 	requests: Vec<PeerPacket>,
 	responses: Vec<PeerPacket>,
 	routes: Vec<Buffer>,
-	owners: Vec<(usize, Buffer)>,
+	owners: Vec<((bool,usize), Buffer)>,
 	response_table: Buffer,
 }
 impl ExpertSplitWeights {
@@ -19650,17 +19807,17 @@ impl ExpertSplitWeights {
 		let main = devices[plan.main_die].expect("main die is permitted");
 		for die in 0..8 {
 			if devices[die].is_none() { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
-		// Ordinary tapes own nonexpert weights. This allocation holds experts only.
+		// Ordinary tapes own norms and unmapped operations. This pool holds row slices and experts.
 		let mut expert_bytes = [0;8];
-		for item in plan.placements.iter_mut().filter(|item| item.expert.is_some() && !item.spilled) {
+		for item in plan.placements.iter_mut().filter(|item| (item.expert.is_some() || item.row_start.is_some()) && !item.spilled) {
 			let (offset,end)=ExpertSplitPlan::end(expert_bytes[item.die],item.tensor.bytes)?; item.offset=offset; expert_bytes[item.die]=end;
 		}
 		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
 		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
-		for item in plan.placements.iter().filter(|item| item.expert.is_some()) {
+		for item in plan.placements.iter().filter(|item| item.expert.is_some() || item.row_start.is_some()) {
 			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
 			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
-			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else { original.clone() };
+			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
 			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
 			if item.spilled {
 				let spill=spill.as_ref().expect("spill allocation is present");
@@ -19675,13 +19832,17 @@ impl ExpertSplitWeights {
 			let pointer=if item.spilled {spill.as_ref().expect("spill allocation is present").mapped[item.die]} else {buffers[item.die].as_ref().unwrap().pointer};
 			entries[expert]=Some((item.die,pointer+item.offset as u64,item.tensor.bytes,item.tensor.kind));
 		}
-		let mut value = Self { bindings,spill,plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
+		let mut dense_bindings=std::collections::HashMap::new();
+		for item in plan.placements.iter().filter(|item|item.row_start.is_some()) {
+			dense_bindings.insert((item.mtp,item.tensor.name.clone(),item.die),(buffers[item.die].as_ref().unwrap().pointer+item.offset as u64,item.tensor.bytes,item.tensor.kind,item.row_start.unwrap()));
+		}
+		let mut value = Self { dense_bindings,bindings,spill,plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
 		let mut layers = std::collections::BTreeMap::new();
 		for item in &value.plan.placements {
 			if item.tensor.name.ends_with("ffn_up_exps.weight") {
 				let layer = item.tensor.name.split('.').nth(1).and_then(|number| number.parse::<usize>().ok()).expect("validated expert block index");
 				let expert = item.expert.expect("validated expert slice") as usize;
-				let entries = layers.entry(layer).or_insert_with(Vec::new);
+				let entries = layers.entry((item.mtp,layer)).or_insert_with(Vec::new);
 				if entries.len() <= expert { entries.resize(expert + 1, u32::MAX); }
 				entries[expert] = item.die as u32;
 			}
@@ -19713,8 +19874,8 @@ impl ExpertSplitWeights {
 	pub fn channel(&self, index: usize) -> Option<(&PeerPacket, &PeerPacket, u64)> {
 		Some((self.requests.get(index)?, self.responses.get(index)?, self.routes.get(index)?.pointer))
 	}
-	pub fn owner_address(&self, layer: usize) -> Option<(u64, usize)> {
-		self.owners.iter().find(|(index, _)| *index == layer).map(|(_, buffer)| (buffer.pointer, buffer.bytes / 4))
+	pub fn owner_address(&self, mtp:bool, layer: usize) -> Option<(u64, usize)> {
+		self.owners.iter().find(|(index, _)| *index == (mtp,layer)).map(|(_, buffer)| (buffer.pointer, buffer.bytes / 4))
 	}
 	/// Main-die resident `{payload, sequence_address}` records for split_combine.
 	pub fn response_table_address(&self) -> u64 { self.response_table.pointer }
@@ -20069,6 +20230,17 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	/// Export actual cumulative router counters after a request or on demand.
+	/// Dense jobs do not produce router records. Shared target/head pools export once.
+	pub fn export_router_picks(&self)->Result<()> {
+		let mut pools=std::collections::HashSet::new();
+		for tape in self.tapes.iter().flatten() {
+			if let Some(execution)=&tape.expert_execution && pools.insert(Arc::as_ptr(execution) as usize) {
+				execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.export_picks()?;
+			}
+		}
+		Ok(())
+	}
 	/// Paths of the loaded native modules, in graph and device order.
 	pub fn native_artifacts(&self) -> Vec<PathBuf> {
 		self.tapes.iter().flatten().map(|tape| tape.program.artifact.path.clone()).collect()
@@ -34776,8 +34948,142 @@ worker_done:
 	setp.eq.u32 p1,r6,0; mul.wide.u32 a23,r7,4; add.u64 a24,a2,a23; @p1 st.global.u32 [a24+64],r12;
 	st.param.u32 [result],r12; ret;
 }
+// Dense slices write disjoint output rows into the main tape.
+.func split_dense_typed(.param .u64 w0,.param .u32 t0,.param .u64 x0,.param .u64 o0,.param .u32 k0,.param .u32 m0,.param .u32 c0) {
+	.reg .b64 w,x,o,a<4>; .reg .b32 t,k,m,c,r<15>; .reg .f32 f<4>; .reg .pred p<3>;
+	ld.param.u64 w,[w0]; ld.param.u32 t,[t0]; ld.param.u64 x,[x0]; ld.param.u64 o,[o0]; ld.param.u32 k,[k0]; ld.param.u32 m,[m0]; ld.param.u32 c,[c0];
+	mov.u32 r0,%tid.x; mov.u32 r1,%ctaid.x; mov.u32 r2,%ntid.x; mov.u32 r3,%nctaid.x;
+	and.b32 r4,r0,31; shr.u32 r5,r0,5; shr.u32 r6,r2,5; mad.lo.u32 r5,r1,r6,r5; mul.lo.u32 r6,r6,r3; mul.lo.u32 r7,m,c;
+dt_row:
+	setp.ge.u32 p0,r5,r7; @p0 ret; rem.u32 r8,r5,m; div.u32 r9,r5,m; mov.f32 f0,0f00000000; mov.u32 r10,r4;
+dt_k:
+	setp.ge.u32 p0,r10,k; @p0 bra dt_sum;
+	mad.lo.u32 r11,r8,k,r10; mad.lo.u32 r12,r9,k,r10; mul.wide.u32 a0,r12,4; add.u64 a1,x,a0; ld.global.f32 f1,[a1];
+	setp.eq.u32 p1,t,30; @p1 bra dt_bf;
+	mul.wide.u32 a0,r11,4; add.u64 a1,w,a0; ld.global.f32 f2,[a1]; bra dt_fma;
+dt_bf:
+	mul.wide.u32 a0,r11,2; add.u64 a1,w,a0; ld.global.u16 r13,[a1]; shl.b32 r13,r13,16; mov.b32 f2,r13;
+dt_fma:
+	fma.rn.f32 f0,f1,f2,f0; add.u32 r10,r10,32; bra dt_k;
+dt_sum:
+	mov.u32 r14,16;
+dt_shuffle:
+	shfl.sync.bfly.b32 r13,f0,r14,31,-1; mov.b32 f3,r13; add.f32 f0,f0,f3; shr.u32 r14,r14,1; setp.ne.u32 p0,r14,0; @p0 bra dt_shuffle;
+	setp.eq.u32 p0,r4,0; mul.wide.u32 a0,r5,4; add.u64 a1,o,a0; @p0 st.global.f32 [a1],f0;
+	add.u32 r5,r5,r6; bra dt_row;
+}
+.func (.param .u32 result) split_dense_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
+	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<5>; .reg .f32 f;
+	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
+	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+40]; ld.global.u64 a8,[a0+48];
+	ld.global.u64 a9,[a0+56]; ld.global.u64 a10,[a0+72]; ld.global.u64 a11,[a0+88]; ld.global.u64 a12,[a0+96]; ld.global.u64 a13,[a0+112];
+	ld.global.u32 r2,[a0+128]; ld.global.u32 r3,[a0+136]; ld.global.u32 r4,[a0+176];
+	mov.u32 r5,%tid.x; mov.u32 r6,%ctaid.x; mov.u32 r7,%ntid.x; mov.u32 r8,%nctaid.x; mad.lo.u32 r9,r6,r7,r5; mul.lo.u32 r10,r7,r8;
+	setp.eq.u32 p0,r9,0; mov.u32 r11,1; mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2],a14; add.u64 a15,a14,5000000000;
+	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a4; st.param.u64 [dl],a15; st.param.u32 [sq],r0; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,401; @p1 bra dl_done;
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+8],a14;
+	ld.volatile.global.u64 a16,[a5]; ld.volatile.global.u32 r13,[a5+8]; ld.volatile.global.u32 r14,[a5+12];
+	mov.u32 r15,r9; mul.lo.u32 r16,r2,r1;
+dl_copy:
+	setp.ge.u32 p1,r15,r16; @p1 bra dl_copied; div.u32 r17,r15,r2; rem.u32 r18,r15,r2; mad.lo.u32 r19,r17,r4,r18;
+	mul.wide.u32 a17,r19,4; add.u64 a18,a3,a17; ld.volatile.global.f32 f,[a18]; mul.wide.u32 a17,r15,4; add.u64 a18,a6,a17; st.global.f32 [a18],f;
+	add.u32 r15,r15,r10; bra dl_copy;
+dl_copied:
+	mul.lo.u32 r20,r0,64;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,402; @p1 bra dl_done;
+	ld.global.u32 r27,[a0+180]; setp.eq.u32 p1,r27,0; @p1 bra dl_prepared;
+	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a6; st.param.u64 [pk],a7; st.param.u64 [sc],a8; st.param.u32 [k],r2; st.param.u32 [c],r1; st.param.u32 [ac],r1; st.param.u32 [rank],r6; st.param.u32 [count],r8; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
+dl_prepared:
+	add.u32 r20,r20,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,403; @p1 bra dl_done;
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+16],a14; mov.u32 r21,0;
+	mov.u32 r22,1; setp.gt.u32 p1,r1,1; @p1 mov.u32 r22,2; setp.gt.u32 p1,r1,2; @p1 mov.u32 r22,4; setp.gt.u32 p1,r1,4; @p1 mov.u32 r22,8;
+dl_slice:
+	setp.ge.u32 p1,r21,r3; @p1 bra dl_return; mul.wide.u32 a17,r21,40; add.u64 a18,a9,a17;
+	ld.global.u64 a19,[a18]; ld.global.u32 r23,[a18+8]; ld.global.u32 r24,[a18+12]; ld.global.u32 r25,[a18+16]; ld.global.u64 a20,[a18+32];
+	setp.eq.u32 p1,r23,0; setp.eq.u32 p2,r23,30; or.pred p1,p1,p2; @p1 bra dl_typed;
+	ld.global.u32 r28,[a18+24]; bfind.u32 r30,r22; shl.b32 r30,r30,3; shr.u32 r28,r28,r30; and.b32 r28,r28,255; mov.u32 r29,0;
+	setp.eq.u32 p1,r23,17; setp.eq.u32 p2,r22,8; and.pred p1,p1,p2; @p1 mov.u32 r29,2;
+	{ .param .u64 w,x,s,o; .param .u32 t,k,m,cap,c,kind,lanes,mask,rank,count,ok;
+	st.param.u64 [w],a19; st.param.u64 [x],a7; st.param.u64 [s],a8; st.param.u64 [o],a10;
+	st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [cap],r22; st.param.u32 [c],r1; st.param.u32 [kind],r29; st.param.u32 [lanes],r28;
+	mov.u32 r12,0; st.param.u32 [mask],r12; st.param.u32 [rank],r6; st.param.u32 [count],r8;
+	call.uni (ok),packed_matvec,(t,cap,c,kind,lanes,mask,w,x,s,o,k,m,rank,count); ld.param.u32 r12,[ok]; }
+
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,404; @p1 bra dl_done; bra dl_computed;
+dl_typed:
+	{ .param .u64 w,x,o; .param .u32 t,k,m,c; st.param.u64 [w],a19; st.param.u64 [x],a6; st.param.u64 [o],a10; st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [c],r1; call.uni split_dense_typed,(w,t,x,o,k,m,c); }
+dl_computed:
+	add.u32 r20,r20,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,405; @p1 bra dl_done;
+	mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
+dl_scatter:
+	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r25; rem.u32 r18,r15,r25; mul.wide.u32 a17,r18,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_scatter_next; mad.lo.u32 r19,r18,r13,r14; add.u32 r19,r19,r17;
+	mul.wide.u32 a17,r15,4; add.u64 a18,a10,a17; ld.global.f32 f,[a18]; mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
+dl_scatter_next:
+	add.u32 r15,r15,r10; bra dl_scatter;
+dl_scattered:
+	add.u32 r20,r20,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,406; @p1 bra dl_done; add.u32 r21,r21,1; bra dl_slice;
+dl_return:
+	mul.lo.u32 r20,r0,64; add.u32 r20,r20,63;
+	{ .param .u64 sl,fl,dl; .param .u32 tag,sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a13; st.param.u64 [dl],a15; st.param.u32 [tag],r20; st.param.u32 [sq],r0; call.uni (ok),p2p_publish_tagged,(sl,fl,tag,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,407;
+dl_done:
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+24],a14; @p0 st.global.u32 [a2+56],r3;
+	setp.eq.u32 p1,r5,0; mul.wide.u32 a17,r6,4; add.u64 a18,a2,a17; @p1 st.global.u32 [a18+64],r11; st.param.u32 [result],r11; ret;
+}
+.func (.param .u32 result) split_dense_forward(.param .u64 desc0,.param .u64 source0,.param .u64 output0,.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
+	.reg .b64 a<25>; .reg .b32 r<27>; .reg .pred p<4>; .reg .f32 f;
+	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[output0]; ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a3,[sh0];
+	ld.global.u64 a4,[a0]; ld.global.u64 a5,[a0+8]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+64]; ld.global.u32 r4,[a0+72]; ld.global.u32 r5,[a0+76]; ld.global.u32 r6,[a0+80];
+	ld.global.u64 a8,[a4+32]; ld.global.u64 a9,[a4+40]; ld.volatile.global.u32 r7,[a4]; ld.volatile.global.u32 r8,[a4+4]; ld.volatile.global.u32 r9,[a4+8]; ld.volatile.global.u32 r10,[a4+12]; ld.volatile.global.u32 r11,[a4+16];
+	mov.u32 r12,%tid.x; mov.u32 r13,%ctaid.x; mov.u32 r14,%ntid.x; mov.u32 r15,%nctaid.x; mad.lo.u32 r16,r13,r14,r12; mul.lo.u32 r17,r14,r15; setp.eq.u32 p0,r16,0;
+	mov.u64 a10,%globaltimer; add.u64 a11,a10,5000000000; ld.volatile.global.u32 r18,[a4+24]; setp.ne.u32 p1,r18,0; @p1 bra df_fail;
+	sub.u32 r18,r3,r8; div.u32 r18,r18,r9; mul.lo.u32 r18,r18,r10; sub.u32 r19,r4,r11; add.u32 r18,r18,r19; add.u32 r19,r18,r7; add.u32 r19,r19,1;
+	mov.u32 r20,r16; mul.lo.u32 r21,r6,r2;
+df_gather:
+	setp.ge.u32 p1,r20,r21; @p1 bra df_ready; div.u32 r22,r20,r6; rem.u32 r23,r20,r6; mad.lo.u32 r24,r23,r0,r1; add.u32 r24,r24,r22;
+	mul.wide.u32 a12,r24,4; add.u64 a13,a1,a12; ld.global.f32 f,[a13]; mul.wide.u32 a12,r20,4; add.u64 a13,a6,a12; st.global.f32 [a13],f; add.u32 r20,r20,r17; bra df_gather;
+df_ready:
+	mul.lo.u32 r25,r19,64;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a8; st.param.u64 [fl],a9; st.param.u64 [dl],a11; st.param.u32 [sq],r25; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r26,[ok]; }
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,411; @p1 bra df_failed; mov.u32 r20,0; max.u32 r24,r6,4096;
+df_send:
+	setp.ge.u32 p1,r20,r5; @p1 bra df_local; mul.wide.u32 a12,r20,48; add.u64 a13,a5,a12; ld.global.u64 a14,[a13]; ld.global.u64 a15,[a13+8]; ld.global.u64 a16,[a13+24]; ld.global.u64 a17,[a13+32];
+	@p0 st.volatile.global.u64 [a15],a2; @p0 st.volatile.global.u32 [a15+8],r0; @p0 st.volatile.global.u32 [a15+12],r1;
+	mov.u32 r21,r16; mul.lo.u32 r22,r24,r2;
+df_packet:
+	setp.ge.u32 p1,r21,r22; @p1 bra df_publish; div.u32 r23,r21,r24; rem.u32 r25,r21,r24; setp.lt.u32 p2,r25,r6; mov.f32 f,0f00000000;
+	mad.lo.u32 r25,r23,r6,r25; mul.wide.u32 a12,r25,4; add.u64 a13,a6,a12; @p2 ld.global.f32 f,[a13]; mul.wide.u32 a12,r21,4; add.u64 a13,a14,a12; st.volatile.global.f32 [a13],f;
+	add.u32 r21,r21,r17; bra df_packet;
+df_publish:
+	mul.lo.u32 r25,r19,64; add.u32 r25,r25,32; add.u32 r25,r25,r20;
+	{ .param .u64 sl,fl,dl; .param .u32 tag,sq,ok; st.param.u64 [sl],a16; st.param.u64 [fl],a17; st.param.u64 [dl],a11; st.param.u32 [tag],r25; st.param.u32 [sq],r19; call.uni (ok),p2p_publish_tagged,(sl,fl,tag,sq,dl); ld.param.u32 r26,[ok]; }
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,412; @p1 bra df_failed; add.u32 r20,r20,1; bra df_send;
+df_local:
+	ld.global.u64 a18,[a7+120]; mul.wide.u32 a12,r18,128; add.u64 a18,a18,a12;
+	{ .param .u64 d,sh,rp; .param .u32 sq,c,ok; st.param.u64 [d],a7; st.param.u64 [sh],a3; st.param.u64 [rp],a18; st.param.u32 [sq],r19; st.param.u32 [c],r2; call.uni (ok),split_dense_layer,(d,sq,c,sh,rp); ld.param.u32 r26,[ok]; }
+	setp.ne.u32 p1,r26,1; @p1 bra df_failed; ld.global.u64 a19,[a0+16]; mov.u32 r20,0;
+df_wait:
+	setp.ge.u32 p1,r20,r5; @p1 bra df_success; mul.wide.u32 a12,r20,16; add.u64 a13,a19,a12; ld.global.u64 a17,[a13+8];
+	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a17; st.param.u64 [dl],a11; st.param.u32 [sq],r19; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r26,[ok]; }
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,413; @p1 bra df_failed; add.u32 r20,r20,1; bra df_wait;
+df_success:
+	mov.u32 r26,1; st.param.u32 [result],r26; ret;
+df_failed:
+	@p0 st.volatile.global.u32 [a4+24],r26; @p0 st.volatile.global.u32 [a4+28],r4;
+df_fail:
+	mov.u32 r26,0; st.param.u32 [result],r26; ret;
+}
+
 .visible .entry expert_split_worker(.param .u64 jobs0,.param .u32 first0,.param .u32 layers0,.param .u32 base0,.param .u32 tokens0,.param .u32 capacity0) {
-	.reg .b64 a<8>; .reg .b32 r<14>; .reg .pred p<3>;
+	.reg .b64 a<8>; .reg .b32 r<16>; .reg .pred p<3>;
 	ld.param.u64 a0,[jobs0]; ld.param.u32 r0,[first0]; ld.param.u32 r1,[layers0]; ld.param.u32 r2,[base0]; ld.param.u32 r3,[tokens0]; ld.param.u32 r4,[capacity0];
 	cvta.shared.u64 a1,scratch; mov.u32 r5,0; mov.u32 r6,0;
 entry_chunk:
@@ -34785,8 +35091,12 @@ entry_chunk:
 entry_layer:
 	add.u32 r9,r0,r8; mul.wide.u32 a2,r9,192; add.u64 a3,a0,a2; ld.global.u64 a4,[a3+120]; mul.wide.u32 a5,r6,128; add.u64 a4,a4,a5;
 	add.u32 r10,r2,r6; add.u32 r10,r10,1;
-	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r7;
-	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1; st.param.u32 [cols],r13; ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
+	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); bra entry_result;
+entry_dense:
+	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report);
+entry_result:
+	ld.param.u32 r11,[ok]; }
 	setp.ne.u32 p0,r11,1; @p0 ret; add.u32 r6,r6,1; add.u32 r8,r8,1; setp.lt.u32 p0,r8,r1; @p0 bra entry_layer;
 	add.u32 r5,r5,r4; bra entry_chunk;
 }
@@ -34795,6 +35105,12 @@ entry_layer:
 	.reg .b64 a<36>; .reg .b32 r<32>; .reg .pred p<8>; .reg .f32 f;
 	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[coef0]; ld.param.u64 a3,[selected0]; ld.param.u64 a4,[output0];
 	ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a5,[sh0];
+	ld.global.u32 r30,[a0+104]; setp.ne.u32 p1,r30,0; @!p1 bra main_expert;
+	{ .param .u64 d,x,o,h; .param .u32 l,b,c,t,ok; st.param.u64 [d],a0; st.param.u64 [x],a1; st.param.u64 [o],a4; st.param.u64 [h],a5; st.param.u32 [l],r0; st.param.u32 [b],r1; st.param.u32 [c],r2; st.param.u32 [t],r3;
+	call.uni (ok),split_dense_forward,(d,x,o,l,b,c,t,h); ld.param.u32 r30,[ok]; }
+	st.param.u32 [result],r30; ret;
+main_expert:
+
 	ld.global.u64 a6,[a0]; ld.global.u64 a7,[a0+8]; ld.global.u64 a8,[a0+16]; ld.global.u64 a9,[a0+24];
 	ld.global.u64 a10,[a0+32]; ld.global.u64 a11,[a0+40]; ld.global.u64 a12,[a0+48]; ld.global.u64 a13,[a0+56]; ld.global.u64 a14,[a0+64];
 	ld.global.u64 a29,[a0+96];
@@ -34876,3 +35192,32 @@ main_invalid:
 }
 
 "# }
+
+#[cfg(test)]
+mod split_forward_checks {
+	use super::*;
+	#[test]
+	fn dense_dispatch_uses_external_weights_and_compiles_native_caller() {
+		let mut graph=Graph::new(Shape {channels:64,length:5},1e-5);
+		graph.block_precision=Some(Compute::FP32);
+		push_node(&mut graph,Primitive::Contraction,Shape {channels:32,length:5},64*32,[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,1.0],-1).unwrap();
+		graph.nodes[0].block_kind="split_dense";graph.nodes[0].precision=Compute::FP32;graph.nodes[0].acc=Compute::FP32;
+		graph.expert_layers.push(ExpertLayer {node:0,global:0,mtp:false,layer:0,last_only:false,work:SplitWork::Dense(Vec::new())});
+		assert_eq!(native_weight_arena(&graph,Compute::FP32,true).unwrap().1,24);
+		let check_tile=Tile {m:16,n:8,k:32};
+		let schedule=NativeSchedule {element:Compute::FP32,matrix:false,block:256,tile:check_tile,register_m:8,register_n:8,register_count:64,fragment_k:16,
+			chunk_k:64,chunk_values:10240,chunk_bias_values:0,scratch_base:0,shared_values:10240,contractions:vec![None],attention:vec![None]};
+		let model=NativeModelIr::from_graph(&graph,1,Compute::FP32,schedule.clone(),true).unwrap();
+		let ir=model.emit(Backend::Nvidia,None,None,false,false,true).unwrap();
+		assert!(ir.contains("split_main_forward"));
+		assert!(!ir.contains("@recipe_model_step("));
+		if std::env::var_os("RECIPE_SPLIT_ASSEMBLE_CHECK").is_some() {
+			// Compile only; the fixture creates no CUDA context or model allocation.
+			NVIDIA_DRIVER_VERSION.store(11040,Ordering::Relaxed);
+			assert!(native_nvidia_assembler("sm_52").is_some());
+			let artifact=compile_model(&BackendTarget::Nvidia {architecture:"sm_52".to_owned()},&graph,Compute::FP32,None,false,1,schedule).unwrap();
+			assert!(artifact.path.metadata().unwrap().len()>1024);
+			eprintln!("dense native caller artifact: {}",artifact.path.display());
+		}
+	}
+}
