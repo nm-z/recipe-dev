@@ -7589,7 +7589,7 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
-		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
+		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) && !(backend==Backend::Nvidia && !self.graph.expert_layers.is_empty()) {
 			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
 			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
@@ -19177,8 +19177,9 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	let head_file=head.as_ref().map(|head|&head.bound.file);
 	let (reserve,native_bytes,requests)=expert_main_reserve(&target_graph,head_graph.as_ref(),&bound.file,head_file,precision)?;
 	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:32<<20};8];
-	for die in [0,1,2,3,4,5,7] {
-		let gpu=device(Some(&format!("nv{die}")))?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
+	for gpu in selected_gpus()? {
+		let die=gpu.name.strip_prefix("nv").and_then(|value|value.parse::<usize>().ok()).ok_or_else(||RecipeError::new("expert startup requires physical local NVIDIA names"))?;
+		require(die<8 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
 		#[cfg(nvidia)] if die==2 && let Driver::Cuda(driver)=&gpu.driver {
 			gpu.activate()?; let (mut free,mut total)=(0,0); unsafe {gpu.status((driver.memory_info)(&mut free,&mut total),"capped expert memory")?;}
 			budgets[die].free_bytes=budgets[die].free_bytes.min(free.saturating_sub(total.saturating_sub(5_798_205_440)));
@@ -19216,12 +19217,14 @@ fn expert_pick_seed()->Result<std::collections::BTreeMap<(bool,usize,u32),u64>> 
 	let Some(path)=std::env::var_os("RECIPE_EXPERT_PICK_COUNTS") else {return Ok(counts)};
 	if !Path::new(&path).is_file() {return Ok(counts)}
 	let text=fs::read_to_string(path).map_err(|error|RecipeError::new(format!("expert frequency read: {error}")))?;
-	for line in text.lines().filter(|line|!line.is_empty() && !line.starts_with("model,")) {
-		let fields=line.split(',').collect::<Vec<_>>(); require(fields.len()==4,"expert frequency record needs model,layer,expert,picks")?;
-		let mtp=match fields[0] {"target"=>false,"mtp"=>true,_=>return Err(RecipeError::new("expert frequency model is invalid"))};
-		let layer=fields[1].parse().map_err(|_|RecipeError::new("expert frequency layer is invalid"))?;
-		let expert=fields[2].parse::<u32>().map_err(|_|RecipeError::new("expert frequency ID is invalid"))?;
-		let picks=fields[3].parse().map_err(|_|RecipeError::new("expert frequency count is invalid"))?;
+	for line in text.lines().filter(|line|!line.is_empty() && !line.starts_with("model,") && !line.starts_with("layer\t")) {
+		let reference=line.contains('\t');
+		let fields=line.split(if reference {'\t'} else {','}).collect::<Vec<_>>(); require(fields.len()==4,"expert frequency record needs four fields")?;
+		let mtp=if reference {false} else {match fields[0] {"target"=>false,"mtp"=>true,_=>return Err(RecipeError::new("expert frequency model is invalid"))}};
+		let offset=usize::from(!reference);
+		let layer=fields[offset].parse().map_err(|_|RecipeError::new("expert frequency layer is invalid"))?;
+		let expert=fields[offset+1].parse::<u32>().map_err(|_|RecipeError::new("expert frequency ID is invalid"))?;
+		let picks=fields[offset+2].parse().map_err(|_|RecipeError::new("expert frequency count is invalid"))?;
 		require(expert<512,"expert frequency ID exceeds Flash-Next expert count")?; counts.insert((mtp,layer,expert),picks);
 	}
 	Ok(counts)
@@ -19258,7 +19261,8 @@ fn wire_expert_graph(graph: &mut Graph, binding: &Binding, mtp: bool, first: usi
 fn expert_enabled(file: &Gguf, devices: &[&Gpu]) -> bool {
 	file.value("general.architecture").and_then(GgufValue::text) == Some("qwen4exp")
 		&& file.value("qwen4exp.expert_count").and_then(GgufValue::integer) == Some(512)
-		&& devices.iter().any(|gpu| gpu.name == "nv2") && devices.iter().any(|gpu| gpu.name == "nv7")
+		&& ["nv0","nv1","nv3","nv4","nv5","nv7"].iter().all(|name|devices.iter().any(|gpu|gpu.name==*name))
+		&& devices.iter().all(|gpu|matches!(gpu.name.as_str(),"nv0"|"nv1"|"nv2"|"nv3"|"nv4"|"nv5"|"nv7"))
 }
 struct ExpertModule { gpu: &'static Gpu, handle: usize, function: usize }
 impl Drop for ExpertModule {
@@ -19311,13 +19315,9 @@ impl ExpertExecution {
 		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
 		let main_sync=PeerPacket::new("nv4")?;
 		control.write_bytes(32,&native_words(&[main_sync.completion_address(),main_sync.sequence_address()+4]))?;
-		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_COUNTS").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
-		let seed=expert_pick_seed()?;
-		let mut initial=vec![0u32;layers.len()*512];
-		for layer in &layers {for expert in 0..512 {initial[layer.global*512+expert]=seed.get(&(layer.mtp,layer.layer,expert as u32)).copied().unwrap_or(0).min(u32::MAX as u64) as u32;}}
-		pick_counts.write_bytes(0,&initial.iter().flat_map(|count|count.to_ne_bytes()).collect::<Vec<_>>())?;
+		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_LOG").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
 		let mut value = Self { pick_counts,pick_path,failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
-		for die in [0,1,2,3,4,5,7] {
+		for die in [0,1,2,3,4,5,7].into_iter().filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
 			let gpu = device(Some(&format!("nv{die}")))?;
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
@@ -19367,7 +19367,7 @@ impl ExpertExecution {
 			let owner = value.weights.owner_address(layer.layer).ok_or_else(|| RecipeError::new("expert owner map is absent"))?.0;
 			let fields = [value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
 			let mut record = native_words(&fields);
-			for dimension in [layer.global as u32,7,layer.gate.shape[0] as u32,layer.gate.shape[2] as u32,10,layer.gate.shape[1] as u32] { record.extend(dimension.to_ne_bytes()); }
+			for dimension in [layer.global as u32,value.workers.len() as u32,layer.gate.shape[0] as u32,layer.gate.shape[2] as u32,10,layer.gate.shape[1] as u32] { record.extend(dimension.to_ne_bytes()); }
 			record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
 			value.main_descriptors.push(Buffer::upload(main,&record)?);
 			value.channel_tables.push(channels);
@@ -19456,7 +19456,8 @@ impl ExpertSplitPlan {
 	/// `head` contains unique MTP tensors; the holder decides whether its output
 	/// projection and token lookup share the target's quantized representation.
 	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; 8]) -> Result<Self> {
-		require((2..6).contains(&main_die), "expert split main die must be physical Archy die 2, 3, 4, or 5")?;
+		require(matches!(main_die,3|4), "expert split main die must be physical Archy die 3 or 4")?;
+		let mut budgets=budgets;for budget in &mut budgets {if budget.free_bytes==0 {budget.reserve_bytes=0;}}
 		let mut plan = Self { spill_bytes:0, main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
 		let mut layers: std::collections::BTreeMap<(bool, usize), Vec<&GgufTensor>> = std::collections::BTreeMap::new();
 		let mut names = std::collections::HashSet::new();
@@ -19534,7 +19535,7 @@ impl ExpertSplitPlan {
 			if die == 2 || die == 6 { continue; }
 			let budget = self.budgets[die];
 			let remaining = budget.free_bytes as i128 - budget.reserve_bytes as i128 - self.weights[die] as i128;
-			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
+			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if budget.free_bytes==0 {"excluded"} else if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
 		}
 		text.push_str(&format!("\nUnplaced expert bundles: {}; unplaced packed bytes: {}; pinned RAM expert bytes: {}; complete placement fit: {}.\n", self.unplaced_experts, self.unplaced_bytes,self.spill_bytes,self.fits()));
 		text
@@ -19600,8 +19601,8 @@ impl ExpertSplitWeights {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
 		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
 		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
-		require(plan.budgets.iter().enumerate().all(|(die, budget)| die == 2 || die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
-		let devices = names.iter().enumerate().map(|(die, name)| if die == 2 || die == 6 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
+		require(plan.budgets.iter().enumerate().all(|(die, budget)| die == 2 || die == 6 || budget.free_bytes==0 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
+		let devices = names.iter().enumerate().map(|(die, name)| if die == 2 || die == 6 || plan.budgets[die].free_bytes==0 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
 		for (die, gpu) in devices.iter().enumerate().filter_map(|(die, gpu)| gpu.map(|gpu| (die, gpu))) {
 			#[cfg(nvidia)]
 			require(matches!(gpu.driver, Driver::Cuda(_)), "expert split requires local NVIDIA dies")?;
@@ -19613,7 +19614,7 @@ impl ExpertSplitWeights {
 		}
 		let main = devices[plan.main_die].expect("main die is permitted");
 		for die in 0..8 {
-			if die == 6 { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
+			if devices[die].is_none() { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
 		// Ordinary tapes own nonexpert weights. This allocation holds experts only.
 		let mut expert_bytes = [0;8];
 		for item in plan.placements.iter_mut().filter(|item| item.expert.is_some() && !item.spilled) {
@@ -19655,7 +19656,7 @@ impl ExpertSplitWeights {
 			value.owners.push((layer, Buffer::upload(main, &owners)?));
 		}
 		for die in 0..8 {
-			if die == 6 { continue; }
+			if devices[die].is_none() { continue; }
 			let request = PeerPacket::with_payload(names[die], 5 * 10240 * 4)?;
 			let response = PeerPacket::with_payload(names[value.plan.main_die], 5 * 10240 * 4)?;
 			if die != value.plan.main_die { request.enable_sender(&response)?; response.enable_sender(&request)?; }
@@ -26605,7 +26606,9 @@ impl Gpu {
 		}
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
-		let vector_waves = if cpu {
+		let vector_waves = if self.backend==Backend::Nvidia && !graph.expert_layers.is_empty() {
+			8
+		} else if cpu {
 			1
 		} else {
 			narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32
@@ -34568,7 +34571,18 @@ fn expert_forward_functions() -> &'static str { r#"
 	ld.param.u64 w,[w0]; ld.param.u32 t,[t0]; ld.param.u64 x,[x0]; ld.param.u64 s,[s0]; ld.param.u64 o,[o0];
 	ld.param.u32 k,[k0]; ld.param.u32 m,[m0]; ld.param.u32 cap,[cap0]; ld.param.u32 cols,[cols0]; ld.param.u32 mask,[mask0];
 	ld.param.u32 rank,[rank0]; ld.param.u32 count,[count0]; ld.param.u64 sh,[sh0];
-	mov.u32 kind,0; setp.ge.u32 p,t,17; @p mov.u32 kind,2; mov.u32 lanes,16;
+	// Measured 256-thread expert tuples from 431203e's cta-256 table.
+	mov.u32 kind,0; mov.u32 lanes,8;
+	setp.eq.u32 p,t,17; @!p bra tuple_iq3;
+	setp.eq.u32 p,cap,8; @p mov.u32 kind,2;
+	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; bra tuple_ready;
+tuple_iq3:
+	setp.eq.u32 p,t,18; @!p bra tuple_q8;
+	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; setp.eq.u32 p,cap,8; @p mov.u32 lanes,8; bra tuple_ready;
+tuple_q8:
+	setp.eq.u32 p,t,8; @!p bra tuple_ready;
+	setp.eq.u32 p,k,2560; @p mov.u32 lanes,16;
+tuple_ready:
 	{ .param .u32 a,b,c,d,e,f,j,l,n,p,r,z; .param .u64 g,h,i,q;
 	st.param.u32 [a],t; st.param.u32 [b],cap; st.param.u32 [c],cols; st.param.u32 [d],kind; st.param.u32 [e],lanes; st.param.u32 [f],mask;
 	st.param.u64 [g],w; st.param.u64 [h],x; st.param.u64 [i],s; st.param.u64 [q],o;
