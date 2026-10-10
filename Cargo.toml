@@ -149,6 +149,25 @@ exact-cpu = false
 tolerance = 0.05
 step = 32
 
+[precision.flash]
+sum = "fp32"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+atvn = "fp32"
+norm = "fp32"
+res = "fp16"
+acc = "fp32"
+train = "fp32"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.05
+step = 32
+
 [precision.llamacpp]
 fp8 = "e4m3"
 train = "fp32"
@@ -170,6 +189,10 @@ math = "libm"
 step = 256
 
 [storage.recipe]
+kv = "fp8"
+fp8 = "e4m3"
+
+[storage.flash]
 kv = "fp8"
 fp8 = "e4m3"
 

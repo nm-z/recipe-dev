@@ -2035,17 +2035,28 @@ fn native_gradient_arena(graph: &Graph) -> Result<(Vec<usize>, usize)> {
 fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Result<(Vec<usize>, usize)> {
 	let mut offsets = Vec::with_capacity(graph.nodes.len());
 	let mut bytes = 0;
+	let mut mapped = std::collections::BTreeMap::new();
 	let _ = precision;
 	for index in 0..graph.nodes.len() {
 		let element = graph.nodes[index].precision.bytes();
+		let weight = packed_weight(graph, index, inference);
+		let key = weight.filter(|weight| weight.codebook.is_empty() && weight.arithmetic.is_empty()).map(|weight| {
+			(weight.format.0, weight.count, weight.format_segments().into_iter().map(|(format, count)| (format.0, count)).collect::<Vec<_>>(),
+				weight.bytes.runs().into_iter().map(|(offset, bytes)| (offset, bytes.as_ptr() as usize, bytes.len())).collect::<Vec<_>>())
+		});
+		if let Some(offset) = key.as_ref().and_then(|key| mapped.get(key)) {
+			offsets.push(*offset);
+			continue;
+		}
 		// Sixteen-byte alignment: a packed node's 144-byte Q4_K blocks are then
 		// read sixteen bytes at a time by the block dots.
 		let offset = align(bytes, element.max(16))?;
-		let span = match packed_weight(graph, index, inference) {
+		let span = match weight {
 			Some(weight) => weight.bytes.len(),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
 		};
 		offsets.push(offset);
+		if let Some(key) = key { mapped.insert(key, offset); }
 		bytes = checked_add(offset, span, "native weight arena")?;
 	}
 	// Sixteen bytes of slack: the block dots read a two-aligned slice as the
@@ -2139,8 +2150,9 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 
 /// Causal token graphs retain K/V, recurrent state, and convolution history
 /// independently of their temporary position window.
-fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
-	const POSITIONS: usize = 128;
+fn inference_window(graph: &Graph, rows: usize, inference: bool) -> Result<usize> {
+	let positions = std::env::var("RECIPE_INFERENCE_WINDOW_POSITIONS").ok().map(|value| count("inference window positions", &value)).transpose()?.unwrap_or(128);
+	require(positions != 0 && positions <= 128, "inference window positions must be in 1..=128")?;
 	let length = graph.input.length;
 	let tokens = graph.nodes.first().is_some_and(Node::token_input);
 	let bounded = inference && rows == 1 && (!tokens || graph.input.channels == 1)
@@ -2156,7 +2168,7 @@ fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
 					_ => false,
 				}
 		});
-	if bounded { length.min(POSITIONS) } else { length }
+	Ok(if bounded { length.min(positions) } else { length })
 }
 
 fn window_shape(shape: Shape, sequence: usize, positions: usize) -> Shape {
@@ -2293,7 +2305,7 @@ impl NativeLayout {
 	/// use the same lifetime-based allocator. Retained regions stay private;
 	/// transient regions share storage after their last reader's barrier.
 	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
-		let window_positions = inference_window(graph, rows, inference);
+		let window_positions = inference_window(graph, rows, inference)?;
 		let element = precision.bytes();
 		let unit = 8;
 		let mut values = Vec::with_capacity(graph.nodes.len());
@@ -3423,6 +3435,7 @@ mod quantized {
 		fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int;
 		fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int;
 		fn half(&mut self, offset: Self::Int) -> Self::Value;
+		fn bfloat(&mut self, offset: Self::Int) -> Self::Value;
 		fn float(&mut self, offset: Self::Int) -> Self::Value;
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value;
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int;
@@ -4024,6 +4037,10 @@ mod quantized {
 		fn half(&mut self, offset: Self::Int) -> Self::Value {
 			f64::from(half(&self.bytes[offset as usize..]))
 		}
+		fn bfloat(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = u16::from_le_bytes(self.bytes[offset as usize..offset as usize + 2].try_into().unwrap());
+			f64::from(f32::from_bits(u32::from(bits) << 16))
+		}
 		fn float(&mut self, offset: Self::Int) -> Self::Value {
 			f64::from(f32::from_le_bytes(self.bytes[offset as usize..offset as usize + 4].try_into().unwrap()))
 		}
@@ -4143,6 +4160,16 @@ mod quantized {
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load float, {pointer} {address}, align 4"));
 			self.instruction(format!("call {state} @recipe.state.from.f32{}(float {loaded})", self.suffix))
+		}
+		fn bfloat(&mut self, offset: Self::Int) -> Self::Value {
+			let pointer = pointer_type(self.backend);
+			let state = self.precision.state_type;
+			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
+			let loaded = self.instruction(format!("load i16, {pointer} {address}, align 2"));
+			let extended = self.instruction(format!("zext i16 {loaded} to i32"));
+			let shifted = self.instruction(format!("shl i32 {extended}, 16"));
+			let value = self.instruction(format!("bitcast i32 {shifted} to float"));
+			self.instruction(format!("call {state} @recipe.state.from.f32{}(float {value})", self.suffix))
 		}
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
 			let state = self.precision.state_type;
@@ -9055,7 +9082,7 @@ mod gguf {
 			26 => return Ok(("I32", 1, 4, None)),
 			27 => return Ok(("I64", 1, 8, None)),
 			28 => return Ok(("F64", 1, 8, None)),
-			30 => return Ok(("BF16", 1, 2, None)),
+			30 => "bf16",
 			2 => "q4_0",
 			3 => "q4_1",
 			6 => "q5_0",
@@ -14342,6 +14369,7 @@ pub(crate) struct StorageFormat(pub(crate) u16);
 #[derive(Clone, Copy)]
 enum NativeDequant {
 	F16,
+	BF16,
 	F32,
 	Nf4,
 	Scalar(ScalarLayout),
@@ -14367,6 +14395,11 @@ impl NativeDequant {
 				let index = operations.index();
 				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(4));
 				operations.float(offset)
+			}
+			Self::BF16 => {
+				let index = operations.index();
+				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(2));
+				operations.bfloat(offset)
 			}
 			Self::Nf4 => unreachable!("NF4 dequantization requires its model codebook"),
 			Self::Scalar(layout) => quantized::dequant_scalar(operations, layout),
@@ -14460,6 +14493,7 @@ macro_rules! quantizations {
 
 quantizations! {
 	F16 { code: (2, 16, [0]), block: 1, stride: 2, name: "f16", quant: Quantizer::Raw, native: Some(NativeDequant::F16) }
+	BF16 { code: (2, 16, [1]), block: 1, stride: 2, name: "bf16", quant: Quantizer::Raw, native: Some(NativeDequant::BF16) }
 	F32 { code: (2, 32, [0]), block: 1, stride: 4, name: "f32", quant: Quantizer::Raw, native: Some(NativeDequant::F32) }
 	Q4_0 { code: (0, 4, [0]), block: 32, stride: 18, name: "q4_0", quant: Quantizer::Scalar { bits: 4, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 0 })) }
 	Q4_1 { code: (0, 4, [1]), block: 32, stride: 20, name: "q4_1", quant: Quantizer::Scalar { bits: 4, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 1 })) }
@@ -17507,6 +17541,32 @@ impl Recipe {
 	}
 }
 impl Infer {
+	/// Plan complete target and head working buffers without allocating device weights.
+	/// The target includes five speculative delta slots when an MTP head is selected.
+	pub fn memory(&self, model: &Model, data: &Data, positions: usize) -> Result<Vec<DeviceMemory>> {
+		require(positions != 0, "inference memory plan has no context positions")?;
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("inference memory planning requires GGUF data"))?;
+		let gpu = selected_gpus()?[0];
+		let head = self.mtp.as_ref().map(|path| MtpHead::open(path, file, model)).transpose()?;
+		let bound = explicit_bound(file, model, head.is_none())?;
+		let mut graph = bound_graph_on(file, &bound.model, &bound.plan, &vec![0.0; positions], 1, gpu)?;
+		if head.is_some() {
+			retain_mtp_hidden(&mut graph)?;
+			for node in &mut graph.nodes { if node.op == Primitive::Delta { node.argument[5] = 5.0; } }
+		}
+		let precision = Config::load()?.precision;
+		let mut target = part_memory(&graph, precision)?;
+		target.device = device_label(gpu)?;
+		let mut memory = vec![target];
+		if let Some(head) = head {
+			let mut graph = head.graph(positions, gpu)?;
+			retain_mtp_hidden(&mut graph)?;
+			let mut planned = part_memory(&graph, precision)?;
+			planned.device = device_label(gpu)?;
+			memory.push(planned);
+		}
+		Ok(memory)
+	}
 	/// Select an MTP checkpoint on the machine executing inference.
 	pub fn mtp(mut self, path: impl AsRef<Path>) -> Self {
 		self.mtp = Some(path.as_ref().to_path_buf());
@@ -25531,8 +25591,10 @@ impl Buffer {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
 		let bytes = bytes.max(1);
 		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let mut written = std::collections::BTreeSet::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
+				if !written.insert((offsets[index], weight.bytes.len())) { continue; }
 				buffer.write_runs(offsets[index], &weight.bytes)?;
 			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
 				// The load kernel writes this node from its stored bytes.
@@ -26106,7 +26168,7 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<NativeProgram> {
-		let window_positions = inference_window(graph, rows, !epoch);
+		let window_positions = inference_window(graph, rows, !epoch)?;
 		for (index, node) in graph.nodes.iter().enumerate() {
 			let output = window_shape(node.output, graph.input.length, window_positions);
 			let elements = checked_mul(rows, output.elements(), "node batch")?;

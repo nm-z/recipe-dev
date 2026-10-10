@@ -30,12 +30,15 @@ pub fn model() -> Model {
 fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let model = model();
-	if std::env::args().any(|arg| arg == "--memory") {
-		println!("{}", model.memory(&data, 128).unwrap());
-		return;
-	}
 	let mut infer = recipe.infer();
 	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }
+	if std::env::args().any(|arg| arg == "--memory") {
+		for (index, memory) in infer.memory(&model, &data, 128).unwrap().iter().enumerate() {
+			println!("planned {} {memory}", if index == 0 { "target" } else { "MTP" });
+			println!("weights_bytes {} values_bytes {} contexts_bytes {} input_bytes {} scratch_bytes {}", memory.weights, memory.values, memory.contexts, memory.input, memory.scratch);
+		}
+		return;
+	}
 	let report = infer.chat([time, pp, tg, input, out, cached, mtp]).run(&model, &data);
 	println!("generation tokens {} rate {} tok/s", report.out, report.tg());
 }
