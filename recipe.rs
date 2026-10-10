@@ -6,6 +6,17 @@
 #[path = "build.rs"]
 mod native_build;
 use native_build::{encoding, fp8};
+/// Packed GGUF matvec functions for Maxwell, callable inside the native step.
+pub struct PackedMatvec;
+impl PackedMatvec {
+	/// Bytes of 16-byte-aligned CTA shared storage required by `packed_matvec`.
+	pub const SHARED_BYTES: usize = 40960;
+	/// Append this function/table text to the persistent NVIDIA PTX module.
+	pub fn ptx() -> &'static str {
+		include_str!("packed.ptx").split_once("// BEGIN PACKED HELPERS\n").expect("packed PTX function boundary").1
+	}
+}
+
 mod reference;
 pub use reference::Summary as ReferenceReport;
 mod program_ir {
@@ -8347,7 +8358,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
-	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes()]); }
+	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes()]); }
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
@@ -8719,6 +8730,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
+			ptx_source.push_str(expert_split_functions());
+			ptx_source.push_str(PackedMatvec::ptx());
 			fs::write(output, ptx_source).map_err(|error| RecipeError::new(format!("cannot append MTP PTX: {error}")))?;
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
@@ -9199,6 +9212,20 @@ mod gguf {
 		}
 		/// Parses one shard's header.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
+			Self::shard_header(path, index, false)
+		}
+		/// Read tensor names, types, shapes, and packed sizes before downloads finish.
+		/// Paths are in shard order. This does not validate or read tensor payloads.
+		/// Descriptors retain their shard index for a later complete `Gguf::open`.
+		pub fn tensor_headers(paths: &[PathBuf]) -> Result<Vec<GgufTensor>> {
+			let mut tensors = Vec::new();
+			for (index, path) in paths.iter().enumerate() {
+				let (_, _, shard) = Self::shard_header(path, index as u64, true)?;
+				tensors.extend(shard.into_iter().map(|mut tensor| { tensor.shard = index; tensor }));
+			}
+			Ok(tensors)
+		}
+		fn shard_header(path: &Path, index: u64, header_only: bool) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
 			let mapping = Mapping::open(path)?;
 			let bytes = mapping.bytes();
 			let mut reader = Reader { bytes, at: 0, depth: 0 };
@@ -9231,7 +9258,7 @@ mod gguf {
 				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
 			}
 			let data = usize::try_from((reader.at as u64).div_ceil(alignment) * alignment).map_err(|_| RecipeError::new("GGUF data offset exceeds the address space"))?;
-			for tensor in &tensors {
+			for tensor in tensors.iter().filter(|_| !header_only) {
 				let end = data.checked_add(tensor.offset).and_then(|start| start.checked_add(tensor.bytes));
 				require(end.is_some_and(|end| end <= bytes.len()), format!("tensor {} runs past the end of {}", tensor.name, path.display()))?;
 			}
@@ -17557,7 +17584,7 @@ impl Infer {
 			None if devices.len() == 1 => fitting_context(&file, &bound.model, &bound.plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
 			None => ceiling,
 		};
-		let checkpoints = head.as_ref().map_or(0, |head| head.tokens + 1);
+		let checkpoints = head.as_ref().map_or(0, |_| 5);
 		let mut mtp = head.map(|head| MtpRuntime::place(head, sequence, devices)).transpose()?;
 		let mut placed = place_bound_observed(&bound, sequence, &[], devices, checkpoints, tensor_observation_mask(&self.log))?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
@@ -17583,7 +17610,7 @@ impl Infer {
 		let mut memory = resident_memory(&placed, mtp.as_ref());
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
-		let mut request_history = Vec::new();
+		let mut request_history: Vec<Arc<InferenceRequest>> = Vec::new();
 		loop {
 			let start_progress = |started| {
 				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
@@ -17594,6 +17621,58 @@ impl Infer {
 				if INTERRUPTED.load(Ordering::Acquire) { break; }
 				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
 				let Some(line) = input.read()? else { break };
+				if let Some(value) = line.trim().strip_prefix("/mtp ") {
+					match (value.parse::<usize>(), mtp.as_mut()) {
+						(Ok(drafts @ 0..=4), Some(runtime)) => runtime.head.tokens = drafts,
+						(_, None) => eprintln!("MTP head is not resident"),
+						_ => eprintln!("MTP draft tokens must be in 0..=4"),
+					}
+					continue;
+				}
+				if let Some(value) = line.trim().strip_prefix("/lookup ") {
+					match (value, mtp.as_mut()) {
+						("0", Some(runtime)) => runtime.lookup_enabled = false,
+						("1", Some(runtime)) => runtime.lookup_enabled = true,
+						(_, None) => eprintln!("MTP head is not resident"),
+						_ => eprintln!("MTP lookup must be 0 or 1"),
+					}
+					continue;
+				}
+				if line.trim() == "/report" || line.trim().starts_with("/report ") {
+					use std::fmt::Write as _;
+					let mut text = String::from("request\tinput\toutput\tcached\tprefill_seconds\tgeneration_seconds\ttok_per_second\tmtp_drafted\tmtp_accepted\tmtp_verify_seconds\tmtp_step_seconds\n");
+					for (index, request) in request_history.iter().enumerate() {
+						let rate = if request.tg_seconds > 0.0 { request.out as f64 / request.tg_seconds } else { 0.0 };
+						writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{rate}\t{}\t{}\t{}\t{}", request.input, request.out, request.cached, request.pp_seconds,
+							request.tg_seconds, request.mtp.drafted, request.mtp.accepted, request.mtp.verify_seconds, request.mtp.step_seconds)?;
+					}
+					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\n");
+					for (index, request) in request_history.iter().enumerate() {
+						for operation in &request.operations {
+							writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block,
+								operation.node, operation.operation, operation.begin, operation.end, operation.positions, operation.ticks,
+								operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()))?;
+						}
+					}
+					if let Some(path) = line.trim().strip_prefix("/report ") {
+						if let Err(error) = fs::write(path, text) { eprintln!("cannot write inference report {path}: {error}"); }
+					} else { eprint!("{text}"); }
+					continue;
+				}
+				if let Some(path) = line.trim().strip_prefix("/dump_logits ") {
+					if let Some(request) = request_history.last() {
+						let bytes = request.logits.iter().flat_map(|value| (*value as f32).to_le_bytes()).collect::<Vec<_>>();
+						if let Err(error) = fs::write(path, bytes) { eprintln!("cannot write final logits {path}: {error}"); }
+					} else { eprintln!("no completed inference request"); }
+					continue;
+				}
+				if line.trim() == "/reload_mtp" {
+					if let Some(runtime) = &mut mtp {
+						let paths = runtime.placed.native_artifacts();
+						if let Err(error) = runtime.placed.reload_native(&paths) { eprintln!("{error}"); }
+					} else { eprintln!("MTP head is not resident"); }
+					continue;
+				}
 				if line.trim() == "/artifacts" {
 					for path in placed.native_artifacts() { eprintln!("artifact {}", path.display()); }
 					if let Some(mtp) = &mtp { for path in mtp.placed.native_artifacts() { eprintln!("MTP artifact {}", path.display()); } }
@@ -18954,6 +19033,230 @@ impl PeerPacket {
 }
 impl Drop for PeerPacket {
 	fn drop(&mut self) { self.gpu.free(self.slots); self.gpu.free(self.packet); }
+}
+
+/// Physical Archy die capacity measured before placement. Reserve includes KV,
+/// CUDA working storage, and the persistent peer packets, separately from weights.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertDieBudget {
+	pub free_bytes: usize,
+	pub reserve_bytes: usize,
+}
+#[derive(Clone, Debug)]
+pub struct ExpertWeightPlacement {
+	pub tensor: GgufTensor,
+	pub expert: Option<u32>,
+	pub die: usize,
+	pub offset: usize,
+	pub mtp: bool,
+}
+/// A complete assignment or a capacity report. An incomplete assignment cannot
+/// load. All three matrices of an expert share a die; packed GGUF slices retain
+/// their type and byte layout. Lookup tables remain in the caller's RAM mapping.
+#[derive(Clone, Debug)]
+pub struct ExpertSplitPlan {
+	pub main_die: usize,
+	pub budgets: [ExpertDieBudget; 8],
+	pub weights: [usize; 8],
+	pub experts: [usize; 8],
+	pub unplaced_experts: usize,
+	pub unplaced_bytes: usize,
+	pub placements: Vec<ExpertWeightPlacement>,
+}
+impl ExpertSplitPlan {
+	/// `head` contains unique MTP tensors; the holder decides whether its output
+	/// projection and token lookup share the target's quantized representation.
+	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; 8]) -> Result<Self> {
+		require((2..6).contains(&main_die), "expert split main die must be physical Archy die 2, 3, 4, or 5")?;
+		let mut plan = Self { main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
+		let mut layers: std::collections::BTreeMap<(bool, usize), Vec<&GgufTensor>> = std::collections::BTreeMap::new();
+		let mut names = std::collections::HashSet::new();
+		for (mtp, tensors) in [(false, target), (true, head)] {
+			for tensor in tensors {
+				require(tensor.bytes != 0, "expert split cannot place an empty tensor")?;
+				require(names.insert((mtp, tensor.name.clone())), format!("duplicate split tensor {}", tensor.name))?;
+				if matches!(tensor.name.as_str(), "token_embd.weight" | "per_layer_token_embd.weight") { continue; }
+				if tensor.name.ends_with("_exps.weight") {
+					let layer = tensor.name.strip_prefix("blk.").and_then(|name| name.split('.').next()).and_then(|number| number.parse::<usize>().ok())
+						.ok_or_else(|| RecipeError::new(format!("expert tensor {} has no block index", tensor.name)))?;
+					layers.entry((mtp, layer)).or_default().push(tensor);
+				} else {
+					plan.append(tensor.clone(), None, main_die, mtp)?;
+				}
+			}
+		}
+		for ((mtp, layer), tensors) in layers {
+			require(tensors.len() == 3, format!("block {layer} must contain up, gate, and down expert matrices"))?;
+			for suffix in ["ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight"] {
+				require(tensors.iter().any(|tensor| tensor.name == format!("blk.{layer}.{suffix}")), format!("block {layer} lacks {suffix}"))?;
+			}
+			let count = tensors[0].shape.get(2).copied().unwrap_or(0);
+			require(count != 0 && count <= u32::MAX as u64 && tensors.iter().all(|tensor| tensor.shape.len() == 3 && tensor.shape[2] == count && tensor.bytes % count as usize == 0),
+				format!("block {layer} expert shapes or packed byte strides disagree"))?;
+			for expert in 0..count as usize {
+				let slices = tensors.iter().map(|tensor| tensor.expert(expert)).collect::<Result<Vec<_>>>()?;
+				let die = (0..8).filter(|die| *die != main_die && *die != 6).filter_map(|die| {
+					let mut end = plan.weights[die];
+					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
+					let available = budgets[die].free_bytes.saturating_sub(budgets[die].reserve_bytes);
+					(end <= available).then(|| (die, available - end))
+				}).max_by_key(|(die, remaining)| (*remaining, std::cmp::Reverse(*die))).map(|(die, _)| die);
+				if let Some(die) = die {
+					for slice in slices { plan.append(slice, Some(expert as u32), die, mtp)?; }
+					plan.experts[die] += 1;
+				} else {
+					plan.unplaced_experts += 1;
+					for slice in slices { plan.unplaced_bytes = checked_add(plan.unplaced_bytes, slice.bytes, "unplaced expert bytes")?; }
+				}
+			}
+		}
+		Ok(plan)
+	}
+	fn end(before: usize, bytes: usize) -> Result<(usize, usize)> {
+		let offset = checked_add(before, 255, "packed tensor alignment")? & !255;
+		Ok((offset, checked_add(offset, bytes, "packed expert placement")?))
+	}
+	fn append(&mut self, tensor: GgufTensor, expert: Option<u32>, die: usize, mtp: bool) -> Result<()> {
+		let (offset, end) = Self::end(self.weights[die], tensor.bytes)?;
+		self.weights[die] = end;
+		self.placements.push(ExpertWeightPlacement { tensor, expert, die, offset, mtp });
+		Ok(())
+	}
+	pub fn fits(&self) -> bool {
+		self.unplaced_experts == 0 && (0..8).all(|die| self.weights[die] <= self.budgets[die].free_bytes.saturating_sub(self.budgets[die].reserve_bytes))
+	}
+	pub fn table(&self) -> String {
+		let mut text = String::from("| Physical die | Role | Free bytes | KV/scratch reserve | Assigned weight bytes | Expert bundles | Remaining bytes |\n|---:|---|---:|---:|---:|---:|---:|\n");
+		for die in 0..8 {
+			if die == 6 { continue; }
+			let budget = self.budgets[die];
+			let remaining = budget.free_bytes as i128 - budget.reserve_bytes as i128 - self.weights[die] as i128;
+			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
+		}
+		text.push_str(&format!("\nUnplaced expert bundles: {}; unplaced packed bytes: {}; complete resident fit: {}.\n", self.unplaced_experts, self.unplaced_bytes, self.fits()));
+		text
+	}
+	/// Native selected records are `[count, expert IDs...]`; the route coefficients
+	/// use the original selected-slot order. This prepares or checks captures only;
+	/// the token kernel performs routing on the GPU through `expert_split_functions`.
+	pub fn selected_dies(&self, layer: usize, selected: &[i32], top_k: usize) -> Result<Vec<(usize, Vec<usize>)>> {
+		require(top_k != 0 && top_k <= 16 && selected.len() == top_k + 1 && selected[0] >= 0 && selected[0] as usize <= top_k, "invalid expert selected record")?;
+		let mut dies: Vec<(usize, Vec<usize>)> = Vec::new();
+		let mut seen = std::collections::HashSet::new();
+		let name = format!("blk.{layer}.ffn_up_exps.weight");
+		for (slot, expert) in selected[1..1 + selected[0] as usize].iter().copied().enumerate() {
+			require(expert >= 0 && seen.insert(expert), "selected expert IDs must be nonnegative and unique")?;
+			let die = self.placements.iter().find(|item| !item.mtp && item.tensor.name == name && item.expert == Some(expert as u32)).map(|item| item.die)
+				.ok_or_else(|| RecipeError::new(format!("selected expert {expert} in block {layer} is not resident")))?;
+			if let Some((_, slots)) = dies.iter_mut().find(|(placed, _)| *placed == die) { slots.push(slot); } else { dies.push((die, vec![slot])); }
+		}
+		Ok(dies)
+	}
+}
+
+/// Retain this object in cx-flash's holder. Creation is transactional: capacity
+/// failure returns before weight allocation; upload failure drops new buffers.
+/// Module replacement leaves these allocations and peer sequences unchanged.
+pub struct ExpertSplitWeights {
+	plan: ExpertSplitPlan,
+	buffers: Vec<Option<Buffer>>,
+	requests: Vec<PeerPacket>,
+	responses: Vec<PeerPacket>,
+	routes: Vec<Buffer>,
+	owners: Vec<(usize, Buffer)>,
+	response_table: Buffer,
+}
+impl ExpertSplitWeights {
+	/// Names use physical Archy ordinal order. Die 6 has no context or buffer.
+	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
+	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str; 8]) -> Result<Self> {
+		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
+		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
+		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
+		require(plan.budgets.iter().enumerate().all(|(die, budget)| die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
+		let devices = names.iter().enumerate().map(|(die, name)| if die == 6 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
+		for (die, gpu) in devices.iter().enumerate().filter_map(|(die, gpu)| gpu.map(|gpu| (die, gpu))) {
+			#[cfg(nvidia)]
+			require(matches!(gpu.driver, Driver::Cuda(_)), "expert split requires local NVIDIA dies")?;
+			#[cfg(not(nvidia))]
+			return Err(RecipeError::new("expert split requires the NVIDIA backend"));
+			#[allow(unreachable_code)]
+			require(gpu.free_bytes()? >= checked_add(plan.weights[die], plan.budgets[die].reserve_bytes, "expert split reserve")? as u64,
+				format!("physical die {die} free VRAM changed before resident loading"))?;
+		}
+		let main = devices[plan.main_die].expect("main die is permitted");
+		for die in 0..8 {
+			if die == 6 { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
+		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, plan.weights[die])).transpose()).collect::<Result<Vec<_>>>()?;
+		for item in &plan.placements {
+			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
+			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
+			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else { original.clone() };
+			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
+			buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;
+		}
+		let response_table = Buffer::reserve(main, 6 * 16)?;
+		let mut value = Self { plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
+		let mut layers = std::collections::BTreeMap::new();
+		for item in &value.plan.placements {
+			if item.tensor.name.ends_with("ffn_up_exps.weight") {
+				let layer = item.tensor.name.split('.').nth(1).and_then(|number| number.parse::<usize>().ok()).expect("validated expert block index");
+				let expert = item.expert.expect("validated expert slice") as usize;
+				let entries = layers.entry(layer).or_insert_with(Vec::new);
+				if entries.len() <= expert { entries.resize(expert + 1, u32::MAX); }
+				entries[expert] = item.die as u32;
+			}
+		}
+		for (layer, owners) in layers {
+			require(owners.iter().all(|owner| *owner != u32::MAX), "resident expert owner table has a hole")?;
+			value.owners.push((layer, Buffer::upload(main, &owners)?));
+		}
+		for die in 0..8 {
+			if die == 6 { continue; }
+			if die == value.plan.main_die { continue; }
+			let request = PeerPacket::with_payload(names[die], 5 * 10240 * 4)?;
+			let response = PeerPacket::with_payload(names[value.plan.main_die], 5 * 10240 * 4)?;
+			request.enable_sender(&response)?;
+			response.enable_sender(&request)?;
+			value.requests.push(request);
+			value.responses.push(response);
+			value.routes.push(Buffer::zeroed(devices[die].expect("worker die is permitted"), 1024)?);
+		}
+		let table: Vec<u8> = value.responses.iter().flat_map(|packet| [packet.address(), packet.sequence_address()].into_iter().flat_map(u64::to_ne_bytes)).collect();
+		value.response_table.write_bytes(0, &table)?;
+		Ok(value)
+	}
+	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
+	pub fn weight_address(&self, mtp: bool, name: &str, expert: Option<u32>) -> Option<(usize, u64, usize, u32)> {
+		self.plan.placements.iter().find(|item| item.mtp == mtp && item.tensor.name == name && item.expert == expert)
+			.map(|item| (item.die, self.buffers[item.die].as_ref().expect("assigned die is permitted").pointer + item.offset as u64, item.tensor.bytes, item.tensor.kind))
+	}
+	/// Channels are ordered by increasing physical expert die, excluding main.
+	/// Route storage: up to five native count/ID records at +0, FP32 coefficients
+	/// at +512. Strides are top_k+1 for records and top_k for coefficients.
+	pub fn channel(&self, index: usize) -> Option<(&PeerPacket, &PeerPacket, u64)> {
+		Some((self.requests.get(index)?, self.responses.get(index)?, self.routes.get(index)?.pointer))
+	}
+	pub fn owner_address(&self, layer: usize) -> Option<(u64, usize)> {
+		self.owners.iter().find(|(index, _)| *index == layer).map(|(_, buffer)| (buffer.pointer, buffer.bytes / 4))
+	}
+	/// Main-die resident `{payload, sequence_address}` records for split_combine.
+	pub fn response_table_address(&self) -> u64 { self.response_table.pointer }
+	/// Reserve the same checked sequence range on both ends before queuing a token.
+	pub fn reserve_sequences(&mut self, layers: u32) -> Result<u32> {
+		require(layers != 0 && self.requests.iter().chain(&self.responses).all(|packet| packet.sequence.checked_add(layers).is_some()), "expert split sequence exhausted")?;
+		let base = self.requests[0].sequence;
+		require(self.requests.iter().chain(&self.responses).all(|packet| packet.sequence == base), "expert split channel sequences disagree")?;
+		for packet in self.requests.iter_mut().chain(&mut self.responses) { packet.reserve_sequences(layers)?; }
+		Ok(base)
+	}
+}
+
+/// Append callable expert transport functions after p2p_functions() in the
+/// holder's persistent step module. The source has no separate entry or launch.
+pub fn expert_split_functions() -> &'static str {
+	let source = include_str!("barrier.ptx");
+	&source[source.find("// Expert split transport.").expect("owned expert split PTX")..]
 }
 
 /// A model placed across the selected devices: contiguous block ranges, each
@@ -25773,6 +26076,22 @@ fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
 }
 impl Gpu {
+	/// Enable direct CUDA access from every participating peer to this die.
+	fn reaches(&'static self, peers: &[&'static Gpu]) -> bool {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			return peers.iter().filter(|peer| !ptr::eq(**peer, self)).all(|peer| {
+				let Driver::Cuda(other) = &peer.driver else { return false; };
+				unsafe {
+					let Ok(enable) = other._runtime.function::<unsafe extern "C" fn(Ptr, u32) -> i32>(b"cuCtxEnablePeerAccess\0") else { return false; };
+					(other.set)(other.context) == 0 && matches!(enable(driver.context, 0), 0 | 704)
+				}
+			});
+		}
+		let _ = peers;
+		false
+	}
+
 	#[cfg(any(amd, nvidia))]
 	fn status(&self, status: i32, action: &str) -> Result<()> {
 		driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend)))
