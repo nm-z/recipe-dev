@@ -49,13 +49,13 @@ hsa-abi-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_abi_version_600.bc" }
 hsa-device-library-directory = { linux = "/opt/rocm/amdgcn/bitcode" }
 hsa-finite-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc" }
 hsa-math-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc" }
-nvidia-ptx = "ptx71"
+nvidia-ptx = "ptx74"
 nvidia-compiler = { linux = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
 nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc.exe" }
 nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
-nvidia-assembler = "bin/ptxas"
+nvidia-assembler = "/opt/cuda-11.4/bin/ptxas"
 
 [package.metadata.mtp]
 tokens = 3

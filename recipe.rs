@@ -4630,7 +4630,9 @@ impl NativeModelIr {
 					if blocks != 0 {
 						// Keep running key sums in context and score only touched window blocks.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
-						let key_weights = &geometry.key_weights;
+						let key_weights = format!("%n{index}.index.weights");
+						ir.push_str(&ptr_gep(backend, "weights", self.plans[geometry.key_weights].weight_offset, &format!("n{index}.index.weights")));
+
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						// The selection clears the block score gradients the reverse pass
@@ -4645,13 +4647,13 @@ impl NativeModelIr {
 						let touched = NodeWindow { begin: first, span: count };
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"
+								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
 						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared} )\n"
+								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
@@ -16015,7 +16017,14 @@ impl MtpHead {
 		}
 		let mut model = recipe.model().e(file.float_at(&format!("{architecture}.attention.layer_norm_rms_epsilon"))?).push(Operation::Join(lanes));
 		let attention = builder.open(layer, "attn", &dimensions)?;
-		let mut attention = builder.attention(attention, layer, &dimensions)?.fp(32);
+		let mut attention = builder.attention(attention, layer, &dimensions)?.edit(|model| {
+			// Name each operation explicitly; a trailing fp after rope names rotary alone.
+			let block = model.blocks.last_mut().expect("MTP attention block is absent");
+			block.blck_precision = Some(Compute::FP32);
+			block.qk_precision = Some(Compute::FP32);
+			block.rope_precision = Some(Compute::FP32);
+		});
+
 		let mut scaling = None;
 		let mut consistent = true;
 		visit_attention(&target_model.blocks, &mut |block| {
@@ -16269,7 +16278,7 @@ impl MtpBatch {
 	/// Router coefficients are FP32 `[expert * positions + position]`.
 	pub fn from_selected(selected: &[i32], coefficients: &[f32], positions: usize, top_k: usize, experts: usize) -> Result<Self> {
 		require((1..=5).contains(&positions), "MTP target batch requires 1..=5 positions")?;
-		require(top_k > 0 && top_k <= experts, "MTP selected-expert count is invalid")?;
+		require(top_k > 0 && top_k <= experts && top_k <= 16, "MTP selected-expert count is invalid")?;
 		let stride = checked_add(top_k, 1, "MTP selected-expert stride")?;
 		require(selected.len() == checked_mul(positions, stride, "MTP selected-expert records")?, "MTP selected-expert record size differs")?;
 		require(coefficients.len() == checked_mul(experts, positions, "MTP router coefficients")?, "MTP router coefficient size differs")?;
@@ -16296,21 +16305,19 @@ impl MtpBatch {
 	/// Linkable device functions, without a second PTX module header.
 	pub fn ptx() -> &'static str {
 		let source = include_str!("mtp.ptx");
-		&source[source.find("// All threads").expect("MTP PTX function boundary is absent")..]
+		&source[source.find("// Every warp").expect("MTP PTX function boundary is absent")..]
 	}
-	/// Global grouping storage per expert: count, padding word, and eight position/slot pairs.
-	pub const fn map_bytes() -> usize { 72 }
 }
 impl MtpExpertGroup {
-	/// The exact map the PTX grouping helper writes, including inactive padding.
-	pub fn map(&self) -> [u32; 18] {
-		let mut words = [0; 18];
-		words[0] = self.columns.len() as u32;
-		for column in 0..8 {
-			words[2 + 2 * column] = self.columns.get(column).map_or(u32::MAX, |value| value.position as u32);
-			words[3 + 2 * column] = self.columns.get(column).map_or(0, |value| value.slot as u32);
+	/// Low word: original-position mask. High word: selected-slot nibbles by position.
+	pub fn routing(&self) -> u64 {
+		let mut mask = 0_u32;
+		let mut slots = 0_u32;
+		for column in &self.columns {
+			mask |= 1 << column.position;
+			slots |= (column.slot as u32) << (4 * column.position);
 		}
-		words
+		u64::from(mask) | (u64::from(slots) << 32)
 	}
 }
 /// Verified successors indexed by the model's n-gram rows and the exact token context.
@@ -16468,7 +16475,6 @@ impl MtpRuntime {
 			self.hidden.resize_with(prompt.len(), Vec::new);
 			for (slot, hidden) in self.hidden[cached..prompt.len()].iter_mut().zip(mtp_hidden(main, cached, prompt.len())?) { *slot = hidden; }
 		}
-		if budget > 0 { self.refresh(prompt, self.head_valid.min(cached.saturating_sub(1)), prompt.len() - 1)?; }
 		self.ids = prompt.to_vec();
 		if self.lookup_enabled { self.lookup.observe(prompt, stop); }
 		let boundary = Instant::now();
@@ -16496,9 +16502,8 @@ impl MtpRuntime {
 			if !from_lookup && limit > 0 { self.refresh(&generation.ids, self.head_valid, base - 1)?; }
 			let mut proposed = vec![next];
 			proposed.extend(lookup);
-			let mut hidden
- = self.hidden[base - 1].clone();
-			let mut head_checkpoint = None;
+			let mut hidden = if !from_lookup && limit > 0 { self.hidden[base - 1].clone() } else { Vec::new() };
+			let mut head_prefix = None;
 			for offset in 0..if from_lookup { 0 } else { limit } {
 				let position = base + offset - 1;
 				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
@@ -16507,18 +16512,20 @@ impl MtpRuntime {
 				if offset == 0 {
 					self.head_valid = position + 1;
 					self.release_hidden(self.head_valid)?;
-					head_checkpoint = Some(MtpCheckpoint::keep(&self.placed)?);
+					head_prefix = Some(self.head_valid as u32);
 				}
 				let logits = self.placed.last_logits(&output, position as u32, position as u32 + 1)?;
 				let mut draft_sampler = recipe.sampler().temperature(0.0);
 				draft_sampler.suppressed.clone_from(&sampler.suppressed);
 				let id = draft_sampler.sample(&logits, &[]);
-				let peak = logits[id as usize];
-				let mass = logits.iter().enumerate().filter(|(id, _)| !sampler.suppressed.contains(&(*id as u32))).map(|(_, value)| (value - peak).exp()).sum::<f64>();
-				if mass.recip() < self.head.probs { break; }
+				if self.head.probs > 0.0 {
+					let peak = logits[id as usize];
+					let mass = logits.iter().enumerate().filter(|(id, _)| !sampler.suppressed.contains(&(*id as u32))).map(|(_, value)| (value - peak).exp()).sum::<f64>();
+					if mass.recip() < self.head.probs { break; }
+				}
 				proposed.push(id);
-				hidden = mtp_hidden(&self.placed, position, position + 1)?.remove(0);
 				if stop.contains(&id) { break; }
+				if offset + 1 < limit { hidden = mtp_hidden(&self.placed, position, position + 1)?.remove(0); }
 			}
 			for (slot, id) in samples[base..].iter_mut().zip(&proposed) { *slot = f64::from(*id); }
 			let end = base + proposed.len();
@@ -16550,8 +16557,8 @@ impl MtpRuntime {
 			generation.mtp.rejected += proposed.len() - accepted;
 			let committed = base + accepted - usize::from(terminal);
 			if committed < end { main.commit_mtp_prefix(committed as u32)?; }
-			let ran_head = head_checkpoint.is_some();
-			if let Some(checkpoint) = head_checkpoint { checkpoint.restore(&self.placed)?; }
+			let ran_head = head_prefix.is_some();
+			if let Some(prefix) = head_prefix { self.placed.commit_mtp_prefix(prefix)?; }
 			self.ids = generation.ids[..committed.min(generation.ids.len())].to_vec();
 			self.hidden.truncate(committed);
 			if self.lookup_enabled { self.lookup.observe(&generation.ids, stop); }
@@ -19456,7 +19463,7 @@ impl Placed {
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					let predictions = self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None })?;
+					let predictions = self.forward_window_with_tokens(ranges, prepared, samples, begin as usize, begin, end, if graph == graphs.len() { progress } else { None })?;
 					ranges.last().ok_or_else(|| RecipeError::new("saved graph has no output range"))?.saved_predictions(predictions)
 				})
 			}
@@ -19475,16 +19482,17 @@ impl Placed {
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
-		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress)
+		let input = tapes.first().ok_or_else(|| RecipeError::new("placement has no range"))?.input;
+		let token_begin = if samples.len() == input.elements() { begin as usize } else { 0 };
+		self.forward_window_with_tokens(tapes, samples, samples, token_begin, begin, end, progress)
 	}
 	/// Every part receives the original token IDs, independently of transformed
 	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
-	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		require(begin <= end, "window begins after its end")?;
 		let packed_input = samples.len() != first.input.elements();
 		let positions = (end - begin) as usize;
-		let token_begin = if packed_input && tokens.len() != first.input.length && tokens.len() != first.input.elements() { 0 } else { begin as usize };
 		let token_window = tokens.get(token_begin..token_begin + positions).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
 
 		for tape in tapes {

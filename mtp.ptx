@@ -2,194 +2,245 @@
 .target sm_52
 .address_size 64
 
-// All threads of a CTA call with the same expert and a CTA-owned global map.
-// Map: count and one padding word, then eight (position, selected-slot) pairs. Padding uses position -1.
-.visible .func (.param .b32 result) mtp_group_expert(
-	.param .b64 selected, .param .b64 map, .param .b32 positions,
-	.param .b32 top_k, .param .b32 expert)
+// Every warp scans coalesced selected records, then reduces its register results.
+// Routing lives in the same persistent launch, so coherent L2 loads are required.
+.visible .func (.param .b64 routing) mtp_group_warp(
+	.param .b64 selected, .param .b32 positions, .param .b32 top_k,
+	.param .b32 expert)
 {
-	.reg .pred %p<4>;
-	.reg .b32 %r<16>;
+	.reg .pred %p<5>;
+	.reg .b32 %r<26>;
 	.reg .b64 %d<8>;
 	ld.param.u64 %d0, [selected];
-	ld.param.u64 %d1, [map];
 	ld.param.u32 %r0, [positions];
 	ld.param.u32 %r1, [top_k];
 	ld.param.u32 %r2, [expert];
 	mov.u32 %r3, %tid.x;
-	setp.ne.u32 %p0, %r3, 0;
-	@%p0 bra GROUP_WAIT;
-	mov.u32 %r4, 0;
-	mov.u32 %r14, 0xffffffff;
-	mov.u32 %r15, 0;
-GROUP_CLEAR:
-	mul.wide.u32 %d2, %r4, 8;
-	add.u64 %d2, %d2, %d1;
-	add.u64 %d2, %d2, 8;
-	st.global.v2.u32 [%d2], {%r14, %r15};
-	add.u32 %r4, %r4, 1;
-	setp.lt.u32 %p0, %r4, 8;
-	@%p0 bra GROUP_CLEAR;
-	mov.u32 %r4, 0;
-	mov.u32 %r5, 0;
-	add.u32 %r6, %r1, 1;
-GROUP_POSITION:
-	setp.ge.u32 %p0, %r4, %r0;
-	@%p0 bra GROUP_DONE;
-	mul.lo.u32 %r7, %r4, %r6;
-	mul.wide.u32 %d2, %r7, 4;
-	add.u64 %d2, %d0, %d2;
-	ld.global.u32 %r8, [%d2];
-	mov.u32 %r9, 0;
-GROUP_SLOT:
-	setp.ge.u32 %p0, %r9, %r8;
-	@%p0 bra GROUP_ADVANCE;
-	add.u32 %r10, %r9, 1;
-	mul.wide.u32 %d3, %r10, 4;
-	add.u64 %d3, %d2, %d3;
-	ld.global.u32 %r11, [%d3];
-	setp.eq.u32 %p1, %r11, %r2;
-	@!%p1 bra GROUP_NEXT_SLOT;
-	mul.wide.u32 %d3, %r5, 8;
-	add.u64 %d3, %d1, %d3;
-	add.u64 %d3, %d3, 8;
-	st.global.v2.u32 [%d3], {%r4, %r9};
-	add.u32 %r5, %r5, 1;
-	bra GROUP_ADVANCE;
-GROUP_NEXT_SLOT:
-	add.u32 %r9, %r9, 1;
-	bra GROUP_SLOT;
-GROUP_ADVANCE:
-	add.u32 %r4, %r4, 1;
-	bra GROUP_POSITION;
-GROUP_DONE:
-	st.global.u32 [%d1], %r5;
-GROUP_WAIT:
-	bar.sync 0;
-	ld.global.u32 %r5, [%d1];
-	st.param.b32 [result], %r5;
+	and.b32 %r3, %r3, 31;
+	add.u32 %r4, %r1, 1;
+	mul.lo.u32 %r5, %r4, %r0;
+	mov.u32 %r6, 0;
+	mov.u32 %r7, 0;
+	setp.eq.u32 %p3, %r4, 11;
+PARALLEL_SCAN:
+	setp.ge.u32 %p0, %r3, %r5;
+	@%p0 bra PARALLEL_REDUCE;
+	@!%p3 bra PARALLEL_GENERIC;
+	div.u32 %r8, %r3, 11;
+	rem.u32 %r9, %r3, 11;
+	bra PARALLEL_RECORD;
+PARALLEL_GENERIC:
+	div.u32 %r8, %r3, %r4;
+	rem.u32 %r9, %r3, %r4;
+PARALLEL_RECORD:
+	setp.eq.u32 %p0, %r9, 0;
+	@%p0 bra PARALLEL_NEXT;
+	sub.u32 %r9, %r9, 1;
+	mul.lo.u32 %r10, %r8, %r4;
+	mul.wide.u32 %d1, %r10, 4;
+	add.u64 %d1, %d1, %d0;
+	mul.wide.u32 %d2, %r3, 4;
+	add.u64 %d2, %d2, %d0;
+	ld.global.cg.u32 %r11, [%d1];
+	ld.global.cg.u32 %r12, [%d2];
+	setp.lt.u32 %p0, %r9, %r11;
+	setp.eq.u32 %p1, %r12, %r2;
+	and.pred %p0, %p0, %p1;
+	@!%p0 bra PARALLEL_NEXT;
+	mov.u32 %r13, 1;
+	shl.b32 %r13, %r13, %r8;
+	or.b32 %r6, %r6, %r13;
+	mul.lo.u32 %r13, %r8, 4;
+	shl.b32 %r13, %r9, %r13;
+	or.b32 %r7, %r7, %r13;
+PARALLEL_NEXT:
+	add.u32 %r3, %r3, 32;
+	bra PARALLEL_SCAN;
+PARALLEL_REDUCE:
+	shfl.bfly.b32 %r14, %r6, 16, 31;
+	shfl.bfly.b32 %r15, %r7, 16, 31;
+	or.b32 %r6, %r6, %r14;
+	or.b32 %r7, %r7, %r15;
+	shfl.bfly.b32 %r14, %r6, 8, 31;
+	shfl.bfly.b32 %r15, %r7, 8, 31;
+	or.b32 %r6, %r6, %r14;
+	or.b32 %r7, %r7, %r15;
+	shfl.bfly.b32 %r14, %r6, 4, 31;
+	shfl.bfly.b32 %r15, %r7, 4, 31;
+	or.b32 %r6, %r6, %r14;
+	or.b32 %r7, %r7, %r15;
+	shfl.bfly.b32 %r14, %r6, 2, 31;
+	shfl.bfly.b32 %r15, %r7, 2, 31;
+	or.b32 %r6, %r6, %r14;
+	or.b32 %r7, %r7, %r15;
+	shfl.bfly.b32 %r14, %r6, 1, 31;
+	shfl.bfly.b32 %r15, %r7, 1, 31;
+	or.b32 %r6, %r6, %r14;
+	or.b32 %r7, %r7, %r15;
+	cvt.u64.u32 %d3, %r6;
+	cvt.u64.u32 %d4, %r7;
+	shl.b64 %d4, %d4, 32;
+	or.b64 %d3, %d3, %d4;
+	st.param.b64 [routing], %d3;
 	ret;
 }
-
-// Gather already-packed columns. Strides are uint32 pairs and float2 scales.
-// Each destination column reads one mapped position; padded columns are zero.
-.visible .func mtp_gather_packed(
-	.param .b64 packed_x, .param .b64 scales, .param .b64 map,
-	.param .b64 gathered_x, .param .b64 gathered_scales,
-	.param .b32 pairs_per_column, .param .b32 scales_per_column,
-	.param .b32 capacity)
+// The five-bit position mask has 32 exact compact-column mappings.
+// Each nibble is a source position; 15 is inactive padding.
+.const .align 4 .u32 __mtp_columns[32] = {
+	0xffffffff,
+	0xfffffff0,
+	0xfffffff1,
+	0xffffff10,
+	0xfffffff2,
+	0xffffff20,
+	0xffffff21,
+	0xfffff210,
+	0xfffffff3,
+	0xffffff30,
+	0xffffff31,
+	0xfffff310,
+	0xffffff32,
+	0xfffff320,
+	0xfffff321,
+	0xffff3210,
+	0xfffffff4,
+	0xffffff40,
+	0xffffff41,
+	0xfffff410,
+	0xffffff42,
+	0xfffff420,
+	0xfffff421,
+	0xffff4210,
+	0xffffff43,
+	0xfffff430,
+	0xfffff431,
+	0xffff4310,
+	0xfffff432,
+	0xffff4320,
+	0xffff4321,
+	0xfff43210
+};
+.visible .func (.param .b32 position) mtp_column_position(
+	.param .b32 position_mask, .param .b32 column)
 {
-	.reg .pred %p<4>;
-	.reg .b32 %r<20>;
-	.reg .b64 %d<16>;
-	ld.param.u64 %d0, [packed_x];
-	ld.param.u64 %d1, [scales];
-	ld.param.u64 %d2, [map];
-	ld.param.u64 %d3, [gathered_x];
-	ld.param.u64 %d4, [gathered_scales];
-	ld.param.u32 %r0, [pairs_per_column];
-	ld.param.u32 %r1, [scales_per_column];
-	ld.param.u32 %r2, [capacity];
-	add.u32 %r3, %r0, %r1;
-	mul.lo.u32 %r4, %r3, %r2;
-	mov.u32 %r5, %tid.x;
-	mov.u32 %r6, %ntid.x;
-GATHER_LOOP:
-	setp.ge.u32 %p0, %r5, %r4;
-	@%p0 bra GATHER_DONE;
-	div.u32 %r7, %r5, %r3;
-	rem.u32 %r8, %r5, %r3;
-	mul.wide.u32 %d5, %r7, 8;
-	add.u64 %d5, %d5, %d2;
-	add.u64 %d5, %d5, 8;
-	ld.global.u32 %r9, [%d5];
-	setp.eq.u32 %p1, %r9, 0xffffffff;
-	setp.ge.u32 %p2, %r8, %r0;
-	@%p2 bra GATHER_SCALE;
-	mad.lo.u32 %r10, %r7, %r0, %r8;
-	mul.wide.u32 %d6, %r10, 4;
-	add.u64 %d6, %d6, %d3;
-	mov.u32 %r11, 0;
-	@%p1 bra GATHER_STORE_X;
-	mad.lo.u32 %r10, %r9, %r0, %r8;
-	mul.wide.u32 %d7, %r10, 4;
-	add.u64 %d7, %d7, %d0;
-	ld.global.u32 %r11, [%d7];
-GATHER_STORE_X:
-	st.global.u32 [%d6], %r11;
-	bra GATHER_NEXT;
-GATHER_SCALE:
-	sub.u32 %r8, %r8, %r0;
-	mad.lo.u32 %r10, %r7, %r1, %r8;
-	mul.wide.u32 %d6, %r10, 8;
-	add.u64 %d6, %d6, %d4;
-	mov.u64 %d8, 0;
-	@%p1 bra GATHER_STORE_SCALE;
-	mad.lo.u32 %r10, %r9, %r1, %r8;
-	mul.wide.u32 %d7, %r10, 8;
-	add.u64 %d7, %d7, %d1;
-	ld.global.u64 %d8, [%d7];
-GATHER_STORE_SCALE:
-	st.global.u64 [%d6], %d8;
-GATHER_NEXT:
-	add.u32 %r5, %r5, %r6;
-	bra GATHER_LOOP;
-GATHER_DONE:
-	bar.sync 0;
+	.reg .pred %p<2>;
+	.reg .b32 %r<7>;
+	.reg .b64 %d<3>;
+	ld.param.u32 %r0, [position_mask];
+	ld.param.u32 %r1, [column];
+	and.b32 %r0, %r0, 31;
+	mov.u64 %d0, __mtp_columns;
+	mul.wide.u32 %d1, %r0, 4;
+	add.u64 %d0, %d0, %d1;
+	ld.const.u32 %r2, [%d0];
+	shl.b32 %r3, %r1, 2;
+	shr.b32 %r2, %r2, %r3;
+	and.b32 %r2, %r2, 15;
+	setp.eq.u32 %p0, %r2, 15;
+	setp.ge.u32 %p1, %r1, 8;
+	or.pred %p0, %p0, %p1;
+	selp.u32 %r4, 0xffffffff, %r2, %p0;
+	st.param.b32 [position], %r4;
 	ret;
 }
-
-// Store each expert's weighted down result in its distinct selected-slot plane.
-// The caller converts router coefficients to FP32 before entering this helper.
-.visible .func mtp_scatter_expert(
-	.param .b64 down, .param .b64 router_f32, .param .b64 map,
-	.param .b64 partials, .param .b32 expert, .param .b32 positions,
+// One warp scans each CTA's expert record; every warp reuses that routing word.
+// This synchronization is inside the existing persistent launch.
+.shared .align 8 .u64 __mtp_routing_result;
+.visible .func (.param .b64 routing) mtp_group_cta(
+	.param .b64 selected, .param .b32 positions, .param .b32 top_k,
+	.param .b32 expert)
+{
+	.reg .pred %p<2>;
+	.reg .b32 %r<5>;
+	.reg .b64 %d<4>;
+	.param .b64 selected_arg, warp_route;
+	.param .b32 positions_arg, top_arg, expert_arg;
+	mov.u32 %r0, %tid.x;
+	setp.ge.u32 %p0, %r0, 32;
+	@%p0 bra CTA_ROUTE_WAIT;
+	ld.param.u64 %d0, [selected];
+	ld.param.u32 %r1, [positions];
+	ld.param.u32 %r2, [top_k];
+	ld.param.u32 %r3, [expert];
+	st.param.b64 [selected_arg], %d0;
+	st.param.b32 [positions_arg], %r1;
+	st.param.b32 [top_arg], %r2;
+	st.param.b32 [expert_arg], %r3;
+	call.uni (warp_route), mtp_group_warp, (selected_arg,positions_arg,top_arg,expert_arg);
+	setp.ne.u32 %p0, %r0, 0;
+	@%p0 bra CTA_ROUTE_WAIT;
+	ld.param.u64 %d1, [warp_route];
+	mov.u64 %d2, __mtp_routing_result;
+	st.shared.u64 [%d2], %d1;
+CTA_ROUTE_WAIT:
+	bar.sync 0;
+	mov.u64 %d2, __mtp_routing_result;
+	ld.shared.u64 %d1, [%d2];
+	bar.sync 0;
+	st.param.b64 [routing], %d1;
+	ret;
+}
+// After the packed down projection completes across the existing grid, store
+// weighted compact columns in disjoint [position, selected-slot, row] planes.
+.visible .func mtp_scatter_warp(
+	.param .b64 down, .param .b64 router_f32, .param .b64 partials,
+	.param .b64 routing, .param .b32 expert, .param .b32 positions,
 	.param .b32 top_k, .param .b32 rows)
 {
 	.reg .pred %p<2>;
-	.reg .b32 %r<16>;
+	.reg .b32 %r<20>;
 	.reg .b64 %d<12>;
 	.reg .f32 %f<4>;
+	.param .b32 mask_arg, column_arg, mapped;
 	ld.param.u64 %d0, [down];
 	ld.param.u64 %d1, [router_f32];
-	ld.param.u64 %d2, [map];
-	ld.param.u64 %d3, [partials];
+	ld.param.u64 %d2, [partials];
+	ld.param.u64 %d3, [routing];
 	ld.param.u32 %r0, [expert];
 	ld.param.u32 %r1, [positions];
 	ld.param.u32 %r2, [top_k];
 	ld.param.u32 %r3, [rows];
-	ld.global.u32 %r4, [%d2];
-	mul.lo.u32 %r4, %r4, %r3;
-	mov.u32 %r5, %tid.x;
-	mov.u32 %r6, %ntid.x;
-SCATTER_LOOP:
-	setp.ge.u32 %p0, %r5, %r4;
-	@%p0 bra SCATTER_DONE;
-	div.u32 %r7, %r5, %r3;
-	rem.u32 %r8, %r5, %r3;
-	mul.wide.u32 %d4, %r7, 8;
-	add.u64 %d4, %d4, %d2;
-	add.u64 %d4, %d4, 8;
-	ld.global.v2.u32 {%r9, %r10}, [%d4];
-	mad.lo.u32 %r11, %r0, %r1, %r9;
-	mul.wide.u32 %d5, %r11, 4;
-	add.u64 %d5, %d5, %d1;
-	ld.global.f32 %f0, [%d5];
-	mul.wide.u32 %d5, %r5, 4;
-	add.u64 %d5, %d5, %d0;
-	ld.global.f32 %f1, [%d5];
+	cvt.u32.u64 %r4, %d3;
+	shr.u64 %d3, %d3, 32;
+	cvt.u32.u64 %r5, %d3;
+	popc.b32 %r6, %r4;
+	mul.lo.u32 %r6, %r6, %r3;
+	mov.u32 %r7, %tid.x;
+	mov.u32 %r8, %ntid.x;
+	mov.u32 %r9, %ctaid.x;
+	mad.lo.u32 %r7, %r9, %r8, %r7;
+	mov.u32 %r9, %nctaid.x;
+	mul.lo.u32 %r8, %r8, %r9;
+SCATTER_WARP_LOOP:
+	setp.ge.u32 %p0, %r7, %r6;
+	@%p0 bra SCATTER_WARP_DONE;
+	div.u32 %r10, %r7, %r3;
+	rem.u32 %r11, %r7, %r3;
+	st.param.b32 [mask_arg], %r4;
+	st.param.b32 [column_arg], %r10;
+	call.uni (mapped), mtp_column_position, (mask_arg, column_arg);
+	ld.param.u32 %r12, [mapped];
+	mul.lo.u32 %r13, %r12, 4;
+	shr.b32 %r13, %r5, %r13;
+	and.b32 %r13, %r13, 15;
+	mad.lo.u32 %r14, %r0, %r1, %r12;
+	mul.wide.u32 %d4, %r14, 4;
+	add.u64 %d4, %d4, %d1;
+	ld.global.cg.f32 %f0, [%d4];
+	mul.wide.u32 %d4, %r7, 4;
+	add.u64 %d4, %d4, %d0;
+	ld.global.cg.f32 %f1, [%d4];
 	mul.f32 %f2, %f0, %f1;
-	mad.lo.u32 %r11, %r9, %r2, %r10;
-	mad.lo.u32 %r11, %r11, %r3, %r8;
-	mul.wide.u32 %d5, %r11, 4;
-	add.u64 %d5, %d5, %d3;
-	st.global.f32 [%d5], %f2;
-	add.u32 %r5, %r5, %r6;
-	bra SCATTER_LOOP;
-SCATTER_DONE:
+	mad.lo.u32 %r14, %r12, %r2, %r13;
+	mad.lo.u32 %r14, %r14, %r3, %r11;
+	mul.wide.u32 %d4, %r14, 4;
+	add.u64 %d4, %d4, %d2;
+	st.global.f32 [%d4], %f2;
+	add.u32 %r7, %r7, %r8;
+	bra SCATTER_WARP_LOOP;
+SCATTER_WARP_DONE:
 	ret;
 }
-
 // Call after the existing grid completion barrier. Output is column-major.
 .visible .func mtp_combine_experts(
 	.param .b64 selected, .param .b64 partials, .param .b64 output,
@@ -221,7 +272,7 @@ COMBINE_LOOP:
 	mul.lo.u32 %r8, %r6, %r8;
 	mul.wide.u32 %d3, %r8, 4;
 	add.u64 %d3, %d3, %d0;
-	ld.global.u32 %r8, [%d3];
+	ld.global.cg.u32 %r8, [%d3];
 	mov.u32 %r9, 0;
 	mov.f32 %f0, 0f00000000;
 COMBINE_SLOT:
@@ -231,7 +282,7 @@ COMBINE_SLOT:
 	mad.lo.u32 %r10, %r10, %r2, %r7;
 	mul.wide.u32 %d3, %r10, 4;
 	add.u64 %d3, %d3, %d1;
-	ld.global.f32 %f1, [%d3];
+	ld.global.cg.f32 %f1, [%d3];
 	add.f32 %f0, %f0, %f1;
 	add.u32 %r9, %r9, 1;
 	bra COMBINE_SLOT;
@@ -244,97 +295,17 @@ COMBINE_STORE:
 COMBINE_DONE:
 	ret;
 }
-// Warp-local routing. Every warp calls collectively with the same expert.
-// Selected records have stride top_k+1. Positions <=5 and top_k <=16.
-// Result mask bits name source positions; four slot bits belong to each position.
-.visible .func (.param .b64 routing) mtp_group_warp(
-	.param .b64 selected, .param .b32 positions, .param .b32 top_k,
-	.param .b32 expert)
+// Cache this word before the packed weight loop; one nibble names each column.
+.visible .func (.param .b32 columns) mtp_column_word(.param .b32 position_mask)
 {
-	.reg .pred %p<4>;
-	.reg .b32 %r<18>;
-	.reg .b64 %d<5>;
-	ld.param.u64 %d0, [selected];
-	ld.param.u32 %r0, [positions];
-	ld.param.u32 %r1, [top_k];
-	ld.param.u32 %r2, [expert];
-	mov.u32 %r3, %tid.x;
-	and.b32 %r3, %r3, 31;
-	mov.u32 %r4, 0;
-	mov.u32 %r5, 0;
-	setp.lt.u32 %p0, %r3, %r0;
-	@!%p0 bra WARP_JOIN;
-	add.u32 %r6, %r1, 1;
-	mul.lo.u32 %r6, %r6, %r3;
-	mul.wide.u32 %d1, %r6, 4;
-	add.u64 %d1, %d1, %d0;
-	ld.global.u32 %r7, [%d1];
-WARP_SLOT:
-	setp.ge.u32 %p0, %r5, %r7;
-	@%p0 bra WARP_JOIN;
-	add.u32 %r8, %r5, 1;
-	mul.wide.u32 %d2, %r8, 4;
-	add.u64 %d2, %d2, %d1;
-	ld.global.u32 %r9, [%d2];
-	setp.eq.u32 %p1, %r9, %r2;
-	@%p1 bra WARP_FOUND;
-	add.u32 %r5, %r5, 1;
-	bra WARP_SLOT;
-WARP_FOUND:
-	mov.u32 %r4, 1;
-	mul.lo.u32 %r8, %r3, 4;
-	shl.b32 %r4, %r5, %r8;
-	mov.u32 %r5, 1;
-	bra WARP_REDUCE;
-WARP_JOIN:
-	mov.u32 %r4, 0;
-	mov.u32 %r5, 0;
-WARP_REDUCE:
-	setp.ne.u32 %p0, %r5, 0;
-	vote.ballot.b32 %r10, %p0;
-	shfl.bfly.b32 %r11, %r4, 16, 31;
-	or.b32 %r4, %r4, %r11;
-	shfl.bfly.b32 %r11, %r4, 8, 31;
-	or.b32 %r4, %r4, %r11;
-	shfl.bfly.b32 %r11, %r4, 4, 31;
-	or.b32 %r4, %r4, %r11;
-	shfl.bfly.b32 %r11, %r4, 2, 31;
-	or.b32 %r4, %r4, %r11;
-	shfl.bfly.b32 %r11, %r4, 1, 31;
-	or.b32 %r4, %r4, %r11;
-	cvt.u64.u32 %d3, %r10;
-	cvt.u64.u32 %d4, %r4;
-	shl.b64 %d4, %d4, 32;
-	or.b64 %d3, %d3, %d4;
-	st.param.b64 [routing], %d3;
-	ret;
-}
-
-// Call from the packed matvec's activation load, rather than copying columns.
-// UINT_MAX means an inactive padded column, whose activation and scale are zero.
-.visible .func (.param .b32 position) mtp_column_position(
-	.param .b32 position_mask, .param .b32 column)
-{
-	.reg .pred %p<2>;
-	.reg .b32 %r<7>;
+	.reg .b32 %r<3>;
+	.reg .b64 %d<3>;
 	ld.param.u32 %r0, [position_mask];
-	ld.param.u32 %r1, [column];
-	mov.u32 %r2, 0;
-COLUMN_SKIP:
-	setp.ge.u32 %p0, %r2, %r1;
-	@%p0 bra COLUMN_FIND;
-	sub.u32 %r3, %r0, 1;
-	and.b32 %r0, %r0, %r3;
-	add.u32 %r2, %r2, 1;
-	bra COLUMN_SKIP;
-COLUMN_FIND:
-	setp.eq.u32 %p0, %r0, 0;
-	mov.u32 %r4, 0xffffffff;
-	@%p0 bra COLUMN_RETURN;
-	brev.b32 %r3, %r0;
-	bfind.u32 %r3, %r3;
-	sub.u32 %r4, 31, %r3;
-COLUMN_RETURN:
-	st.param.b32 [position], %r4;
+	and.b32 %r0, %r0, 31;
+	mov.u64 %d0, __mtp_columns;
+	mul.wide.u32 %d1, %r0, 4;
+	add.u64 %d0, %d0, %d1;
+	ld.const.u32 %r1, [%d0];
+	st.param.b32 [columns], %r1;
 	ret;
 }
