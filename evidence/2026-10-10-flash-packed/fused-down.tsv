@@ -1,0 +1,13 @@
+type	m	k	batch	experts	kind	warps	row_lanes	composed_evidence
+20	2560	640	1	1	2	8	8	results-t17-e1-n1.csv
+20	2560	640	1	2	2	8	8	results-t17-e2-n1.csv
+20	2560	640	1	3	2	8	8	results-t17-e3-n1.csv
+20	2560	640	1	1	2	16	8	results-t17-e1-n1.csv
+20	2560	640	1	2	2	16	8	results-t17-e2-n1.csv
+20	2560	640	1	3	2	16	8	results-t17-e3-n1.csv
+20	2560	640	2	1	2	8	8	results-t17-e1-n2.csv
+20	2560	640	2	2	2	8	8	results-t17-e2-n2.csv
+20	2560	640	2	3	2	8	8	results-t17-e3-n2.csv
+20	2560	640	2	1	2	16	8	results-t17-e1-n2.csv
+20	2560	640	2	2	2	16	8	results-t17-e2-n2.csv
+20	2560	640	2	3	2	16	8	results-t17-e3-n2.csv
