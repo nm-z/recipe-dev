@@ -4650,7 +4650,9 @@ impl NativeModelIr {
 					if blocks != 0 {
 						// Keep running key sums in context and score only touched window blocks.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
-						let key_weights = &geometry.key_weights;
+						let key_weights = format!("%n{index}.index.weights");
+						ir.push_str(&ptr_gep(backend, "weights", self.plans[geometry.key_weights].weight_offset, &format!("n{index}.index.weights")));
+
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						// The selection clears the block score gradients the reverse pass
@@ -4665,13 +4667,13 @@ impl NativeModelIr {
 						let touched = NodeWindow { begin: first, span: count };
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"
+								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
 						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared} )\n"
+								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
@@ -8345,6 +8347,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
+	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes()]); }
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
@@ -8713,13 +8716,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
 				validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
 			}
+			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
+			ptx_source.push_str(MtpBatch::ptx());
+			ptx_source.push_str(p2p_functions());
+			fs::write(output, ptx_source).map_err(|error| RecipeError::new(format!("cannot append MTP PTX: {error}")))?;
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
 				let mut command = Command::new(assembler);
 				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
 				let assembled = native_command(command, "NVIDIA PTX assembler", key);
-				fs::remove_file(&ptx).map_err(|error| RecipeError::new(format!("cannot remove native PTX: {error}")))?;
 				assembled?;
 				return Ok(Vec::new());
 			}
@@ -15982,6 +15988,7 @@ pub struct Bound {
 struct MtpHead {
 	bound: Bound,
 	embedding: StoredWeight,
+	lookup_hash: Option<RowHash>,
 	width: usize,
 	lanes: usize,
 	tokens: usize,
@@ -15993,7 +16000,7 @@ impl MtpHead {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("MTP architecture is not a string"))?;
 		require(matches!(architecture, "qwen35" | "qwen4exp"), format!("MTP binding does not support architecture {architecture:?}"))?;
 		require(target.value("general.architecture").and_then(GgufValue::text) == Some(architecture), "MTP and main-model architectures differ")?;
-		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default() };
 		require(builder.integer("nextn_predict_layers")? == 1, "Qwen MTP requires one prediction layer")?;
 		let layer = builder.integer("block_count")?.checked_sub(1).ok_or_else(|| RecipeError::new("MTP block count is zero"))?;
 		require(target.integer_at(&format!("{architecture}.block_count"))? == layer, "MTP layer does not follow the main model's layers")?;
@@ -16026,7 +16033,14 @@ impl MtpHead {
 		}
 		let mut model = recipe.model().e(file.float_at(&format!("{architecture}.attention.layer_norm_rms_epsilon"))?).push(Operation::Join(lanes));
 		let attention = builder.open(layer, "attn", &dimensions)?;
-		let mut attention = builder.attention(attention, layer, &dimensions)?.fp(32);
+		let mut attention = builder.attention(attention, layer, &dimensions)?.edit(|model| {
+			// Name each operation explicitly; a trailing fp after rope names rotary alone.
+			let block = model.blocks.last_mut().expect("MTP attention block is absent");
+			block.blck_precision = Some(Compute::FP32);
+			block.qk_precision = Some(Compute::FP32);
+			block.rope_precision = Some(Compute::FP32);
+		});
+
 		let mut scaling = None;
 		let mut consistent = true;
 		visit_attention(&target_model.blocks, &mut |block| {
@@ -16040,7 +16054,7 @@ impl MtpHead {
 		model = builder.close(model, attention, &dimensions);
 		let ffn = builder.open(layer, "ffn", &dimensions)?;
 		let ffn = match &dimensions.experts {
-			Some(experts) => builder.experts(ffn, layer, experts, &dimensions)?,
+			Some(experts) => builder.experts(ffn, layer, experts, &dimensions)?.fp(32),
 			None => builder.feed_forward(ffn, layer, &dimensions)?,
 		};
 		model = builder.close(model, ffn, &dimensions);
@@ -16069,14 +16083,16 @@ impl MtpHead {
 		if let Some(scale) = builder.optional("output_norm.weight") {
 			require(scale.shape == [width as u64], "MTP checkpoint output_norm has an invalid shape")?;
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
+		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("MTP tensors have no binding: {}", unread.join(", ")))?;
-		let tensors = builder.consumed.len();
+		let tensors = builder.plan.tensors.len();
 		let plan = builder.plan;
-		let tokens = natural("MTP draft tokens", env!("RECIPE_MTP_TOKENS"))?;
+		let tokens = std::env::var("RECIPE_MTP_DRAFTS").ok().map(|value| count("MTP draft tokens", &value)).transpose()?.unwrap_or(natural("MTP draft tokens", env!("RECIPE_MTP_TOKENS"))?);
+		require(tokens <= 4, "MTP draft tokens must be in 0..=4")?;
 		let probs = env!("RECIPE_MTP_PROBS").parse::<f64>().map_err(|_| RecipeError::new("MTP probability is invalid"))?;
 		let embedding = if shared { target.embedding_stored(&embedding)? } else { file.embedding_stored(&embedding)? };
-		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, width, lanes, tokens, probs })
+		let lookup_hash = MtpLookup::new(target)?.hash;
+		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, lookup_hash, width, lanes, tokens, probs })
 	}
 	fn graph(&self, positions: usize, device: &'static Gpu) -> Result<Graph> {
 		let stream = checked_mul(self.lanes, self.width, "MTP hidden stream")?;
@@ -16251,8 +16267,132 @@ impl MtpCheckpoint {
 		Ok(())
 	}
 }
+/// One token position and its selected-expert slot in a speculative target batch.
+#[derive(Clone, Copy, Debug)]
+pub struct MtpColumn {
+	pub position: usize,
+	pub slot: usize,
+	pub coefficient: f32,
+}
+/// All target columns routed to one expert. Read that expert's weights once per matvec.
+#[derive(Clone, Debug)]
+pub struct MtpExpertGroup {
+	pub expert: usize,
+	pub columns: Vec<MtpColumn>,
+	pub capacity: usize,
+}
+/// The grouping contract shared by the native persistent step and packed helpers.
+#[derive(Clone, Debug)]
+pub struct MtpBatch {
+	pub positions: usize,
+	pub top_k: usize,
+	pub experts: usize,
+	pub groups: Vec<MtpExpertGroup>,
+}
+impl MtpBatch {
+	/// Selected records are `[count, expert IDs...]` with stride `top_k + 1`.
+	/// Router coefficients are FP32 `[expert * positions + position]`.
+	pub fn from_selected(selected: &[i32], coefficients: &[f32], positions: usize, top_k: usize, experts: usize) -> Result<Self> {
+		require((1..=5).contains(&positions), "MTP target batch requires 1..=5 positions")?;
+		require(top_k > 0 && top_k <= experts && top_k <= 16, "MTP selected-expert count is invalid")?;
+		let stride = checked_add(top_k, 1, "MTP selected-expert stride")?;
+		require(selected.len() == checked_mul(positions, stride, "MTP selected-expert records")?, "MTP selected-expert record size differs")?;
+		require(coefficients.len() == checked_mul(experts, positions, "MTP router coefficients")?, "MTP router coefficient size differs")?;
+		let mut groups = BTreeMap::<usize, Vec<MtpColumn>>::new();
+		for position in 0..positions {
+			let record = &selected[position * stride..(position + 1) * stride];
+			let count = usize::try_from(record[0]).map_err(|_| RecipeError::new("MTP selected-expert count is negative"))?;
+			require(count <= top_k, "MTP selected-expert count exceeds top-k")?;
+			let mut seen = BTreeSet::new();
+			for (slot, expert) in record[1..1 + count].iter().enumerate() {
+				let expert = usize::try_from(*expert).map_err(|_| RecipeError::new("MTP selected expert is negative"))?;
+				require(expert < experts && seen.insert(expert), "MTP selected expert is outside its table or repeated")?;
+				let coefficient = coefficients[expert * positions + position];
+				require(coefficient.is_finite(), "MTP router coefficient is nonfinite")?;
+				groups.entry(expert).or_default().push(MtpColumn { position, slot, coefficient });
+			}
+		}
+		let groups = groups.into_iter().map(|(expert, columns)| {
+			let capacity = columns.len().next_power_of_two();
+			MtpExpertGroup { expert, columns, capacity }
+		}).collect();
+		Ok(Self { positions, top_k, experts, groups })
+	}
+	/// Linkable device functions, without a second PTX module header.
+	pub fn ptx() -> &'static str {
+		let source = include_str!("mtp.ptx");
+		&source[source.find("// Every warp").expect("MTP PTX function boundary is absent")..]
+	}
+}
+impl MtpExpertGroup {
+	/// Low word: original-position mask. High word: selected-slot nibbles by position.
+	pub fn routing(&self) -> u64 {
+		let mut mask = 0_u32;
+		let mut slots = 0_u32;
+		for column in &self.columns {
+			mask |= 1 << column.position;
+			slots |= (column.slot as u32) << (4 * column.position);
+		}
+		u64::from(mask) | (u64::from(slots) << 32)
+	}
+}
+/// Verified successors indexed by the model's n-gram rows and the exact token context.
+/// PLE rows contain embeddings; the successor IDs come only from committed tokens.
+#[derive(Clone, Default)]
+struct MtpLookup {
+	hash: Option<RowHash>,
+	entries: BTreeMap<(Vec<usize>, Vec<u32>), u32>,
+	observed: usize,
+}
+impl MtpLookup {
+	fn new(file: &Gguf) -> Result<Self> {
+		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
+		let hash = if file.value("ngram.heads").is_some() || file.value(&format!("{architecture}.ple.ngram_size")).is_some() {
+			Some(Ngram::new(file)?.hash().clone())
+		} else { None };
+		Ok(Self { hash, ..Self::default() })
+	}
+	fn clear(&mut self) { self.entries.clear(); self.observed = 0; }
+	fn order(&self) -> usize { self.hash.as_ref().map_or(8, |hash| hash.ngram.max(2)) }
+	fn key(&self, ids: &[u32], end: usize, order: usize) -> (Vec<usize>, Vec<u32>) {
+		let context = ids[end - order..end].to_vec();
+		let rows = self.hash.as_ref().filter(|_| order >= 2).map_or_else(Vec::new, |hash| {
+			let rows = hash.rows_at(ids, end - 1);
+			let first = (order - 2) * hash.per_order;
+			rows[first..first + hash.per_order].to_vec()
+		});
+		(rows, context)
+	}
+	fn observe(&mut self, ids: &[u32], stop: &[u32]) {
+		if ids.len() < self.observed { self.clear(); }
+		for successor in self.observed.max(1)..ids.len() {
+			for order in 2..=self.order().min(successor) {
+				if ids[successor - order..successor].iter().any(|id| stop.contains(id)) { break; }
+				self.entries.insert(self.key(ids, successor, order), ids[successor]);
+			}
+		}
+		self.observed = ids.len();
+	}
+	fn propose(&self, ids: &[u32], limit: usize, stop: &[u32], suppressed: &[u32]) -> Vec<u32> {
+		let mut context = ids.to_vec();
+		let begin = context.len();
+		while context.len() - begin < limit {
+			let next = (2..=self.order().min(context.len())).rev().find_map(|order| {
+				let suffix = &context[context.len() - order..];
+				if suffix.iter().any(|id| stop.contains(id)) { return None; }
+				self.entries.get(&self.key(&context, context.len(), order)).copied().filter(|id| !suppressed.contains(id))
+			});
+			let Some(next) = next else { break; };
+			context.push(next);
+			if stop.contains(&next) { break; }
+		}
+		context[begin..].to_vec()
+	}
+}
 struct MtpRuntime {
 	head: MtpHead,
+	lookup: MtpLookup,
+	lookup_enabled: bool,
 	placed: Placed,
 	samples: Vec<f64>,
 	hidden: Vec<Vec<f64>>,
@@ -16265,18 +16405,26 @@ struct MtpRuntime {
 }
 impl MtpRuntime {
 	fn place(head: MtpHead, sequence: usize, devices: &'static [&'static Gpu]) -> Result<Self> {
+		let lookup = MtpLookup { hash: head.lookup_hash.clone(), ..MtpLookup::default() };
+		let lookup_enabled = match std::env::var("RECIPE_MTP_LOOKUP").ok().as_deref() {
+			None | Some("1") => true,
+			Some("0") => false,
+			Some(_) => return Err(RecipeError::new("RECIPE_MTP_LOOKUP must be 0 or 1")),
+		};
+		let devices = &devices[..1];
 		let mut graph = head.graph(sequence, devices[0])?;
 		retain_mtp_hidden(&mut graph)?;
 		let (split, ranges, resident, movement, moved) = place_ranges(&graph, &[], devices, Config::load()?.precision, &[])?;
 		let samples = Vec::new();
 		let placed = Placed { source: PlacedSource::Bound(graph.input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved };
-		Ok(Self { head, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false })
+		Ok(Self { head, lookup, lookup_enabled, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false })
 	}
 	fn clear(&mut self) {
 		self.ids.clear();
 		self.logits.clear();
 		self.hidden.clear();
 		self.hidden_released = 0;
+		self.lookup.clear();
 		self.head_valid = 0;
 		self.placed.clear();
 	}
@@ -16312,14 +16460,14 @@ impl MtpRuntime {
 			Ok(head) => head,
 			Err(error) => { self.poisoned = true; target.restore(main)?; return Err(error); }
 		};
-		let saved = (self.samples.clone(), self.hidden.clone(), self.hidden_released, self.ids.clone(), self.logits.clone(), self.head_valid);
+		let saved = (self.samples.clone(), self.hidden.clone(), self.hidden_released, self.ids.clone(), self.logits.clone(), self.head_valid, self.lookup.clone());
 		match self.decode_inner(main, prompt, sampler, stop, budget, progress, emit) {
 			Ok(generation) => Ok(generation),
 			Err(error) => {
 				self.poisoned = true;
 				let target_result = target.restore(main);
 				let head_result = head.restore(&self.placed);
-				(self.samples, self.hidden, self.hidden_released, self.ids, self.logits, self.head_valid) = saved;
+				(self.samples, self.hidden, self.hidden_released, self.ids, self.logits, self.head_valid, self.lookup) = saved;
 				target_result?; head_result?;
 				Err(error)
 			}
@@ -16343,8 +16491,8 @@ impl MtpRuntime {
 			self.hidden.resize_with(prompt.len(), Vec::new);
 			for (slot, hidden) in self.hidden[cached..prompt.len()].iter_mut().zip(mtp_hidden(main, cached, prompt.len())?) { *slot = hidden; }
 		}
-		if budget > 0 { self.refresh(prompt, self.head_valid.min(cached.saturating_sub(1)), prompt.len() - 1)?; }
 		self.ids = prompt.to_vec();
+		if self.lookup_enabled { self.lookup.observe(prompt, stop); }
 		let boundary = Instant::now();
 		if let Some(progress) = progress { progress.prefilled(prompt.len()); progress.phase(if budget > 0 { "tg" } else { "done" }, boundary); }
 		let mut generation = Generation { ids: prompt.to_vec(), logits: self.logits.clone(), cached, prefill_seconds: boundary.duration_since(started).as_secs_f64(), generation_seconds: 0.0, mtp: MtpReport::default(), reference: ReferenceReport::default() };
@@ -16355,6 +16503,7 @@ impl MtpRuntime {
 		let mut next = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&self.logits, &generation.ids));
 		let mut stopped = None;
 		while generation.ids.len() - prompt.len() < budget && !INTERRUPTED.load(Ordering::Acquire) {
+			let step_started = Instant::now();
 			let base = generation.ids.len();
 			generation.ids.push(next);
 			emit(next)?;
@@ -16362,11 +16511,16 @@ impl MtpRuntime {
 			if let Some(progress) = progress { progress.generated(true); }
 			let remaining = budget - (generation.ids.len() - prompt.len());
 			if remaining == 0 { break; }
-			let limit = self.head.tokens.min(remaining.saturating_sub(1));
+			let limit = self.head.tokens.min(remaining);
+			let draft_started = Instant::now();
+			let lookup = if self.lookup_enabled { self.lookup.propose(&generation.ids, limit, stop, &sampler.suppressed) } else { Vec::new() };
+			let from_lookup = !lookup.is_empty();
+			if !from_lookup && limit > 0 { self.refresh(&generation.ids, self.head_valid, base - 1)?; }
 			let mut proposed = vec![next];
-			let mut hidden = self.hidden[base - 1].clone();
-			let mut head_checkpoint = None;
-			for offset in 0..limit {
+			proposed.extend(lookup);
+			let mut hidden = if !from_lookup && limit > 0 { self.hidden[base - 1].clone() } else { Vec::new() };
+			let mut head_prefix = None;
+			for offset in 0..if from_lookup { 0 } else { limit } {
 				let position = base + offset - 1;
 				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
 				self.input(0, 1, proposed[offset], &hidden)?;
@@ -16374,26 +16528,31 @@ impl MtpRuntime {
 				if offset == 0 {
 					self.head_valid = position + 1;
 					self.release_hidden(self.head_valid)?;
-					head_checkpoint = Some(MtpCheckpoint::keep(&self.placed)?);
+					head_prefix = Some(self.head_valid as u32);
 				}
 				let logits = self.placed.last_logits(&output, position as u32, position as u32 + 1)?;
 				let mut draft_sampler = recipe.sampler().temperature(0.0);
 				draft_sampler.suppressed.clone_from(&sampler.suppressed);
 				let id = draft_sampler.sample(&logits, &[]);
-				let peak = logits[id as usize];
-				let mass = logits.iter().enumerate().filter(|(id, _)| !sampler.suppressed.contains(&(*id as u32))).map(|(_, value)| (value - peak).exp()).sum::<f64>();
-				if mass.recip() < self.head.probs { break; }
+				if self.head.probs > 0.0 {
+					let peak = logits[id as usize];
+					let mass = logits.iter().enumerate().filter(|(id, _)| !sampler.suppressed.contains(&(*id as u32))).map(|(_, value)| (value - peak).exp()).sum::<f64>();
+					if mass.recip() < self.head.probs { break; }
+				}
 				proposed.push(id);
-				hidden = mtp_hidden(&self.placed, position, position + 1)?.remove(0);
 				if stop.contains(&id) { break; }
+				if offset + 1 < limit { hidden = mtp_hidden(&self.placed, position, position + 1)?.remove(0); }
 			}
 			for (slot, id) in samples[base..].iter_mut().zip(&proposed) { *slot = f64::from(*id); }
 			let end = base + proposed.len();
+			let draft_seconds = draft_started.elapsed().as_secs_f64();
+			let verify_started = Instant::now();
 			let predictions = main.run_window(&samples, base as u32, end as u32)?;
 			generation.mtp.drafted += proposed.len() - 1;
 			generation.mtp.verifications += 1;
 			self.hidden.resize_with(end, Vec::new);
 			for (slot, hidden) in self.hidden[base..end].iter_mut().zip(mtp_hidden(main, base, end)?) { *slot = hidden; }
+			let verify_seconds = verify_started.elapsed().as_secs_f64();
 			let output_tape = main.tapes[0].last().unwrap();
 			let mut accepted = 1;
 			for offset in 0..proposed.len() {
@@ -16414,17 +16573,37 @@ impl MtpRuntime {
 			generation.mtp.rejected += proposed.len() - accepted;
 			let committed = base + accepted - usize::from(terminal);
 			if committed < end { main.commit_mtp_prefix(committed as u32)?; }
-			if let Some(checkpoint) = head_checkpoint { checkpoint.restore(&self.placed)?; }
+			let ran_head = head_prefix.is_some();
+			if let Some(prefix) = head_prefix { self.placed.commit_mtp_prefix(prefix)?; }
 			self.ids = generation.ids[..committed.min(generation.ids.len())].to_vec();
 			self.hidden.truncate(committed);
-			if let Some(progress) = progress { progress.mtp(generation.mtp); }
+			if self.lookup_enabled { self.lookup.observe(&generation.ids, stop); }
 			generation.logits = self.logits.clone();
 			if terminal {
 				self.logits = output_tape.logits_at(&predictions, committed - 1)?;
-				break;
+			} else if ran_head {
+				// Replace speculative head inputs with the verified main-model states.
+				self.refresh(&generation.ids, base, base + accepted - 1)?;
 			}
-			// Replace speculative head inputs with the verified main-model states.
-			self.refresh(&generation.ids, if limit > 0 { base } else { base - 1 }, base + accepted - 1)?;
+			let drafts = proposed.len() - 1;
+			let accepted_drafts = accepted - 1;
+			let step_seconds = step_started.elapsed().as_secs_f64();
+			generation.mtp.draft_seconds += draft_seconds;
+			generation.mtp.verify_seconds += verify_seconds;
+			generation.mtp.step_seconds += step_seconds;
+			if from_lookup {
+				generation.mtp.lookup_drafted += drafts;
+				generation.mtp.lookup_accepted += accepted_drafts;
+			} else { generation.mtp.head_drafted += drafts; }
+			let observation = &mut generation.mtp.batches[drafts];
+			observation.verifications += 1;
+			observation.positions += proposed.len();
+			observation.accepted += accepted_drafts;
+			observation.verify_seconds += verify_seconds;
+			observation.step_seconds += step_seconds;
+			if let Some(progress) = progress { progress.mtp(generation.mtp); }
+			if terminal { break; }
+
 		}
 		let ended = stopped.unwrap_or_else(Instant::now);
 		generation.generation_seconds = if budget > 0 { ended.duration_since(boundary).as_secs_f64() } else { 0.0 };
@@ -16434,11 +16613,33 @@ impl MtpRuntime {
 		Ok(generation)
 	}
 }
+/// A target and its main-die MTP head, kept resident across requests and draft-cap sweeps.
+pub struct MtpPlaced {
+	main: Placed,
+	runtime: MtpRuntime,
+}
+impl MtpPlaced {
+	/// Change draft count without replacing either placement or reloading weights.
+	pub fn decode(&mut self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, drafts: usize, lookup: bool, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		require(drafts <= 4, "MTP draft tokens must be in 0..=4")?;
+		self.runtime.head.tokens = drafts;
+		self.runtime.lookup_enabled = lookup;
+		self.runtime.decode(&self.main, prompt, sampler, stop, budget, None, emit)
+	}
+	/// Clear carried state and lookup successors while retaining both weight allocations.
+	pub fn clear(&mut self) { self.main.clear(); self.runtime.clear(); }
+	pub fn main(&self) -> &Placed { &self.main }
+	pub fn head(&self) -> &Placed { &self.runtime.placed }
+	pub fn memory(&self) -> Vec<DeviceMemory> {
+		let mut memory = self.main.memory();
+		memory.extend(self.runtime.placed.memory());
+		memory
+	}
+}
 /// Walks the standard metadata and tensor names of one file, emitting the
 /// Recipe blocks and, beside every block, the plan entries its weighted nodes
 /// take, in the order the lowering pushes those nodes.
 struct Builder<'a> {
-	consumed: BTreeSet<String>,
 	file: &'a Gguf,
 	architecture: &'a str,
 	rope: RopePairs,
@@ -16487,7 +16688,7 @@ impl<'a> Builder<'a> {
 			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: BTreeSet::new() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -17284,6 +17485,18 @@ impl Infer {
 		self.mtp = Some(path.as_ref().to_path_buf());
 		self
 	}
+	/// Keep target and MTP placements resident while decoding with 0..=4 drafts per request.
+	pub fn place_mtp(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Result<MtpPlaced> {
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("MTP placement requires GGUF data"))?;
+		let path = self.mtp.as_ref().ok_or_else(|| RecipeError::new("MTP placement requires an MTP checkpoint"))?;
+		require(positions > 0, "MTP placement has no context positions")?;
+		let head = MtpHead::open(path, file, model)?;
+		let bound = explicit_bound(file, model, false)?;
+		let devices = selected_gpus()?;
+		let runtime = MtpRuntime::place(head, positions, devices)?;
+		let main = place_bound_observed(&bound, positions, split, devices, 5, tensor_observation_mask(&self.log))?;
+		Ok(MtpPlaced { main, runtime })
+	}
 	/// Keep the explicit Model+Data declaration resident for full forwards,
 	/// incremental decode, or serving through the same persistent stepper.
 	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
@@ -17544,7 +17757,7 @@ fn with_last_projection(model: &Model) -> Model {
 /// longest fitting length follows from it, and that length is checked and
 /// stepped down while it is over.
 fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static Gpu, ceiling: usize, observations: u8) -> Result<usize> {
-	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	let reserve = placement_reserve_bytes()? as u64;
 	let free = device.free_bytes()?.saturating_sub(reserve);
 	let bytes_at = |length: usize| -> Result<u64> {
 		let samples = vec![0.0; length];
@@ -17599,7 +17812,7 @@ fn visit_attention(blocks: &[Block], visit: &mut impl FnMut(&AttentionBlock)) {
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -17958,12 +18171,38 @@ impl Sampler {
 }
 /// What `decode` produced: the prompt followed by the generated ids, the logits
 /// of the last forward, and elapsed seconds for prefill and generation.
+/// Totals for target verification batches with one fixed number of draft tokens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MtpBatchReport {
+	pub verifications: usize,
+	pub positions: usize,
+	pub accepted: usize,
+	pub verify_seconds: f64,
+	pub step_seconds: f64,
+}
+impl MtpBatchReport {
+	pub fn tokens_per_step(&self) -> f64 { if self.verifications == 0 { 0.0 } else { (self.verifications + self.accepted) as f64 / self.verifications as f64 } }
+	pub fn verify_seconds_per_step(&self) -> f64 { if self.verifications == 0 { 0.0 } else { self.verify_seconds / self.verifications as f64 } }
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MtpReport {
 	pub drafted: usize,
 	pub accepted: usize,
 	pub rejected: usize,
 	pub verifications: usize,
+	pub head_drafted: usize,
+	pub lookup_drafted: usize,
+	pub lookup_accepted: usize,
+	pub draft_seconds: f64,
+	pub verify_seconds: f64,
+	pub step_seconds: f64,
+	/// Index is the actual draft count, 0..=4; each verification also evaluates its leading token.
+	pub batches: [MtpBatchReport; 5],
+}
+impl MtpReport {
+	pub fn acceptance_rate(&self) -> f64 { if self.drafted == 0 { 0.0 } else { self.accepted as f64 / self.drafted as f64 } }
+	pub fn tokens_per_step(&self) -> f64 { if self.verifications == 0 { 0.0 } else { (self.verifications + self.accepted) as f64 / self.verifications as f64 } }
+	pub fn lookup_acceptance_rate(&self) -> f64 { if self.lookup_drafted == 0 { 0.0 } else { self.lookup_accepted as f64 / self.lookup_drafted as f64 } }
 }
 pub struct Generation {
 	pub mtp: MtpReport,
@@ -18619,6 +18858,104 @@ enum PlacedSource {
 	Saved(Vec<bundle::SemanticGraph>),
 	Bound(Shape, Vec<u32>),
 }
+/// Device functions for a persistent Flash-Next token kernel. Append this text
+/// after the caller's PTX header and call `p2p_wait` and `p2p_publish` in that kernel.
+/// Every payload writer must call publication; launch no more than one CTA per SM.
+pub fn p2p_functions() -> &'static str {
+	let source = include_str!("barrier.ptx");
+	let start = source.find("// Hand-owned sm_52 peer publication.").expect("owned P2P functions");
+	let end = source[start..].find("// Persistent all-SM packed layer chain.").expect("owned P2P function boundary") + start;
+	&source[start..end]
+}
+/// A receiving die's resident peer packet and local CTA completion slots.
+/// Allocate alongside the weight holder and retain across tokens. Before reuse
+/// or destruction, finish both dies' previous token. Sequence zero means empty.
+pub struct PeerPacket {
+	gpu: &'static Gpu,
+	packet: u64,
+	slots: u64,
+	ctas: u32,
+	sequence: u32,
+	payload_bytes: usize,
+}
+impl PeerPacket {
+	pub const PAYLOAD_BYTES: usize = 16384;
+	pub const SEQUENCE_OFFSET: u64 = 16384;
+	pub const SLOT_STRIDE: usize = 128;
+	pub const PACKET_BYTES: usize = 16452;
+
+	/// Use a local named NVIDIA device from `RECIPE_DEVICE`.
+	pub fn new(name: &str) -> Result<Self> { Self::with_payload(name, Self::PAYLOAD_BYTES) }
+	/// Hold complete hidden streams or several verification columns in one packet.
+	pub fn with_payload(name: &str, payload_bytes: usize) -> Result<Self> {
+		require(payload_bytes != 0 && payload_bytes % 16 == 0, "P2P payload must be a nonzero multiple of 16 bytes")?;
+		let packet_bytes = checked_add(payload_bytes, Self::PACKET_BYTES - Self::PAYLOAD_BYTES, "P2P packet bytes")?;
+		#[cfg(nvidia)]
+		{
+			let gpu = device(Some(name))?;
+			let ctas = match &gpu.driver { Driver::Cuda(driver) => driver.cus, _ => return Err(RecipeError::new("P2P requires a local NVIDIA device")) };
+			require(ctas != 0 && ctas <= 32, "P2P coordinator supports one CTA per SM on devices with 1..32 SMs")?;
+			let packet = gpu.allocate_bytes(packet_bytes)?;
+			let slots = match gpu.allocate_bytes(ctas as usize * Self::SLOT_STRIDE) {
+				Ok(slots) => slots,
+				Err(error) => { gpu.free(packet); return Err(error); }
+			};
+			let value = Self { gpu, packet, slots, ctas, sequence: 0, payload_bytes };
+			gpu.clear(packet, packet_bytes)?;
+			gpu.clear(slots, ctas as usize * Self::SLOT_STRIDE)?;
+			Ok(value)
+		}
+		#[cfg(not(nvidia))]
+		{ let _ = (name, packet_bytes); Err(RecipeError::new("P2P requires the NVIDIA backend")) }
+	}
+	pub fn address(&self) -> u64 { self.packet }
+	pub fn sequence_address(&self) -> u64 { self.packet + self.payload_bytes as u64 }
+	pub fn payload_bytes(&self) -> usize { self.payload_bytes }
+	pub fn completion_address(&self) -> u64 { self.slots }
+	pub fn resident_ctas(&self) -> u32 { self.ctas }
+	/// Reserve a token's strictly increasing sequence range. The return value is
+	/// its base; hop h uses base+h. Exhaustion requires a new packet after completion.
+	pub fn reserve_sequences(&mut self, hops: u32) -> Result<u32> {
+		require(hops != 0, "P2P token must contain a hop")?;
+		let base = self.sequence;
+		self.sequence = base.checked_add(hops).ok_or_else(|| RecipeError::new("P2P sequence exhausted; allocate a new packet after completion"))?;
+		Ok(base)
+	}
+	/// Enable the sender's access to this receiving packet. No machine-memory fallback.
+	pub fn enable_sender(&self, sender: &Self) -> Result<()> {
+		require(!std::ptr::eq(self.gpu, sender.gpu), "P2P requires distinct dies")?;
+		#[cfg(nvidia)]
+		if let (Driver::Cuda(receiver), Driver::Cuda(source)) = (&self.gpu.driver, &sender.gpu.driver) {
+			let get: unsafe extern "C" fn(*mut i32) -> i32 = receiver._runtime.function(b"cuCtxGetDevice\0")?;
+			let can: unsafe extern "C" fn(*mut i32, i32, i32) -> i32 = receiver._runtime.function(b"cuDeviceCanAccessPeer\0")?;
+			let enable: unsafe extern "C" fn(Ptr, u32) -> i32 = source._runtime.function(b"cuCtxEnablePeerAccess\0")?;
+			let (mut destination, mut origin, mut available) = (0, 0, 0);
+			self.gpu.activate()?;
+			driver_status(Backend::Nvidia, unsafe { get(&mut destination) }, "peer receiving device")?;
+			sender.gpu.activate()?;
+			driver_status(Backend::Nvidia, unsafe { get(&mut origin) }, "peer sending device")?;
+			driver_status(Backend::Nvidia, unsafe { can(&mut available, origin, destination) }, "peer access capability")?;
+			require(available != 0, "CUDA peer access is unavailable")?;
+			let status = unsafe { enable(receiver.context, 0) };
+			if status == 704 { return Ok(()); }
+			return driver_status(Backend::Nvidia, status, "peer access enable");
+		}
+		Err(RecipeError::new("P2P requires two local NVIDIA devices"))
+	}
+	/// Select the packet's CUDA context for the caller's resident weights and kernel.
+	pub fn activate(&self) -> Result<()> { self.gpu.activate() }
+	/// Borrow the CUDA context handle for a forward kernel's driver integration.
+	/// The handle remains owned by Recipe and must not be released by the caller.
+	pub fn context_address(&self) -> usize {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.gpu.driver { return driver.context as usize; }
+		0
+	}
+}
+impl Drop for PeerPacket {
+	fn drop(&mut self) { self.gpu.free(self.slots); self.gpu.free(self.packet); }
+}
+
 /// A model placed across the selected devices: contiguous block ranges, each
 /// held by one persistent tape on its own device, run in sequence with the
 /// stream moved at every hop. The tapes are the model's state, so a decode
@@ -18746,9 +19083,13 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 /// boundary before it cuts no connection, so the device listed last takes the
 /// tail. A part that fits here is the tape the device later builds, so a
 /// placement that no device can hold is refused before any tape is created.
+fn placement_reserve_bytes() -> Result<usize> {
+	let value = std::env::var("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES").unwrap_or_else(|_| env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES").to_owned());
+	count("placement launch reserve bytes", &value)
+}
 fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
 	require(!devices.is_empty(), "placement selected no devices")?;
-	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	let reserve = placement_reserve_bytes()? as u64;
 	let available = |device: &&'static Gpu| device.free_bytes().map(|free| free.saturating_sub(reserve));
 	let mut starts = Vec::new();
 	for (index, node) in graph.nodes.iter().enumerate() {
@@ -18875,7 +19216,7 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 	// footprint measured_split uses. This check runs before range_tape can upload
 	// weights or allocate any device arena, and it runs for every graph in a
 	// multi-graph saved model.
-	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	let reserve = placement_reserve_bytes()? as u64;
 	let parts = split_graph(graph, &split)?;
 	for (part, device) in parts.iter().zip(devices) {
 		let required = part_bytes(part, precision)? as u64;
@@ -18935,7 +19276,6 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 		retain_mtp_hidden(&mut graph)?;
 		for node in &mut graph.nodes {
 			if node.op == Primitive::Delta { node.argument[5] = checkpoints as f64; }
-			require(node.op != Primitive::Attention || attention_blocks(node) == 0, "MTP rollback does not support indexed attention")?;
 		}
 	}
 	let input = graph.input;
@@ -19294,7 +19634,7 @@ impl Placed {
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					let predictions = self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None })?;
+					let predictions = self.forward_window_with_tokens(ranges, prepared, samples, begin as usize, begin, end, if graph == graphs.len() { progress } else { None })?;
 					ranges.last().ok_or_else(|| RecipeError::new("saved graph has no output range"))?.saved_predictions(predictions)
 				})
 			}
@@ -19313,20 +19653,27 @@ impl Placed {
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
-		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress)
+		let input = tapes.first().ok_or_else(|| RecipeError::new("placement has no range"))?.input;
+		let token_begin = if samples.len() == input.elements() { begin as usize } else { 0 };
+		self.forward_window_with_tokens(tapes, samples, samples, token_begin, begin, end, progress)
 	}
 	/// Every part receives the original token IDs, independently of transformed
 	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
-	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		require(begin <= end, "window begins after its end")?;
-		let token_window = tokens.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		let packed_input = samples.len() != first.input.elements();
+		let positions = (end - begin) as usize;
+		let token_window = tokens.get(token_begin..token_begin + positions).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+
 		for tape in tapes {
 			require(end <= tape.positions, "token window exceeds a persistent range")?;
 		}
 		for (start, count) in first.input_runs(begin, end) {
-			require(start.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
+			let source = if packed_input { (start / first.input.length) * positions + start % first.input.length - begin as usize } else { start };
+			require(source.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
 		}
+
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
@@ -19335,15 +19682,6 @@ impl Placed {
 		for tape in tapes {
 			tape.prepare_request(window.0, window.1)?;
 			window = tape.output_window(window.0, window.1)?;
-		}
-		for (start, count) in first.input_runs(begin, end) {
-			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
-		}
-		let packed_input = samples.len() != first.input.elements();
-		if tapes.iter().any(|tape| !tape.lookups.is_empty()) {
-			let start = if packed_input { 0 } else { begin as usize };
-			let token_window = samples.get(start..start + (end - begin) as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
-			tapes.iter().try_for_each(|tape| tape.write_tokens(begin as usize, token_window))?;
 		}
 		if packed_input && first.program.artifact.layout.request_control.is_some() {
 			first.write_samples(begin as usize, samples)?;
@@ -21036,19 +21374,24 @@ fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize
 	if !shared {
 		return Ok(());
 	}
-	// The shared expert is one more expert that every position takes. Its routing
-	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
-	// so the dispatch that runs the routed experts runs it under that per-position
-	// value and its gradient reaches the gate and the input through the same adjoints.
+	// The shared branch runs densely, then its scalar sigmoid gate scales the
+	// result. It does not produce a routed-expert selection record.
 	let dispatched = graph.source;
 	reset(graph, source, input);
-	// The gate is the `[width]` vector alone, trained or bound, so a view of it
-	// must hold exactly that many values.
 	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
 	lower_activation(graph, Activation::Sigmoid, config)?;
 	let gate = graph.source;
-	lower_experts(graph, source, input, gate, 1, 1, hidden, expert.clone(), config)?;
-	let gated = graph.source;
+	reset(graph, source, input);
+	let inherited_bias = graph.bias;
+	graph.bias = false;
+	let result = lower_glu(graph, hidden, activation, config);
+	graph.bias = inherited_bias;
+	result?;
+	let shared_output = graph.source;
+	reset(graph, gate, Shape { channels: 1, length: input.length });
+	push_node(graph, Primitive::Expand, input, 0, arguments(input.channels as f64, 0.0), -2)?;
+	let expanded_gate = graph.source;
+	let gated = binary(graph, shared_output, expanded_gate, input, ScalarOpcode::Multiply)?;
 	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
 	Ok(())
 }
@@ -25644,6 +25987,7 @@ impl Gpu {
 				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
+					require(bytes as u64 <= self.free_bytes()?, format!("{} allocation of {bytes} bytes exceeds usable device memory", self.name))?;
 					let mut pointer = 0;
 					self.status((driver.allocate)(&mut pointer, bytes), "allocation")?;
 					Ok(pointer)
@@ -25801,7 +26145,8 @@ impl Gpu {
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
 					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
-					Ok(free as u64)
+					let unusable = device_usable_bytes(&self.name)?.map_or(0, |usable| (total as u64).saturating_sub(usable));
+					Ok((free as u64).saturating_sub(unusable))
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
@@ -26000,6 +26345,11 @@ static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Dots chain devices under the most recent host prefix. Commas are invalid.
 /// `cpu` names the available CPU pool, not a physical socket.
 /// The first name is the primary device.
+fn device_usable_bytes(name: &str) -> Result<Option<u64>> {
+	let device = format!("{}:{name}", local_host()?);
+	env!("RECIPE_DEVICE_USABLE_BYTES").split(';').filter_map(|entry| entry.split_once('=')).find(|(entry, _)| *entry == device)
+		.map(|(_, bytes)| bytes.parse::<u64>().map_err(|error| RecipeError::new(format!("device-usable-bytes for {device} is invalid: {error}")))).transpose()
+}
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {

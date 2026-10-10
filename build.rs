@@ -2007,6 +2007,14 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
+	let usable = setting(&manifest, "device-usable-bytes")?.trim().strip_prefix('{').and_then(|value| value.strip_suffix('}')).ok_or_else(|| io::Error::other("device-usable-bytes must be a table"))?;
+	let usable = usable.split(',').map(str::trim).filter(|entry| !entry.is_empty()).map(|entry| {
+		let (device, bytes) = entry.split_once('=').ok_or_else(|| io::Error::other(format!("device-usable-bytes entry {entry} must be \"node:device\" = bytes")))?;
+		let (device, bytes) = (device.trim().trim_matches('"'), bytes.trim());
+		bytes.parse::<u64>().map_err(|error| io::Error::other(format!("device-usable-bytes for {device} must be a byte count: {error}")))?;
+		Ok(format!("{device}={bytes}"))
+	}).collect::<BuildResult<Vec<_>>>()?.join(";");
+	println!("cargo:rustc-env=RECIPE_DEVICE_USABLE_BYTES={usable}");
 	let mtp = manifest.split_once("[package.metadata.mtp]").ok_or_else(|| io::Error::other("[package.metadata.mtp] must be configured"))?.1;
 	let mtp = mtp.split("\n[").next().unwrap_or(mtp);
 	let tokens = setting(mtp, "tokens")?.parse::<u32>().ok().filter(|tokens| *tokens > 0)

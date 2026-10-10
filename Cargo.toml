@@ -32,6 +32,8 @@ attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 536870912
+# Archy allocations remain below die 0's bad VRAM band; die 6 is fenced.
+device-usable-bytes = { "archy:nv0" = 6186598400, "archy:nv6" = 0 }
 cpu-worker-threads = 0
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }

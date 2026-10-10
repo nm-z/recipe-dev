@@ -4717,13 +4717,14 @@ ret void
 ; earlier window left, so a decode step adds one key to one block.
 define internal void @attention_index_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
 i64 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width,
-i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
+i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i32 %input.length, i32 %input.origin ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64 %begin.wide = zext i32 %begin to i64 %end.wide = zext i32 %end to i64
 %length = udiv i64 %from.wide, %channels.wide
+%input.length.wide = zext i32 %input.length to i64 %input.origin.wide = zext i32 %input.origin to i64
 %index.query.channels = mul i64 %index.heads.wide, %index.width.wide
 %index.channels = add i64 %index.query.channels, %index.width.wide
-%row.stride = mul i64 %index.channels, %length
-%index.key.base = mul i64 %index.query.channels, %length
+%row.stride = mul i64 %index.channels, %input.length.wide
+%index.key.base = mul i64 %index.query.channels, %input.length.wide
 %blocks.numerator = add i64 %length, %select.block.wide
 %blocks.less = sub i64 %blocks.numerator, 1
 %blocks = udiv i64 %blocks.less, %select.block.wide
@@ -4785,7 +4786,8 @@ key.loop:
 %key.more = icmp ult i64 %key, %stop
 br i1 %key.more, label %key.prepare, label %exit
 key.prepare:
-%key.position = add i64 %key.origin, %key
+%key.relative = sub i64 %key, %input.origin.wide
+%key.position = add i64 %key.origin, %key.relative
 %cache.position = mul i64 %key, %index.width.wide
 %cache.local = add i64 %cache.row, %cache.position
 %raw.start = add i64 %raw.base, %cache.local
@@ -4797,7 +4799,7 @@ dim.loop:
 %dim.more = icmp ult i32 %dim, %index.width
 br i1 %dim.more, label %dim.step, label %key.step
 dim.step:
-%dim.wide = zext i32 %dim to i64 %dim.offset = mul i64 %dim.wide, %length
+%dim.wide = zext i32 %dim to i64 %dim.offset = mul i64 %dim.wide, %input.length.wide
 %dim.index = add i64 %key.position, %dim.offset
 %dim.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i64 %dim.index
 %dim.value = load double, ptr addrspace(1) %dim.ptr, align 8
@@ -4831,13 +4833,14 @@ ret void
 ; query's prefix; an earlier block uses its final filled position.
 define internal void @attention_select_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
 i64 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads,
-i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
+i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i32 %input.length, i32 %input.origin ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64
 %length = udiv i64 %from.wide, %channels.wide
+%input.length.wide = zext i32 %input.length to i64 %input.origin.wide = zext i32 %input.origin to i64
 %index.query.channels = mul i64 %index.heads.wide, %index.width.wide
 %index.channels = add i64 %index.query.channels, %index.width.wide
-%row.stride = mul i64 %index.channels, %length
-%index.key.base = mul i64 %index.query.channels, %length
+%row.stride = mul i64 %index.channels, %input.length.wide
+%index.key.base = mul i64 %index.query.channels, %input.length.wide
 %blocks.numerator = add i64 %length, %select.block.wide
 %blocks.less = sub i64 %blocks.numerator, 1
 %blocks = udiv i64 %blocks.less, %select.block.wide
@@ -4859,7 +4862,8 @@ i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode,
 %cache.row = mul i64 %cache.row.positions, %index.width.wide
 %row.base = mul i64 %row, %row.stride
 %key.origin = add i64 %row.base, %index.key.base
-%query.position = add i64 %row.base, %query
+%query.relative = sub i64 %query, %input.origin.wide
+%query.position = add i64 %row.base, %query.relative
 %count.less = udiv i64 %query, %select.block.wide
 %count.wide = add i64 %count.less, 1
 %count = trunc i64 %count.wide to i32
@@ -4887,7 +4891,7 @@ head.loop:
 br i1 %head.more, label %head.prepare, label %threshold.prepare
 head.prepare:
 %head.wide = zext i32 %head to i64 %head.offset = mul i64 %head.wide, %index.width.wide
-%head.plane = mul i64 %head.offset, %length
+%head.plane = mul i64 %head.offset, %input.length.wide
 %head.base = add i64 %query.position, %head.plane
 br label %score.loop
 score.loop:
@@ -4911,7 +4915,7 @@ score.dim.loop:
 %score.dim.more = icmp ult i32 %score.d, %index.width
 br i1 %score.dim.more, label %score.dim.step, label %score.store
 score.dim.step:
-%score.d.wide = zext i32 %score.d to i64 %score.dim.offset = mul i64 %score.d.wide, %length
+%score.d.wide = zext i32 %score.d to i64 %score.dim.offset = mul i64 %score.d.wide, %input.length.wide
 %score.query.index = add i64 %head.base, %score.dim.offset
 %score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i64 %score.query.index
 %score.query.value = load double, ptr addrspace(1) %score.query.ptr, align 8
