@@ -25257,11 +25257,11 @@ impl NativeTape {
 	fn request_bytes(&self) -> (usize, usize) {
 		self.request.lock().unwrap().as_ref().map_or((0, 0), |request| (request.input.bytes, request.output.bytes + request.hidden.bytes + request.lookups.iter().map(|buffer| buffer.bytes).sum::<usize>()))
 	}
-	/// The logits of the last reached position in `begin..end`, read from the full output tensor.
+	/// The logits of the last reached position, using the current request's output layout.
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let (_, reached) = self.output_window(begin, end)?;
 		require(reached != 0, "decode window reaches no output position")?;
-		select_last_logits(predictions, self.output, reached as usize - 1)
+		self.logits_at(predictions, reached as usize - 1)
 	}
 	fn logits_at(&self, predictions: &[f64], position: usize) -> Result<Vec<f64>> {
 		if predictions.len() == self.output.elements() { return select_last_logits(predictions, self.output, position); }
