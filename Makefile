@@ -27,7 +27,7 @@ $(BUILD)/probes.ptx: $(PACKED_EVIDENCE)/packed.cu $(BUILD)/codebooks.inc | $(BUI
 	mkdir -p $(BUILD)/tmp
 	TMPDIR=$(BUILD)/tmp $(NVCC) -Wno-deprecated-gpu-targets -arch=sm_52 -I$(LLAMA)/ggml/src -I$(BUILD) -ptx $< -o $@
 	sed -i 's/^\.version .*/.version 7.4/' $@
-$(BUILD)/selected.cu: $(PACKED_EVIDENCE)/packed.cu $(PACKED_EVIDENCE)/winners.tsv $(PACKED_EVIDENCE)/fixed-cta.tsv $(PACKED_EVIDENCE)/select-source.sh | $(BUILD)
+$(BUILD)/selected.cu: $(PACKED_EVIDENCE)/packed.cu $(PACKED_EVIDENCE)/winners.tsv $(PACKED_EVIDENCE)/fixed-cta.tsv $(PACKED_EVIDENCE)/cta-256.tsv $(PACKED_EVIDENCE)/select-source.sh | $(BUILD)
 	bash $(PACKED_EVIDENCE)/select-source.sh $(PACKED_EVIDENCE)/packed.cu $(PACKED_EVIDENCE)/winners.tsv $@ $(BUILD)/selected-configs.txt
 $(BUILD)/selected.ptx: $(BUILD)/selected.cu $(BUILD)/codebooks.inc
 	mkdir -p $(BUILD)/tmp

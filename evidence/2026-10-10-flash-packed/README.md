@@ -13,7 +13,7 @@ packed_matvec(type, capacity, active_columns, kind, row_lanes, position_mask,
 packed_matvec_wide(same parameters) -> u32
 ```
 
-`packed_matvec` dispatches only the measured configurations in `winners.tsv` and `fixed-cta.tsv`. Every format and capacity includes a 512-thread configuration for a persistent launch. The wide function accepts 1024 threads and capacities 1/2. Row lanes are 8/16. Capacity is 1/2/4/8. Every thread in the CTA calls together. Cooperating CTAs use consistent arguments and distinct logical ranks.
+`packed_matvec` dispatches only the measured configurations in `winners.tsv`, `fixed-cta.tsv`, and `cta-256.tsv`. Every format and capacity includes both 256-thread and 512-thread configurations for a persistent launch. The wide function accepts 1024 threads and capacities 1/2. Row lanes are 8/16. Capacity is 1/2/4/8. Every thread in the CTA calls together. Cooperating CTAs use consistent arguments and distinct logical ranks.
 
 - Split expert rows across the assigned logical CTA group; pass its rank as cta_index and its size as cta_count. Allocate the die's 16 CTAs across selected experts in proportion to weight bytes.
 - For a matrix shared by the grid, pass the CTA's logical rank and the cooperating CTA count.
@@ -48,6 +48,6 @@ Performance acceptance is not passed. The 85% target is 123.25 GB/s. The current
 
 Stock IQ2_XS/IQ3_XXS differs from the independently decoded algebra beyond the original 3e-6 float-noise threshold. Both errors are reported. The full-model 10% final-logit gate and 60/80 tok/s checkpoints are not measured by this harness.
 
-The shipped winners use the canonical format tables; unreferenced signed codebooks are removed. Tensor weights remain in their original GGUF layout. Follow-up codebook and spill reductions remain outside this snapshot until their measured configurations are selected.
+The shipped winners use the referenced canonical and signed format tables; unreferenced codebooks are removed. Tensor weights remain in their original GGUF layout. Follow-up codebook and spill reductions remain outside this snapshot until their measured configurations are selected.
 
-The shipped library contains the measured winner functions and the fastest measured 512-thread configuration for every shape and capacity. Unlisted kind/CTA/row-lane configurations return 0. Use winners.tsv for the unrestricted AOT choice, or fixed-cta.tsv for a 512-thread persistent launch; the full candidate generator and benchmark source remain in the evidence directory. The selected library replaces the 1.1-million-line artifact.
+The shipped library contains the measured winner functions and the fastest measured 512-thread configuration for every shape and capacity. Unlisted kind/CTA/row-lane configurations return 0. Use winners.tsv for the unrestricted AOT choice, or fixed-cta.tsv for a 512-thread persistent launch and cta-256.tsv for a 256-thread launch; the full candidate generator and benchmark source remain in the evidence directory. The selected library replaces the 1.1-million-line artifact.
