@@ -1771,6 +1771,9 @@ pub(crate) struct NativeLayout {
 	/// device clock per node, written by thread 0 as each node begins; a
 	/// traced forward reads them back and logs the time between nodes.
 	pub clocks: Option<usize>,
+	/// Five device timestamps per exchange under a trace: entry, completed
+	/// writes, posted flag, completed peer wait, and post-grid acquire.
+	pub exchange_clocks: Vec<Option<usize>>,
 	/// At inference, the byte offset in the context arena of the output node's
 	/// values at the last position a forward reached, one per output channel,
 	/// gathered on the device so a decode reads one column and not the tensor.
@@ -2472,6 +2475,11 @@ impl NativeLayout {
 		let clocks = if tracing() || tuned || (inference && timed) {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
+		let exchange_clocks = graph.nodes.iter().map(|node| {
+			if tracing() && node.op == Primitive::Exchange {
+				context_plan.allocate(&[(40, BufferLifetime::Retained)], 8, 0, false).map(Some)
+			} else { Ok(None) }
+		}).collect::<Result<Vec<_>>>()?;
 		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let last_column = match graph.nodes.last().filter(|_| inference) {
 			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
@@ -2481,7 +2489,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, exchange_clocks, last_column, split_scratch, knobs, kept })
 	}
 }
 
@@ -3353,6 +3361,11 @@ fn barrier(backend: Backend) -> &'static str {
 		Backend::Cpu => "call void @recipe.cpu.barrier()\n",
 		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)\n",
 	}
+}
+
+fn clock_stamp(backend: Backend, prefix: &str, slot: usize) -> String {
+	let pointer = pointer_type(backend);
+	format!("%{prefix}.zero = icmp eq i32 %tid, 0\nbr i1 %{prefix}.zero, label %{prefix}.mark, label %{prefix}.done\n{prefix}.mark:\n%{prefix}.value = call i64 @recipe.clock()\n%{prefix}.ptr = getelementptr i8, {pointer} %contexts, i64 {slot}\nstore i64 %{prefix}.value, {pointer} %{prefix}.ptr, align 8\nbr label %{prefix}.done\n{prefix}.done:\n")
 }
 
 fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
@@ -5347,6 +5360,8 @@ impl NativeModelIr {
 						half = half.max(checked_mul(checked_mul(plan.node.output.elements(), planes, "exchange planes")?, self.node_precision(&plan.node).model.bytes(), "exchange bytes")?);
 					}
 					let prefix = format!("n{index}.exchange");
+					let phases = self.layout.exchange_clocks[index];
+					if let Some(slot) = phases { ir.push_str(&clock_stamp(backend, &format!("{prefix}.entry.clock"), slot)); }
 					let exchanges = self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
 					let ordinal = self.plans[..index].iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
 					// Another die's values reach machine RAM past this device's caches: a
@@ -5391,11 +5406,15 @@ impl NativeModelIr {
 					// fence then orders them all before its flag, as one fence per thread
 					// would at a thousand times the cost.
 					ir.push_str(barrier(backend));
+					if let Some(slot) = phases { ir.push_str(&clock_stamp(backend, &format!("{prefix}.post.clock"), slot + 8)); }
 					ir.push_str(&format!(
-						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.posted\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\nbr label %{prefix}.posted\n{prefix}.posted:\nbr i1 %{prefix}.leader, label %{prefix}.wait, label %{prefix}.signaled\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.posted ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\nfence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n"
+						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.posted\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\n{signal_clock}br label %{prefix}.posted\n{prefix}.posted:\nbr i1 %{prefix}.leader, label %{prefix}.wait, label %{prefix}.signaled\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.posted ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\n{peer_clock}fence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n",
+						signal_clock = phases.map(|slot| clock_stamp(backend, &format!("{prefix}.signal.clock"), slot + 16)).unwrap_or_default(),
+						peer_clock = phases.map(|slot| clock_stamp(backend, &format!("{prefix}.peer.clock"), slot + 24)).unwrap_or_default()
 					));
 					ir.push_str(barrier(backend));
 					ir.push_str("fence acquire\n");
+					if let Some(slot) = phases { ir.push_str(&clock_stamp(backend, &format!("{prefix}.wait.clock"), slot + 32)); }
 					emit_runtime_window_loop(&mut ir, index, "exchange.take", node.output, &window, |ir, _p, wide| {
 						if sum {
 							let mut total = String::new();
@@ -5987,11 +6006,7 @@ impl NativeModelIr {
 			// Stamp that boundary, so neighboring clock slots enclose one node's
 			// work rather than the next node's entry or the prior node's tail.
 			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
-				let pointer = pointer_type(backend);
-				ir.push_str(&format!(
-					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
-					at = clocks + index * 8
-				));
+				ir.push_str(&clock_stamp(backend, &format!("clk.n{index}"), clocks + index * 8));
 			}
 			if reverse {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
@@ -25139,6 +25154,13 @@ impl NativeTape {
 				}
 				line.push_str(&format!(" device={}", self.device_label()?));
 				trace(&line)?;
+				for (region, (index, slot)) in self.program.artifact.layout.exchange_clocks.iter().enumerate().filter_map(|(index, slot)| slot.map(|slot| (index, slot))).enumerate() {
+					let stamps = self.contexts.download_range::<i64>(slot / 8, 5)?;
+					let node = &self.nodes[index];
+					trace(&format!("exchange phase region={region} node={index} die={} dies={} device={} positions={begin}..{end} post_ns={} signal_ns={} peer_wait_ns={} acquire_ns={} take_ns={}",
+						node.argument[1] as usize, node.argument[2] as usize, self.device_label()?,
+						stamps[1].wrapping_sub(stamps[0]), stamps[2].wrapping_sub(stamps[1]), stamps[3].wrapping_sub(stamps[2]), stamps[4].wrapping_sub(stamps[3]), node_ticks[index].wrapping_sub(stamps[4])))?;
+				}
 			}
 		}
 		Ok(())
