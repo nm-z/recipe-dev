@@ -17809,6 +17809,12 @@ impl Infer {
 					} else { eprintln!("no completed inference request"); }
 					continue;
 				}
+				if line.trim()=="/reload_workers" || line.trim().starts_with("/reload_workers ") {
+					let path=if let Some(path)=line.trim().strip_prefix("/reload_workers ") {Ok(PathBuf::from(path))}
+						else {placed.expert_artifacts().and_then(|paths|paths.into_iter().next().ok_or_else(||RecipeError::new("no resident expert workers")))};
+					if let Err(error)=path.and_then(|path|placed.reload_expert_workers(path)) {eprintln!("{error}");}
+					continue;
+				}
 				if line.trim() == "/reload_mtp" {
 					if let Some(runtime) = &mut mtp {
 						let paths = runtime.placed.native_artifacts();
@@ -17818,6 +17824,7 @@ impl Infer {
 				}
 				if line.trim() == "/artifacts" {
 					for path in placed.native_artifacts() { eprintln!("artifact {}", path.display()); }
+					for path in placed.expert_artifacts()? {eprintln!("worker artifact {}",path.display());}
 					if let Some(mtp) = &mtp { for path in mtp.placed.native_artifacts() { eprintln!("MTP artifact {}", path.display()); } }
 					continue;
 				}
@@ -19402,6 +19409,23 @@ fn expert_enabled(file: &Gguf, devices: &[&Gpu]) -> bool {
 		&& devices.iter().all(|gpu|matches!(gpu.name.as_str(),"nv0"|"nv1"|"nv2"|"nv3"|"nv4"|"nv5"|"nv7"))
 }
 struct ExpertModule { gpu: &'static Gpu, handle: usize, function: usize }
+impl ExpertModule {
+	fn load(gpu: &'static Gpu, bytes: &[u8]) -> Result<Self> {
+		#[cfg(nvidia)] {
+			let Driver::Cuda(driver)=&gpu.driver else {return Err(RecipeError::new("expert worker requires CUDA"));};
+			gpu.activate()?; let (mut handle,mut function,mut active)=(ptr::null_mut(),0,0);
+			unsafe {
+				gpu.status((driver.load)(&mut handle,bytes.as_ptr().cast()),"expert module load")?;
+				let mut module=Self {gpu,handle:handle as usize,function:0};
+				gpu.status((driver.function)(&mut function,handle,c"expert_split_worker".as_ptr().cast()),"expert worker symbol")?;
+				gpu.status((driver.occupancy)(&mut active,function,256,40960),"expert worker occupancy")?;
+				require(active>=1 && driver.cus==16,"expert worker requires all 16 M60 SMs to be resident")?;
+				module.function=function; Ok(module)
+			}
+		}
+		#[cfg(not(nvidia))] {let _=(gpu,bytes);Err(RecipeError::new("expert worker requires NVIDIA support"))}
+	}
+}
 impl Drop for ExpertModule {
 	fn drop(&mut self) {
 		#[cfg(nvidia)] if let Driver::Cuda(driver) = &self.gpu.driver { let _ = self.gpu.activate(); unsafe { (driver.unload)(self.handle as Ptr); } }
@@ -19411,6 +19435,7 @@ struct ExpertWorker { read_bytes:Vec<usize>, die: usize, gpu: &'static Gpu, jobs
 struct ExpertExecution {
 	pick_counts: Buffer,
 	pick_path: PathBuf,
+	worker_path: PathBuf,
 	failed: bool,
 	main_sync: PeerPacket,
 	weights: ExpertSplitWeights,
@@ -19424,6 +19449,19 @@ struct ExpertExecution {
 }
 fn native_words(words: &[u64]) -> Vec<u8> { words.iter().flat_map(|word| word.to_ne_bytes()).collect() }
 impl ExpertExecution {
+	fn reload_workers(&mut self, path: &Path) -> Result<()> {
+		require(!self.failed,"expert execution is invalid after an unsuccessful request")?;
+		let bytes=fs::read(path).map_err(|error|RecipeError::new(format!("cannot read worker {}: {error}",path.display())))?;
+		require(bytes.starts_with(b"\x7fELF"),"worker replacement is not a cubin")?;
+		let mut replacements=Vec::new();
+		for (index,worker) in self.workers.iter().enumerate().filter(|(_,worker)|worker.module.is_some()) {
+			worker.gpu.synchronize()?;
+			replacements.push((index,ExpertModule::load(worker.gpu,&bytes)?));
+		}
+		for (index,module) in replacements {self.workers[index].module=Some(module);}
+		self.worker_path=path.to_path_buf();
+		Ok(())
+	}
 	fn worker_source() -> String {
 		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}", p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
 	}
@@ -19453,7 +19491,7 @@ impl ExpertExecution {
 		let main_sync=PeerPacket::new("nv4")?;
 		control.write_bytes(32,&native_words(&[main_sync.completion_address(),main_sync.sequence_address()+4]))?;
 		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_LOG").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
-		let mut value = Self { pick_counts,pick_path,failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
+		let mut value = Self { pick_counts,pick_path,worker_path:cubin.clone(),failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
 		for die in [0,1,2,3,4,5,7].into_iter().filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
 			let gpu = device(Some(&format!("nv{die}")))?;
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
@@ -19461,18 +19499,8 @@ impl ExpertExecution {
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
 			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
-			#[cfg(nvidia)] if die != 4 {
-				let Driver::Cuda(driver) = &gpu.driver else { return Err(RecipeError::new("expert worker is not CUDA")); };
-				gpu.activate()?; let (mut handle, mut function, mut active) = (ptr::null_mut(),0,0);
-				unsafe {
-					gpu.status((driver.load)(&mut handle, bytes.as_ptr().cast()),"expert module load")?;
-					let mut owned = ExpertModule { gpu, handle: handle as usize, function: 0 };
-					gpu.status((driver.function)(&mut function, handle, c"expert_split_worker".as_ptr().cast()),"expert worker symbol")?;
-					gpu.status((driver.occupancy)(&mut active,function,256,40960),"expert worker occupancy")?;
-					require(active >= 1 && driver.cus == 16,"expert worker requires all 16 M60 SMs to be resident")?;
-					owned.function=function; module = Some(owned);
-				}
-			}
+			#[cfg(nvidia)] if die != 4 {module=Some(ExpertModule::load(gpu,&bytes)?);}
+
 			value.workers.push(ExpertWorker { read_bytes:Vec::new(), die, gpu, jobs, reports, scratch, module });
 		}
 		for layer in &value.layers {
@@ -20261,6 +20289,18 @@ impl Placed {
 	/// Paths of the loaded native modules, in graph and device order.
 	pub fn native_artifacts(&self) -> Vec<PathBuf> {
 		self.tapes.iter().flatten().map(|tape| tape.program.artifact.path.clone()).collect()
+	}
+	/// The resident worker module shared by the target and MTP execution.
+	pub fn expert_artifacts(&self) -> Result<Vec<PathBuf>> {
+		let Some(execution)=self.tapes.iter().flatten().find_map(|tape|tape.expert_execution.as_ref()) else {return Ok(Vec::new());};
+		let execution=execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?;
+		Ok(vec![execution.worker_path.clone()])
+	}
+	/// Replace all worker modules transactionally, retaining weights, packets, and sequences.
+	/// The replacement must retain the worker entrypoint and descriptor layout.
+	pub fn reload_expert_workers(&self, path: impl AsRef<Path>) -> Result<()> {
+		let execution=self.tapes.iter().flatten().find_map(|tape|tape.expert_execution.as_ref()).ok_or_else(||RecipeError::new("no resident expert workers"))?;
+		execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.reload_workers(path.as_ref())
 	}
 	/// Replace NVIDIA modules without loading weights or resetting carried state.
 	/// Each cubin must retain the current graph's buffer layout and entrypoint ABI.
