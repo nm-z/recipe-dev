@@ -1698,7 +1698,7 @@ struct NvidiaToolkit {
 fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
 	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
 	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
-	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(text(manifest, "nvidia-assembler")?), required: entry.starts_with('$') }))
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(platform(manifest, "nvidia-assembler", os)?), required: entry.starts_with('$') }))
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(

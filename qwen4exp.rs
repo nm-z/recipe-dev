@@ -1,7 +1,7 @@
 use recipe::*;
-use recipe::infer::{cached, input, out, pp, tg, time};
+use recipe::infer::{cached, input, mtp, out, pp, tg, time};
 
-const GGUF: &str = "/mnt/sentry-nfs/unsloth/Qwen3.8-Flash-Next-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf";
+const GGUF: &str = "/mnt/sentry-nfs/flash-next-q2/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf";
 
 pub fn model() -> Model {
 	let (width, vocabulary) = (qwen4exp.embedding_length, tokenizer.ggml.tokens.len());
@@ -30,5 +30,12 @@ pub fn model() -> Model {
 fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let model = model();
-	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+	if std::env::args().any(|arg| arg == "--memory") {
+		println!("{}", model.memory(&data, 128).unwrap());
+		return;
+	}
+	let mut infer = recipe.infer();
+	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }
+	let report = infer.chat([time, pp, tg, input, out, cached, mtp]).run(&model, &data);
+	println!("generation tokens {} rate {} tok/s", report.out, report.tg());
 }

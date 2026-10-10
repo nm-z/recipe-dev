@@ -4289,6 +4289,25 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Gather) => {
+					if self.inference {
+						let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+						let prefix = format!("n{index}.gather");
+						let per_row = checked_mul(node.output.channels, node.output.length, "gather row elements")?;
+						let width = node.argument[1] as usize;
+						let compact = self.layout.request_control.is_some();
+						let context = if compact {
+							ir.push_str(&format!("%{prefix}.address = load i64, {pointer} {context}, align 8\n%{prefix}.request = inttoptr i64 %{prefix}.address to {pointer}\n", context = pointers.context));
+							format!("%{prefix}.request")
+						} else { pointers.context.clone() };
+						emit_runtime_window_loop(&mut ir, index, "gather", node.output, &window, |ir, _p, wide| {
+							let (stride, origin) = if compact { ("%request.span.wide".to_owned(), "%request.local.begin.wide") } else { (node.output.length.to_string(), "0") };
+							ir.push_str(&format!(
+								"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.embedding = icmp ult i64 %{prefix}.channel, {width}\nbr i1 %{prefix}.embedding, label %{prefix}.embed, label %{prefix}.hidden\n{prefix}.embed:\n%{prefix}.token = mul i64 %{prefix}.row, {stride}\n%{prefix}.local = add i64 %{prefix}.position, {origin}\n%{prefix}.slot = add i64 %{prefix}.token, %{prefix}.local\n%{prefix}.base = mul i64 %{prefix}.slot, {width}\n%{prefix}.index = add i64 %{prefix}.base, %{prefix}.channel\n%{prefix}.in = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.index\n%{prefix}.embedded = load {ty}, {pointer} %{prefix}.in, align {align}\nbr label %{prefix}.join\n{prefix}.hidden:\n%{prefix}.hidden.channel = sub i64 %{prefix}.channel, {offset}\n%{prefix}.hidden.base = mul i64 %{prefix}.hidden.channel, {length}\n%{prefix}.input.row = mul i64 %{prefix}.row, {input_row}\n%{prefix}.input.slot = add i64 %{prefix}.input.row, %{prefix}.position\n%{prefix}.hidden.index = add i64 %{prefix}.input.slot, %{prefix}.hidden.base\n%{prefix}.hidden.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.hidden.index\n%{prefix}.hidden.value = load {ty}, {pointer} %{prefix}.hidden.ptr, align {align}\nbr label %{prefix}.join\n{prefix}.join:\n%{prefix}.value = phi {ty} [ %{prefix}.embedded, %{prefix}.embed ], [ %{prefix}.hidden.value, %{prefix}.hidden ]\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+								length = node.output.length, input_row = node.input.channels * node.input.length, offset = width - 1,
+								source = pointers.source, value = pointers.value, align = alignment(ty)
+							));
+						})?;
+					} else {
 					let (layout, _) = embedding_row(node)?;
 					let per_row = checked_mul(node.output.channels, node.output.length, "gather row elements")?;
 					let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
@@ -4315,6 +4334,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
+					}
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::TopK) => {
@@ -6970,7 +6990,7 @@ impl NativeModelIr {
 				continue;
 			}
 			// A lookup's table decodes on the host, so the device needs no decoder for it.
-			if plan.node.op == Primitive::Lookup {
+			if plan.node.op == Primitive::Lookup || self.inference && plan.node.op == Primitive::Gather {
 				continue;
 			}
 			// A requantized node decodes its file bytes and its own format.
@@ -14556,10 +14576,6 @@ impl StoredBytes {
 		}
 		Ok(out)
 	}
-	fn in_ram(&self) -> Result<Self> {
-		if self.0.iter().all(|run| matches!(run, StoredSegment::Owned(_))) { return Ok(self.clone()); }
-		Ok(Self::from(self.to_vec()?))
-	}
 }
 impl From<Vec<u8>> for StoredBytes {
 	fn from(bytes: Vec<u8>) -> Self {
@@ -17330,11 +17346,11 @@ impl Infer {
 		};
 		let checkpoints = head.as_ref().map_or(0, |head| head.tokens + 1);
 		let mut mtp = head.map(|head| MtpRuntime::place(head, sequence, devices)).transpose()?;
-		let placed = place_bound_observed(&bound, sequence, &[], devices, checkpoints, tensor_observation_mask(&self.log))?;
+		let mut placed = place_bound_observed(&bound, sequence, &[], devices, checkpoints, tensor_observation_mask(&self.log))?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
 		let input = ChatInput::new(interactive)?;
-		let resident_memory = |mtp: Option<&MtpRuntime>| {
+		let resident_memory = |placed: &Placed, mtp: Option<&MtpRuntime>| {
 			let mut memory = placed.memory();
 			if let Some(mtp) = mtp {
 				for head in mtp.placed.memory() {
@@ -17351,7 +17367,7 @@ impl Infer {
 			}
 			memory
 		};
-		let mut memory = resident_memory(mtp.as_ref());
+		let mut memory = resident_memory(&placed, mtp.as_ref());
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history = Vec::new();
@@ -17365,6 +17381,16 @@ impl Infer {
 				if INTERRUPTED.load(Ordering::Acquire) { break; }
 				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
 				let Some(line) = input.read()? else { break };
+				if line.trim() == "/artifacts" {
+					for path in placed.native_artifacts() { eprintln!("artifact {}", path.display()); }
+					if let Some(mtp) = &mtp { for path in mtp.placed.native_artifacts() { eprintln!("MTP artifact {}", path.display()); } }
+					continue;
+				}
+				if line.trim() == "/reload" {
+					let paths = placed.native_artifacts();
+					if let Err(error) = placed.reload_native(&paths) { eprintln!("{error}"); }
+					continue;
+				}
 				if line.trim() == "/exit" { break; }
 				if line.trim() == "/clear" { conversation.clear(); placed.clear(); if let Some(mtp) = &mut mtp { mtp.clear(); } continue; }
 				if line.trim().is_empty() { continue; }
@@ -17421,7 +17447,7 @@ impl Infer {
 				None => placed.decode_observed(&prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit)?,
 			};
 			let seconds = progress.as_ref().map_or_else(|| request_started.elapsed().as_secs_f64(), InferenceLive::finish);
-			memory = resident_memory(mtp.as_ref());
+			memory = resident_memory(&placed, mtp.as_ref());
 			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
 			drop(progress);
 			let reply = coder.decode(&ids);
@@ -18664,9 +18690,7 @@ fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 /// Full-graph model data and working buffers, independent of the failed placement boundary.
 fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> Result<RecipeError> {
 	let memory = part_memory(graph, precision)?;
-	let model = graph.nodes.iter().filter(|node| node.op == Primitive::Gather).try_fold(memory.weights, |bytes, node| {
-		node_context(graph, node, 1, node.precision, true, 0)?.into_iter().try_fold(bytes, |total, (bytes, _)| checked_add(total, bytes, "model embedding bytes"))
-	})?;
+	let model = memory.weights;
 	let total = memory.total()?;
 	let buffers = total.checked_sub(model).ok_or_else(|| RecipeError::new("model data exceeds total planned memory"))?;
 	let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
@@ -18674,7 +18698,7 @@ fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> 
 	// context counted above. Shared table runs contribute their storage once.
 	let mut tables = BTreeSet::new();
 	let mut ngram_bytes = 0;
-	for (index, _) in graph.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Lookup) {
+	for (index, _) in graph.nodes.iter().enumerate().filter(|(_, node)| node.table()) {
 		let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?;
 		for (_, bytes) in table.bytes.runs() {
 			if tables.insert((bytes.as_ptr() as usize, bytes.len())) {
@@ -18683,7 +18707,7 @@ fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> 
 		}
 	}
 	let table_note = if tables.is_empty() { String::new() } else {
-		format!("  n-gram table {:.3} GiB ({ngram_bytes} bytes) in RAM, outside allocation total; gathered rows included in buffer size", gib(ngram_bytes))
+		format!("  lookup tables {:.3} GiB ({ngram_bytes} bytes) in RAM/mmap, outside allocation total; gathered rows included in buffer size", gib(ngram_bytes))
 	};
 	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB{table_note}", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
 }
@@ -18924,6 +18948,51 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	/// Paths of the loaded native modules, in graph and device order.
+	pub fn native_artifacts(&self) -> Vec<PathBuf> {
+		self.tapes.iter().flatten().map(|tape| tape.program.artifact.path.clone()).collect()
+	}
+	/// Replace NVIDIA modules without loading weights or resetting carried state.
+	/// Each cubin must retain the current graph's buffer layout and entrypoint ABI.
+	/// All modules load and pass resource checks before any replacement commits.
+	pub fn reload_native(&mut self, paths: &[PathBuf]) -> Result<()> {
+		#[cfg(not(nvidia))]
+		{ let _ = paths; return Err(RecipeError::new("native reload requires NVIDIA support")); }
+		#[cfg(nvidia)]
+		{
+			let tapes = self.tapes.iter().flatten().collect::<Vec<_>>();
+			require(paths.len() == tapes.len(), format!("native reload needs {} artifacts, received {}", tapes.len(), paths.len()))?;
+			let mut replacements = Vec::with_capacity(tapes.len());
+			for (tape, path) in tapes.iter().zip(paths) {
+				let old = &tape.program;
+				require(!old.artifact.training, "native reload requires inference modules")?;
+				let Driver::Cuda(driver) = &old.gpu.driver else { return Err(RecipeError::new("native reload requires local NVIDIA devices")); };
+				old.gpu.synchronize()?;
+				let mut bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+				require(bytes.starts_with(b"\x7fELF"), format!("{} is not a cubin", path.display()))?;
+				bytes.push(0);
+				let block = old.forward.geometry.block;
+				let register_values = old.reduction_values / block;
+				let waves = block / driver.wave;
+				let (program, forward, epoch, load) = unsafe {
+					driver.load_native(&bytes, old.forward.kernel.element, old.artifact.precision.epoch_layout, false,
+						old.artifact.step, !old.artifact.storage.is_empty(), waves, old.shared_values, register_values)?
+				};
+				let reductions = forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native reload reduction size overflows"))?;
+				require(reductions <= old.reduction_values, "native reload requires a larger reduction buffer")?;
+				replacements.push((program, forward, epoch, load, bytes));
+			}
+			for ((tape, path), (program, forward, epoch, load, bytes)) in self.tapes.iter_mut().flatten().zip(paths).zip(replacements) {
+				tape.program.backend = NativeBackend::Nvidia(program);
+				tape.program.forward = forward;
+				tape.program.epoch = epoch;
+				tape.program.model_load = load;
+				tape.program.artifact.artifact = bytes;
+				tape.program.artifact.path = path.clone();
+			}
+			Ok(())
+		}
+	}
 	/// Commit an evaluated speculative prefix without replaying model arithmetic.
 	fn commit_mtp_prefix(&self, end: u32) -> Result<()> {
 		let mut images = Vec::new();
@@ -22557,7 +22626,7 @@ struct HostLookup {
 	context: usize,
 	/// The arithmetic of the node that reads this table.
 	precision: Compute,
-	hash: RowHash,
+	hash: Option<RowHash>,
 	table: StoredWeight,
 	width: usize,
 	length: usize,
@@ -22945,13 +23014,14 @@ impl NativeTape {
 		let guard = std::env::var("RECIPE_ARENA_GUARD").ok().and_then(|text| text.parse::<usize>().ok()).unwrap_or(0);
 		let values = Buffer::zeroed_guarded(gpu, layout.values_bytes, guard)?;
 		let contexts = Buffer::zeroed_guarded(gpu, layout.contexts_bytes, guard)?;
-		// The packed embedding table is the gather's context, so it reaches the
-		// device whole once and the kernel then reads only the rows it addresses.
-		// Keep packed lookup tables in owned machine RAM, not demand-paged file
-		// mappings. Only the gathered rows are staged on the selected device.
+		// Inference tables keep their packed mappings in machine RAM. Each request
+		// stages only its addressed rows; training retains the device gather table.
 		let (mut lookups, positions) = (Vec::new(), graph_positions(graph));
 		for (index, node) in graph.nodes.iter().enumerate() {
-			if node.op == Primitive::Gather {
+			if inference && node.op == Primitive::Gather {
+				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?.clone();
+				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: None, table, width: node.argument[1] as usize, length: node.output.length });
+			} else if node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
 				let at = layout.contexts[index];
 				require(checked_add(at, table.bytes.len(), "embedding table context")? <= contexts.bytes, "embedding table exceeds its context arena")?;
@@ -22960,12 +23030,11 @@ impl NativeTape {
 				}
 			}
 			if node.op == Primitive::Lookup {
-				let mut table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
-				table.bytes = table.bytes.in_ram()?;
+				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
-				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
+				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: Some(RowHash::from_words(words)?), table, width: node.argument[1] as usize, length: node.output.length });
 			}
 		}
 		let context_resets = layout.context_resets.clone();
@@ -23042,7 +23111,6 @@ impl NativeTape {
 			reached: std::sync::atomic::AtomicU32::new(0),
 			window_begin: std::sync::atomic::AtomicU32::new(0),
 		};
-		if tape.program.artifact.layout.request_control.is_none() { tape.stage_lookups(0, tape.positions, None)?; }
 		Ok(tape)
 	}
 	/// Writes every contraction node's forward, gradient, and previous tiles
@@ -23216,7 +23284,7 @@ impl NativeTape {
 		let tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
 		for (index, lookup) in self.lookups.iter().enumerate() {
 			let bytes = lookup.precision.bytes();
-			let channels = lookup.hash.heads() * lookup.width;
+			let channels = lookup.hash.as_ref().map_or(1, RowHash::heads) * lookup.width;
 			let (buffer, base, length, first) = if let Some(request) = request.as_mut() {
 				if index == request.lookups.len() { request.lookups.push(Buffer::zeroed(self.program.gpu, 1)?); }
 				let buffer = &mut request.lookups[index];
@@ -23228,8 +23296,10 @@ impl NativeTape {
 				let ids = tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
 				let mut staged = Vec::with_capacity((end - begin) * channels);
 				for position in begin..end {
-					for index in lookup.hash.rows_at(&ids, position) {
-						staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?);
+					if let Some(hash) = &lookup.hash {
+						for index in hash.rows_at(&ids, position) { staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?); }
+					} else {
+						staged.extend(ngram::table_row(&lookup.table, lookup.width, ids[position] as usize)?);
 					}
 				}
 				let slot = checked_mul(checked_add(checked_mul(row, length, "lookup row")?, first, "lookup slot")?, channels, "lookup staging offset")?;
@@ -24714,6 +24784,8 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 		},
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
+		Primitive::Gather if inference && node.output.length < graph.input.length => vec![(8, Retained)],
+		Primitive::Gather if inference => vec![(checked_mul(checked_mul(checked_mul(rows, node.argument[1] as usize, "embedding staging channels")?, node.output.length, "embedding staging positions")?, precision.bytes(), "embedding staging bytes")?, Retained)],
 		Primitive::Gather => vec![(checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes")?, ReadOnly)],
 		Primitive::Lookup if inference && node.output.length < graph.input.length => vec![(8, Retained)],
 		Primitive::Lookup => vec![(checked_mul(state.max(1), precision.bytes(), "lookup context bytes")?, Retained)],
@@ -24984,6 +25056,8 @@ const HSA_GRID_SYNC_GROUPS_OFFSET: usize = 40;
 
 #[cfg(nvidia)]
 struct NativeCudaProgram {
+	context: usize,
+	set: unsafe extern "C" fn(Ptr) -> i32,
 	load_seconds: f64,
 	module: usize,
 	step: Option<Dispatch>,
@@ -24994,7 +25068,7 @@ struct NativeCudaProgram {
 impl Drop for NativeCudaProgram {
 	fn drop(&mut self) {
 		if self.module != 0 {
-			unsafe { (self.unload)(self.module as Ptr) };
+			unsafe { (self.set)(self.context as Ptr); (self.unload)(self.module as Ptr) };
 		}
 	}
 }
@@ -26312,7 +26386,7 @@ impl Cuda {
 			let load_started = Instant::now();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
 			let load_seconds = load_started.elapsed().as_secs_f64();
-			let mut program = NativeCudaProgram { module: module as usize, load_seconds, step: None, unload: self.unload };
+			let mut program = NativeCudaProgram { context: self.context as usize, set: self.set, module: module as usize, load_seconds, step: None, unload: self.unload };
 			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves)?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves)).transpose()?;
 			let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));

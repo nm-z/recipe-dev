@@ -1,0 +1,1 @@
+RAM gather comparison: logits 262144, max absolute error 0, max error / reference peak 0, relative RMS error 0
