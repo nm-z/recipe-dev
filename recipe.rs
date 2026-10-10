@@ -4750,6 +4750,7 @@ impl NativeModelIr {
 					let buffer_origin = if compact { "%begin" } else { "0" };
 					let begin = if compact { "%begin" } else { begin.as_str() };
 					let node = &self.graph.nodes[index];
+					let context_capacity = node.output.length;
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let heads = integer_argument(node.argument[0], "attention heads")?;
 					let online_order = self.inference && self.graph.profile.online_softmax;
@@ -4771,7 +4772,7 @@ impl NativeModelIr {
 						// accumulates; an inference layout holds none.
 						let block = integer_argument(node.argument[3], "indexer block")?;
 						let (first, count) = (format!("%n{index}.index.first"), format!("%n{index}.index.count"));
-						let end = format!("%n{index}.end");
+						let end = if compact { "%end".to_owned() } else { format!("%n{index}.end") };
 						ir.push_str(&format!(
 							"{first} = udiv i32 {begin}, {block}\n%n{index}.index.stop = add i32 {end}, {last}\n%n{index}.index.last = udiv i32 %n{index}.index.stop, {block}\n%n{index}.index.touched = sub i32 %n{index}.index.last, {first}\n%n{index}.index.empty = icmp eq i32 {span}, 0\n{count} = select i1 %n{index}.index.empty, i32 0, i32 %n{index}.index.touched\n",
 							last = block - 1
@@ -4783,7 +4784,8 @@ impl NativeModelIr {
 							));
 						})?;
 						ir.push_str(barrier(backend));
-						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
+						let selected = NodeWindow { begin: begin.to_owned(), span: window.span.clone() };
+						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &selected, |ir, _p, wide| {
 							ir.push_str(&format!(
 								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
 							));
@@ -4822,7 +4824,7 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}, i32 {query_capacity}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}, i32 {context_capacity}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
@@ -8509,7 +8511,8 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
-	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes()]); }
+	let local_p2p = local_p2p_functions();
+	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]); }
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
@@ -8893,6 +8896,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
+			ptx_source.push_str(&local_p2p_functions());
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
@@ -12530,7 +12534,7 @@ impl ChatInput {
 		loop {
 			if INTERRUPTED.load(Ordering::Acquire) { return Ok(None); }
 			#[cfg(unix)]
-			{
+			if self.terminal {
 				let mut descriptor = PollFd { fd: 0, events: 1, revents: 0 };
 				let ready = unsafe { poll(&mut descriptor, 1, 100) };
 				if ready < 0 {
@@ -14702,9 +14706,19 @@ pub(crate) struct StorageSpec {
 
 /// A weight's block bytes: owned by the graph, or a view of the mapped file they
 /// were read from, which the view keeps mapped.
+struct ResidentLookupBytes {
+	data: Vec<u8>,
+	_source: StoredBytes,
+}
+impl Drop for ResidentLookupBytes {
+	fn drop(&mut self) {
+		#[cfg(unix)] unsafe { munlock(self.data.as_ptr().cast_mut().cast(), self.data.len()); }
+	}
+}
 #[derive(Clone)]
 enum StoredSegment {
 	Owned(Vec<u8>),
+	Resident(Arc<ResidentLookupBytes>),
 	Mapped(Arc<gguf::Mapping>, usize, usize),
 	/// Bytes the load kernel writes on the device: they take their place in the
 	/// run but exist on no host page.
@@ -14714,6 +14728,7 @@ impl StoredSegment {
 	fn length(&self) -> usize {
 		match self {
 			Self::Owned(bytes) => bytes.len(),
+			Self::Resident(bytes) => bytes.data.len(),
 			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
 		}
 	}
@@ -14723,6 +14738,7 @@ impl std::ops::Deref for StoredSegment {
 	fn deref(&self) -> &[u8] {
 		match self {
 			Self::Owned(bytes) => bytes,
+			Self::Resident(bytes) => &bytes.data,
 			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
 			Self::Absent(_) => &[],
 		}
@@ -14735,6 +14751,26 @@ impl std::ops::Deref for StoredSegment {
 #[derive(Clone)]
 pub(crate) struct StoredBytes(Arc<Vec<StoredSegment>>);
 impl StoredBytes {
+	fn resident_lookup(&self) -> Result<Self> {
+		if self.0.iter().all(|segment| matches!(segment, StoredSegment::Resident(_))) { return Ok(self.clone()); }
+		#[cfg(not(unix))] { return Err(RecipeError::new("resident lookup locking requires Unix memory mappings")); }
+		#[cfg(unix)] {
+			static CACHE: OnceLock<Mutex<std::collections::HashMap<Vec<(usize, usize)>, std::sync::Weak<ResidentLookupBytes>>>> = OnceLock::new();
+			let key = self.runs().map(|(_, bytes)| (bytes.as_ptr() as usize, bytes.len())).collect::<Vec<_>>();
+			let mut cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().map_err(|_| RecipeError::new("resident lookup cache is poisoned"))?;
+			if let Some(bytes) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
+				return Ok(Self(Arc::new(vec![StoredSegment::Resident(bytes)])));
+			}
+			let data = self.to_vec()?;
+			require(!data.is_empty(), "resident lookup table is empty")?;
+			require(unsafe { mlock(data.as_ptr().cast_mut().cast(), data.len()) } == 0,
+				format!("cannot lock {} lookup bytes in machine RAM: {}", data.len(), std::io::Error::last_os_error()))?;
+			let bytes = Arc::new(ResidentLookupBytes { data, _source: self.clone() });
+			cache.insert(key, Arc::downgrade(&bytes));
+			Ok(Self(Arc::new(vec![StoredSegment::Resident(bytes)])))
+		}
+	}
+
 	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Mapped(mapping.clone(), at, length)]))
 	}
@@ -19213,6 +19249,12 @@ pub fn p2p_functions() -> &'static str {
 	let end = source[start..].find("// Persistent all-SM packed layer chain.").expect("owned P2P function boundary") + start;
 	&source[start..end]
 }
+// Internal completion addresses belong to the executing die. Peer publication
+// retains the system fences in the original owned functions.
+fn local_p2p_functions() -> String {
+	p2p_functions().lines().filter(|line| !line.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+		.replace("p2p_wait", "split_local_wait").replace("p2p_publish", "split_local_publish").replace("membar.sys", "membar.gl")
+}
 /// A receiving die's resident peer packet and local CTA completion slots.
 /// Allocate alongside the weight holder and retain across tokens. Before reuse
 /// or destruction, finish both dies' previous token. Sequence zero means empty.
@@ -19579,7 +19621,7 @@ impl ExpertExecution {
 		Ok(())
 	}
 	fn worker_source() -> String {
-		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}", p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
+		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
@@ -21572,6 +21614,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
 		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
 		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
+		StoredSegment::Resident(bytes) => (bytes.data.as_ptr() as usize, 0, bytes.data.len()),
 		StoredSegment::Absent(length) => (0, 0, *length),
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -24589,6 +24632,9 @@ impl NativeTape {
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: Some(RowHash::from_words(words)?), table, width: node.argument[1] as usize, length: node.output.length });
 			}
 		}
+		if inference && graph.expert_execution.is_some() {
+			for lookup in &mut lookups { lookup.table.bytes = lookup.table.bytes.resident_lookup()?; }
+		}
 		let context_resets = layout.context_resets.clone();
 		for (offset, region) in native_context_regions(graph, &layout, &weights, precision.model)? {
 			require(checked_add(offset, region.len(), "nearest index context")? <= contexts.bytes, "nearest index exceeds its context arena")?;
@@ -25076,7 +25122,9 @@ impl NativeTape {
 		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
 		if let Some(request) = request.as_ref() {
 			let positions = if self.output.length == 1 { 1 } else { request.positions };
-			return request.output.download_float_bytes(0, self.output.channels * positions, self.program.artifact.layout.output_precision);
+			let values = request.output.download_float_bytes(0, self.output.channels * positions, self.program.artifact.layout.output_precision)?;
+			self.trace_output_values(&values)?;
+			return Ok(values);
 		}
 		drop(request);
 		self.output(0, self.rows as usize * self.output.elements())
@@ -25094,22 +25142,7 @@ impl NativeTape {
 		}
 		Ok(saved.clone())
 	}
-	/// A run of `count` output values from element `first` of the output arena.
-	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		if let Some(request) = request.as_ref() {
-			let (length, begin) = if self.output.length == 1 { (1, 0) } else { (request.positions, request.begin as usize) };
-			let position = first % self.output.length;
-			require(length == self.output.length || position >= begin && position + count <= begin + length, "output read is outside the request window")?;
-			let offset = (first / self.output.length) * length + position - begin;
-			let precision = self.program.artifact.layout.output_precision;
-			return request.output.download_float_bytes(checked_mul(offset, precision.bytes(), "request output offset")?, count, precision);
-		}
-		drop(request);
-		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let output_precision = self.program.artifact.layout.output_precision;
-		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
-		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+	fn trace_output_values(&self, values: &[f64]) -> Result<()> {
 		// A traced run shows the head of every node's values once, at the first
 		// output, and again if a later output went nonfinite.
 		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -25183,6 +25216,27 @@ impl NativeTape {
 				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
+		Ok(())
+	}
+	/// Read `count` output values starting at `first`.
+	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
+		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
+		if let Some(request) = request.as_ref() {
+			let (length, begin) = if self.output.length == 1 { (1, 0) } else { (request.positions, request.begin as usize) };
+			let position = first % self.output.length;
+			require(length == self.output.length || position >= begin && position + count <= begin + length, "output read is outside the request window")?;
+			let offset = (first / self.output.length) * length + position - begin;
+			let precision = self.program.artifact.layout.output_precision;
+			let values = request.output.download_float_bytes(checked_mul(offset, precision.bytes(), "request output offset")?, count, precision)?;
+			self.trace_output_values(&values)?;
+			return Ok(values);
+		}
+		drop(request);
+		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let output_precision = self.program.artifact.layout.output_precision;
+		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
+		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+		self.trace_output_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn capture_tensors(&self, begin: u32, end: u32) -> Result<Vec<TensorObservation>> {
@@ -28805,6 +28859,8 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+	fn mlock(address: Ptr, length: usize) -> i32;
+	fn munlock(address: Ptr, length: usize) -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
@@ -34994,11 +35050,11 @@ fn expert_forward_functions() -> &'static str { r#"
 	ld.param.u64 s,[s0]; ld.param.u64 f,[f0]; ld.param.u32 q,[q0]; ld.param.u64 d,[d0];
 	{ .param .u64 a,b,c; .param .u32 x,y;
 	st.param.u64 [a],s; st.param.u64 [b],f; st.param.u64 [c],d; st.param.u32 [x],q;
-	call.uni (y),p2p_publish,(a,b,x,c); ld.param.u32 r,[y]; }
+	call.uni (y),split_local_publish,(a,b,x,c); ld.param.u32 r,[y]; }
 	setp.eq.u32 failed,r,0; @failed bra grid_done;
 	{ .param .u64 address,deadline; .param .u32 sequence,receipt;
 	st.param.u64 [address],f; st.param.u64 [deadline],d; st.param.u32 [sequence],q;
-	call.uni (receipt),p2p_wait,(address,sequence,deadline); ld.param.u32 r,[receipt]; }
+	call.uni (receipt),split_local_wait,(address,sequence,deadline); ld.param.u32 r,[receipt]; }
 grid_done:
 	st.param.u32 [result],r; ret;
 }
