@@ -12408,7 +12408,7 @@ impl ChatInput {
 		loop {
 			if INTERRUPTED.load(Ordering::Acquire) { return Ok(None); }
 			#[cfg(unix)]
-			{
+			if self.terminal {
 				let mut descriptor = PollFd { fd: 0, events: 1, revents: 0 };
 				let ready = unsafe { poll(&mut descriptor, 1, 100) };
 				if ready < 0 {
