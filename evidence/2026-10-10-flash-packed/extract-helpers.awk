@@ -9,5 +9,8 @@
 		if (opened && depth==0) dropping=0;
 		next;
 	}
+	sub(/[ \t]+$/, "");
+	if ($0 == "") { blanks++; next }
+	while (blanks > 0) { print ""; blanks-- }
 	print;
 }
