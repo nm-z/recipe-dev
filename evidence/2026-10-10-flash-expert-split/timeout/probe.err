@@ -1,0 +1,4 @@
+
+thread 'main' (1425288) panicked at /home/nate/codex/cx-fl-split-build/probe.rs:147:9:
+per-layer row validation or timeout failed: [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
