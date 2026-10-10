@@ -208,6 +208,160 @@ fn write_stepper_checkpoint(path: &Path) {
 	std::fs::write(path, out).expect("cannot write the stepper checkpoint");
 }
 
+/// A three-channel identity projection makes the affine normalization's output directly observable.
+fn write_layer_norm_checkpoint(path: &Path, scale: bool, shift: bool) {
+	let mut tensors = vec![
+		("token_embd.weight", vec![3u64, 3], vec![1.0f32, 2.0, 4.0, -2.0, 0.0, 3.0, 7.0, 7.0, 7.0]),
+		("output.weight", vec![3, 3], vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+	];
+	if scale { tensors.push(("output_norm.weight", vec![3], vec![2.0, -3.0, 0.5])); }
+	if shift { tensors.push(("output_norm.bias", vec![3], vec![0.25, -0.5, 1.0])); }
+	let mut out = b"GGUF".to_vec();
+	out.extend_from_slice(&3u32.to_le_bytes());
+	out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+	out.extend_from_slice(&2u64.to_le_bytes());
+	gguf_text(&mut out, "general.architecture");
+	out.extend_from_slice(&8u32.to_le_bytes());
+	gguf_text(&mut out, "llama");
+	gguf_text(&mut out, "llama.attention.layer_norm_epsilon");
+	out.extend_from_slice(&12u32.to_le_bytes());
+	out.extend_from_slice(&0.25f64.to_le_bytes());
+	let mut data = Vec::new();
+	for (name, shape, values) in tensors {
+		gguf_text(&mut out, name);
+		out.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+		for dimension in shape { out.extend_from_slice(&dimension.to_le_bytes()); }
+		out.extend_from_slice(&0u32.to_le_bytes());
+		out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+		for value in values { data.extend_from_slice(&value.to_le_bytes()); }
+		while data.len() % 32 != 0 { data.push(0); }
+	}
+	while out.len() % 32 != 0 { out.push(0); }
+	out.extend(data);
+	std::fs::write(path, out).expect("cannot write the layer normalization checkpoint");
+}
+
+fn check_layer_norm(report: &mut Report, work: &Path) {
+	for (name, scale, shift) in [
+		("layer_norm_affine", true, true),
+		("layer_norm_default_scale", false, true),
+		("layer_norm_default_shift", true, false),
+		("layer_norm_defaults", false, false),
+	] {
+		let path = work.join(format!("{name}.gguf"));
+		write_layer_norm_checkpoint(&path, scale, shift);
+		let file = Gguf::open(&path).expect("cannot open the layer normalization checkpoint");
+		let model = recipe.model().no(bias).embed(3, 3).fp(32).norm(layer).fp(32).scale_from("output_norm.weight").layer(3).fp(32);
+		let placed = file.place(&model, 1, &[]);
+		let got = (0..3).flat_map(|position| placed.infer(&[position as f64])).collect::<Vec<_>>();
+		let mut want = vec![0.0; 9];
+		for (position, input) in [[1.0f64, 2.0, 4.0], [-2.0, 0.0, 3.0], [7.0, 7.0, 7.0]].into_iter().enumerate() {
+			let mean = input.iter().sum::<f64>() / 3.0;
+			let variance = input.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / 3.0;
+			for channel in 0..3 {
+				let gamma = if scale { [2.0, -3.0, 0.5][channel] } else { 1.0 };
+				let beta = if shift { [0.25, -0.5, 1.0][channel] } else { 0.0 };
+				want[position * 3 + channel] = (input[channel] - mean) / (variance + 0.25).sqrt() * gamma + beta;
+			}
+		}
+		let worst = worst_absolute(&got, &want);
+		report.record(name, worst < 2e-6, format!("worst_abs_err={worst:.9} scale={scale} shift={shift} epsilon=0.25 positions=3"));
+		let explicit = model.e(0.5);
+		let got = file.place(&explicit, 1, &[]).infer(&[0.0]);
+		let want = (1.0 - 7.0 / 3.0) / (14.0f64 / 9.0 + 0.5).sqrt() * if scale { 2.0 } else { 1.0 } + if shift { 0.25 } else { 0.0 };
+		report.record("layer_norm_explicit_epsilon", (got[0] - want).abs() < 2e-6, format!("produced={:.9} expected={want:.9}", got[0]));
+	}
+	// With no other trainable block, only gamma and beta can fit these targets.
+	for (name, gamma, beta) in [("layer_norm_train_scale", 2.0, 0.0), ("layer_norm_train_shift", 1.0, 0.75)] {
+		let path = work.join(format!("{name}.csv"));
+		let mut csv = "a,b,c,y0,y1,y2\n".to_owned();
+		for row in 0..24 {
+			let input = [row as f64 / 8.0, (row % 5) as f64 - 2.0, (row % 7) as f64 / 3.0];
+			let mean = input.iter().sum::<f64>() / 3.0;
+			let denominator = (input.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / 3.0 + 0.25).sqrt();
+			let target = input.map(|value| (value - mean) / denominator * gamma + beta);
+			csv.push_str(&format!("{},{},{},{},{},{}\n", input[0], input[1], input[2], target[0], target[1], target[2]));
+		}
+		std::fs::write(&path, csv).expect("cannot write the affine training dataset");
+		let data = recipe.data(path.to_str().unwrap()).target(["y0", "y1", "y2"]);
+		let model = recipe.model().e(0.25).norm(layer).fp(32).loss(mse);
+		let bundle = work.join(format!("{name}.ogdl"));
+		let trained = recipe.train().seed(SEED).lr(0.03).stop(0.0).epochs(160).save(&bundle).run(&model, &data);
+		let persisted = recipe.predict(&bundle, &[0.0, -2.0, 0.0]);
+		let denominator = (8.0f64 / 9.0 + 0.25).sqrt();
+		let want = [2.0 / 3.0, -4.0 / 3.0, 2.0 / 3.0].map(|value| value / denominator * gamma + beta);
+		let worst = worst_absolute(&persisted, &want);
+		report.record(name, trained.final_loss() < 1e-5 && worst < 0.01, format!("initial_loss={:.9} final_loss={:.9} persisted_worst={worst:.9}", trained.initial_loss(), trained.final_loss()));
+	}
+}
+
+/// Compare a public GPT-2 GGUF with teacher-forced CPU logits from llama.cpp b10705.
+/// The reference stores GPTNORM1, four u32 counts (prompt, sequence, vocabulary,
+/// steps), sequence u32 token IDs, then step-major fp32 logits, all little-endian.
+fn check_gpt2_layer_norm(report: &mut Report) {
+	let Some(path) = std::env::var_os("RECIPE_LAYER_NORM_GGUF") else { return };
+	let reference = std::fs::read(environment("RECIPE_LAYER_NORM_REFERENCE")).expect("cannot read the GPT-2 reference");
+	assert_eq!(&reference[..8], b"GPTNORM1");
+	let count = |at| u32::from_le_bytes(reference[at..at + 4].try_into().unwrap()) as usize;
+	let (prompt, length, vocabulary, steps) = (count(8), count(12), count(16), count(20));
+	assert_eq!(length, prompt + steps - 1);
+	assert_eq!(reference.len(), 24 + 4 * length + 4 * steps * vocabulary);
+	let ids = (0..length).map(|position| count(24 + 4 * position)).collect::<Vec<_>>();
+	let file = Gguf::open(Path::new(&path)).expect("cannot open the GPT-2 checkpoint");
+	assert_eq!(file.value("general.architecture").unwrap().text(), Some("gpt2"));
+	let integer = |key| file.value(key).unwrap().integer().unwrap() as usize;
+	let (width, heads, hidden, blocks) = (integer("gpt2.embedding_length"), integer("gpt2.attention.head_count"), integer("gpt2.feed_forward_length"), integer("gpt2.block_count"));
+	let mut used = std::collections::BTreeSet::new();
+	let mut tensor = |name: &str| {
+		used.insert(name.to_owned());
+		file.tensor(name).unwrap_or_else(|| panic!("missing {name}")).clone()
+	};
+	let embedding = tensor("token_embd.weight");
+	let positional = tensor("position_embd.weight");
+	assert_eq!(embedding.shape, [width as u64, vocabulary as u64]);
+	let mut plan = file.plan();
+	let mut model = recipe.model();
+	for block in 0..blocks {
+		model = model.res([norm(layer).fp(32), attn(heads).kv(heads).fp(32).width(width / heads).fp(32)])
+			.res([norm(layer).fp(32), layer(hidden).fp(32).gelu().fp(32), layer(width).fp(32)]);
+		for stem in ["attn_norm", "attn_qkv", "attn_output", "ffn_norm", "ffn_up", "ffn_down"] {
+			plan = plan.node(&[tensor(&format!("blk.{block}.{stem}.weight")), tensor(&format!("blk.{block}.{stem}.bias"))]);
+		}
+	}
+	model = model.norm(layer).fp(32).layer(vocabulary).fp(32);
+	plan = plan.node(&[tensor("output_norm.weight"), tensor("output_norm.bias")]);
+	plan = if file.tensor("output.weight").is_some() { plan.node(&[tensor("output.weight")]) } else { plan.node(&[embedding.clone()]) };
+	let unread = file.tensors().iter().filter(|tensor| !used.contains(&tensor.name)).map(|tensor| &tensor.name).collect::<Vec<_>>();
+	assert!(unread.is_empty(), "unread {unread:?}");
+	assert!(plan.defaulted().is_empty());
+	// The public row lookup reads both embedding tables once. The compiled model
+	// evaluates all teacher-forced positions in one forward, with no replay.
+	let mut input = vec![0.0; width * length];
+	for (position, id) in ids.iter().enumerate() {
+		let token = file.row(&embedding, *id).unwrap();
+		let position_values = file.row(&positional, position).unwrap();
+		for channel in 0..width { input[channel * length + position] = f64::from(token[channel] as f32 + position_values[channel] as f32); }
+	}
+	let got = file.infer(&model, &plan, &input, width);
+	assert_eq!(got.len(), length * vocabulary);
+	let mut worst = 0.0f64;
+	for step in 0..steps {
+		let position = prompt - 1 + step;
+		let at = 24 + 4 * length + 4 * step * vocabulary;
+		let expected = reference[at..at + 4 * vocabulary].chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect::<Vec<_>>();
+		assert!(expected.iter().all(|value| value.is_finite()));
+		let range = expected.iter().copied().fold(f64::NEG_INFINITY, f64::max) - expected.iter().copied().fold(f64::INFINITY, f64::min);
+		let error = expected.iter().enumerate().map(|(channel, value)| {
+			let value = (got[channel * length + position] - value).abs();
+			if value.is_finite() { value } else { f64::INFINITY }
+		}).fold(0.0f64, f64::max) / range;
+		worst = worst.max(error);
+		println!("gpt2 step={step} position={position} max_error_of_range={error:.9}");
+	}
+	report.record("gpt2_layer_norm_logits", worst <= 0.1,
+		format!("steps={steps} logits={} worst_error_of_range={worst:.9} tensors={} defaulted={:?} unread={unread:?}", steps * vocabulary, used.len(), plan.defaulted()));
+}
+
 fn main() {
 	let root = PathBuf::from(environment("RECIPE_SUITE_ROOT"));
 	let work = PathBuf::from(environment("RECIPE_SUITE_WORK"));
@@ -219,6 +373,16 @@ fn main() {
 	let linear_source = root.join("data/linear.csv");
 	let multi_source = root.join("data/multi.csv");
 	let mut report = Report { checks: Vec::new() };
+	// Select the LayerNorm group while keeping the checks on the public API.
+	if std::env::var("RECIPE_SUITE_GROUP").is_ok_and(|group| group == "layer-norm") {
+		check_layer_norm(&mut report, &work);
+		check_gpt2_layer_norm(&mut report);
+		let failed = report.checks.iter().filter(|check| !check.passed).map(|check| check.name).collect::<Vec<_>>();
+		write_document(&evidence, &format!("{{\"schema\":\"recipe-layer-norm/1\",\"executed\":{},\"failed\":{}}}", report.checks.len(), failed.len()));
+		assert!(failed.is_empty(), "layer normalization checks failed: {failed:?}");
+		println!("LAYER NORM PASS executed={}", report.checks.len());
+		return;
+	}
 
 	// 1. A linear model recovers an exact linear relationship, checked against
 	//    the closed form rather than against a recorded value.
@@ -381,6 +545,9 @@ fn main() {
 		let repeats = first.initial_loss().to_bits() == second.initial_loss().to_bits() && first.final_loss().to_bits() == second.final_loss().to_bits() && prediction_bits(first.predictions()) == prediction_bits(second.predictions());
 		report.record(name, falls && repeats, format!("initial_loss={:.9} final_loss={:.9} final_bits={:016x} repeats={repeats}", first.initial_loss(), first.final_loss(), first.final_loss().to_bits()));
 	}
+
+	check_layer_norm(&mut report, &work);
+	check_gpt2_layer_norm(&mut report);
 
 	// The shared device-clock writer must preserve full-window and step outputs.
 	let _ = recipe.infer().log([debug]);
