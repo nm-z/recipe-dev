@@ -1,0 +1,50 @@
+Ordinary native Contraction compilation receipt, 2026-10-10
+Machine: archy. Parent wiring commit: 2d804422c4274d67906be9cb528a180038460e22.
+
+The scratch program calls the public Gguf::infer API with the downloaded
+Q8_0 2560x640 sample, FP32 computation, one column, and one planned forward.
+It uses an explicit public GGUF binding and an ordinary recipe.model().layer(2560).
+The fixture keeps the original packed matrix bytes; it is not a full-model run.
+
+Initial public-path attempt: exit 101 before any forward launch.
+LLVM IR compilation and LLVM PTX generation succeed.
+ptxas rejects calls to packed_prepare and packed_matvec without prior prototypes.
+Actual native artifact key: recipe-native-04a40dc0449b983e.
+Trace records block=256, waves=8, shared=10240 FP32 values (40960 bytes).
+The context and allocations are released; die 1 returns to 0 MiB used.
+
+Fix: derive the two declarations from the owned packed.ptx function headers,
+and insert them after .address_size 64 before generated inline-assembly callers.
+The eight-input prepare and fourteen-input matvec ABIs are unchanged.
+
+CPU assembly of the actual emitted native PTX with these declarations succeeds.
+The original monolithic -O3 path reports a 10960-byte stack and 255 registers
+for each of recipe_model_forward and recipe_model_step.
+
+Packed-call native compilation now uses the existing separate -O1 device path,
+with --disable-optimizer-constants, followed by nvlink. The linker retains the
+actual emitted .entry names, including recipe_model_step when present.
+NVIDIA native artifact version advances to v6 so old compilation policy is not reused.
+
+CUDA 11.4 ptxas -c -arch=sm_52 -O1 --disable-optimizer-constants -v: exit 0.
+CUDA 11.4 nvlink -arch=sm_52 --kernels-used recipe_model_forward,recipe_model_step -v: exit 0.
+Both linked entries: 252 registers, 296 stack bytes, 0 static shared bytes,
+372 cmem[0] bytes, 0 local bytes. Dynamic shared remains 40960 bytes.
+Module globals: 1087640 bytes. These resource fields do not establish no spills.
+Final-source release library build: exit 0 in 1m 37s, with five existing warnings.
+git diff --check: exit 0.
+
+The CPU assembly input is the actual public-path PTX with declarations inserted
+using the owned signatures. It is not a fresh model compilation from the final
+library and has not been loaded or executed on a GPU. The subsequent GPU check
+exits before its start record while root holds the shared lock; it is not queued.
+Root owner 3436140 runs target-only source 624f618a. It is left untouched.
+GPU output comparison, observed helper counters, full-model rates, and logits remain open.
+
+Source recipe.rs SHA256: f87e784a46b9c9476ca3a47120aaf222c7a4a426c5c3c26e56023421954a175f
+Declared native PTX SHA256: cefcc2fe1b157c04a9f1bdd67cd823e04705eb899c7bd734d825a047146b3323
+Linked native cubin SHA256: 9366017dcc5118d2dbfa11e70c99e7c6543a1ffd676373973bf310720801493b
+
+Full scratch source, initial failure, trace, and CPU assembly/link logs:
+archy:/home/nate/codex/cx-fl-kern-build/ordinary-forward*, ordinary-native*,
+build-wiring-native-final.log. No cap, clock, reset, reboot, or fenced-die operation occurs.

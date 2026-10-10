@@ -15,6 +15,20 @@ impl PackedMatvec {
 	pub fn ptx() -> &'static str {
 		include_str!("packed.ptx").split_once("// BEGIN PACKED HELPERS\n").expect("packed PTX function boundary").1
 	}
+	fn declarations() -> String {
+		let source = Self::ptx();
+		let mut declarations = String::new();
+		let mut offset = 0;
+		for line in source.lines() {
+			if line.starts_with(".func ") && [" packed_prepare(", " packed_matvec("].iter().any(|name| line.contains(name)) {
+				let end = source[offset..].find('{').expect("packed PTX function body");
+				declarations.push_str(source[offset..offset + end].trim());
+				declarations.push_str(";\n");
+			}
+			offset += line.len() + 1;
+		}
+		declarations
+	}
 }
 
 mod reference;
@@ -8474,7 +8488,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let version = match target {
 		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v6".as_slice(),
 		BackendTarget::Amd { .. } => b"recipe-native-v3".as_slice(),
-		BackendTarget::Nvidia { .. } => b"recipe-native-nvidia-v4".as_slice(),
+		BackendTarget::Nvidia { .. } => b"recipe-native-nvidia-v6".as_slice(),
 	};
 	let requirement = match target {
 		BackendTarget::Cpu { target } => {
@@ -8867,6 +8881,11 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			}
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
 			let expert_calls=ptx_source.contains("split_main_forward");
+			let packed_calls = ptx_source.contains("packed_prepare") || ptx_source.contains("packed_matvec");
+			if packed_calls {
+				let at = ptx_source.find(".address_size 64").ok_or_else(|| RecipeError::new("native packed PTX has no address-size declaration"))? + ".address_size 64".len();
+				ptx_source.insert_str(at, &format!("\n{}", PackedMatvec::declarations()));
+			}
 			if expert_calls {
 				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
 				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
@@ -8877,20 +8896,25 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
+			let entries = ptx_source.lines().filter_map(|line| {
+				let words = line.split_whitespace().collect::<Vec<_>>();
+				let at = words.iter().position(|word| *word == ".entry")?;
+				words.get(at + 1).map(|name| name.trim_end_matches('(').to_owned())
+			}).collect::<Vec<_>>().join(",");
 			fs::write(output, ptx_source).map_err(|error| RecipeError::new(format!("cannot append MTP PTX: {error}")))?;
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
 				let mut command = Command::new(assembler);
-				let separate=expert_calls;
+				let separate = expert_calls || packed_calls;
 				let object=output.with_extension("device.cubin");
-				if separate {command.arg("-c");}
+				if separate {command.args(["-c", "--disable-optimizer-constants"]);}
 				command.arg(format!("-arch={architecture}")).args([if separate {"-O1"} else {"-O3"}, "-o"]).arg(if separate {&object} else {output}).arg(&ptx);
 				let assembled = native_command(command, "NVIDIA PTX assembler", key);
 				assembled?;
 				if separate {
 					let linker=Path::new(&native_nvidia_assembler(architecture).unwrap()).with_file_name("nvlink");
-					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used","recipe_model_forward,recipe_model_load,expert_split_worker"]).arg("-o").arg(output).arg(&object);
+					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used", &entries]).arg("-o").arg(output).arg(&object);
 					native_command(command,"NVIDIA device linker",key)?;
 				}
 				return Ok(Vec::new());
