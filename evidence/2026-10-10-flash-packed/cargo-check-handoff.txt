@@ -1,0 +1,73 @@
+[1m[33mwarning[0m: Cargo.toml: unused manifest key: architecture
+[1m[33mwarning[0m: Cargo.toml: unused manifest key: encoding
+[1m[33mwarning[0m: Cargo.toml: unused manifest key: precision
+[1m[33mwarning[0m: `recipe` (manifest) generated 3 warnings
+[1m[92m   Compiling[0m recipe v0.1.0 (/home/nate/work/cx-fl-kern)
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+     [1m[94m--> [0mrecipe.rs:18837:8
+      [1m[94m|[0m
+[1m[94m18837[0m [1m[94m|[0m             let mut prompt = if let Some(ids) = &self.prompt_ids {
+      [1m[94m|[0m                 [1m[94m----[0m[1m[33m^^^^^^[0m
+      [1m[94m|[0m                 [1m[94m|[0m
+      [1m[94m|[0m                 [1m[94mhelp: remove this `mut`[0m
+      [1m[94m|[0m
+      [1m[94m= [0m[1mnote[0m: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `std::arch::x86_64::_mm256_storeu_ps` is unsafe and requires unsafe block[0m
+     [1m[94m--> [0mrecipe.rs:25767:3
+      [1m[94m|[0m
+[1m[94m25767[0m [1m[94m|[0m         _mm256_storeu_ps(out.as_mut_ptr(), lane);
+      [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+      [1m[94m|[0m
+      [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+     [1m[94m--> [0mrecipe.rs:25755:1
+      [1m[94m|[0m
+[1m[94m25755[0m [1m[94m|[0m unsafe fn fma_burst_avx2(iterations: u64) -> f32 {
+      [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+      [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+      [1m[94m= [0m[1mnote[0m: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+[1m[33mwarning[0m[1m: method `name` is never used[0m
+     [1m[94m--> [0mrecipe.rs:14067:5
+      [1m[94m|[0m
+[1m[94m14062[0m [1m[94m|[0m impl ActivationStep {
+      [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m14067[0m [1m[94m|[0m     fn name(self) -> &'static str {
+      [1m[94m|[0m        [1m[33m^^^^[0m
+      [1m[94m|[0m
+      [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: method `name` is never used[0m
+     [1m[94m--> [0mrecipe.rs:16615:11
+      [1m[94m|[0m
+[1m[94m16614[0m [1m[94m|[0m impl BlockNormalization {
+      [1m[94m|[0m [1m[94m-----------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m16615[0m [1m[94m|[0m     const fn name(self) -> &'static str {
+      [1m[94m|[0m              [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: struct `AttentionIndexLayout` is never constructed[0m
+     [1m[94m--> [0mrecipe.rs:23148:8
+      [1m[94m|[0m
+[1m[94m23148[0m [1m[94m|[0m struct AttentionIndexLayout {
+      [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: function `attention_index_layout` is never used[0m
+     [1m[94m--> [0mrecipe.rs:23154:4
+      [1m[94m|[0m
+[1m[94m23154[0m [1m[94m|[0m fn attention_index_layout(node: &Node, rows: usize) -> Result<AttentionIndexLayout> {
+      [1m[94m|[0m    [1m[33m^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: method `commit_index_prefix` is never used[0m
+     [1m[94m--> [0mrecipe.rs:24834:5
+      [1m[94m|[0m
+[1m[94m24525[0m [1m[94m|[0m impl NativeTape {
+      [1m[94m|[0m [1m[94m---------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m24834[0m [1m[94m|[0m     fn commit_index_prefix(&self, contexts: &mut [u8], values: &mut [u8], end: u32) -> Result<()> {
+      [1m[94m|[0m        [1m[33m^^^^^^^^^^^^^^^^^^^[0m
+
+[1mFor more information about this error, try `rustc --explain E0133`.[0m
+[1m[33mwarning[0m: `recipe` (lib) generated 7 warnings (run `cargo fix --lib -p recipe` to apply 2 suggestions)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 1m 29s

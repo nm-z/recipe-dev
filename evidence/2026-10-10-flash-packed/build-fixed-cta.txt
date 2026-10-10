@@ -1,0 +1,15 @@
+bash evidence/2026-10-10-flash-packed/select-source.sh evidence/2026-10-10-flash-packed/packed.cu evidence/2026-10-10-flash-packed/winners.tsv /home/nate/codex/cx-fl-kern-build/selected.cu /home/nate/codex/cx-fl-kern-build/selected-configs.txt
+mkdir -p /home/nate/codex/cx-fl-kern-build/tmp
+TMPDIR=/home/nate/codex/cx-fl-kern-build/tmp /opt/cuda/bin/nvcc -Wno-deprecated-gpu-targets -arch=sm_52 -I/home/nate/llama.cpp-master/ggml/src -I/home/nate/codex/cx-fl-kern-build -ptx /home/nate/codex/cx-fl-kern-build/selected.cu -o /home/nate/codex/cx-fl-kern-build/selected.ptx
+/home/nate/codex/cx-fl-kern-build/selected.cu(223): warning #177-D: function "warp_sum" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float warp_sum(float v) {
+                                                                                 ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+sed -i 's/^\.version .*/.version 7.4/' /home/nate/codex/cx-fl-kern-build/selected.ptx
+awk -f evidence/2026-10-10-flash-packed/prune-globals.awk /home/nate/codex/cx-fl-kern-build/selected.ptx /home/nate/codex/cx-fl-kern-build/selected.ptx > /home/nate/codex/cx-fl-kern-build/selected-pruned.ptx
+awk -f evidence/2026-10-10-flash-packed/extract-helpers.awk /home/nate/codex/cx-fl-kern-build/selected-pruned.ptx > packed.ptx
+/opt/cuda-11.4/bin/ptxas -arch=sm_52 -v packed.ptx -o /home/nate/codex/cx-fl-kern-build/helpers.cubin
+ptxas info    : 6160 bytes gmem
+exit=0

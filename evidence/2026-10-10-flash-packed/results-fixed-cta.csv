@@ -1,0 +1,2 @@
+type,m,k,batch,path,warps,weight_GBs,kernel_plus_prep_GBs,stock_GBs,stock_error,cpu_error,copies,correct,stock_float_noise,stock_cpu_error,cpu_rows,experts
+20,2560,640,1,r8_xmad,16,23.973,22.267,27.937,1.0584617e-07,1.05492788e-07,37,1,1,1.05492788e-07,64,1

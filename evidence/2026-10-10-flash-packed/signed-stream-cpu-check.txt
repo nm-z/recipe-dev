@@ -1,0 +1,1 @@
+iq2_pair_checks=262144 iq3_pair_checks=131072 iq3_index_checks=16777216 iq3_scale_checks=1015808 mismatches=0
