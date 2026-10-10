@@ -28,17 +28,14 @@ pub fn model() -> Model {
 }
 
 fn main() {
-	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
-	let model = model();
-	let mut infer = recipe.infer();
-	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }
-	if std::env::args().any(|arg| arg == "--memory") {
-		for (index, memory) in infer.memory(&model, &data, 128).unwrap().iter().enumerate() {
-			println!("planned {} {memory}", if index == 0 { "target" } else { "MTP" });
-			println!("weights_bytes {} values_bytes {} contexts_bytes {} input_bytes {} scratch_bytes {}", memory.weights, memory.values, memory.contexts, memory.input, memory.scratch);
-		}
-		return;
-	}
-	let report = infer.chat([time, pp, tg, input, out, cached, mtp]).run(&model, &data);
-	println!("generation tokens {} rate {} tok/s", report.out, report.tg());
+	let data=recipe.data(GGUF);
+	let model=model();
+	let mut infer=recipe.infer();
+	if let Ok(path)=std::env::var("MTP") {infer=infer.mtp(path);}
+	let free=[6113460224usize,8450998272,0,7915765760,8450998272,8450998272,0,8450998272];
+	let budgets=std::array::from_fn(|die|ExpertDieBudget {free_bytes:free[die],reserve_bytes:32<<20});
+	let plan=infer.expert_plan(&model,&data,128,budgets).unwrap();
+	println!("{}",plan.table()); for item in &plan.placements {if item.row_start.is_some() {println!("dense_slice\t{}\t{}\t{}\t{}\t{}\t{}",item.mtp,item.tensor.name,item.die,item.row_start.unwrap(),item.tensor.shape[1],item.tensor.bytes);}}
+	assert_eq!(plan.unplaced_bytes,0); assert_eq!(plan.unplaced_experts,0); assert_eq!(plan.main_die,4);
+	assert!(plan.placements.iter().all(|item|item.die!=6)); assert!(plan.fits());
 }

@@ -240,6 +240,15 @@ place(path, &[blocks])
 recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128 "Hello"
 ```
 
+In NVIDIA terminal chat, `/artifacts` prints the loaded module paths. Reassemble
+those cubins with the same graph buffer layout and entrypoint ABI, then use
+`/reload` to replace the main model modules while its weights and state stay
+resident. A failed module load preserves the existing modules. Use `/clear`
+to start a new conversation with the resident weights.
+
+`Placed::native_artifacts()` returns the paths. `Placed::reload_native(&paths)`
+replaces the modules through the same path.
+
 ## GGUF statistics
 
 ```bash

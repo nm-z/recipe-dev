@@ -1,0 +1,1 @@
+resident reload PASS: 65536 logits, weights [1243637776], artifacts ["/home/nate/.cache/recipe/native/recipe-native-1e7b0b93f29a9e14/artifact.cubin"]
