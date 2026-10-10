@@ -4,18 +4,18 @@ Root `packed.ptx` contains device functions and tables, with no launch entries. 
 
 ## Device interface
 
-All pointers are u64. Dimensions, selectors, and the receipt are u32. The shared pointer is a generic address obtained from `cvta.shared`, aligned to 16 bytes.
+All pointers are u64. Dimensions, selectors, and the receipt are u32. The module declares `.extern .shared .align 16 .b8 scratch[]`; the caller launches with 40960 dynamic shared bytes. The PTX interface has no shared-pointer parameter.
 
 ```text
 packed_prepare(x_f32, packed_x, scales, k, source_columns, active_source_columns, cta_index, cta_count) -> void
 packed_matvec(type, capacity, active_columns, kind, row_lanes, position_mask,
-	weights, packed_x, scales, output_f32, k, m, cta_index, cta_count, shared) -> u32
+	weights, packed_x, scales, output_f32, k, m, cta_index, cta_count) -> u32
 packed_matvec_wide(same parameters) -> u32
 ```
 
-`packed_matvec` dispatches CTA sizes 64/128/256/512, plus 1024 for capacities 1/2. The wide function accepts 1024 threads and capacities 1/2. Row lanes are 8/16. Capacity is 1/2/4/8. Every thread in the CTA calls together. Cooperating CTAs use consistent arguments and distinct logical ranks.
+`packed_matvec` dispatches only the measured configurations in `winners.tsv` and `fixed-cta.tsv`. Every format and capacity includes a 512-thread configuration for a persistent launch. The wide function accepts 1024 threads and capacities 1/2. Row lanes are 8/16. Capacity is 1/2/4/8. Every thread in the CTA calls together. Cooperating CTAs use consistent arguments and distinct logical ranks.
 
-- For one expert per CTA, pass cta_index=0 and cta_count=1.
+- Split expert rows across the assigned logical CTA group; pass its rank as cta_index and its size as cta_count. Allocate the die's 16 CTAs across selected experts in proportion to weight bytes.
 - For a matrix shared by the grid, pass the CTA's logical rank and the cooperating CTA count.
 - Kind 0 is XMAD; kind 1 is FP32 magic/FADD; kind 2 is a signed-codebook XMAD candidate for IQ2_XS/IQ3_XXS/IQ4_NL only.
 - Types are ggml IDs 8=Q8_0, 12=Q4_K, 13=Q5_K, 14=Q6_K, 17=IQ2_XS, 18=IQ3_XXS, and 20=IQ4_NL.
@@ -24,7 +24,7 @@ packed_matvec_wide(same parameters) -> u32
 - Output is compact column-major, m floats per column. Inactive columns remain untouched. Gate/up outputs are compact; reprepare their compact activation product and use mask 0 for down. Apply routing coefficients at combine.
 - The caller provides a grid completion barrier after preparation and after matrix writes. The helper performs CTA barriers only. Inputs and output must not overlap.
 
-The receipt is 1 for a valid call and 0 for invalid type, dimensions, capacity, mask, CTA size, or logical CTA rank/count. A zero-active-column call reads no matrix and writes no output. Typed `packed_g_*`/`packed_h_*` functions are also exported for AOT selection; their parameters are `(weights, packed_x, scales, out, k, m, active, mask, cta_index, cta_count, shared)` and return void.
+The receipt is 1 for a valid call and 0 for invalid type, dimensions, capacity, mask, CTA size, or logical CTA rank/count. A zero-active-column call reads no matrix and writes no output. Typed `packed_g_*`/`packed_h_*` functions are also exported for AOT selection; their parameters are `(weights, packed_x, scales, out, k, m, active, mask, cta_index, cta_count)` and return void.
 
 ## Build and benchmark
 
@@ -48,6 +48,6 @@ Performance acceptance is not passed. The 85% target is 123.25 GB/s. The current
 
 Stock IQ2_XS/IQ3_XXS differs from the independently decoded algebra beyond the original 3e-6 float-noise threshold. Both errors are reported. The full-model 10% final-logit gate and 60/80 tok/s checkpoints are not measured by this harness.
 
-The signed codebooks add 1605632 bytes per module, plus the canonical tables. They are format dictionaries; tensor weights remain in their original GGUF layout. Follow-up reductions of spills and codebook traffic are separate, unmeasured work after this stable handoff. The resident full-model load now occupies die 1, so no additional standalone GPU suite is queued from this snapshot.
+The shipped winners use the canonical format tables; unreferenced signed codebooks are removed. Tensor weights remain in their original GGUF layout. Follow-up codebook and spill reductions remain outside this snapshot until their measured configurations are selected.
 
-The shipped library contains only 43 unique measured winner functions. Unlisted kind/CTA/row-lane configurations return 0. Use winners.tsv for the AOT choice; the full candidate generator and benchmark source remain in the evidence directory. The 75,037-line, 2.4 MiB library replaces the 1.1-million-line artifact.
+The shipped library contains the measured winner functions and the fastest measured 512-thread configuration for every shape and capacity. Unlisted kind/CTA/row-lane configurations return 0. Use winners.tsv for the unrestricted AOT choice, or fixed-cta.tsv for a 512-thread persistent launch; the full candidate generator and benchmark source remain in the evidence directory. The selected library replaces the 1.1-million-line artifact.

@@ -67,7 +67,14 @@ int main(int ac,char **av){
 		const char *prefix="r";
 		int nwmin=getenv("WARPS_MIN")?atoi(getenv("WARPS_MIN")):4;
 		int row_lanes=getenv("ROW_LANES")?atoi(getenv("ROW_LANES")):16;
-		for(int kind=0;kind<3;kind++)for(int nw=nwmin;nw<=32;nw*=2){
+		int nwmax=getenv("WARPS_MAX")?atoi(getenv("WARPS_MAX")):32,selected_kind=-1;
+		if(getenv("CONFIG_TSV")){
+			FILE *cfg=fopen(getenv("CONFIG_TSV"),"r");if(!cfg)return 1;char line[1024];int found=0;
+			while(fgets(line,sizeof(line),cfg)){int ct,cm,ck,cn,ce,cg,cw,cl;if(sscanf(line,"%d%d%d%d%d%d%d%d",&ct,&cm,&ck,&cn,&ce,&cg,&cw,&cl)==8&&ct==t&&cm==m&&ck==k&&cn==n&&ce==experts){selected_kind=cg;nwmin=nwmax=cw;row_lanes=cl;found=1;break;}}
+			fclose(cfg);if(!found){fprintf(stderr,"missing measured configuration type=%d m=%d k=%d batch=%d experts=%d\n",t,m,k,n,experts);return 1;}
+		}
+		for(int kind=0;kind<3;kind++)for(int nw=nwmin;nw<=nwmax;nw*=2){
+			if(selected_kind>=0&&kind!=selected_kind)continue;
 			if(kind==2&&t!=17&&t!=18&&t!=20)continue;
 			if(nw==32&&n>2)continue;
 			if((*prefix=='f'||*prefix=='h')&&kind)continue;

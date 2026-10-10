@@ -4,7 +4,7 @@ source=$1
 winners=$2
 output=$3
 scratch=$4
-awk -F'\t' 'NR>1{family=($1==12||$1==13)&&$6==0?"h":"g";name=family=="h"?sprintf("packed_h_%s_%s_%s_%s",$1,$4,$7,$8):sprintf("packed_g_%s_%s_%s_%s_%s",$1,$4,$7,$6,$8);if(!seen[name]++)print $1,$4,$7,$8,$6,family,name}' "$winners" > "$scratch"
+awk -F'\t' '$1~/^[0-9]+$/{family=($1==12||$1==13)&&$6==0?"h":"g";name=family=="h"?sprintf("packed_h_%s_%s_%s_%s",$1,$4,$7,$8):sprintf("packed_g_%s_%s_%s_%s_%s",$1,$4,$7,$6,$8);if(!seen[name]++)print $1,$4,$7,$8,$6,family,name}' "$winners" "${winners%/*}/fixed-cta.tsv" > "$scratch"
 awk '/^extern "C" __device__ __noinline__ u32 packed_matvec_wide/{exit} /^(GT|WIDET|DT|WIDTHT|WIDTH|GW|DW|GK|G)\([0-9]/{next} {print}' "$source" > "$output"
 while read -r type cap warps lanes kind family symbol; do
 	if [[ $family == h ]]; then printf 'WIDTH(%s,%s,%s,%s)\n' "$type" "$cap" "$warps" "$lanes" >> "$output"; else printf 'G(%s,%s,%s,%s,%s)\n' "$type" "$cap" "$warps" "$lanes" "$kind" >> "$output"; fi
@@ -25,3 +25,4 @@ extern "C" __device__ __noinline__ u32 packed_matvec_wide(int type,int capacity,
 	return packed_matvec(type,capacity,active,kind,lanes,mask,W,x,ds,out,k,m,index,count,scratch);
 }
 PART
+awk '/^extern "C" __global__ void __launch_bounds__\(512,1\) packed_probe\(/{copy=1} copy{print}' "$source" >> "$output"
