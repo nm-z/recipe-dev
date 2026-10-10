@@ -16038,7 +16038,7 @@ impl MtpHead {
 		model = builder.close(model, attention, &dimensions);
 		let ffn = builder.open(layer, "ffn", &dimensions)?;
 		let ffn = match &dimensions.experts {
-			Some(experts) => builder.experts(ffn, layer, experts, &dimensions)?,
+			Some(experts) => builder.experts(ffn, layer, experts, &dimensions)?.fp(32),
 			None => builder.feed_forward(ffn, layer, &dimensions)?,
 		};
 		model = builder.close(model, ffn, &dimensions);
