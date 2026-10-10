@@ -9223,6 +9223,10 @@ impl FloatFormat {
 	fn unpack(self, bits: u64) -> f64 {
 		if self == Self::FP8 { return fp8::Encoding::E4M3.unpack(bits); }
 		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.unpack(bits); }
+		if self.arithmetic == self.storage && self.storage.exp == 8 && self.storage.man == 23 && bits >> 32 == 0 {
+			let value = f64::from(f32::from_bits(bits as u32));
+			return if value.is_nan() { f64::NAN.copysign(value) } else { value };
+		}
 		self.arithmetic.unpack(self.arithmetic.pack(self.storage.unpack(bits)))
 	}
 }
@@ -19561,7 +19565,7 @@ fn external_expert(node: &Node) -> bool { matches!(node.block_kind,"split_expert
 #[derive(Clone)]
 enum SplitWork { Expert([GgufTensor;3]), Dense(Vec<GgufTensor>) }
 #[derive(Clone)]
-struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, last_only: bool, work: SplitWork }
+struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, last_only: bool, terminal: bool, work: SplitWork }
 impl ExpertLayer {
 	fn tensors(&self)->&[GgufTensor] {match &self.work {SplitWork::Expert(tensors)=>tensors,SplitWork::Dense(tensors)=>tensors}}
 	fn dense(&self)->bool {matches!(self.work,SplitWork::Dense(_))}
@@ -19592,7 +19596,7 @@ fn wire_expert_graph(graph: &mut Graph, binding: &Binding, mtp: bool, first: usi
 		graph.nodes[out].input = input;
 		graph.nodes[out].block_kind = "split_expert";
 		graph.nodes[out].argument[8] = (group + 1) as f64;
-		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, last_only:false, work:SplitWork::Expert([tensors[0].clone(),tensors[1].clone(),tensors[2].clone()]) });
+		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, last_only:false, terminal:false, work:SplitWork::Expert([tensors[0].clone(),tensors[1].clone(),tensors[2].clone()]) });
 	}
 	Ok(())
 }
@@ -19661,7 +19665,7 @@ fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Res
 		require(tensors.iter().map(|tensor|&tensor.name).collect::<std::collections::HashSet<_>>().len()<=16 && tensors.iter().all(|tensor|matches!(tensor.kind,0|8|12|13|14|17|18|20|30) && tensor.shape[0]<=10240 && (matches!(tensor.kind,0|30) || tensor.shape[0]%32==0)),format!("dense row split needs supported types, aligned quantized widths, and at most sixteen source matrices: {tensors:?}"))?;
 		let layer=node.block_index;let last_only=node.output.length==1;
 		graph.nodes[index].block_kind="split_dense";graph.nodes[index].precision=Compute::FP32;graph.nodes[index].acc=Compute::FP32;graph.nodes[index].argument[8]=1.0;
-		graph.expert_layers.push(ExpertLayer {node:index,global:0,mtp,layer,last_only,work:SplitWork::Dense(tensors)});
+		graph.expert_layers.push(ExpertLayer {node:index,global:0,mtp,layer,last_only,terminal:index+1==graph.nodes.len(),work:SplitWork::Dense(tensors)});
 	}
 	graph.expert_layers.sort_by_key(|layer|layer.node);
 	for (local,layer) in graph.expert_layers.iter_mut().enumerate() {layer.global=first+local;graph.nodes[layer.node].argument[8]=(local+1) as f64;}
@@ -19814,6 +19818,7 @@ impl ExpertExecution {
 				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
 				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
 				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),layer.input_width().max(4096) as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				record.extend(u32::from(layer.terminal).to_ne_bytes());
 				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
 				value.channel_tables.push(table);
 			}
@@ -25095,6 +25100,12 @@ impl NativeTape {
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
+		self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?.push(OperationReport {
+			device: self.device_label()?, model: String::new(), block: 0, node: usize::MAX, operation: "ForwardWindow".to_owned(), begin, end,
+			positions: (end - begin) as usize, ticks: ticks[1].wrapping_sub(ticks[0]).max(0) as u64,
+			seconds: (self.program.gpu.backend != Backend::Cpu).then_some(seconds), selected_experts: 0, weight_bytes: 0, packed_calls: 0,
+			packed_fallbacks: [0; 4], fingerprints: Vec::new(), cache_fingerprints: Vec::new(), cache_channel_fingerprints: Vec::new(),
+		});
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
@@ -25259,11 +25270,11 @@ impl NativeTape {
 	fn request_bytes(&self) -> (usize, usize) {
 		self.request.lock().unwrap().as_ref().map_or((0, 0), |request| (request.input.bytes, request.output.bytes + request.hidden.bytes + request.lookups.iter().map(|buffer| buffer.bytes).sum::<usize>()))
 	}
-	/// The logits of the last reached position in `begin..end`, read from the full output tensor.
+	/// The logits of the last reached position, using the current request's output layout.
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let (_, reached) = self.output_window(begin, end)?;
 		require(reached != 0, "decode window reaches no output position")?;
-		select_last_logits(predictions, self.output, reached as usize - 1)
+		self.logits_at(predictions, reached as usize - 1)
 	}
 	fn logits_at(&self, predictions: &[f64], position: usize) -> Result<Vec<f64>> {
 		if predictions.len() == self.output.elements() { return select_last_logits(predictions, self.output, position); }
@@ -35647,7 +35658,7 @@ dt_shuffle:
 	add.u32 r5,r5,r6; bra dt_row;
 }
 .func (.param .u32 result) split_dense_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
-	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<5>; .reg .f32 f;
+	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<6>; .reg .f32 f;
 	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
 	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+40]; ld.global.u64 a8,[a0+48];
 	ld.global.u64 a9,[a0+56]; ld.global.u64 a10,[a0+72]; ld.global.u64 a11,[a0+88]; ld.global.u64 a12,[a0+96]; ld.global.u64 a13,[a0+112];
@@ -35699,12 +35710,27 @@ dl_computed:
 	add.u32 r20,r20,1;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
 	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,405; @p1 bra dl_done;
-	mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
+	// Terminal compact rows have no later consumers of inactive positions.
+	// Writing the complete row coalesces peer traffic while retaining its active logit.
+	ld.global.u32 r31,[a0+184]; setp.ne.u32 p1,r31,0; setp.eq.u32 p2,r1,1; and.pred p1,p1,p2;
+	setp.gt.u32 p2,r13,1; and.pred p1,p1,p2; setp.le.u32 p2,r13,8; and.pred p1,p1,p2;
+	@p1 bra dl_padded_begin;
+	 mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
 dl_scatter:
 	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r25; rem.u32 r18,r15,r25; mul.wide.u32 a17,r18,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_scatter_next; mad.lo.u32 r19,r18,r13,r14; add.u32 r19,r19,r17;
 	mul.wide.u32 a17,r15,4; add.u64 a18,a10,a17; ld.global.f32 f,[a18]; mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
 dl_scatter_next:
 	add.u32 r15,r15,r10; bra dl_scatter;
+dl_padded_begin:
+	mov.u32 r15,r9; mul.lo.u32 r16,r25,r13;
+dl_padded:
+	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r13; rem.u32 r26,r15,r13;
+	mul.wide.u32 a17,r17,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_padded_next;
+	mad.lo.u32 r19,r18,r13,r26; mov.f32 f,0f00000000; setp.eq.u32 p2,r26,r14;
+	mul.wide.u32 a17,r17,4; add.u64 a18,a10,a17; @p2 ld.global.f32 f,[a18];
+	mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
+dl_padded_next:
+	add.u32 r15,r15,r10; bra dl_padded;
 dl_scattered:
 	add.u32 r20,r20,1;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
