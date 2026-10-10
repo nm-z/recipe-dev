@@ -9073,7 +9073,7 @@ mod gguf {
 		pub kind: u32,
 		pub offset: usize,
 		pub bytes: usize,
-		shard: usize,
+		pub(super) shard: usize,
 	}
 
 	impl GgufTensor {
