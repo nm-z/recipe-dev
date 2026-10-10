@@ -1,0 +1,7 @@
+Sat Oct 10 15:43:42 UTC 2026
+30a7727409c3e40287dcb630709e8aa88dcd215927cfac4019b78ccea54c6c84  /home/nate/work/cx-fl-dispatch/recipe.rs
+ba05e064ffb107079e7b04704fd2a095ebd0d8e53e6fd41bd624efc1c79f4ab6  /home/nate/work/cx-fl-dispatch/barrier.ptx
+53213ef107ff38bd664846dff43f41295a8b91c1af717616a3d500a21eddada1  /home/nate/work/cx-fl-dispatch/packed.ptx
+7b179372c68d7e6a613d6b9d248de5056b86e98df9d4eea4ba3cedad1fb7fd9c  /home/nate/work/cx-fl-dispatch/target/debug/librecipe.rlib
+f6c52bf8362529b8be34d3ffa643940d517e87ff9c3bdc6656d81bc2fad0bd6d  /home/nate/codex/cx-fl-dispatch-build/worker-handoff.cubin
+  1277: 0000000000000000   576 FUNC    GLOBAL DEFAULT [<other>: 10]  1598 expert_split_worker
