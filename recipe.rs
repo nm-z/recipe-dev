@@ -6,8 +6,8 @@
 #[path = "build.rs"]
 mod native_build;
 use native_build::{encoding, fp8};
-mod reference;
 pub use reference::Summary as ReferenceReport;
+mod reference;
 mod program_ir {
 	//! Compile-time lowering for the scalar, predictor, route, and normalization
 	//! pieces of a concrete model.
@@ -44,6 +44,11 @@ mod program_ir {
 		/// The left operand rounded through fp16 and back.
 		Half = 17,
 		SquareRoot = 18,
+		/// The channel of the element the program runs on, as a state value.
+		Channel = 19,
+		/// A trainable parameter at `left + channel mod right`, so one span of
+		/// `right` values gives every channel its own value.
+		ChannelParameter = 20,
 	}
 
 	impl ScalarOpcode {
@@ -67,6 +72,8 @@ mod program_ir {
 				16 => Ok(Self::FusedAdd),
 				17 => Ok(Self::Half),
 				18 => Ok(Self::SquareRoot),
+				19 => Ok(Self::Channel),
+				20 => Ok(Self::ChannelParameter),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -160,6 +167,8 @@ mod program_ir {
 		pub decode: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
+		/// The i32 name of the element's channel, when the program reads one.
+		pub channel: Option<&'a str>,
 	}
 
 	pub struct ScalarForward {
@@ -172,6 +181,8 @@ mod program_ir {
 		pub first_adjoint: String,
 		pub second_adjoint: String,
 		pub parameter_adjoint: BTreeMap<usize, String>,
+		/// The i32 parameter column and state adjoint of each channel parameter.
+		pub channel_adjoint: Vec<(String, String)>,
 	}
 
 	struct ScalarInstruction {
@@ -180,7 +191,18 @@ mod program_ir {
 		right: f64,
 	}
 
-	fn integer(value: f64, kind: &'static str) -> Result<i32, EmitError> {
+	/// The base index and period of a channel parameter, both nonnegative integers
+/// with a positive period.
+fn channel_span(instruction: &ScalarInstruction) -> Result<(i32, i32), EmitError> {
+	let base = integer(instruction.left, "scalar channel base")?;
+	let period = integer(instruction.right, "scalar channel period")?;
+	if base < 0 || period <= 0 {
+		return Err(EmitError::InvalidOperand { kind: "scalar channel parameter", value: instruction.right });
+	}
+	Ok((base, period))
+}
+
+fn integer(value: f64, kind: &'static str) -> Result<i32, EmitError> {
 		if !value.is_finite() || value.fract() != 0.0 || value < i32::MIN as f64 || value > i32::MAX as f64 {
 			return Err(EmitError::InvalidOperand { kind, value });
 		}
@@ -304,6 +326,28 @@ mod program_ir {
 					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
 					name
 				}
+				ScalarOpcode::Channel => {
+					let channel = context.channel.ok_or(EmitError::InvalidOperand { kind: "scalar channel", value: instruction.left })?;
+					let _ = writeln!(output, "{name} = uitofp i32 {channel} to {ty}");
+					name
+				}
+				ScalarOpcode::ChannelParameter => {
+					let channel = context.channel.ok_or(EmitError::InvalidOperand { kind: "scalar channel", value: instruction.left })?;
+					let (base, period) = channel_span(instruction)?;
+					let column = format!("{name}.column");
+					let _ = writeln!(output, "{column}.rem = urem i32 {channel}, {period}");
+					let _ = writeln!(output, "{column}.index = add i32 {column}.rem, {base}");
+					let _ = writeln!(output, "{column}.wide = zext i32 {column}.index to i64");
+					if context.decode == 0 {
+						let pointer = format!("{name}.ptr");
+						let _ = writeln!(output, "{pointer} = getelementptr inbounds {model}, {ptrty} {weights}, i64 {column}.wide", model = context.value_type, ptrty = context.pointer_type, weights = context.weights);
+						let _ = writeln!(output, "{name}.model = load {model}, {ptrty} {pointer}, align {align}", model = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = context.alignment);
+					} else {
+						let _ = writeln!(output, "{name}.model = call {model} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {column}.wide, i32 {decode})", model = context.value_type, ptrty = context.pointer_type, weights = context.weights, decode = context.decode);
+					}
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
+					name
+				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &first, &second)?,
 				ScalarOpcode::Select => {
 					let condition = scalar_operand(instruction.left, &values, &first, &second)?;
@@ -407,6 +451,7 @@ mod program_ir {
 		let incoming = incoming_state.as_str();
 		let mut values = Vec::with_capacity(instructions.len());
 		let mut parameter_for = vec![None; instructions.len()];
+		let mut channel_columns: Vec<Option<String>> = vec![None; instructions.len()];
 		for (index, instruction) in instructions.iter().enumerate() {
 			let value = match instruction.opcode {
 				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
@@ -416,6 +461,11 @@ mod program_ir {
 						return Err(EmitError::InvalidOperand { kind: "scalar parameter", value: instruction.left });
 					}
 					parameter_for[index] = Some(parameter as usize);
+					format!("%{}.scalar.{index}", context.prefix)
+				}
+				ScalarOpcode::Channel => format!("%{}.scalar.{index}", context.prefix),
+				ScalarOpcode::ChannelParameter => {
+					channel_columns[index] = Some(format!("%{}.scalar.{index}.column.index", context.prefix));
 					format!("%{}.scalar.{index}", context.prefix)
 				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &entry_first, &entry_second)?,
@@ -442,6 +492,7 @@ mod program_ir {
 		let mut first = state_zero.clone();
 		let mut second = state_zero.clone();
 		let mut parameters = BTreeMap::new();
+		let mut channel_adjoints = Vec::new();
 		let mut sequence = 0;
 		if let Some(last) = adjoints.last_mut() {
 			*last = incoming.to_owned();
@@ -463,7 +514,11 @@ mod program_ir {
 		};
 		for (index, instruction) in instructions.iter().enumerate().rev() {
 			let adjoint = adjoints[index].clone();
-			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::FusedAdd) { String::new() } else { operand(instruction.left, &values)? };
+			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::Channel | ScalarOpcode::ChannelParameter | ScalarOpcode::FusedAdd) {
+				String::new()
+			} else {
+				operand(instruction.left, &values)?
+			};
 			let right = if matches!(
 				instruction.opcode,
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough
@@ -604,7 +659,11 @@ mod program_ir {
 					// A rounding passes its adjoint straight through.
 					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
-				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
+				ScalarOpcode::ChannelParameter => {
+					let column = channel_columns[index].clone().ok_or(EmitError::InvalidReference { kind: "scalar channel", index: index as i32 })?;
+					channel_adjoints.push((column, adjoint.clone()));
+				}
+				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::Channel => {}
 			}
 		}
 		for (index, parameter) in parameter_for.into_iter().enumerate() {
@@ -629,7 +688,7 @@ mod program_ir {
 		let first = encode("first", &first);
 		let second = encode("second", &second);
 		let parameters = parameters.into_iter().map(|(index, value)| (index, encode(&format!("parameter{index}"), &value))).collect();
-		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters })
+		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters, channel_adjoint: channel_adjoints })
 	}
 
 	#[derive(Clone, Copy)]
@@ -994,6 +1053,8 @@ mod program_ir {
 		pub span: usize,
 		/// The per-channel scale applied after normalization, when the node carries one.
 		pub weight: Option<&'a str>,
+		/// Whether a per-channel shift follows the scale, stored after it.
+		pub shift: bool,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
 	}
@@ -1129,7 +1190,19 @@ mod program_ir {
 				let _ =
 					writeln!(output, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 				let _ = writeln!(output, "{scaled} = call {ty} @recipe.mul{suffix}({ty} {value}, {ty} {weight_value})", ty = context.value_type);
-				scaled
+				if context.shift {
+					let shift_column = format!("%{prefix}.shift.column");
+					let shift_pointer = format!("%{prefix}.shift.ptr");
+					let shift_value = format!("%{prefix}.shift");
+					let shifted = format!("%{prefix}.shifted");
+					let _ = writeln!(output, "{shift_column} = add i64 {column}, {span}", span = context.span);
+					let _ = writeln!(output, "{shift_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i64 {shift_column}", ty = context.value_type, ptrty = context.pointer_type);
+					let _ = writeln!(output, "{shift_value} = load {ty}, {ptrty} {shift_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+					let _ = writeln!(output, "{shifted} = call {ty} @recipe.add{suffix}({ty} {scaled}, {ty} {shift_value})", ty = context.value_type);
+					shifted
+				} else {
+					scaled
+				}
 			}
 		};
 		let Some(inside) = &index.inside else { return NormalizeFragment { code: output, value } };
@@ -1204,7 +1277,7 @@ mod program_ir {
 			let normalized = emit_normalize(NormalizeContext {
 				value_type: mt, suffix, pointer_type: ptr, alignment: context.alignment,
 				source_value: &source, context: context.context, rows: context.rows, channels: context.channels,
-				length: context.length, width: context.width, span: context.span, weight: None, mode: context.mode, prefix: &replay_prefix,
+				length: context.length, width: context.width, span: context.span, weight: None, shift: false, mode: context.mode, prefix: &replay_prefix,
 			}, element);
 			code.push_str(&normalized.code);
 			normalized.value
@@ -1677,8 +1750,6 @@ use std::sync::atomic::AtomicUsize;
 #[derive(Clone)]
 pub(crate) struct NativeLayout {
 	pub window_positions: usize,
-	pub input_window: Option<usize>,
-	pub request_control: Option<usize>,
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
 	pub contexts_in_values: Vec<bool>,
@@ -1697,13 +1768,20 @@ pub(crate) struct NativeLayout {
 	pub adjoints_bytes: usize,
 	/// Two i64 device timestamps for the current forward: entry and completion.
 	pub timing: usize,
-	/// Per-node device clock, accumulated ticks, and completed positions.
-	/// Only the current invocation occupies device memory; reports live in RAM.
+	/// Under a traced run, the byte offset in the context arena of one i64
+	/// device clock per node, written by thread 0 as each node begins; a
+	/// traced forward reads them back and logs the time between nodes.
 	pub clocks: Option<usize>,
-	/// Output and retained-KV fingerprint planes for reference runs. Each plane
-	/// holds one bounded window; collected observations live in RAM.
-	pub fingerprints: Option<usize>,
-	pub cache_channel_fingerprints: Vec<Option<usize>>,
+	/// At inference, the byte offset in the context arena of the output node's
+	/// values at the last position a forward reached, one per output channel,
+	/// gathered on the device so a decode reads one column and not the tensor.
+	pub last_column: Option<usize>,
+	/// At inference, the byte offset in the context arena of the parts a packed
+	/// sum with too few rows for the device leaves before it adds them up.
+	pub split_scratch: Option<usize>,
+	/// At inference, the byte offset in the context arena of one i32 hardware
+	/// knob per node that the lane tuner writes between steps.
+	pub knobs: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
@@ -1727,6 +1805,10 @@ pub(crate) struct NativeLayout {
 	/// The adjoint slot each such operand's contribution is written to in this
 	/// state type before it is converted and added to the operand's adjoint.
 	pub cast_adjoints: Vec<[Option<usize>; 2]>,
+	/// Each node whose carried state a window changes in place: the context
+	/// offset of that state, of the copies of it after each of the window's first
+	/// positions, and its bytes.
+	pub kept: Vec<(usize, usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1853,7 +1935,6 @@ pub(crate) struct NativeArtifact {
 	step: bool,
 	llvm: LlvmNames,
 	compile_seconds: f64,
-	cache_hit: bool,
 }
 
 #[derive(Clone, Default)]
@@ -2031,7 +2112,7 @@ fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Re
 		// read sixteen bytes at a time by the block dots.
 		let offset = align(bytes, element.max(16))?;
 		let span = match packed_weight(graph, index, inference) {
-			Some(weight) => weight.bytes.len(),
+			Some(weight) => interleaved_span(weight),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
 		};
 		offsets.push(offset);
@@ -2097,7 +2178,7 @@ fn retained_outputs(graph: &Graph) -> Vec<bool> {
 		*last = true;
 	}
 	for (index, node) in graph.nodes.iter().enumerate() {
-		if node.op == Primitive::Scan || node.retain_output {
+		if node.op == Primitive::Scan {
 			retained[index] = true;
 		}
 		// Inference attention writes its settled keys and values to the dedicated
@@ -2126,22 +2207,26 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 	last
 }
 
-/// Causal token graphs retain K/V, recurrent state, and convolution history
-/// independently of their temporary position window.
+/// A causal token graph keeps history in K/V, not in intermediate tensors.
+/// Other temporal operators retain their existing full-sequence layout until
+/// they declare an independent history buffer and a position-local interface.
 fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
 	const POSITIONS: usize = 128;
 	let length = graph.input.length;
-	let tokens = graph.nodes.first().is_some_and(Node::token_input);
-	let bounded = inference && rows == 1 && (!tokens || graph.input.channels == 1)
+	// Token ids stay whole and are read at the window's first position; a part
+	// that continues another part's stream holds one window of it.
+	let ids = graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather);
+	let bounded = inference && rows == 1 && (!ids || graph.input.channels == 1)
 		&& graph.nodes.iter().enumerate().all(|(index, node)| {
 			(node.input.length == length || node.input.length == 1) && (node.output.length == length || node.output.length == 1)
-				&& (!tokens || (index == 0 || node.source >= 0 || node.op == Primitive::Lookup) && node.second != -1)
+				&& (index == 0 || node.source >= 0 || !ids || (node.source == -2 && node.op == Primitive::Lookup)) && (node.second != -1 || !ids)
 				&& match node.op {
-					Primitive::Gather | Primitive::Lookup | Primitive::Elementwise | Primitive::Rope | Primitive::Last | Primitive::Dconv | Primitive::Delta
-					| Primitive::Read | Primitive::Outer | Primitive::Fold | Primitive::Expand | Primitive::TopK | Primitive::ExpertIn | Primitive::ExpertOut => true,
+					// Each position on its own, or a state carried from the window's
+					// first position that the op reads at the window's origin.
+					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last | Primitive::Expand | Primitive::Read | Primitive::Outer | Primitive::Fold | Primitive::TopK
+					| Primitive::ExpertIn | Primitive::ExpertOut | Primitive::Exchange | Primitive::Lookup | Primitive::Delta | Primitive::Dconv | Primitive::Attention => true,
 					Primitive::Contraction => node.argument[0] <= 1.0,
 					Primitive::Normalize => normalize_mode(node.argument[0]).is_ok_and(|mode| mode.per_row()),
-					Primitive::Attention => true,
 					_ => false,
 				}
 		});
@@ -2150,14 +2235,6 @@ fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
 
 fn window_shape(shape: Shape, sequence: usize, positions: usize) -> Shape {
 	Shape { length: if shape.length == sequence { positions } else { shape.length }, ..shape }
-}
-
-fn dconv_history(graph: &Graph, node: &Node) -> Result<usize> {
-	let kernel = integer_argument(node.argument[0], "depthwise kernel")? as usize;
-	let dilation = integer_argument(node.argument[1], "depthwise dilation")? as usize;
-	let tail = checked_mul(kernel.saturating_sub(1), dilation, "depthwise history tail")?;
-	let checkpoints = graph.nodes.iter().filter(|node| node.op == Primitive::Delta).map(|node| node.argument[5] as usize).max().unwrap_or(0);
-	checked_add(checked_add(node.input.length, tail, "depthwise history")?, checkpoints, "depthwise checkpoint history")
 }
 
 #[derive(Clone, Copy)]
@@ -2281,7 +2358,7 @@ impl NativeLayout {
 	/// regions only the reverse pass fills. Values, conversions, and workspace
 	/// use the same lifetime-based allocator. Retained regions stay private;
 	/// transient regions share storage after their last reader's barrier.
-	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
+	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool, timed: bool) -> Result<Self> {
 		let window_positions = inference_window(graph, rows, inference);
 		let element = precision.bytes();
 		let unit = 8;
@@ -2291,18 +2368,15 @@ impl NativeLayout {
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
+		let mut kept = Vec::new();
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
-		let input_window = if window_positions < graph.input.length && graph.nodes.first().is_some_and(|node| !node.token_input()) {
-			let bytes = graph_rows_buffer(window_shape(graph.input, graph.input.length, window_positions), rows, graph.nodes[0].precision.bytes())?;
-			Some(value_plan.allocate(&[(bytes, BufferLifetime::Retained)], unit, 0, false)?)
-		} else { None };
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
 		let signatures = window_signatures(graph);
 		let lifetimes = (0..graph.nodes.len()).map(|index| {
 			let observed = graph.nodes[index].observation.is_some_and(|site| graph.observations & site.family != 0)
 				|| tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
-			if inference && !retained[index] && !observed {
+			if inference && !retained[index] && !observed && !graph.nodes[index].retain_output {
 				Ok(BufferLifetime::Until(checked_add(checked_mul(last[index], 2, "buffer lifetime")?, 1, "buffer lifetime")?))
 			} else { Ok(BufferLifetime::Retained) }
 		}).collect::<Result<Vec<_>>>()?;
@@ -2356,7 +2430,12 @@ impl NativeLayout {
 			let regions = node_context(graph, &context_node, rows, node.precision, inference, step)?;
 			let temporary = inference && regions.iter().all(|(_, lifetime)| matches!(lifetime, BufferLifetime::Until(_) | BufferLifetime::Unused));
 			let plan = if temporary { &mut value_plan } else { &mut context_plan };
-			contexts.push(plan.allocate(&regions, unit, step, inference)?);
+			let offset = plan.allocate(&regions, unit, step, inference)?;
+			if inference && matches!(node.op, Primitive::Delta | Primitive::Dconv) && let [(live, _), .., _] = regions[..] {
+				let before = regions[..regions.len() - 1].iter().map(|(bytes, _)| bytes).sum::<usize>();
+				kept.push((offset, checked_add(offset, before, "kept state offset")?, live));
+			}
+			contexts.push(offset);
 			contexts_in_values.push(temporary);
 			let kv = if inference && node.op == Primitive::Attention {
 				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], unit, step, false)?;
@@ -2389,24 +2468,21 @@ impl NativeLayout {
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
-		let request_control = if window_positions < graph.input.length {
-			Some(context_plan.allocate(&[(24, BufferLifetime::Retained)], 8, 0, false)?)
+		// The lane tuner reads the node clocks too.
+		let tuned = inference && lane_tuning();
+		let clocks = if tracing() || tuned || (inference && timed) {
+			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
-		let clocks = if inference || tracing() {
-			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 24, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
-		} else { None };
-		let fingerprints = if inference && rows == 1 && ["RECIPE_REFERENCE", "RECIPE_REFERENCE_WRITE"].iter().any(|name| std::env::var_os(name).is_some()) {
-			let bytes = checked_mul(checked_mul(window_positions, graph.nodes.len(), "operation fingerprint count")?, 16, "output and KV fingerprint bytes")?;
-			Some(context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false)?)
-		} else { None };
-		let cache_channel_fingerprints = graph.nodes.iter().map(|node| {
-			if fingerprints.is_none() || node.op != Primitive::Attention { return Ok(None); }
-			let channels = attention_kv_bytes(node, 1, node.kv_precision)? / node.output.length / node.kv_precision.bytes();
-			let bytes = checked_mul(channels, 8, "KV channel fingerprint bytes")?;
-			context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false).map(Some)
-		}).collect::<Result<Vec<_>>>()?;
+		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
+		let last_column = match graph.nodes.last().filter(|_| inference) {
+			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
+			None => None,
+		};
+		// One part per 32 inputs of every row: the most segments a row splits into.
+		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
+		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, fingerprints, cache_channel_fingerprints })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
 	}
 }
 
@@ -2677,224 +2753,7 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
-	fn emit_topk_shared(&self, backend: Backend, ir: &mut String) -> Result<()> {
-		if backend != Backend::Nvidia || !self.inference { return Ok(()); }
-		let shared_tile = ir.match_indices("@contraction_tile").find_map(|(at, _)| {
-			let tail = &ir[at + 1..];
-			let name = tail.split_whitespace().next()?;
-			tail[name.len()..].starts_with(" = external addrspace(3)").then(|| name.to_owned())
-		}).ok_or_else(|| RecipeError::new("shared contraction storage is absent"))?;
-		let mut emitted = std::collections::HashSet::new();
-		for plan in self.plans.iter().filter(|plan| plan.node.op == Primitive::TopK) {
-			let v = self.variant(&plan.node);
-			if !emitted.insert(v) { continue; }
-			let original = format!("topk_forward_body{v}");
-			let shared = format!("topk_forward_shared_body{v}");
-			let (start, end) = definition_span(ir, &original).ok_or_else(|| RecipeError::new("top-K body is absent"))?;
-			let definition = ir[start..end].replacen(&format!("@{original}("), &format!("@{shared}("), 1).replace("ptr addrspace(1)", "ptr");
-			ir.push_str(&definition);
-			let native = self.node_precision(&plan.node);
-			let ty = native.model_type;
-			let element = native.model.bytes();
-			ir.push_str(&format!(r#"
-define internal void @topk_forward_group_body{v}(ptr addrspace(1) %scores, ptr addrspace(1) %weights, ptr addrspace(1) %selected, i32 %rows, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize, i32 %begin, i32 %span, i32 %threads) #1 {{
-entry:
-%lid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
-%group = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
-%width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
-%groups = udiv i32 %threads, %width
-%leader = icmp eq i32 %lid, 0
-%jobs = mul i32 %rows, %span
-%experts.wide = zext i32 %experts to i64
-%length.wide = zext i32 %length to i64
-%arrays.bytes = mul i64 %experts.wide, {pair_bytes}
-%selected.rounded = add i64 %arrays.bytes, 3
-%selected.bytes.offset = and i64 %selected.rounded, -4
-%top.wide = zext i32 %top to i64
-%selected.stride = add i64 %top.wide, 1
-%selected.bytes = mul i64 %selected.stride, 4
-%required = add i64 %selected.bytes.offset, %selected.bytes
-%tile.bytes = call i32 @recipe.tile.bytes()
-%tile.wide = zext i32 %tile.bytes to i64
-%fits = icmp ule i64 %required, %tile.wide
-%shared.scores = getelementptr i8, ptr addrspace(3) @{shared_tile}, i64 0
-%shared.weights = getelementptr {ty}, ptr addrspace(3) %shared.scores, i64 %experts.wide
-%generic.scores = addrspacecast ptr addrspace(3) %shared.scores to ptr
-%generic.weights = addrspacecast ptr addrspace(3) %shared.weights to ptr
-%shared.selected = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %selected.bytes.offset
-%generic.selected = addrspacecast ptr addrspace(3) %shared.selected to ptr
-br label %job.loop
-job.loop:
-%job = phi i32 [ %group, %entry ], [ %job.next, %job.done ]
-%more = icmp ult i32 %job, %jobs
-br i1 %more, label %job.run, label %exit
-job.run:
-%row = udiv i32 %job, %span
-%local = urem i32 %job, %span
-%position = add i32 %begin, %local
-%row.wide = zext i32 %row to i64
-%position.wide = zext i32 %position to i64
-%row.base = mul i64 %row.wide, %length.wide
-%p = add i64 %row.base, %position.wide
-%selected.offset = mul i64 %p, %selected.stride
-%selected.position = getelementptr i32, ptr addrspace(1) %selected, i64 %selected.offset
-%plane = mul i64 %experts.wide, %length.wide
-%scores.row = mul i64 %row.wide, %plane
-%base = add i64 %scores.row, %position.wide
-br i1 %fits, label %stage.loop, label %fallback
-fallback:
-br i1 %leader, label %fallback.run, label %job.done
-fallback.run:
-call void @{original}(ptr addrspace(1) %scores, ptr addrspace(1) %weights, ptr addrspace(1) %selected, i64 %p, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize)
-br label %job.done
-stage.loop:
-%stage = phi i32 [ %lid, %job.run ], [ %stage.next, %stage.body ]
-%stage.more = icmp ult i32 %stage, %experts
-br i1 %stage.more, label %stage.body, label %stage.done
-stage.body:
-%stage.wide = zext i32 %stage to i64
-%stage.offset = mul i64 %stage.wide, %length.wide
-%stage.index = add i64 %base, %stage.offset
-%stage.from = getelementptr {ty}, ptr addrspace(1) %scores, i64 %stage.index
-%stage.value = load {ty}, ptr addrspace(1) %stage.from, align {element}
-%stage.to = getelementptr {ty}, ptr addrspace(3) %shared.scores, i64 %stage.wide
-store {ty} %stage.value, ptr addrspace(3) %stage.to, align {element}
-%stage.next = add i32 %stage, %width
-br label %stage.loop
-stage.done:
-call void @llvm.nvvm.barrier0()
-br i1 %leader, label %select, label %selection.done
-select:
-call void @{shared}(ptr %generic.scores, ptr %generic.weights, ptr %generic.selected, i64 0, i32 %experts, i32 1, i32 %top, i32 %scoring, i32 %renormalize)
-br label %selection.done
-selection.done:
-call void @llvm.nvvm.barrier0()
-br label %copy.loop
-copy.loop:
-%copy = phi i32 [ %lid, %selection.done ], [ %copy.next, %copy.body ]
-%copy.more = icmp ult i32 %copy, %experts
-br i1 %copy.more, label %copy.body, label %indices.entry
-copy.body:
-%copy.wide = zext i32 %copy to i64
-%copy.from = getelementptr {ty}, ptr addrspace(3) %shared.weights, i64 %copy.wide
-%copy.value = load {ty}, ptr addrspace(3) %copy.from, align {element}
-%copy.offset = mul i64 %copy.wide, %length.wide
-%copy.index = add i64 %base, %copy.offset
-%copy.to = getelementptr {ty}, ptr addrspace(1) %weights, i64 %copy.index
-store {ty} %copy.value, ptr addrspace(1) %copy.to, align {element}
-%copy.next = add i32 %copy, %width
-br label %copy.loop
-indices.entry:
-%selected.count = load i32, ptr addrspace(3) %shared.selected, align 4
-br label %indices.loop
-indices.loop:
-%index = phi i32 [ %lid, %indices.entry ], [ %index.next, %indices.body ]
-%index.more = icmp ule i32 %index, %selected.count
-br i1 %index.more, label %indices.body, label %job.done
-indices.body:
-%index.wide = zext i32 %index to i64
-%index.from = getelementptr i32, ptr addrspace(3) %shared.selected, i64 %index.wide
-%index.value = load i32, ptr addrspace(3) %index.from, align 4
-%index.to = getelementptr i32, ptr addrspace(1) %selected.position, i64 %index.wide
-store i32 %index.value, ptr addrspace(1) %index.to, align 4
-%index.next = add i32 %index, %width
-br label %indices.loop
-job.done:
-call void @llvm.nvvm.barrier0()
-%job.next = add i32 %job, %groups
-br label %job.loop
-exit:
-ret void
-}}
-"#, pair_bytes = element * 2));
-		}
-		Ok(())
-	}
-	/// Equal weight layouts and operation shapes share one specialized body.
-	/// The weights remain arguments; only their interpretation is constant.
-	fn contraction_specialization(&self, backend: Backend, matrix: bool, index: usize) -> Option<(usize, String)> {
-		let plan = &self.plans[index];
-		if !self.inference || self.rows != 1 || backend == Backend::Cpu || plan.node.op != Primitive::Contraction { return None; }
-		let segments = if plan.packed {
-			if !self.block_dot_fits(backend, plan) { return None; }
-			let segments = plan.stored.as_ref()?.format_segments();
-			if segments.len() != 1 || device_quantizer(segments[0].0.spec()?.codec).is_none() { return None; }
-			segments
-		} else {
-			if matrix && matrix_capable(self.node_precision(&plan.node)) || plan.node.argument[0] != 0.0 { return None; }
-			Vec::new()
-		};
-		let node = &plan.node;
-		let suffix = self.variant(node);
-		let representative = self.plans[..=index].iter().position(|other| {
-			other.node.op == Primitive::Contraction && other.packed == plan.packed && (!other.packed || self.block_dot_fits(backend, other))
-				&& self.variant(&other.node) == suffix && other.node.int_bits == node.int_bits && other.node.int_step == node.int_step
-				&& other.node.input.channels == node.input.channels && other.node.input.length == node.input.length
-				&& other.node.output.channels == node.output.channels && other.node.output.length == node.output.length
-				&& other.node.argument[..3] == node.argument[..3]
-				&& (!other.packed || other.stored.as_ref().is_some_and(|weight| weight.format_segments() == segments))
-		})?;
-		let body = if plan.packed { "contraction_forward_body" } else { "contraction_forward_gemv_wave_body" };
-		Some((representative, format!("{body}{suffix}.n{representative}")))
-	}
-	fn specialize_contractions(&self, backend: Backend, matrix: bool, ir: &mut String) -> Result<()> {
-		let mut emitted = std::collections::HashSet::new();
-		for index in 0..self.plans.len() {
-			let Some((representative, name)) = self.contraction_specialization(backend, matrix, index) else { continue };
-			if !emitted.insert(name.clone()) { continue; }
-			let plan = &self.plans[representative];
-			let node = &plan.node;
-			let body = if plan.packed { "contraction_forward_body" } else { "contraction_forward_gemv_wave_body" };
-			let original = format!("{body}{}", self.variant(node));
-			let bindings = [
-				("rows", "1".to_owned()),
-				("in.channels", node.input.channels.to_string()), ("in.length", node.input.length.to_string()),
-				("out.channels", node.output.channels.to_string()), ("out.length", node.output.length.to_string()),
-				("kernel", integer_argument(node.argument[0], "contraction kernel")?.to_string()),
-				("has.bias", (node.argument[2] == 0.0).to_string()), ("relu", (node.argument[1] == 1.0).to_string()),
-				("transpose", "false".to_owned()), ("reverse", "false".to_owned()), ("accumulate", "false".to_owned()),
-				("weight.base", "0".to_owned()), ("decode", plan.decode(representative).to_string()),
-			];
-			specialize_definition(ir, &original, &name, &bindings)?;
-		}
-		Ok(())
-	}
-	fn expert_specialization(&self, backend: Backend, index: usize) -> Option<(usize, String)> {
-		let plan = &self.plans[index];
-		let node = &plan.node;
-		if !self.inference || backend == Backend::Cpu || !matches!(node.op, Primitive::ExpertIn | Primitive::ExpertOut) { return None; }
-		let segments = plan.stored.as_ref().map(StoredWeight::format_segments);
-		let suffix = self.variant(node);
-		let representative = self.plans[..=index].iter().position(|other| {
-			other.node.op == node.op && other.packed == plan.packed && self.variant(&other.node) == suffix
-				&& other.node.input == node.input && other.node.output == node.output && other.node.argument[..3] == node.argument[..3]
-				&& (!plan.packed || other.stored.as_ref().map(StoredWeight::format_segments) == segments)
-		})?;
-		let body = if node.op == Primitive::ExpertIn { "expert_in_forward_body" } else { "expert_out_forward_body" };
-		Some((representative, format!("{body}{suffix}.n{representative}")))
-	}
-	fn specialize_experts(&self, backend: Backend, ir: &mut String) -> Result<()> {
-		let mut emitted = std::collections::HashSet::new();
-		for index in 0..self.plans.len() {
-			let Some((representative, name)) = self.expert_specialization(backend, index) else { continue };
-			if !emitted.insert(name.clone()) { continue; }
-			let plan = &self.plans[representative];
-			let node = &plan.node;
-			let input = node.op == Primitive::ExpertIn;
-			let original = format!("{}{}", if input { "expert_in_forward_body" } else { "expert_out_forward_body" }, self.variant(node));
-			let bindings = [
-				("channels", (if input { node.input.channels } else { node.output.channels }).to_string()),
-				("length", node.output.length.to_string()),
-				("experts", integer_argument(node.argument[0], "expert count")?.to_string()),
-				("top", integer_argument(node.argument[1], "selected expert count")?.to_string()),
-				("hidden", integer_argument(node.argument[2], "expert width")?.to_string()),
-				("decode", plan.decode(representative).to_string()),
-			];
-			specialize_definition(ir, &original, &name, &bindings)?;
-		}
-		Ok(())
-	}
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool, timed: bool) -> Result<Self> {
 		// Integer inference stages activation codes; training uses the declared
 		// float arithmetic and keeps packed storage for checkpoint output only.
 		let tile_bytes = schedule.shared_values as usize * schedule.element.bytes();
@@ -2913,7 +2772,7 @@ ret void
 			require(needed <= tile_bytes, format!("{} computes in int{} over {} inputs, whose activation codes take {needed} bytes of the {tile_bytes}-byte tile; increase contraction-cpu-shared-values", node.identity(index), node.int_bits, node.input.channels))?;
 		}
 		require(rows != 0, "native model rows must be positive")?;
-		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
+		let layout = NativeLayout::for_graph(graph, rows, precision, inference, timed)?;
 		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
 		let precision = NativePrecision::new(precision, graph.profile.acc)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
@@ -3035,12 +2894,10 @@ struct NativeVariant {
 /// The template key of a cache format a block may name.
 fn kv_key(kv: Compute) -> Result<&'static str> {
 	match kv {
-		Compute::Fp(format) if format == FloatFormat::FP8 => Ok("f8"),
-		Compute::Fp(format) if format == FloatFormat::FP8_E5M2 => Ok("f8e5m2"),
 		Compute::Fp(format) if format == FloatFormat::FP16 => Ok("f16"),
 		Compute::Fp(format) if format == FloatFormat::FP32 => Ok("f32"),
 		Compute::Bf(format) if format == FloatFormat::BF16 => Ok("bf16"),
-		_ => Err(RecipeError::new(format!("a key-value cache takes fp(8), fp(16), fp(32), or bf(16), not {}", kv.label()))),
+		_ => Err(RecipeError::new(format!("a key-value cache takes fp(16), fp(32) or bf(16), not {}", kv.label()))),
 	}
 }
 /// The symbol suffix of a template variant: `-f16` links as `_f16`, the
@@ -3111,6 +2968,8 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 		}
 	}
 	names.push("recipe.model.decode".to_owned());
+	names.push("recipe.model.dot.run".to_owned());
+	names.push("recipe.model.dot.run4".to_owned());
 	names.sort();
 	names.dedup();
 	// Backend plumbing has no arithmetic in it and, on the CPU, owns the
@@ -3193,6 +3052,163 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 	Ok(ir)
 }
 
+/// A packed node's one stored format when the run dot reads it: the format,
+/// its decoder, and its block's values and bytes.
+fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	// Dense weights in the arena are values of the node's own float type.
+	if !plan.packed && plan.stored.is_none() && plan.node.parameters != 0 {
+		let name = match plan.node.precision { Compute::FP32 => "f32", Compute::FP16 => "f16", _ => return None };
+		let spec = StorageFormat::named(name)?.spec()?;
+		return Some((spec.codec.quantization(), spec.codec.quantization().native, spec.block, spec.stride));
+	}
+	let stored = plan.stored.as_ref().filter(|_| plan.packed)?;
+	// A bias after the matrix is read through the node's element decoder, so the
+	// runs take the matrix's format.
+	let segment = match stored.format_segments()[..] {
+		[(segment, _)] => segment,
+		[(segment, _), _] if bias_tail(stored).is_some_and(|(_, count, _)| count == plan.node.shard.rows.local(plan.node.output.channels)) => segment,
+		_ => return None,
+	};
+	run_segment_format(segment)
+}
+/// A run format a packed weight's segment can take: its quantization, decoder,
+/// block and stride.
+fn run_segment_format(format: StorageFormat) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	let spec = format.spec()?;
+	let quantization = spec.codec.quantization();
+	if matches!(quantization.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % 32 == 0 || 32 % spec.block == 0) {
+		return None;
+	}
+	Some((quantization, quantization.native, spec.block, spec.stride))
+}
+/// One format's rows of a packed sum whose weight joins several formats, such
+/// as a query, key and value projection quantized apart: its decoder, its first
+/// row and row count, where its bytes start, and the id its runs dispatch on.
+#[derive(Clone)]
+struct RowSegment {
+	format: &'static Quantization,
+	native: NativeDequant,
+	block: usize,
+	stride: usize,
+	row: usize,
+	rows: usize,
+	bytes: usize,
+	id: usize,
+}
+/// The row segments of every packed sum whose weight joins formats a row at a
+/// time, by node; each segment's id follows the nodes' own ids.
+fn row_segments(plans: &[NodePlan], inference: bool, rows: usize) -> Vec<Option<Vec<RowSegment>>> {
+	let mut next = plans.len() + 1;
+	plans
+		.iter()
+		.map(|plan| {
+			let node = &plan.node;
+			let stored = plan.stored.as_ref().filter(|_| plan.packed && inference && rows == 1)?;
+			let segments = stored.format_segments();
+			let whole = node.shard.rows.count == 0 && node.shard.terms.count == 0 && node.parameters == node.input.channels * node.output.channels;
+			if segments.len() < 2 || !whole || node.op != Primitive::Contraction || node.int_bits != 0 || node.argument[0] > 1.0 || node.argument[2] == 0.0 {
+				return None;
+			}
+			let terms = node.input.channels;
+			let (mut row, mut bytes, mut parts) = (0, 0, Vec::new());
+			for (format, count) in segments {
+				let (format, native, block, stride) = run_segment_format(format)?;
+				if count % terms != 0 || terms % dot_run(block) != 0 || count % block != 0 {
+					return None;
+				}
+				parts.push(RowSegment { format, native, block, stride, row, rows: count / terms, bytes, id: 0 });
+				row += count / terms;
+				bytes += count / block * stride;
+			}
+			for part in &mut parts {
+				part.id = next;
+				next += 1;
+			}
+			Some(parts)
+		})
+		.collect()
+}
+/// The rows of stored weight `index` that interleave four bytes at a time, so
+/// the lanes of a wave, each on its own row, read one run of memory per word:
+/// the device's `lanes` for a weight only the run-decoder bodies read, and one
+/// (rows one after another) for every other weight.
+fn interleaved_lanes(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> u32 {
+	row_interleave(graph, index, inference, rows, lanes).map_or(1, |(lanes, ..)| lanes)
+}
+/// The bytes one block takes in interleaved rows. A lane's run over a large
+/// block is one straight body per place of the block within a word, so such
+/// blocks start on a word and the run has one body; small blocks stay packed.
+fn interleaved_stride(block: usize, stride: usize) -> usize {
+	if block >= 256 { stride.next_multiple_of(4) } else { stride }
+}
+/// The bytes a packed weight takes in the weight arena: room for its blocks at
+/// their interleaved stride, which the rows take when they interleave.
+fn interleaved_span(weight: &StoredWeight) -> usize {
+	let bytes = weight.bytes.len();
+	match weight.format_segments()[..] {
+		[(segment, _)] => segment.spec().filter(|spec| spec.stride != 0 && bytes % spec.stride == 0).map_or(bytes, |spec| bytes / spec.stride * interleaved_stride(spec.block, spec.stride)),
+		_ => bytes,
+	}
+}
+/// The lanes, row bytes and interleaved row bytes of stored weight `index`
+/// when its rows interleave.
+fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> Option<(u32, usize, usize)> {
+	let node = &graph.nodes[index];
+	let stored = graph.stored.get(index).and_then(Option::as_ref)?;
+	if lanes <= 1 || !inference || rows != 1 || !node.packed || node.int_bits != 0 || graph.requantize.get(index).is_some_and(Option::is_some) || stored.bytes.absent_runs() {
+		return None;
+	}
+	let [(segment, _)] = stored.format_segments()[..] else { return None };
+	let spec = segment.spec()?;
+	// Blocks of a whole run, or small word-sized blocks a run holds whole (a float a value).
+	let whole_blocks = spec.block >= 32 && spec.block % 32 == 0;
+	let word_blocks = spec.block < 32 && 32 % spec.block == 0 && spec.stride % 4 == 0;
+	if matches!(spec.codec.quantization().native, NativeDequant::Nf4) || spec.stride == 0 || !(whole_blocks || word_blocks) {
+		return None;
+	}
+	let unit = dot_run(spec.block);
+	let (rows_local, terms_local) = (node.shard.rows.local(node.output.channels), node.shard.terms.local(node.input.channels));
+	let expert_width = |count: usize| if count != 0 { count } else { node.argument[2] as usize };
+	// The rows of the stored table, and the values in each row.
+	let (table_rows, row_values) = match node.op {
+		Primitive::Contraction if node.argument[0] <= 1.0 && node.argument[2] != 0.0 && node.input.channels % unit == 0 => (rows_local, terms_local),
+		Primitive::ExpertIn if node.input.channels % unit == 0 => (node.argument[0] as usize * expert_width(node.shard.rows.count), terms_local),
+		Primitive::ExpertOut if node.input.channels % unit == 0 && (node.argument[2] as usize) % unit == 0 => (node.argument[0] as usize * rows_local, expert_width(node.shard.terms.count)),
+		_ => return None,
+	};
+	let row_bytes = row_values / spec.block * spec.stride;
+	// Interleaved rows take whole words at the interleaved stride.
+	let padded_row = row_values / spec.block * interleaved_stride(spec.block, spec.stride);
+	let whole = row_values % spec.block == 0 && padded_row % 4 == 0 && table_rows % lanes as usize == 0 && stored.bytes.len() == table_rows * row_bytes;
+	whole.then_some((lanes, row_bytes, padded_row))
+}
+/// `bytes` of `rows` rows of `row_bytes` each, every block of `stride` bytes
+/// widened to `padded` with zeros, and the rows of every group of `lanes`
+/// interleaved four bytes at a time: word `w` of the group's row `l` sits at
+/// word `w * lanes + l` of the group.
+fn interleave_rows(bytes: &[u8], rows: usize, row_bytes: usize, lanes: usize, stride: usize, padded: usize) -> Vec<u8> {
+	let padded_row = row_bytes / stride * padded;
+	let (words, group_bytes) = (padded_row / 4, padded_row * lanes);
+	let mut interleaved = vec![0_u8; rows * padded_row];
+	let mut row_padded = vec![0_u8; padded_row];
+	for row in 0..rows {
+		for (block, source) in bytes[row * row_bytes..(row + 1) * row_bytes].chunks_exact(stride).enumerate() {
+			row_padded[block * padded..block * padded + stride].copy_from_slice(source);
+		}
+		let (group, lane) = (row / lanes, row % lanes);
+		for word in 0..words {
+			let to = group * group_bytes + (word * lanes + lane) * 4;
+			interleaved[to..to + 4].copy_from_slice(&row_padded[word * 4..word * 4 + 4]);
+		}
+	}
+	interleaved
+}
+/// The adjacent stored weights one lane decodes and dots at a time in a packed
+/// matrix-vector product: a whole block, so the lane reads each block once with
+/// wide loads, or 32 values of smaller blocks.
+fn dot_run(block: usize) -> usize {
+	if block >= 32 { block } else { 32 }
+}
 fn pointer_type(backend: Backend) -> &'static str {
 	if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" }
 }
@@ -3217,28 +3233,6 @@ fn definition_span(ir: &str, name: &str) -> Option<(usize, usize)> {
 		}
 	}
 	None
-}
-/// Bind scalar arguments in a shared body without changing its pointer arguments.
-fn specialize_definition(ir: &mut String, original: &str, name: &str, bindings: &[(&str, String)]) -> Result<()> {
-	let (start, end) = definition_span(ir, original).ok_or_else(|| RecipeError::new(format!("{original} body is absent")))?;
-	let definition = &ir[start..end];
-	let open = definition.find('{').ok_or_else(|| RecipeError::new(format!("{original} body has no entry")))?;
-	let mut specialized = definition[..=open].replacen(&format!("@{original}("), &format!("@{name}("), 1).replace("#1", "#3");
-	let body = &definition[open + 1..];
-	let mut from = 0;
-	while let Some(found) = body[from..].find('%') {
-		let at = from + found;
-		let end = body[at + 1..].find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-')).map_or(body.len(), |length| at + 1 + length);
-		specialized.push_str(&body[from..at]);
-		if let Some((_, value)) = bindings.iter().find(|(parameter, _)| *parameter == &body[at + 1..end]) { specialized.push_str(value); }
-		else { specialized.push_str(&body[at..end]); }
-		from = end;
-	}
-	specialized.push_str(&body[from..]);
-	ir.push('\n');
-	ir.push_str(&specialized);
-	ir.push('\n');
-	Ok(())
 }
 
 fn strip_definition(mut ir: String, name: &str) -> String {
@@ -3357,18 +3351,9 @@ fn prune_internal_definitions(mut ir: String) -> String {
 
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
-		Backend::Cpu => "call void @recipe.cpu.barrier()",
-		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
+		Backend::Cpu => "call void @recipe.cpu.barrier()\n",
+		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)\n",
 	}
-}
-
-fn emit_position_fingerprint(ir: &mut String, prefix: &str, pointer: &str, value: &str, ty: &str, bits: usize, shape: Shape, position: &str, count: Option<&str>) {
-	ir.push_str(&format!("br label %{prefix}.channel.entry\n{prefix}.channel.entry:\nbr label %{prefix}.channel.loop\n{prefix}.channel.loop:\n%{prefix}.channel = phi i64 [ 0, %{prefix}.channel.entry ], [ %{prefix}.channel.next, %{prefix}.channel.loop ]\n%{prefix}.hash = phi i64 [ 14695981039346656037, %{prefix}.channel.entry ], [ %{prefix}.hash.next, %{prefix}.channel.loop ]\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {length}\n%{prefix}.element = add i64 %{prefix}.channel.base, {position}\n%{prefix}.value.ptr = getelementptr {ty}, {pointer} {value}, i64 %{prefix}.element\n%{prefix}.value = load {ty}, {pointer} %{prefix}.value.ptr, align {align}\n", length = shape.length, align = bits / 8));
-	if ty.starts_with('i') { ir.push_str(&format!("%{prefix}.bits = add i{bits} %{prefix}.value, 0\n")); }
-	else { ir.push_str(&format!("%{prefix}.bits = bitcast {ty} %{prefix}.value to i{bits}\n")); }
-	if bits < 64 { ir.push_str(&format!("%{prefix}.word = zext i{bits} %{prefix}.bits to i64\n")); }
-	else { ir.push_str(&format!("%{prefix}.word = add i64 %{prefix}.bits, 0\n")); }
-	ir.push_str(&format!("%{prefix}.mixed = xor i64 %{prefix}.hash, %{prefix}.word\n%{prefix}.hash.next = mul i64 %{prefix}.mixed, 1099511628211\n%{prefix}.channel.next = add i64 %{prefix}.channel, 1\n%{prefix}.more = icmp ult i64 %{prefix}.channel.next, {channels}\nbr i1 %{prefix}.more, label %{prefix}.channel.loop, label %{prefix}.store\n{prefix}.store:\n", channels = count.map(str::to_owned).unwrap_or_else(|| shape.channels.to_string())));
 }
 
 fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
@@ -3417,6 +3402,9 @@ mod quantized {
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int;
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int;
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value;
+		/// One 64-bit word of a table built at emission, such as a grid entry's
+		/// levels packed a byte each: the values that share an entry share its load.
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int;
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value;
 		fn literal(&self, value: f64) -> Self::Value;
 		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value;
@@ -3460,6 +3448,8 @@ mod quantized {
 		pub(super) packing: IqPacking,
 		pub(super) table_name: &'static str,
 		pub(super) table: &'static [u16],
+		/// The value of each grid level: ggml's grid bytes, which are not evenly spaced.
+		pub(super) levels: &'static [u16],
 	}
 
 	#[derive(Clone, Copy)]
@@ -3590,12 +3580,14 @@ mod quantized {
 			}
 			_ => unreachable!(),
 		};
-		let table_word = quant.table(layout.table_name, layout.table, grid);
-		let man_shift = quant_int(quant, QuantIntOp::Multiply, table_lane, layout.man as u64);
-		let man_code = quant_bits(quant, table_word, man_shift, layout.man);
-		let man_code = quant_int(quant, QuantIntOp::Multiply, man_code, 2);
-		let man_code = quant_int(quant, QuantIntOp::Add, man_code, 1);
-		let mantissa = quant.number(man_code, false);
+		// Every grid entry's levels, a byte each in one word: the values of one
+		// entry share one load, and each takes its byte.
+		let lanes = if layout.man == 2 { 8 } else { 4 };
+		let packed = layout.table.iter().map(|word| (0..lanes).fold(0_u64, |packed, lane| packed | u64::from(layout.levels[(word >> (lane * layout.man as usize)) as usize & ((1 << layout.man) - 1)]) << (8 * lane))).collect::<Vec<_>>();
+		let entry = quant.word_table(&format!("{}_levels", layout.table_name), &packed, grid);
+		let shift = quant_int(quant, QuantIntOp::Multiply, table_lane, 8);
+		let level = quant_bits(quant, entry, shift, 8);
+		let mantissa = quant.number(level, false);
 		let exponent = if odd_factor {
 			let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
 			let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
@@ -4025,6 +4017,9 @@ mod quantized {
 		fn signed_table(&mut self, _name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
 			values[index as usize] as i64 as u64
 		}
+		fn word_table(&mut self, _name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			values[index as usize]
+		}
 		fn value_table(&mut self, _name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			values[index as usize]
 		}
@@ -4140,26 +4135,57 @@ mod quantized {
 			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {half})", self.suffix))
 		}
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
-			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			let loaded = self.instruction(format!("load i16, ptr {address}, align 2"));
+			// Up to eight byte entries fit one constant: the entry is a shift away.
+			if values.len() <= 8 && values.iter().all(|value| *value < 256) {
+				let packed = values.iter().enumerate().fold(0_u64, |packed, (at, value)| packed | u64::from(*value) << (8 * at));
+				let shift = self.instruction(format!("shl i64 {index}, 3"));
+				let shifted = self.instruction(format!("lshr i64 {packed}, {shift}"));
+				return self.instruction(format!("and i64 {shifted}, 255"));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			let loaded = self.instruction(format!("load i16, ptr addrspace(1) {address}, align 2, !invariant.load !{{}}"));
 			self.instruction(format!("zext i16 {loaded} to i64"))
 		}
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
-			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			let loaded = self.instruction(format!("load i8, ptr {address}, align 1"));
+			// Up to sixteen byte entries fit two constants: the entry is a select and a
+			// shift away, with no load.
+			if values.len() <= 16 {
+				let pack = |part: &[i8]| part.iter().enumerate().fold(0_u64, |packed, (at, value)| packed | u64::from(*value as u8) << (8 * at)) as i64;
+				let (low, high) = (pack(&values[..values.len().min(8)]), pack(values.get(8..).unwrap_or(&[])));
+				let upper = self.instruction(format!("icmp uge i64 {index}, 8"));
+				let word = self.instruction(format!("select i1 {upper}, i64 {high}, i64 {low}"));
+				let lane = self.instruction(format!("and i64 {index}, 7"));
+				let shift = self.instruction(format!("shl i64 {lane}, 3"));
+				let shifted = self.instruction(format!("lshr i64 {word}, {shift}"));
+				let byte = self.instruction(format!("trunc i64 {shifted} to i8"));
+				return self.instruction(format!("sext i8 {byte} to i64"));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			let loaded = self.instruction(format!("load i8, ptr addrspace(1) {address}, align 1, !invariant.load !{{}}"));
 			self.instruction(format!("sext i8 {loaded} to i64"))
+		}
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+				self.globals.push_str(&format!(
+					"@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i64] [{}]\n",
+					values.len(),
+					values.iter().map(|value| format!("i64 {}", *value as i64)).collect::<Vec<_>>().join(", ")
+				));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i64], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			self.instruction(format!("load i64, ptr addrspace(1) {address}, align 8, !invariant.load !{{}}"))
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			let ty = self.precision.state_type;
-			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+			if !self.globals.contains(&format!("@recipe_model_{name}_{ty} =")) {
 				self.globals.push_str(&format!(
-					"@recipe_model_{name} = private unnamed_addr constant [{} x {ty}] [{}]\n",
+					"@recipe_model_{name}_{ty} = private unnamed_addr addrspace(1) constant [{} x {ty}] [{}]\n",
 					values.len(),
 					values.iter().map(|value| format!("{ty} {}", native_literal(self.precision.state, ty, *value))).collect::<Vec<_>>().join(", ")
 				));
 			}
-			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			self.instruction(format!("load {ty}, ptr {address}, align {}", super::alignment(ty)))
+			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr addrspace(1) @recipe_model_{name}_{ty}, i32 0, i64 {index}", values.len()));
+			self.instruction(format!("load {ty}, ptr addrspace(1) {address}, align {}, !invariant.load !{{}}", super::alignment(ty)))
 		}
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
 			let ty = self.precision.state_type;
@@ -4190,8 +4216,245 @@ mod quantized {
 			self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}"))
 		}
 	}
+
+	/// An integer of a run decoder: known when the generator can compute it, IR otherwise.
+	#[derive(Clone)]
+	pub(super) enum RunInt {
+		Known(u64),
+		Ir(String),
+	}
+	impl RunInt {
+		fn text(&self) -> String {
+			match self {
+				Self::Known(value) => value.to_string(),
+				Self::Ir(name) => name.clone(),
+			}
+		}
+	}
+
+	/// Decodes one value of a block whose place in the block is known when the IR
+	/// is generated. Every integer the format derives from that place folds to a
+	/// constant, so its byte offsets are constants too, and the bytes come from
+	/// aligned words loaded once per block and shared by every value decoded
+	/// through the same `RunQuantOps`.
+	pub(super) struct RunQuantOps<'a> {
+		pub(super) inner: &'a mut NativeQuantOps,
+		/// The value's place in its block.
+		pub(super) local: u64,
+		/// The block's byte address and the alignment it is known to have.
+		pub(super) block: String,
+		pub(super) align: u64,
+		pub(super) words: &'a mut std::collections::HashMap<(String, u64), String>,
+		/// The bytes before the block's first byte from `block`, the aligned
+		/// address the words are read from.
+		pub(super) skew: u64,
+		/// The bytes from one word of the block to the next: the word itself, or
+		/// a word of every lane's row where rows interleave.
+		pub(super) pitch: u64,
+	}
+	impl RunQuantOps<'_> {
+		fn word_bytes(&self) -> u64 {
+			self.align.min(4)
+		}
+		fn word(&mut self, word: u64) -> String {
+			let key = (self.block.clone(), word);
+			if let Some(name) = self.words.get(&key) {
+				return name.clone();
+			}
+			let (bytes, pointer) = (self.word_bytes(), pointer_type(self.inner.backend));
+			let offset = word * self.pitch;
+			let align = if offset == 0 { self.align } else { self.align.min(1 << offset.trailing_zeros()) };
+			let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {offset}", self.block));
+			let loaded = self.inner.instruction(format!("load i{}, {pointer} {address}, align {align}, !invariant.load !{{}}", bytes * 8));
+			let wide = self.inner.instruction(format!("zext i{} {loaded} to i64", bytes * 8));
+			self.words.insert(key, wide.clone());
+			wide
+		}
+		/// The little-endian integer of `bits` bits at byte `offset`, assembled from words.
+		fn bytes(&mut self, offset: u64, bits: u8) -> String {
+			let per = self.word_bytes();
+			let mut value = "0".to_owned();
+			for byte in 0..u64::from(bits / 8) {
+				let at = self.skew + offset + byte;
+				let word = self.word(at / per);
+				let shifted = self.inner.instruction(format!("lshr i64 {word}, {}", (at % per) * 8));
+				let masked = self.inner.instruction(format!("and i64 {shifted}, 255"));
+				let placed = self.inner.instruction(format!("shl i64 {masked}, {}", byte * 8));
+				value = self.inner.instruction(format!("or i64 {value}, {placed}"));
+			}
+			value
+		}
+	}
+	impl QuantOps for RunQuantOps<'_> {
+		type Int = RunInt;
+		type Value = String;
+		fn index(&self) -> Self::Int {
+			RunInt::Known(self.local)
+		}
+		fn integer(&self, value: u64) -> Self::Int {
+			RunInt::Known(value)
+		}
+		fn int(&mut self, operation: QuantIntOp, left: Self::Int, right: Self::Int) -> Self::Int {
+			if let (RunInt::Known(left), RunInt::Known(right)) = (&left, &right) {
+				let (left, right) = (*left, *right);
+				let folded = match operation {
+					QuantIntOp::Add => Some(left.wrapping_add(right)),
+					QuantIntOp::Subtract => Some(left.wrapping_sub(right)),
+					QuantIntOp::Multiply => Some(left.wrapping_mul(right)),
+					QuantIntOp::Divide => left.checked_div(right),
+					QuantIntOp::Remainder => left.checked_rem(right),
+					QuantIntOp::ShiftLeft => (right < 64).then(|| left << right),
+					QuantIntOp::ShiftRight => (right < 64).then(|| left >> right),
+					QuantIntOp::And => Some(left & right),
+					QuantIntOp::Or => Some(left | right),
+					QuantIntOp::Xor => Some(left ^ right),
+				};
+				if let Some(value) = folded {
+					return RunInt::Known(value);
+				}
+			}
+			RunInt::Ir(self.inner.int(operation, left.text(), right.text()))
+		}
+		fn equal(&mut self, left: Self::Int, right: Self::Int) -> Self::Int {
+			match (&left, &right) {
+				(RunInt::Known(left), RunInt::Known(right)) => RunInt::Known(u64::from(left == right)),
+				_ => RunInt::Ir(self.inner.equal(left.text(), right.text())),
+			}
+		}
+		fn less(&mut self, left: Self::Int, right: Self::Int) -> Self::Int {
+			match (&left, &right) {
+				(RunInt::Known(left), RunInt::Known(right)) => RunInt::Known(u64::from(left < right)),
+				_ => RunInt::Ir(self.inner.less(left.text(), right.text())),
+			}
+		}
+		fn select_int(&mut self, condition: Self::Int, yes: Self::Int, no: Self::Int) -> Self::Int {
+			match condition {
+				RunInt::Known(condition) => if condition != 0 { yes } else { no },
+				RunInt::Ir(condition) => RunInt::Ir(self.inner.select_int(condition, yes.text(), no.text())),
+			}
+		}
+		fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int {
+			match value {
+				RunInt::Known(value) => {
+					let shift = 64 - u32::from(bits);
+					RunInt::Known((((value << shift) as i64) >> shift) as u64)
+				}
+				RunInt::Ir(value) => RunInt::Ir(self.inner.sign_extend(value, bits)),
+			}
+		}
+		fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int {
+			match offset {
+				RunInt::Known(offset) => RunInt::Ir(self.bytes(offset, bits)),
+				// A byte at a runtime offset of interleaved rows lies in its word's
+				// place of the lane's row: the value assembles a byte at a time.
+				RunInt::Ir(offset) if self.pitch != self.word_bytes() => {
+					let offset = self.inner.int(QuantIntOp::Add, offset, self.skew.to_string());
+					let pointer = pointer_type(self.inner.backend);
+					let mut value = "0".to_owned();
+					for byte in 0..u64::from(bits / 8) {
+						let at = self.inner.int(QuantIntOp::Add, offset.clone(), byte.to_string());
+						let word = self.inner.int(QuantIntOp::Divide, at.clone(), "4".to_owned());
+						let within = self.inner.int(QuantIntOp::Remainder, at, "4".to_owned());
+						let spaced = self.inner.int(QuantIntOp::Multiply, word, self.pitch.to_string());
+						let place = self.inner.int(QuantIntOp::Add, spaced, within);
+						let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {place}", self.block));
+						let loaded = self.inner.instruction(format!("load i8, {pointer} {address}, align 1, !invariant.load !{{}}"));
+						let wide = self.inner.instruction(format!("zext i8 {loaded} to i64"));
+						let placed = self.inner.instruction(format!("shl i64 {wide}, {}", byte * 8));
+						value = self.inner.instruction(format!("or i64 {value}, {placed}"));
+					}
+					RunInt::Ir(value)
+				}
+				RunInt::Ir(offset) => {
+					let offset = if self.skew == 0 { offset } else { self.inner.int(QuantIntOp::Add, offset, self.skew.to_string()) };
+					let address = self.inner.instruction(format!("getelementptr inbounds i8, {} {}, i64 {offset}", pointer_type(self.inner.backend), self.block));
+					let loaded = self.inner.instruction(format!("load i{bits}, {} {address}, align 1, !invariant.load !{{}}", pointer_type(self.inner.backend)));
+					RunInt::Ir(if bits == 64 { loaded } else { self.inner.instruction(format!("zext i{bits} {loaded} to i64")) })
+				}
+			}
+		}
+		fn half(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = self.load(16, offset);
+			self.half_bits(bits)
+		}
+		fn float(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = self.load(32, offset).text();
+			let state = self.inner.precision.state_type;
+			let narrow = self.inner.instruction(format!("trunc i64 {bits} to i32"));
+			let float = self.inner.instruction(format!("bitcast i32 {narrow} to float"));
+			self.inner.instruction(format!("call {state} @recipe.state.from.f32{}(float {float})", self.inner.suffix))
+		}
+		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
+			self.inner.half_bits(bits.text())
+		}
+		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(u64::from(values[index as usize])),
+				// Values of one grid point share its entry: the run reads it once.
+				RunInt::Ir(index) => {
+					let key = (format!("table {name} {index}"), 0);
+					if let Some(entry) = self.words.get(&key) {
+						return RunInt::Ir(entry.clone());
+					}
+					let entry = self.inner.table(name, values, index);
+					self.words.insert(key, entry.clone());
+					RunInt::Ir(entry)
+				}
+			}
+		}
+		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(i64::from(values[index as usize]) as u64),
+				RunInt::Ir(index) => RunInt::Ir(self.inner.signed_table(name, values, index)),
+			}
+		}
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(values[index as usize]),
+				RunInt::Ir(index) => {
+					let key = (format!("words {name} {index}"), 0);
+					if let Some(entry) = self.words.get(&key) {
+						return RunInt::Ir(entry.clone());
+					}
+					let entry = self.inner.word_table(name, values, index);
+					self.words.insert(key, entry.clone());
+					RunInt::Ir(entry)
+				}
+			}
+		}
+		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
+			match index {
+				RunInt::Known(index) => self.inner.literal(values[index as usize]),
+				RunInt::Ir(index) => self.inner.value_table(name, values, index),
+			}
+		}
+		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
+			match value {
+				RunInt::Known(value) => self.inner.literal(if signed { value as i64 as f64 } else { value as f64 }),
+				RunInt::Ir(value) => self.inner.number(value, signed),
+			}
+		}
+		fn literal(&self, value: f64) -> Self::Value {
+			self.inner.literal(value)
+		}
+		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value {
+			self.inner.value(operation, left, right)
+		}
+		fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value {
+			match condition {
+				RunInt::Known(condition) => if condition != 0 { yes } else { no },
+				RunInt::Ir(condition) => self.inner.select_value(condition, yes, no),
+			}
+		}
+		fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value {
+			match sign {
+				RunInt::Known(0) => magnitude,
+				sign => self.inner.signed(magnitude, sign.text()),
+			}
+		}
+	}
 }
-use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, ScalarLayout, dequant_nf4};
+use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, RunQuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
 	/// Emits loads of a runtime schedule slot from the context arena. Keeping
@@ -4218,9 +4481,14 @@ impl NativeModelIr {
 			.collect())
 	}
 
-	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool, functions: &mut String) -> Result<String> {
+	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
-		let outlined = self.inference && backend == Backend::Nvidia && !reverse && !training;
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		// An inference pass computes every node's window first, then marks where
+		// each block's nodes begin, so the caller can give each block a function.
+		let blocked = !reverse && !training;
+		let mut windows = String::new();
+		let mut block = None;
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
 		} else {
@@ -4234,41 +4502,103 @@ impl NativeModelIr {
 			if plan.node.block_kind == "recur_body" {
 				continue;
 			}
-			// Keep position propagation in the caller. Operation-local values do
-			// not need to remain live across later operations in the same kernel.
-			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: plan.node.output.length.to_string() } } else { self.emit_node_window(index, &plan.node, &mut ir)? };
-			let body_start = ir.len();
-			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
-			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
-				let pointer = pointer_type(backend);
-				if backend == Backend::Nvidia {
-					// Predicate the stores without divergent branches around grid barriers.
-					ir.push_str(&format!("%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\ncall void asm sideeffect \"{{ .reg .pred p; .reg .b64 t; setp.eq.u32 p, $1, 0; mov.u64 t, %globaltimer; @p st.u64 [$0], t; }}\", \"l,r,~{{memory}}\"({pointer} %clk.n{index}.ptr, i32 %tid)\n", at = clocks + index * 24));
-				} else {
-				ir.push_str(&format!(
-					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
-					at = clocks + index * 24
-				));
-				}
+			if blocked && block != Some(plan.node.block_index) {
+				block = Some(plan.node.block_index);
+				ir.push_str(&format!("{BLOCK_MARK}{}\n", plan.node.block_index));
 			}
+			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			let node = &plan.node;
 			let v = self.variant(node);
+			// The run decoder a packed sum over stored weights calls, when it has one.
+			let key = self.run_key(index).unwrap_or_default();
 			let matrix = matrix && matrix_capable(self.node_precision(node));
 			let gradient_base = self.gradient_base(plan)?;
+			// The reverse pass differentiates the whole sequence at once.
+			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, if blocked { &mut windows } else { &mut ir })? };
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
+				// A float sum over a stored format, one row at a time: the packed body.
+				// A weight that joins formats a row at a time takes it once per format.
+				(false, Primitive::Contraction)
+					if self.inference
+						&& self.rows == 1 && node.int_bits == 0
+						&& node.argument[0] <= 1.0
+						&& (dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) || segments[index].is_some()) =>
+				{
+					let rows = node.shard.rows.local(node.output.channels);
+					// Each part: its decoder key, dispatch id, first row, rows, and first byte.
+					let parts = match &segments[index] {
+						Some(segments) => segments.iter().map(|segment| (segment.format.name.to_owned(), segment.id, segment.row, segment.rows, segment.bytes)).collect::<Vec<_>>(),
+						None => vec![(key.clone(), index + 1, 0, rows, 0)],
+					};
+					let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+					let scratch = self.split_scratch_name(backend, index);
+					ir.push_str(&self.split_scratch_gep(backend, index));
+					for (part, (key, id, first_row, rows, bytes)) in parts.iter().enumerate() {
+						let p = format!("n{index}.p{part}");
+						// A later part's split scratch is free only once the part before is summed.
+						if part > 0 {
+							ir.push_str(barrier(backend));
+						}
+						let weights = if *bytes == 0 { pointers.weights.clone() } else {
+							ir.push_str(&format!("%{p}.weights = getelementptr inbounds i8, {pointer} {}, i64 {bytes}\n", pointers.weights));
+							format!("%{p}.weights")
+						};
+						let value = if *first_row == 0 { pointers.value.clone() } else {
+							ir.push_str(&format!("%{p}.value = getelementptr inbounds {ty}, {pointer} {}, i64 {}\n", pointers.value, first_row * node.output.length));
+							format!("%{p}.value")
+						};
+						// A window of two positions or more takes the four-position lane body;
+						// a one-position step takes the lane body, and the row body takes what
+						// the lane bodies cannot.
+						ir.push_str(&format!("br label %{p}.pre\n{p}.pre:\n"));
+						ir.push_str(&format!(
+							"%{p}.tiling = icmp uge i32 {span}, 2\nbr i1 %{p}.tiling, label %{p}.tile, label %{p}.untiled\n{p}.tile:\n%{p}.tiled.count = call i32 @packed_lanes4_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %{p}.untiled\n{p}.untiled:\n%{p}.tiled = phi i32 [ 0, %{p}.pre ], [ %{p}.tiled.count, %{p}.tile ]\n%{p}.rest.begin = add i32 {begin}, %{p}.tiled\n%{p}.rest.span = sub i32 {span}, %{p}.tiled\n%{p}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %{p}.rest.begin, i32 %{p}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%{p}.last.begin = add i32 %{p}.rest.begin, %{p}.laned\n%{p}.last.span = sub i32 %{p}.rest.span, %{p}.laned\n",
+							source = pointers.source,
+							terms = node.shard.terms.local(node.input.channels),
+							in_length = node.input.length,
+							out_length = node.output.length,
+							bias = node.argument[2] == 0.0,
+							relu = node.argument[1] == 1.0,
+							decode = plan.decode(index),
+							row_first = node.shard.rows.first,
+							row_period = node.shard.rows.period,
+							row_share = node.shard.rows.count,
+							in_first = node.shard.terms.first,
+							in_period = node.shard.terms.period,
+							in_share = node.shard.terms.count,
+						));
+						ir.push_str(&format!("%{p}.rows.some = icmp ne i32 %{p}.last.span, 0\nbr i1 %{p}.rows.some, label %{p}.rows, label %{p}.rows.done\n{p}.rows:\n"));
+						ir.push_str(&format!(
+							"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %{p}.last.begin, i32 %{p}.last.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+							row_first = node.shard.rows.first,
+							row_period = node.shard.rows.period,
+							row_share = node.shard.rows.count,
+							in_first = node.shard.terms.first,
+							in_period = node.shard.terms.period,
+							in_share = node.shard.terms.count,
+							decode = plan.decode(index),
+							source = pointers.source,
+							terms = node.shard.terms.local(node.input.channels),
+							in_length = node.input.length,
+							out_length = node.output.length,
+							bias = node.argument[2] == 0.0,
+							relu = node.argument[1] == 1.0,
+						));
+						ir.push_str(&format!("br label %{p}.rows.done\n{p}.rows.done:\n"));
+					}
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Contraction) => {
+					if self.inference && tracing() {
+						let segments = plan.stored.as_ref().map(|stored| stored.format_segments().iter().map(|(format, count)| format!("{}x{count}", quantization(format.0))).collect::<Vec<_>>().join("+"));
+						trace(&format!("contraction node {index} takes the general body: packed {} segments {segments:?} int {} kernel {} inputs {}", plan.packed, node.int_bits, node.argument[0], node.input.channels))?;
+					}
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
-					// Dense exact CPU inference uses one reduction order for prefill,
-					// speculative verification, and single-position decoding.
-					let contraction = if self.inference && backend == Backend::Cpu && self.graph.profile.exact_cpu && !plan.packed && node.int_bits == 0 {
-						format!("contraction_forward_gemm_body{v}")
-					} else if let Some((_, name)) = self.contraction_specialization(backend, matrix, index) { name }
-					else { format!("contraction_forward_body{v}") };
 					let call = format!(
-						"call void @{contraction}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {begin}, i32 {span}, i32 {kernel}, i1 {bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i64 0, i32 {decode} )\n",
+						"call void @contraction_forward_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {begin}, i32 {span}, i32 {kernel}, i1 {bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i64 0, i32 {decode} )\n",
 						pointer = pointer_type(backend),
 						bias = node.argument[2] == 0.0,
 						decode = plan.decode(index),
@@ -4294,15 +4624,6 @@ impl NativeModelIr {
 					let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
 					let prefix = format!("n{index}.gather");
 					emit_runtime_window_loop(&mut ir, index, "gather", node.output, &window, |ir, _p, wide| {
-						if !node.token_input() {
-							let width = node.argument[1] as usize;
-							ir.push_str(&format!(
-								"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.base = mul i64 %{prefix}.row, {input_row}\n%{prefix}.token = add i64 %{prefix}.base, %{prefix}.position\n%{prefix}.embedding = icmp ult i64 %{prefix}.channel, {width}\nbr i1 %{prefix}.embedding, label %{prefix}.embed, label %{prefix}.hidden\n{prefix}.embed:\n%{prefix}.id.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.token\n%{prefix}.id.value = load {ty}, {pointer} %{prefix}.id.ptr, align {align}\n%{prefix}.id = fptoui {ty} %{prefix}.id.value to i64\n%{prefix}.embedded = call {ty} @recipe_model_quantized_{name}{v}({pointer} {table}, i64 %{prefix}.id, i64 %{prefix}.channel, i64 {width})\nbr label %{prefix}.join\n{prefix}.hidden:\n%{prefix}.hidden.channel = sub i64 %{prefix}.channel, {offset}\n%{prefix}.hidden.base = mul i64 %{prefix}.hidden.channel, {length}\n%{prefix}.hidden.index = add i64 %{prefix}.token, %{prefix}.hidden.base\n%{prefix}.hidden.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.hidden.index\n%{prefix}.hidden.value = load {ty}, {pointer} %{prefix}.hidden.ptr, align {align}\nbr label %{prefix}.join\n{prefix}.join:\n%{prefix}.value = phi {ty} [ %{prefix}.embedded, %{prefix}.embed ], [ %{prefix}.hidden.value, %{prefix}.hidden ]\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
-								source = pointers.source, table = pointers.context, value = pointers.value, length = node.output.length,
-								input_row = node.input.channels * node.input.length, offset = width - 1, name = layout.name, align = alignment(ty),
-							));
-							return;
-						}
 						ir.push_str(&format!(
 							"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.base = mul i64 %{prefix}.row, {length}\n%{prefix}.token = add i64 %{prefix}.base, %{prefix}.position\n%{prefix}.id.ptr = getelementptr inbounds i32, {pointer} {source}, i64 %{prefix}.token\n%{prefix}.id = load i32, {pointer} %{prefix}.id.ptr, align 4\n%{prefix}.id.wide = zext i32 %{prefix}.id to i64\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}{v}({pointer} {table}, i64 %{prefix}.id.wide, i64 %{prefix}.channel, i64 {width})\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
 							source = pointers.source,
@@ -4317,19 +4638,36 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::TopK) if self.inference && self.rows == 1 && backend != Backend::Cpu && node.output.channels <= 64 * 32 => {
+					// A lane keeps its experts' picks in 64 bits, so a 32-lane wave takes up to 2048 experts.
+					// One wave per position: the lanes pick the top experts together.
+					let prefix = format!("n{index}.topk");
+					ir.push_str(&format!(
+						"%{prefix}.width = call i32 @recipe.wavefront.width()\n%{prefix}.wave = udiv i32 %tid, %{prefix}.width\n%{prefix}.lane = urem i32 %tid, %{prefix}.width\n%{prefix}.waves = udiv i32 %threads, %{prefix}.width\n%{prefix}.end = add i32 {begin}, {span}\n%{prefix}.first = add i32 {begin}, %{prefix}.wave\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.position = phi i32 [ %{prefix}.first, %{prefix}.entry ], [ %{prefix}.position.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.position, %{prefix}.end\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.p = zext i32 %{prefix}.position to i64\ncall void @topk_forward_wave_body{v}( {pointer} {source}, {pointer} {value}, i64 %{prefix}.p, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 %{prefix}.lane, i32 %{prefix}.width )\n%{prefix}.position.next = add i32 %{prefix}.position, %{prefix}.waves\nbr label %{prefix}.loop\n{prefix}.done:\n",
+						pointer = pointer_type(backend),
+						begin = window.begin,
+						span = window.span,
+						source = pointers.source,
+						value = pointers.value,
+						experts = node.output.channels,
+						length = node.output.length,
+						top = node.argument[0],
+						scoring = node.argument[1],
+						renormalize = node.argument[2]
+					));
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::TopK) => {
-					if self.inference && backend == Backend::Nvidia {
-						ir.push_str(&format!("call void @topk_forward_group_body{v}(ptr addrspace(1) {source}, ptr addrspace(1) {value}, ptr addrspace(1) {selected}, i32 %rows, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 {begin}, i32 {span}, i32 %threads)\n", source = pointers.source, value = pointers.value, selected = pointers.context, experts = node.output.channels, length = node.output.length, top = node.argument[0], scoring = node.argument[1], renormalize = node.argument[2]));
-					} else {
 					// One router decision per row and position: a `[1, length]` shape.
 					let positions = Shape { channels: 1, length: node.output.length };
 					emit_runtime_window_loop(&mut ir, index, "topk", positions, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @topk_forward_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {selected}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
+							"call void @topk_forward_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {selection}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 {biased} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
-							selected = pointers.context,
+							selection = if node.parameters != 0 { &pointers.weights } else { &pointers.source },
+							biased = u8::from(node.parameters != 0),
 							experts = node.output.channels,
 							length = node.output.length,
 							top = node.argument[0],
@@ -4337,7 +4675,6 @@ impl NativeModelIr {
 							renormalize = node.argument[2]
 						));
 					})?;
-					}
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Expand) => {
@@ -4363,7 +4700,7 @@ impl NativeModelIr {
 					let factor = native_literal(self.node_precision(node).model, ty, node.argument[5]);
 					let chain = native_literal(self.node_precision(node).model, ty, node.argument[6]);
 					let fast = native_literal(self.node_precision(node).model, ty, node.argument[7]);
-					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
+					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8].abs());
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
 							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, {pointer} {context}, i1 {sectioned}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
@@ -4373,6 +4710,19 @@ impl NativeModelIr {
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							has_factors = node.parameters != 0,
+							body = body,
+							v = v,
+							input = input,
+							output = output,
+							wide = wide,
+							ty = ty,
+							base = base,
+							mscale = mscale,
+							factor = factor,
+							chain = chain,
+							fast = fast,
+							slow = slow,
+							reverse = reverse,
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -4387,15 +4737,61 @@ impl NativeModelIr {
 					}
 					ir.push_str(barrier(backend));
 				}
+				// An expert table in a stored format with a run dot is a contraction
+				// whose rows or inputs the position's routed experts select.
+				(false, Primitive::ExpertIn | Primitive::ExpertOut)
+					if self.inference && self.rows == 1 && node.int_bits == 0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| {
+						let unit = dot_run(block);
+						node.input.channels % unit == 0 && (node.op == Primitive::ExpertIn || (node.argument[2] as usize) % unit == 0)
+					}) =>
+				{
+					// The lane body takes the window, a row per lane; the row body takes
+					// what the lane body cannot.
+					ir.push_str(&format!(
+						"{scratch_gep}%n{index}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 {begin}, %n{index}.laned\n%n{index}.last.span = sub i32 {span}, %n{index}.laned\n%n{index}.rows.some = icmp ne i32 %n{index}.last.span, 0\nbr i1 %n{index}.rows.some, label %n{index}.rows, label %n{index}.rows.done\nn{index}.rows:\ncall void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.last.begin, i32 %n{index}.last.span, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.rows.done\nn{index}.rows.done:\n",
+						// A split expert table holds a share of every expert: the gate and
+						// up tables its hidden rows (placed within each expert's period),
+						// the down table its output rows.
+						row_first = node.shard.rows.first,
+						row_period = node.shard.rows.period,
+						row_local = node.shard.rows.count,
+						in_first = node.shard.terms.first,
+						in_period = node.shard.terms.period,
+						in_share = node.shard.terms.count,
+						node = index + 1,
+						scratch_gep = self.split_scratch_gep(backend, index),
+						scratch = self.split_scratch_name(backend, index),
+						pointer = pointer_type(backend),
+						decode = plan.decode(index),
+						source = pointers.source,
+						routing = pointers.second,
+						weights = pointers.weights,
+						value = pointers.value,
+						rows = node.shard.rows.local(node.output.channels),
+						terms = node.shard.terms.local(node.input.channels),
+						in_length = node.input.length,
+						out_length = node.output.length,
+						mode = if node.op == Primitive::ExpertIn { 1 } else { 2 },
+						// A die holding a share of every expert's hidden rows or inputs
+						// sees that share as the expert's hidden width.
+						hidden = match (node.op, node.shard.rows.count, node.shard.terms.count) {
+							(Primitive::ExpertIn, count, _) if count != 0 => count as f64,
+							(Primitive::ExpertOut, _, count) if count != 0 => count as f64,
+							_ => node.argument[2],
+						},
+						experts = node.argument[0],
+						top = node.argument[1]
+					));
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::ExpertIn) => {
-					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
-					let body = self.expert_specialization(backend, index).map_or_else(|| format!("expert_in_forward_body{v}"), |(_, name)| name);
-					emit_expert_window_loop(&mut ir, index, "expert.in", node.output, &window, self.inference && backend != Backend::Cpu, |ir, wide, lane, width| {
+					emit_runtime_window_loop(&mut ir, index, "expert.in", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @{body}( {pointer} {source}, {pointer} {selected}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode}, i32 {lane}, i32 {width} )\n",
+							"call void @expert_in_forward_body{v}( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
+							routing = pointers.second,
 							weights = pointers.weights,
 							value = pointers.value,
 							channels = node.input.channels,
@@ -4408,11 +4804,10 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Read) => {
-					let pick = integer_argument(node.argument[1], "lane pick")?;
-					require(pick >= 0 && pick <= integer_argument(node.argument[0], "stream lanes")?, "lane pick exceeds the stream")?;
 					emit_runtime_window_loop(&mut ir, index, "read", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
+							pick = node.argument[1],
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -4425,14 +4820,43 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
-				(false, Primitive::Dconv) => {
-					let compact = self.layout.window_positions < self.graph.input.length;
-					let history_positions = if compact { dconv_history(&self.graph, node)? } else { 0 };
-					let origin = if compact { "%begin" } else { "0" };
+				(false, Primitive::Dconv) if self.inference && self.rows == 1 && self.layout.window_positions < self.graph.input.length => {
+					// The window's buffer holds its positions alone; the taps behind it
+					// read the channel history this node keeps in its context.
+					let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")?, integer_argument(node.argument[1], "depthwise dilation")?.max(1));
+					let tail = (kernel - 1) * dilation;
+					ir.push_str(&format!("%n{index}.dconv.fresh = icmp eq i32 %begin, 0\n"));
 					emit_runtime_window_loop(&mut ir, index, "dconv", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @dconv_forward_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode}, i32 {origin}, i32 {history_positions} )\n",
-							context = pointers.context,
+							"call void @dconv_window_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode}, i1 %n{index}.dconv.fresh )\n",
+							pointer = pointer_type(backend), decode = plan.decode(index), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context,
+							channels = node.output.channels, length = node.output.length
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					let channels = Shape { channels: node.output.channels, length: 1 };
+					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
+					let kept_bytes = self.layout.kept.iter().find(|(live, ..)| *live == self.layout.contexts[index]).map_or(0, |(.., bytes)| *bytes);
+					emit_runtime_window_loop(&mut ir, index, "dconv.history", channels, &whole, |ir, _p, wide| {
+						// The history after each of the window's first positions but its
+						// last is kept before the live history moves past them.
+						let p = format!("n{index}.dconv.keep");
+						ir.push_str(&format!(
+							"br label %{p}.entry\n{p}.entry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.next, %{p}.step ]\n%{p}.more = icmp ult i32 %{p}.j, {slots}\n%{p}.last = sub i32 {span}, 1\n%{p}.inner = icmp ult i32 %{p}.j, %{p}.last\n%{p}.go = and i1 %{p}.more, %{p}.inner\nbr i1 %{p}.go, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.span = add i32 %{p}.j, 1\n%{p}.j.wide = zext i32 %{p}.j to i64\n%{p}.at = mul i64 %{p}.j.wide, {kept_bytes}\n%{p}.target = getelementptr i8, {pointer} {kept}, i64 %{p}.at\ncall void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} %{p}.target, i64 {wide}, i32 {length}, i32 %{p}.span, i32 {tail}, i1 %n{index}.dconv.fresh )\n%{p}.next = add i32 %{p}.j, 1\nbr label %{p}.loop\n{p}.done:\n",
+							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
+						));
+						ir.push_str(&format!(
+							"call void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} {context}, i64 {wide}, i32 {length}, i32 {span}, i32 {tail}, i1 %n{index}.dconv.fresh )\n",
+							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Dconv) => {
+					emit_runtime_window_loop(&mut ir, index, "dconv", node.output, &window, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"call void @dconv_forward_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode} )\n",
 							pointer = pointer_type(backend), decode = plan.decode(index), source = pointers.source, weights = pointers.weights, value = pointers.value,
 							channels = node.output.channels, length = node.output.length, kernel = node.argument[0], dilation = node.argument[1]
 						));
@@ -4454,20 +4878,15 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Lookup) => {
-					// The machine stages the gathered rows of the request as
+					// The host stages the gathered rows of the window in the context as
 					// [row][position][channel]; the device lays them out as its value plane.
 					let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
 					let prefix = format!("n{index}.lookup");
 					let per_row = checked_mul(node.output.channels, node.output.length, "lookup row elements")?;
-					let compact = self.layout.request_control.is_some();
-					let context = if compact {
-						ir.push_str(&format!("%{prefix}.address = load i64, {pointer} {context}, align 8\n%{prefix}.request = inttoptr i64 %{prefix}.address to {pointer}\n", context = pointers.context));
-						format!("%{prefix}.request")
-					} else { pointers.context.clone() };
 					emit_runtime_window_loop(&mut ir, index, "lookup", node.output, &window, |ir, _p, wide| {
-						let (stride, origin) = if compact { ("%request.span.wide".to_owned(), "%request.local.begin.wide") } else { (node.output.length.to_string(), "0") };
 						ir.push_str(&format!(
-							"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.token = mul i64 %{prefix}.row, {stride}\n%{prefix}.local = add i64 %{prefix}.position, {origin}\n%{prefix}.slot = add i64 %{prefix}.token, %{prefix}.local\n%{prefix}.base = mul i64 %{prefix}.slot, {channels}\n%{prefix}.index = add i64 %{prefix}.base, %{prefix}.channel\n%{prefix}.in = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.index\n%{prefix}.value = load {ty}, {pointer} %{prefix}.in, align {align}\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+							"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.token = mul i64 %{prefix}.row, {length}\n%{prefix}.slot = add i64 %{prefix}.token, %{prefix}.position\n%{prefix}.base = mul i64 %{prefix}.slot, {channels}\n%{prefix}.index = add i64 %{prefix}.base, %{prefix}.channel\n%{prefix}.in = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.index\n%{prefix}.value = load {ty}, {pointer} %{prefix}.in, align {align}\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+							context = pointers.context,
 							value = pointers.value,
 							wide = wide,
 							length = node.output.length,
@@ -4511,11 +4930,10 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Outer) => {
-					let pick = integer_argument(node.argument[1], "lane write")?;
-					require(pick >= 0 && pick <= integer_argument(node.argument[0], "stream lanes")?, "lane write exceeds the stream")?;
 					emit_runtime_window_loop(&mut ir, index, "outer", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
+							pick = node.argument[1],
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -4528,42 +4946,61 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Delta) if self.inference => {
+					// One row, head and value column per element: columns of the state
+					// never read each other, and the live state walks only the window.
+					let (key_heads, key_width, heads, width) = delta_extent(node)?;
+					let pairs = checked_mul(self.rows, heads as usize, "delta pairs")?;
+					let columns = Shape { channels: checked_mul(pairs, width as usize, "delta columns")?, length: 1 };
+					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					let length = narrow(node.output.length, "delta length")?;
+					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
+					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
+						ir.push_str(&format!(
+							concat!(
+								"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {value}, {pointer} {context}, i64 {wide}, ",
+								"i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, ",
+								"i32 %begin, i32 %end, i1 {tiled}, {ty} {scale}, i32 {origin}, {pointer} {kept}, i32 {slots} )\n"
+							),
+							origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" },
+							tiled = node.argument[5] == 1.0,
+							kept = kept,
+							slots = slots,
+							v = v,
+							wide = wide,
+							pairs = pairs,
+							key_heads = key_heads,
+							key_width = key_width,
+							heads = heads,
+							width = width,
+							length = length,
+							ty = self.node_precision(node).model_type,
+							scale = native_literal(self.node_precision(node).model, self.node_precision(node).model_type, if node.argument[6] == 0.0 { 1.0 } else { node.argument[6] }),
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							second = pointers.second,
+							value = pointers.value,
+							context = pointers.context,
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Delta) => {
+					require(node.argument[5] == 0.0 && (node.argument[6] == 0.0 || node.argument[6] == 1.0), "a delta block with tiled key heads or a scaled output runs at inference only")?;
+					// One row and head per element: a `[heads, 1]` shape walked whole.
 					let shape = delta_shape(node, self.rows)?;
-					let (_, key_width, _, width) = delta_extent(node)?;
-					let columns = if self.inference { width } else { 1 };
-					let pairs = Shape { channels: checked_mul(shape.heads as usize, columns as usize, "delta parallel columns")?, length: 1 };
+					let pairs = Shape { channels: shape.heads as usize, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// The reverse pass replays each chunk from its committed entry state,
 					// so a training layout commits every entry; an inference layout holds
 					// the live state alone and commits nothing.
 					let entries = if self.inference { 0 } else { shape.chunks };
-					let checkpoints = if self.inference { integer_argument(node.argument[5], "delta checkpoint slots")? } else { 0 };
-					let origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" };
-					let pointer = pointer_type(backend);
-					let state = self.node_precision(node).state_type;
-					let prepared = format!("%n{index}.delta.prepared");
-					if self.inference {
-						let cells = checked_mul(checked_mul(self.rows, shape.heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?, "delta states")?;
-						let offset = checked_mul(cells, checkpoints as usize + 1, "delta checkpoint states")?;
-						ir.push_str(&format!("{prepared} = getelementptr inbounds {state}, {pointer} {context}, i64 {offset}\n", context = pointers.context));
-						emit_runtime_window_loop(&mut ir, index, "delta.prepare", Shape { channels: shape.heads as usize, length: 1 }, &whole, |ir, _p, wide| {
-							ir.push_str(&format!("call void @delta_prepare_body{v}({pointer} {gates}, {pointer} {weights}, {pointer} {prepared}, i64 {wide}, i32 {heads}, i32 {key_width}, i32 {length}, i32 %n{index}.begin, i32 %n{index}.end, i32 {decode})\n", gates = pointers.second, weights = pointers.weights, heads = shape.heads, length = node.output.length, decode = plan.decode(index)));
-						})?;
-						ir.push_str(barrier(backend));
-					}
 					emit_runtime_window_loop(&mut ir, index, "delta", pairs, &whole, |ir, _p, wide| {
-						let (pair, column, scalars) = if self.inference {
-							ir.push_str(&format!("%n{index}.delta.pair = udiv i64 {wide}, {columns}\n%n{index}.delta.column.wide = urem i64 {wide}, {columns}\n%n{index}.delta.column = trunc i64 %n{index}.delta.column.wide to i32\n%n{index}.delta.scalars.offset = mul i64 %n{index}.delta.pair, {stride}\n%n{index}.delta.scalars = getelementptr inbounds {state}, {pointer} {prepared}, i64 %n{index}.delta.scalars.offset\n", stride = node.output.length * 3));
-							(format!("%n{index}.delta.pair"), format!("%n{index}.delta.column"), format!("%n{index}.delta.scalars"))
-						} else { (wide.to_owned(), "0".to_owned(), "null".to_owned()) };
 						ir.push_str(&format!(
-							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {pair}, {arguments}, i32 {entries}, i32 {decode}, i32 %n{index}.begin, i32 %n{index}.end, i32 {checkpoints}, i32 {origin}, i32 {column}, i32 {columns}, {pointer} {scalars} )\n",
+							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries} )\n",
 							pointer = pointer_type(backend),
-							decode = plan.decode(index),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							value = pointers.value,
 							context = pointers.context,
 							arguments = shape.arguments
@@ -4572,11 +5009,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertOut) => {
-					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
-					let body = self.expert_specialization(backend, index).map_or_else(|| format!("expert_out_forward_body{v}"), |(_, name)| name);
-					emit_expert_window_loop(&mut ir, index, "expert.out", node.output, &window, self.inference && backend != Backend::Cpu, |ir, wide, lane, width| {
+					emit_runtime_window_loop(&mut ir, index, "expert.out", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @{body}( {pointer} {source}, {pointer} {routing}, {pointer} {selected}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode}, i32 {lane}, i32 {width} )\n",
+							"call void @expert_out_forward_body{v}( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -4613,7 +5048,6 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Attention) => {
 					let buffer_length = node.output.length;
-					let query_capacity = node.input.length;
 					let compact = self.layout.window_positions < self.graph.input.length;
 					let buffer_origin = if compact { "%begin" } else { "0" };
 					let begin = if compact { "%begin" } else { begin.as_str() };
@@ -4630,9 +5064,7 @@ impl NativeModelIr {
 					if blocks != 0 {
 						// Keep running key sums in context and score only touched window blocks.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
-						let key_weights = format!("%n{index}.index.weights");
-						ir.push_str(&ptr_gep(backend, "weights", self.plans[geometry.key_weights].weight_offset, &format!("n{index}.index.weights")));
-
+						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						// The selection clears the block score gradients the reverse pass
@@ -4647,13 +5079,13 @@ impl NativeModelIr {
 						let touched = NodeWindow { begin: first, span: count };
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
+								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
 						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared}, i32 {query_capacity}, i32 {buffer_origin} )\n"
+								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
@@ -4690,11 +5122,11 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}, i32 {query_capacity}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
-						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin}, i32 0, i32 0 )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
 						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
@@ -4706,6 +5138,8 @@ impl NativeModelIr {
 					let ty = self.node_precision(node).model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar");
+					let channel_name = format!("%{prefix}.channel");
+					let channel = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel).then_some(channel_name.as_str());
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
@@ -4729,10 +5163,14 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, _p, wide| {
+					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, p, wide| {
+					if let Some(channel) = channel {
+						emit_channel(ir, channel, p, node.output);
+					}
 						let output_pointer = format!("%{prefix}.output.ptr");
 						self.emit_operand_load(backend, index, 0, &pointers.source, wide, &first, ir);
 						if pointers.second != pointers.source {
@@ -4890,6 +5328,98 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(true, Primitive::Exchange) => return Err(RecipeError::new("a tensor-split exchange has no reverse pass")),
+				(false, Primitive::Exchange) => {
+					require(backend == Backend::Nvidia, "a tensor-split exchange runs on NVIDIA devices")?;
+					require(self.rows == 1, "a tensor-split exchange moves one row")?;
+					let pointer = pointer_type(backend);
+					let precision = self.node_precision(node);
+					let (ty, state) = (precision.model_type, precision.state_type);
+					let sum = node.argument[0] != 0.0;
+					let die = integer_argument(node.argument[1], "exchange die")?;
+					let dies = integer_argument(node.argument[2], "exchange dies")?;
+					let (first, last) = (node.shard.rows.first, node.shard.rows.first + node.shard.rows.count);
+					let plane = node.output.elements();
+					// Every exchange alternates between the same two halves, each as large
+					// as the largest exchange, so consecutive exchanges never overlap.
+					let mut half = 0;
+					for plan in self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange) {
+						let planes = if plan.node.argument[0] != 0.0 { dies as usize } else { 1 };
+						half = half.max(checked_mul(checked_mul(plan.node.output.elements(), planes, "exchange planes")?, self.node_precision(&plan.node).model.bytes(), "exchange bytes")?);
+					}
+					let prefix = format!("n{index}.exchange");
+					let exchanges = self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
+					let ordinal = self.plans[..index].iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
+					// Another die's values reach machine RAM past this device's caches: a
+					// read treats any cached line of it as stale and fetches it again.
+					let (fresh, constraint) = match ty {
+						"float" => ("ld.global.cv.f32 $0, [$1];", "=f"),
+						"double" => ("ld.global.cv.f64 $0, [$1];", "=d"),
+						_ => return Err(RecipeError::new(format!("a tensor-split exchange moves float or double values, not {ty}"))),
+					};
+					// The buffer holds a flag per die, then two halves of planes the
+					// exchanges alternate between: a die writes exchange e + 1 only
+					// after every die posted e, so nobody still reads that half.
+					ir.push_str(&format!(
+						"%{prefix}.host.bits = load volatile i64, ptr addrspace(1) @recipe_exchange_host, align 8\n%{prefix}.host = inttoptr i64 %{prefix}.host.bits to {pointer}\n%{prefix}.base = load volatile i32, ptr addrspace(1) @recipe_exchange_epoch, align 4\n%{prefix}.epoch = add i32 %{prefix}.base, {ordinal}\n%{prefix}.next = add i32 %{prefix}.epoch, 1\n%{prefix}.parity = and i32 %{prefix}.epoch, 1\n%{prefix}.parity.wide = zext i32 %{prefix}.parity to i64\n%{prefix}.half = mul i64 %{prefix}.parity.wide, {half}\n%{prefix}.offset = add i64 %{prefix}.half, {EXCHANGE_FLAG_BYTES}\n%{prefix}.data = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.offset\n"
+					));
+					emit_runtime_window_loop(&mut ir, index, "exchange.post", node.output, &window, |ir, _p, wide| {
+						let channel = format!("%n{index}.exchange.post.at.channel");
+						let own = if sum { "true".to_owned() } else { format!("%{prefix}.post.own") };
+						if !sum {
+							// With a period, the share recurs: the channel's place within its period decides.
+							let period = node.shard.rows.period;
+							let place = if period != 0 { format!("%{prefix}.post.place") } else { channel.clone() };
+							if period != 0 {
+								ir.push_str(&format!("%{prefix}.post.place = urem i64 {channel}, {period}\n"));
+							}
+							ir.push_str(&format!("%{prefix}.post.low = icmp uge i64 {place}, {first}\n%{prefix}.post.high = icmp ult i64 {place}, {last}\n%{prefix}.post.own = and i1 %{prefix}.post.low, %{prefix}.post.high\n"));
+						}
+						// Machine RAM holds the window alone, packed: a step's values are
+						// contiguous, so a warp's reads and writes cross the bus together.
+						let packed = format!("%n{index}.exchange.post.at.q");
+						let slot = if sum { format!("%{prefix}.post.slot") } else { packed.clone() };
+						if sum {
+							ir.push_str(&format!("%{prefix}.post.slot = add i64 {packed}, {}\n", die as usize * plane));
+						}
+						ir.push_str(&format!(
+							"br i1 {own}, label %{prefix}.post.write, label %{prefix}.post.skip\n{prefix}.post.write:\n%{prefix}.post.from = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n%{prefix}.post.value = load {ty}, {pointer} %{prefix}.post.from, align {align}\n%{prefix}.post.to = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 {slot}\nstore volatile {ty} %{prefix}.post.value, {pointer} %{prefix}.post.to, align {align}\nbr label %{prefix}.post.skip\n{prefix}.post.skip:\n",
+							source = pointers.source,
+							align = alignment(ty)
+						));
+					})?;
+					// The grid barrier gathers every thread's writes; the leader's system
+					// fence then orders them all before its flag, as one fence per thread
+					// would at a thousand times the cost.
+					ir.push_str(barrier(backend));
+					ir.push_str(&format!(
+						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.posted\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\nbr label %{prefix}.posted\n{prefix}.posted:\nbr i1 %{prefix}.leader, label %{prefix}.wait, label %{prefix}.signaled\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.posted ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\nfence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n"
+					));
+					ir.push_str(barrier(backend));
+					ir.push_str("fence acquire\n");
+					emit_runtime_window_loop(&mut ir, index, "exchange.take", node.output, &window, |ir, _p, wide| {
+						if sum {
+							let mut total = String::new();
+							for other in 0..dies as usize {
+								ir.push_str(&format!("%{prefix}.take.slot{other} = add i64 %n{index}.exchange.take.at.q, {}\n%{prefix}.take.at{other} = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 %{prefix}.take.slot{other}\n%{prefix}.take.raw{other} = call {ty} asm sideeffect \"{fresh}\", \"{constraint},l\"({pointer} %{prefix}.take.at{other})\n%{prefix}.take.part{other} = call {state} @recipe.decode{v}({ty} %{prefix}.take.raw{other})\n", other * plane, fresh = fresh, constraint = constraint));
+								total = if other == 0 { format!("%{prefix}.take.part0") } else {
+									ir.push_str(&format!("%{prefix}.take.sum{other} = call {state} @recipe.state.add{v}({state} {total}, {state} %{prefix}.take.part{other})\n"));
+									format!("%{prefix}.take.sum{other}")
+								};
+							}
+							ir.push_str(&format!("%{prefix}.take.value = call {ty} @recipe.encode{v}({state} {total})\n"));
+						} else {
+							ir.push_str(&format!("%{prefix}.take.at = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 %n{index}.exchange.take.at.q\n%{prefix}.take.value = call {ty} asm sideeffect \"{fresh}\", \"{constraint},l\"({pointer} %{prefix}.take.at)\n", fresh = fresh, constraint = constraint));
+						}
+						ir.push_str(&format!("%{prefix}.take.to = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.take.value, {pointer} %{prefix}.take.to, align {align}\n", value = pointers.value, align = alignment(ty)));
+					})?;
+					ir.push_str(barrier(backend));
+					// Every exchange of a launch reads the launch's base epoch and adds its
+					// place among them; the last one leaves the next launch its base.
+					if ordinal + 1 == exchanges {
+						ir.push_str(&format!("br i1 %{prefix}.leader, label %{prefix}.advance, label %{prefix}.advanced\n{prefix}.advance:\n%{prefix}.following = add i32 %{prefix}.base, {exchanges}\nstore volatile i32 %{prefix}.following, ptr addrspace(1) @recipe_exchange_epoch, align 4\nbr label %{prefix}.advanced\n{prefix}.advanced:\n"));
+					}
+				}
 				(true, Primitive::Last) => {
 					let pointer = pointer_type(backend);
 					let ty = self.node_precision(node).state_type;
@@ -4943,12 +5473,14 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Read) => {
+					require(node.argument[1] == 0.0, format!("{} picks a lane, which the reverse pass does not differentiate", node.identity(index)))?;
 					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!("call void @read_reverse_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
 					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Outer) => {
+					require(node.argument[1] == 0.0, format!("{} picks a lane, which the reverse pass does not differentiate", node.identity(index)))?;
 					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @outer_reverse_branch_body{v}( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
@@ -4984,35 +5516,21 @@ impl NativeModelIr {
 				(true, Primitive::Delta) => {
 					let shape = delta_shape(node, self.rows)?;
 					let keys = Shape { channels: shape.key_heads as usize, length: 1 };
-					let pairs = Shape { channels: shape.heads as usize, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// One row and key head per element, so the value heads sharing a key head
 					// walk in one thread and own the query and key adjoint elements they share.
 					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
+							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							context = pointers.context,
 							backward = pointers.backward_context,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							gate = pointers.second_adjoint,
 							arguments = shape.arguments
-						));
-					})?;
-					ir.push_str(barrier(backend));
-					// Then one decay scale per value head, folding that head's row partials.
-					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, _p, wide| {
-						ir.push_str(&format!(
-							"call void @delta_reverse_decay_body{v}( {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
-							pointer = pointer_type(backend),
-							context = pointers.backward_context,
-							heads = shape.heads,
-							partials = shape.partials,
-							offset = gradient_base
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -5115,6 +5633,9 @@ impl NativeModelIr {
 					let st = self.node_precision(node).state_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar.reverse");
+					let channel_name = format!("%{prefix}.channel");
+					let channel = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel).then_some(channel_name.as_str());
+					let dynamic_parameters = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel_parameter);
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
@@ -5138,6 +5659,7 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
@@ -5157,13 +5679,14 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 						&incoming,
 						true,
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((parameter, value.clone()))).collect::<Result<Vec<_>>>()?;
-					let scalar_body = |ir: &mut String, _p: &str, wide: &str| {
+					let scalar_body = |ir: &mut String, p: &str, wide: &str, row: &str| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let incoming_pointer = format!("%{prefix}.incoming.ptr");
 						let first_adjoint_pointer = format!("%{prefix}.first.adjoint.ptr");
@@ -5188,8 +5711,18 @@ impl NativeModelIr {
 							state_align = alignment(st),
 							wide = wide
 						));
+						if let Some(channel) = channel {
+							emit_channel(ir, channel, p, node.output);
+						}
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
+						for (column_index, (column, value)) in reverse.channel_adjoint.iter().enumerate() {
+							ir.push_str(&format!(
+								"%{prefix}.channel.index.{column_index} = add i32 {row}, {column}\n%{prefix}.channel.ptr.{column_index} = getelementptr inbounds {st}, {pointer} {scratch}, i32 %{prefix}.channel.index.{column_index}\n%{prefix}.channel.old.{column_index} = load {st}, {pointer} %{prefix}.channel.ptr.{column_index}, align {align}\n%{prefix}.channel.new.{column_index} = call {st} @recipe.state.add{v}({st} %{prefix}.channel.old.{column_index}, {st} {value})\nstore {st} %{prefix}.channel.new.{column_index}, {pointer} %{prefix}.channel.ptr.{column_index}, align {align}\n",
+								scratch = pointers.context,
+								align = alignment(st)
+							));
+						}
 						ir.push_str(&format!(
 							"{first_adjoint_pointer} = getelementptr inbounds {st}, {pointer} {source_adjoint}, i64 {wide}\n",
 							source_adjoint = pointers.source_adjoint,
@@ -5214,8 +5747,8 @@ impl NativeModelIr {
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &combined, st, pointer, v, &format!("{prefix}.combined.owned")));
 						}
 					};
-					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide))?;
+					if gradients.is_empty() && !dynamic_parameters {
+						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide, ""))?;
 						ir.push_str(barrier(backend));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
@@ -5238,12 +5771,12 @@ impl NativeModelIr {
 								pointer_type: pointer,
 								scratch: &pointers.context,
 								zero: &literal(0.0, st),
-								gradients: &gradients,
+								gradients: &gradients, dynamic: dynamic_parameters,
 							},
-							|ir, p| {
+							|ir, p, row| {
 								let wide = format!("%{prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
-								scalar_body(ir, p, &wide)
+								scalar_body(ir, p, &wide, row)
 							},
 						)?;
 						ir.push_str(barrier(backend));
@@ -5288,6 +5821,7 @@ impl NativeModelIr {
 								width: normalize_width(node),
 								span: normalize_span(node),
 								weight,
+								shift: node.parameters == 2 * normalize_span(node),
 								mode,
 								prefix: &prefix,
 							},
@@ -5397,8 +5931,8 @@ impl NativeModelIr {
 							&mut ir,
 							index,
 							name,
-							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
-							|ir, p| {
+							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, dynamic: false, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							|ir, p, _row| {
 								let wide = format!("%{weight_prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
 								let source_pointer = format!("%{weight_prefix}.source.ptr");
@@ -5421,6 +5955,7 @@ impl NativeModelIr {
 										width: normalize_width(node),
 										span: normalize_span(node),
 										weight: None,
+										shift: false,
 										mode,
 										prefix: &weight_prefix,
 									},
@@ -5449,99 +5984,21 @@ impl NativeModelIr {
 					}
 				}
 			}
+			// Each forward primitive has completed its node-ending grid barrier.
+			// Stamp that boundary, so neighboring clock slots enclose one node's
+			// work rather than the next node's entry or the prior node's tail.
 			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
 				let pointer = pointer_type(backend);
-				if backend == Backend::Nvidia {
-					ir.push_str(&format!("%clk.n{index}.end.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\ncall void asm sideeffect \"{{ .reg .pred p; .reg .b64 t, start, sum, count, span; setp.eq.u32 p, $1, 0; mov.u64 t, %globaltimer; @p ld.u64 start, [$0]; @p ld.u64 sum, [$0+8]; @p ld.u64 count, [$0+16]; sub.u64 t, t, start; add.u64 sum, sum, t; cvt.u64.u32 span, $2; add.u64 count, count, span; @p st.u64 [$0+8], sum; @p st.u64 [$0+16], count; }}\", \"l,r,r,~{{memory}}\"({pointer} %clk.n{index}.end.ptr, i32 %tid, i32 {span})\n", at = clocks + index * 24, span = window.span));
-				} else {
 				ir.push_str(&format!(
-					"%clk.n{index}.end = call i64 @recipe.clock()\n%clk.n{index}.start.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\n%clk.n{index}.start = load i64, {pointer} %clk.n{index}.start.ptr, align 8\n%clk.n{index}.elapsed = sub i64 %clk.n{index}.end, %clk.n{index}.start\n%clk.n{index}.sum.ptr = getelementptr i64, {pointer} %clk.n{index}.start.ptr, i64 1\n%clk.n{index}.prior = load i64, {pointer} %clk.n{index}.sum.ptr, align 8\n%clk.n{index}.total = add i64 %clk.n{index}.prior, %clk.n{index}.elapsed\n%clk.n{index}.count.ptr = getelementptr i64, {pointer} %clk.n{index}.start.ptr, i64 2\n%clk.n{index}.count = load i64, {pointer} %clk.n{index}.count.ptr, align 8\n%clk.n{index}.span = zext i32 {span} to i64\n%clk.n{index}.positions = add i64 %clk.n{index}.count, %clk.n{index}.span\n%clk.n{index}.end.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.end.zero, label %clk.n{index}.end.mark, label %clk.n{index}.end.done\nclk.n{index}.end.mark:\nstore i64 %clk.n{index}.total, {pointer} %clk.n{index}.sum.ptr, align 8\nstore i64 %clk.n{index}.positions, {pointer} %clk.n{index}.count.ptr, align 8\nbr label %clk.n{index}.end.done\nclk.n{index}.end.done:\n",
-					at = clocks + index * 24, span = window.span,
+					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
+					at = clocks + index * 8
 				));
-				}
-			}
-			if !reverse && self.layout.fingerprints.is_some() {
-				self.emit_fingerprints(backend, index, &pointers.value, &window, &mut ir)?;
-				if let Some(cache) = &pointers.attention_kv { self.emit_cache_fingerprints(backend, index, cache, &mut ir)?; }
 			}
 			if reverse {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
 			}
-			if outlined {
-				let pointer = pointer_type(backend);
-				let mut arguments = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %tid, i32 %begin, i32 %end, i32 %n{index}.begin, i32 %n{index}.end, i32 %n{index}.span");
-				if node.op == Primitive::Last && node.source >= 0 { arguments.push_str(&format!(", i32 %n{}.end", node.source)); }
-				if self.layout.request_control.is_some() {
-					arguments.push_str(", i64 %request.span.wide, i64 %request.local.begin.wide");
-				}
-				if self.layout.input_window.is_some() { arguments.push_str(&format!(", {pointer} %request.input")); }
-				let operation = ir.split_off(body_start);
-				functions.push_str(&format!("define internal void @recipe_operation_n{index}({arguments}) #3 {{\nentry:\n{operation}ret void\n}}\n"));
-				ir.push_str(&format!("call void @recipe_operation_n{index}({arguments})\n"));
-			}
 		}
-		Ok(ir)
-	}
-
-	fn emit_expert_selection(&self, backend: Backend, index: usize, node: &Node, ir: &mut String) -> Result<String> {
-		let routing = usize::try_from(node.second).map_err(|_| RecipeError::new("expert routing source is absent"))?;
-		require(self.plans.get(routing).is_some_and(|plan| plan.node.op == Primitive::TopK), "expert routing source must select its experts")?;
-		let base = if self.layout.contexts_in_values[routing] { "%values" } else { "%contexts" };
-		let selected = format!("%n{index}.selected");
-		ir.push_str(&format!("{selected} = getelementptr i8, {} {base}, i64 {}\n", pointer_type(backend), self.layout.contexts[routing]));
-		Ok(selected)
-	}
-
-	fn emit_fingerprints(&self, backend: Backend, index: usize, value: &str, window: &NodeWindow, ir: &mut String) -> Result<()> {
-		let original = &self.graph.nodes[index];
-		if original.output.length != self.graph.input.length && original.output.length != 1 { return Ok(()); }
-		let node = &self.plans[index].node;
-		let native = self.node_precision(node);
-		let ty = native.model_type;
-		let pointer = pointer_type(backend);
-		let prefix = format!("n{index}.fingerprint");
-		let offset = self.layout.fingerprints.unwrap();
-		ir.push_str(&format!("%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {offset}\n"));
-		emit_runtime_window_loop(ir, index, "fingerprint", Shape { channels: 1, length: node.output.length }, window, |ir, _, position| {
-			emit_position_fingerprint(ir, &prefix, &pointer, value, ty, native.model.bytes() * 8, node.output, position, None);
-			let slot = if original.output.length == 1 {
-				let begin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" };
-				ir.push_str(&format!("%{prefix}.span = sub i32 %end, {begin}\n%{prefix}.last = sub i32 %{prefix}.span, 1\n%{prefix}.slot = zext i32 %{prefix}.last to i64\n"));
-				format!("%{prefix}.slot")
-			} else { position.to_owned() };
-			ir.push_str(&format!("%{prefix}.row = mul i64 {slot}, {nodes}\n%{prefix}.at = add i64 %{prefix}.row, {index}\n%{prefix}.ptr = getelementptr i64, {pointer} %{prefix}.base, i64 %{prefix}.at\nstore i64 %{prefix}.hash.next, {pointer} %{prefix}.ptr, align 8\n", nodes = self.graph.nodes.len()));
-		})?;
-		ir.push_str(barrier(backend));
-		Ok(())
-	}
-	fn emit_cache_fingerprints(&self, backend: Backend, index: usize, cache: &str, ir: &mut String) -> Result<()> {
-		let node = &self.graph.nodes[index];
-		let width = node.output.channels / node.argument[0] as usize;
-		let channels = (node.argument[1] as usize + attention_value_heads(node)) * width;
-		let bits = node.kv_precision.bytes() * 8;
-		let ty = format!("i{bits}");
-		let pointer = pointer_type(backend);
-		let prefix = format!("n{index}.cache.fingerprint");
-		let plane = checked_mul(checked_mul(self.layout.window_positions, self.graph.nodes.len(), "fingerprint plane")?, 8, "fingerprint plane bytes")?;
-		let offset = checked_add(self.layout.fingerprints.unwrap(), plane, "KV fingerprint offset")?;
-		ir.push_str(&format!("%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {offset}\n%{prefix}.full = icmp ugt i32 %end, {capacity}\n%{prefix}.shifted = sub i32 %end, {capacity}\n%{prefix}.begin = select i1 %{prefix}.full, i32 %{prefix}.shifted, i32 0\n%{prefix}.span = sub i32 %end, %{prefix}.begin\n%{prefix}.origin = zext i32 %{prefix}.begin to i64\n", capacity = self.layout.window_positions));
-		let window = NodeWindow { begin: format!("%{prefix}.begin"), span: format!("%{prefix}.span") };
-		emit_runtime_window_loop(ir, index, "cache.fingerprint", Shape { channels: 1, length: node.output.length }, &window, |ir, _, position| {
-			emit_position_fingerprint(ir, &prefix, &pointer, cache, &ty, bits, Shape { channels, length: node.output.length }, position, None);
-			ir.push_str(&format!("%{prefix}.slot = sub i64 {position}, %{prefix}.origin\n%{prefix}.row = mul i64 %{prefix}.slot, {nodes}\n%{prefix}.at = add i64 %{prefix}.row, {index}\n%{prefix}.ptr = getelementptr i64, {pointer} %{prefix}.base, i64 %{prefix}.at\nstore i64 %{prefix}.hash.next, {pointer} %{prefix}.ptr, align 8\n", nodes = self.graph.nodes.len()));
-		})?;
-		if let Some(offset) = self.layout.cache_channel_fingerprints[index] {
-			let channel_prefix = format!("n{index}.cache.channel");
-			ir.push_str(&format!("%{channel_prefix}.base = getelementptr i8, {pointer} %contexts, i64 {offset}\n%{channel_prefix}.count = zext i32 %{prefix}.span to i64\n"));
-			let window = NodeWindow { begin: "0".to_owned(), span: channels.to_string() };
-			emit_runtime_window_loop(ir, index, "cache.channels", Shape { channels: 1, length: channels }, &window, |ir, _, channel| {
-				ir.push_str(&format!("%{channel_prefix}.row = mul i64 {channel}, {length}\n%{channel_prefix}.first = add i64 %{channel_prefix}.row, %{prefix}.origin\n%{channel_prefix}.values = getelementptr {ty}, {pointer} {cache}, i64 %{channel_prefix}.first\n", length = node.output.length));
-				emit_position_fingerprint(ir, &channel_prefix, &pointer, &format!("%{channel_prefix}.values"), &ty, bits, Shape { channels: 0, length: 1 }, "0", Some(&format!("%{channel_prefix}.count")));
-				ir.push_str(&format!("%{channel_prefix}.target = getelementptr i64, {pointer} %{channel_prefix}.base, i64 {channel}\nstore i64 %{channel_prefix}.hash.next, {pointer} %{channel_prefix}.target, align 8\n"));
-			})?;
-		}
-		ir.push_str(barrier(backend));
-		Ok(())
+		Ok(if blocked { windows + &ir } else { ir })
 	}
 
 	// Group statistics are reductions over the batch, like the loss, so they
@@ -5776,7 +6233,7 @@ impl NativeModelIr {
 					let second_operand = if second == source { first.as_str() } else { second_value.as_str() };
 					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar program range is invalid"))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal, channel: None }).map_err(|error| RecipeError::new(error.to_string()))?;
 					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
 					writeln!(ir, "br label %{name}.p.loop")?;
 					writeln!(ir, "{name}.p.loop:")?;
@@ -6257,7 +6714,7 @@ impl NativeModelIr {
 						self.emit_converted_load(&mut ir, pointer, &format!("%recur{index}.reverse{node_index}.second.ptr"), second_node, node, &second_value);
 					}
 					let reverse_weights = format!("%recur{index}.body{node_index}.weights");
-					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
+					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal, channel: None };
 					let forward = program_ir::emit_scalar_forward(code, scalar_context).map_err(|error| RecipeError::new(error.to_string()))?;
 					ir.push_str(&forward.code);
 					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming"), false).map_err(|error| RecipeError::new(error.to_string()))?;
@@ -6824,56 +7281,13 @@ impl NativeModelIr {
 		}
 		Ok(())
 	}
-	fn emit_request_begin(&self, backend: Backend, ir: &mut String) -> Result<()> {
-		let Some(control) = self.layout.request_control else { return Ok(()) };
-		let pointer = pointer_type(backend);
-		for (name, offset, ty) in [("begin", 0, "i32"), ("span", 4, "i32"), ("output.bits", 8, "i64"), ("hidden.bits", 16, "i64")] {
-			ir.push_str(&ptr_gep(backend, "contexts", control + offset, &format!("request.{name}.pointer")));
-			ir.push_str(&format!("%request.{name} = load {ty}, {pointer} %request.{name}.pointer, align {}\n", alignment(ty)));
-		}
-		ir.push_str(&format!("%request.output = inttoptr i64 %request.output.bits to {pointer}\n%request.hidden = inttoptr i64 %request.hidden.bits to {pointer}\n%request.span.wide = zext i32 %request.span to i64\n%request.local.begin = sub i32 %begin, %request.begin\n%request.local.begin.wide = zext i32 %request.local.begin to i64\n%request.chunk.span = sub i32 %end, %begin\n"));
-		if let Some(offset) = self.layout.input_window {
-			let ty = NativePrecision::new(self.layout.input_precision, self.graph.profile.acc)?.model_type;
-			let shape = window_shape(self.graph.input, self.graph.input.length, self.layout.window_positions);
-			ir.push_str(&ptr_gep(backend, "values", offset, "request.input"));
-			let window = NodeWindow { begin: "0".to_owned(), span: "%request.chunk.span".to_owned() };
-			emit_runtime_window_loop(ir, self.plans.len(), "request.input", shape, &window, |ir, _, wide| {
-				ir.push_str(&format!("%request.input.channel = udiv i64 {wide}, {length}\n%request.input.position = urem i64 {wide}, {length}\n%request.input.base = mul i64 %request.input.channel, %request.span.wide\n%request.input.local = add i64 %request.local.begin.wide, %request.input.position\n%request.input.index = add i64 %request.input.base, %request.input.local\n%request.input.source = getelementptr {ty}, {pointer} %samples, i64 %request.input.index\n%request.input.value = load {ty}, {pointer} %request.input.source, align {align}\n%request.input.target = getelementptr {ty}, {pointer} %request.input, i64 {wide}\nstore {ty} %request.input.value, {pointer} %request.input.target, align {align}\n", length = shape.length, align = alignment(ty)));
-			})?;
-			ir.push_str(barrier(backend));
-		}
-		Ok(())
-	}
-	fn emit_request_end(&self, backend: Backend, ir: &mut String) -> Result<()> {
-		if self.layout.request_control.is_none() { return Ok(()) }
-		let pointer = pointer_type(backend);
-		for (index, plan) in self.plans.iter().enumerate().filter(|(index, plan)| *index + 1 == self.plans.len() || plan.node.retain_output) {
-			let name = if index + 1 == self.plans.len() { "output" } else { "hidden" };
-			let prefix = format!("request.{name}.export");
-			let ty = self.node_precision(&plan.node).model_type;
-			let shape = plan.node.output;
-			let window = NodeWindow { begin: "0".to_owned(), span: if shape.length == 1 { "1".to_owned() } else { "%request.chunk.span".to_owned() } };
-			ir.push_str(&ptr_gep(backend, "values", plan.value, &format!("{prefix}.source")));
-			emit_runtime_window_loop(ir, index, &prefix, shape, &window, |ir, _, wide| {
-				if shape.length == 1 {
-					ir.push_str(&format!("%{prefix}.index = add i64 {wide}, 0\n"));
-				} else {
-					ir.push_str(&format!("%{prefix}.channel = udiv i64 {wide}, {length}\n%{prefix}.position = urem i64 {wide}, {length}\n%{prefix}.base = mul i64 %{prefix}.channel, %request.span.wide\n%{prefix}.local = add i64 %request.local.begin.wide, %{prefix}.position\n%{prefix}.index = add i64 %{prefix}.base, %{prefix}.local\n", length = shape.length));
-				}
-				ir.push_str(&format!("%{prefix}.from = getelementptr {ty}, {pointer} %{prefix}.source, i64 {wide}\n%{prefix}.value = load {ty}, {pointer} %{prefix}.from, align {align}\n%{prefix}.to = getelementptr {ty}, {pointer} %request.{name}, i64 %{prefix}.index\nstore {ty} %{prefix}.value, {pointer} %{prefix}.to, align {align}\n", align = alignment(ty)));
-			})?;
-		}
-		ir.push_str(barrier(backend));
-		Ok(())
-	}
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
 		let prefix = format!("n{index}");
-		let input = if self.layout.input_window.is_some() { "%request.input".to_owned() }
-		else if self.layout.request_control.is_some() && (plan.node.source < 0 || plan.node.second == -1) {
-			ir.push_str(&format!("%{prefix}.input = getelementptr i32, {} %samples, i64 %request.local.begin.wide\n", pointer_type(backend)));
+		let source = if plan.node.source >= 0 { format!("%{prefix}.source") }
+		else if self.layout.window_positions < self.graph.input.length && self.graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather) {
+			ir.push_str(&format!("%{prefix}.input.begin = zext i32 %begin to i64\n%{prefix}.input = getelementptr i32, {} %samples, i64 %{prefix}.input.begin\n", pointer_type(backend)));
 			format!("%{prefix}.input")
 		} else { "%samples".to_owned() };
-		let source = if plan.node.source >= 0 { format!("%{prefix}.source") } else { input.clone() };
 		if plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[source], &format!("{prefix}.source")));
@@ -6883,7 +7297,7 @@ impl NativeModelIr {
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[second], &format!("{prefix}.second")));
 			format!("%{prefix}.second")
 		} else if plan.node.second == -1 {
-			input
+			"%samples".to_owned()
 		} else {
 			source.clone()
 		};
@@ -6990,7 +7404,7 @@ impl NativeModelIr {
 				if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) {
 					continue;
 				}
-				if let Some(table) = native.table() {
+				for table in native.tables() {
 					if !tables.contains(&table.name()) {
 						emitted.push_str(&table.definition());
 						tables.push(table.name());
@@ -7185,6 +7599,310 @@ impl NativeModelIr {
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		self.emit_decode_switch(backend, "recipe.model.decode", |plan| plan.stored.as_ref().filter(|_| plan.packed))
 	}
+	/// The dot of one run of `dot_run(block)` adjacent weights of each packed node in one
+	/// format, and the switch that says which nodes have it. The run's values go
+	/// through the node's own decoder with constant offsets, so the inliner shares
+	/// the block fields every value of a run reads.
+	/// The pointer to the split scratch a packed sum hands its body, defined before its call.
+	/// The pointer to node `index`'s kept states and how many window positions
+	/// they hold.
+	fn kept_states(&self, backend: Backend, index: usize, context: &str, ir: &mut String) -> Result<(String, usize)> {
+		let live = self.layout.contexts[index];
+		let &(_, kept, _) = self.layout.kept.iter().find(|(offset, ..)| *offset == live).ok_or_else(|| RecipeError::new(format!("node {index} keeps no carried state")))?;
+		let name = format!("%n{index}.kept");
+		ir.push_str(&format!("{name} = getelementptr i8, {} {context}, i64 {}\n", pointer_type(backend), kept - live));
+		Ok((name, draft_positions()?))
+	}
+	fn split_scratch_gep(&self, backend: Backend, index: usize) -> String {
+		self.layout.split_scratch.map_or(String::new(), |offset| ptr_gep(backend, "contexts", offset, &format!("n{index}.split")))
+	}
+	fn split_scratch_name(&self, backend: Backend, index: usize) -> String {
+		let _ = backend;
+		if self.layout.split_scratch.is_some() { format!("%n{index}.split") } else { "null".to_owned() }
+	}
+	/// Copies the output node's values at the last position this forward reached
+	/// into the layout's last column, one value per channel.
+	fn emit_last_column(&self, backend: Backend) -> Result<String> {
+		let (Some(column), Some(last)) = (self.layout.last_column, self.graph.nodes.len().checked_sub(1)) else { return Ok(String::new()) };
+		let node = &self.graph.nodes[last];
+		let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+		// A buffer that holds one window has the window as its pitch.
+		let (channels, length) = (node.output.channels, window_shape(node.output, self.graph.input.length, self.layout.window_positions).length);
+		let mut ir = String::new();
+		ir.push_str(&ptr_gep(backend, "values", self.layout.values[last], "lc.values"));
+		ir.push_str(&ptr_gep(backend, "contexts", column, "lc.column"));
+		ir.push_str(&format!(
+			"%lc.position = sub i32 %n{last}.end, 1\n%lc.position.wide = zext i32 %lc.position to i64\nbr label %lc.entry\nlc.entry:\nbr label %lc.loop\nlc.loop:\n%lc.c = phi i32 [ %tid, %lc.entry ], [ %lc.c.next, %lc.step ]\n%lc.more = icmp ult i32 %lc.c, {channels}\nbr i1 %lc.more, label %lc.step, label %lc.done\nlc.step:\n%lc.c.wide = zext i32 %lc.c to i64\n%lc.row = mul i64 %lc.c.wide, {length}\n%lc.index = add i64 %lc.row, %lc.position.wide\n%lc.from = getelementptr inbounds {ty}, {pointer} %lc.values, i64 %lc.index\n%lc.value = load {ty}, {pointer} %lc.from\n%lc.to = getelementptr inbounds {ty}, {pointer} %lc.column, i64 %lc.c.wide\nstore {ty} %lc.value, {pointer} %lc.to\n%lc.c.next = add i32 %lc.c, %threads\nbr label %lc.loop\nlc.done:\n"
+		));
+		Ok(ir)
+	}
+	fn emit_dot_run(&self, backend: Backend) -> Result<String> {
+		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
+		let eligible = dot_run_format;
+		let mut ir = String::new();
+		let (mut available, mut cases) = (String::new(), String::new());
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		for (index, plan) in self.plans.iter().enumerate() {
+			if let Some((_, _, block, _)) = eligible(plan) {
+				available.push_str(&format!("i32 {}, label %yes\n", index + 1));
+				cases.push_str(&format!("i32 {}, label %c{}\n", index + 1, dot_run(block)));
+			}
+			for segment in segments[index].iter().flatten() {
+				available.push_str(&format!("i32 {}, label %yes\n", segment.id));
+				cases.push_str(&format!("i32 {}, label %c{}\n", segment.id, dot_run(segment.block)));
+			}
+		}
+		ir.push_str(&format!("define internal i1 @recipe.model.dot.run.available(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %no [\n{available}]\nyes:\nret i1 true\nno:\nret i1 false\n}}\n"));
+		// The runs a block holds: the places a run can start at inside one block.
+		let counts = (1..=256).filter(|count| cases.contains(&format!("label %c{count}\n"))).map(|count| format!("c{count}:\nret i32 {count}\n")).collect::<String>();
+		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.length(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 32\n}}\n"));
+		// How many waves share a packed sum's row group is a hardware knob the lane
+		// tuner writes for each node while the model runs; zero keeps the body's
+		// own choice. The runtime points @recipe_knobs at the table.
+		if self.layout.knobs.is_some() && backend == Backend::Nvidia {
+			let mut lane_cases = String::new();
+			let mut lane_returns = String::new();
+			for (index, parts) in segments.iter().enumerate() {
+				if let Some(parts) = parts {
+					for part in parts {
+						lane_cases.push_str(&format!("i32 {}, label %n{index}\n", part.id));
+					}
+					lane_returns.push_str(&format!("n{index}:\nret i32 {}\n", index + 1));
+				}
+			}
+			ir.push_str(&format!("define internal i32 @recipe.model.lane.node(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %native [\n{lane_cases}]\n{lane_returns}native:\nret i32 %node\n}}\n"));
+			ir.push_str("@recipe_knobs = addrspace(1) externally_initialized global i64 0, align 8\ndefine internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\n%bits = load volatile i64, ptr addrspace(1) @recipe_knobs, align 8\n%bound = icmp ne i64 %bits, 0\nbr i1 %bound, label %read, label %none\nread:\n%base = inttoptr i64 %bits to ptr addrspace(1)\n%owner = call i32 @recipe.model.lane.node(i32 %node)\n%slot = getelementptr i32, ptr addrspace(1) %base, i32 %owner\n%value = load volatile i32, ptr addrspace(1) %slot, align 4\nret i32 %value\nnone:\nret i32 0\n}\n");
+		} else {
+			ir.push_str("define internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\nret i32 0\n}\n");
+		}
+		for (precision, suffix) in self.precisions() {
+			let (ty, state) = (precision.model_type, precision.state_type);
+			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(String, NativeDequant, usize, usize, u32)>::new());
+			for (index, plan) in self.plans.iter().enumerate() {
+				if self.variant(&plan.node) != suffix {
+					continue;
+				}
+				for segment in segments[index].iter().flatten() {
+					let name = segment.format.name.to_owned();
+					arms.push_str(&format!("i32 {}, label %{name}\n", segment.id));
+					if !formats.iter().any(|(known, ..)| *known == name) {
+						bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+						formats.push((name, segment.native, segment.block, segment.stride, 1));
+					}
+				}
+				let Some((_, native, block, stride)) = eligible(plan) else { continue };
+				// Nodes of one format and row layout share one call, so its decoder is
+				// inlined once.
+				let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
+				let name = self.run_key(index).ok_or_else(|| RecipeError::new("a run decoder's node has no run format"))?;
+				arms.push_str(&format!("i32 {}, label %{name}\n", index + 1));
+				if !formats.iter().any(|(known, ..)| *known == name) {
+					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+					formats.push((name, native, block, stride, lanes));
+				}
+			}
+			for (name, native, block, stride, lanes) in &formats {
+				let stride = if *lanes > 1 { interleaved_stride(*block, *stride) } else { *stride };
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 1, *lanes));
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 4, *lanes));
+			}
+			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %row, i64 %k, i32 %node, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
+			// The same formats over four positions at once.
+			let bodies4 = formats.iter().map(|(name, ..)| format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i32 %pitch, i64 %length)\nret <4 x {state}> %{name}.sums\n")).collect::<String>();
+			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %row, i64 %k, i32 %node, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
+			let _ = ty;
+		}
+		Ok(ir)
+	}
+	/// The name of node `index`'s run decoder: its stored format, and the lanes
+	/// its rows interleave when they do.
+	fn run_key(&self, index: usize) -> Option<String> {
+		let (format, ..) = dot_run_format(&self.plans[index])?;
+		let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
+		Some(if lanes > 1 { format!("{}_lanes{lanes}", format.name) } else { format.name.to_owned() })
+	}
+	fn trace_precision_nodes(&self, device: &str) -> Result<()> {
+		for (index, plan) in self.plans.iter().enumerate() {
+			let node = &self.graph.nodes[index];
+			let detail = if node.weights() == 0 {
+				String::new()
+			} else {
+				let formats = if node.table() || plan.packed {
+					plan.stored.as_ref().map(|stored| stored.format_segments().into_iter().map(|(format, count)| {
+						let name = format.spec().map_or_else(|| if format.0 == 0 { node.precision.label().to_owned() } else { quantization(format.0).to_ascii_lowercase() }, |spec| spec.codec.quantization().name.to_owned());
+						format!("{name}:{count}")
+					}).collect::<Vec<_>>().join("+"))
+						.unwrap_or_else(|| format!("{}:{}", node.precision.label(), node.weights()))
+				} else {
+					format!("{}:{}", node.precision.label(), node.parameters)
+				};
+				let bytes = if node.table() {
+					0
+				} else if plan.packed {
+					plan.stored.as_ref().map_or(0, interleaved_span)
+				} else {
+					checked_mul(node.parameters, node.precision.bytes(), "trace stored weight bytes")?
+				};
+				let rows = node.shard.rows;
+				let terms = node.shard.terms;
+				// Whole-axis nodes carry empty shard runs; the local counts resolve them to the
+				// rows and terms this device computes.
+				let (local_rows, local_terms) = (rows.local(node.output.channels), terms.local(node.input.channels));
+				format!(
+					" stored_formats={formats} stored_bytes={bytes} packed={} shard_rows={}:{}:{} shard_terms={}:{}:{} local_rows={} local_terms={} run_key={}",
+					plan.packed,
+					rows.first,
+					rows.count,
+					rows.period,
+					terms.first,
+					terms.count,
+					terms.period,
+					local_rows,
+					local_terms,
+					self.run_key(index).as_deref().unwrap_or("none")
+				)
+			};
+			trace(&format!("precision node {index} {} {} kv {} device={device}{detail}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
+		}
+		Ok(())
+	}
+	/// Copies of the lane bodies that call one run decoder directly. The shared
+	/// bodies reach every format's decoder through one switch and so hold every
+	/// decoder's registers, spilling them at each call; a copy holds one.
+	fn specialize_lane_bodies(&self, mut ir: String) -> Result<String> {
+		let mut done = std::collections::BTreeSet::new();
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		let keys = (0..self.plans.len()).flat_map(|index| self.run_key(index).into_iter().chain(segments[index].iter().flatten().map(|segment| segment.format.name.to_owned())).map(move |key| (index, key))).collect::<Vec<_>>();
+		for (index, key) in keys {
+			let v = self.variant(&self.plans[index].node);
+			if !done.insert((v, key.clone())) {
+				continue;
+			}
+			for (body, generic, direct) in [("packed_lanes_body", "recipe.model.dot.run", "recipe_model_run_"), ("packed_lanes4_body", "recipe.model.dot.run4", "recipe_model_run4_")] {
+				let name = format!("{body}{v}");
+				let Some((start, end)) = definition_span(&ir, &name) else { continue };
+				let mut copy = ir[start..end].replacen(&format!("@{name}("), &format!("@{name}.{key}("), 1);
+				// Each call through the switch drops the node it switched on.
+				let call = format!("@{generic}{v}(");
+				let mut direct_calls = String::with_capacity(copy.len());
+				while let Some(at) = copy.find(&call) {
+					let after = at + call.len();
+					let node = copy[after..].find(" i32 %node,").ok_or_else(|| RecipeError::new(format!("{name} calls the run switch without a node")))?;
+					direct_calls.push_str(&copy[..at]);
+					direct_calls.push_str(&format!("@{direct}{key}{v}("));
+					direct_calls.push_str(&copy[after..after + node]);
+					copy = copy[after + node + " i32 %node,".len()..].to_owned();
+				}
+				direct_calls.push_str(&copy);
+				ir.push('\n');
+				ir.push_str(&direct_calls);
+				ir.push('\n');
+			}
+		}
+		Ok(ir)
+	}
+	/// One format's dot of a run of `dot_run(block)` adjacent weights from `%index`
+	/// (a multiple of the run) with activations `%stride` apart. A run is a whole
+	/// block, or several smaller blocks, so the
+	/// place of every value is known here and its block fields fold into
+	/// constant offsets; a run over several smaller blocks steps block by block.
+	/// With `positions` of 4 the run adds each weight into four staged positions
+	/// `%pitch` apart and returns the four sums; its format's tables come with the
+	/// one-position run.
+	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize, positions: usize, lanes: u32) -> String {
+		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
+		let (ty, state) = (precision.model_type, precision.state_type);
+		let align = {
+			let (mut a, mut b) = (stride as u64, 16_u64);
+			while b != 0 {
+				(a, b) = (b, a % b);
+			}
+			a
+		};
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
+		let run = dot_run(block);
+		// Blocks aligned to less than a four-byte word are read as aligned words:
+		// the run's place within its word selects one of a body per place, each
+		// with that place folded into its byte offsets.
+		let skews = if align >= 4 { vec![0] } else { (0..4).step_by(align as usize).collect::<Vec<u64>>() };
+		let interleaved = lanes > 1;
+		if interleaved {
+			// Rows of `%length` values interleave in groups of `lanes` a word at a
+			// time: word w of the group's row l is word `w * lanes + l` of the group.
+			operations.ir.push_str(&format!(
+				"%run.row = add i64 %row, 0\n%run.k = add i64 %k, 0\n%run.blocks = udiv i64 %length, {block}\n%run.row.bytes = mul i64 %run.blocks, {stride}\n%run.group = udiv i64 %run.row, {lanes}\n%run.lane = urem i64 %run.row, {lanes}\n%run.group.bytes = mul i64 %run.row.bytes, {lanes}\n%run.group.at = mul i64 %run.group, %run.group.bytes\n%run.lane.at = mul i64 %run.lane, 4\n%run.k.block = udiv i64 %run.k, {block}\n%run.k.bytes = mul i64 %run.k.block, {stride}\n%run.word = udiv i64 %run.k.bytes, 4\n%run.word.at = mul i64 %run.word, {pitch}\n%run.lane.base = add i64 %run.group.at, %run.lane.at\n%run.at = add i64 %run.lane.base, %run.word.at\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.at\n%run.place = and i64 %run.k.bytes, 3\n",
+				pitch = 4 * lanes
+			));
+		} else {
+			operations.ir.push_str(&format!("%run.row.start = mul i64 %row, %length\n%index = add i64 %run.row.start, %k\n%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
+		}
+		let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
+		let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
+			let offset = operations.instruction(format!("mul i32 %pitch, {position}"));
+			operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"))
+		}).collect::<Vec<_>>();
+		if skews.len() > 1 {
+			let arms = skews.iter().skip(1).map(|skew| format!("i64 {skew}, label %run.skew{skew}")).collect::<Vec<_>>().join(" ");
+			if !interleaved {
+				operations.ir.push_str(&format!("%run.address = ptrtoint {pointer} %run.base to i64\n%run.place = and i64 %run.address, 3\n"));
+			}
+			operations.ir.push_str(&format!("switch i64 %run.place, label %run.skew0 [ {arms} ]\n"));
+		}
+		for skew in skews.iter().copied() {
+			let (base, word_align) = if interleaved {
+				if skews.len() > 1 {
+					operations.ir.push_str(&format!("run.skew{skew}:\n"));
+				}
+				("%run.base".to_owned(), 4)
+			} else if skews.len() > 1 {
+				operations.ir.push_str(&format!("run.skew{skew}:\n%run.aligned{skew} = getelementptr inbounds i8, {pointer} %run.base, i64 -{skew}\n"));
+				(format!("%run.aligned{skew}"), 4)
+			} else {
+				("%run.base".to_owned(), align)
+			};
+			let pitch = if interleaved { 4 * u64::from(lanes) } else { word_align.min(4) };
+			let mut words = std::collections::HashMap::new();
+			let mut sums = vec![zero.clone(); positions];
+			for j in 0..run {
+				let (relative, local) = if block >= run { (0, j) } else { (j / block, j % block) };
+				// A later block of the run starts `relative * stride` bytes on: its own
+				// place within a word follows from the run's.
+				let start = skew + (relative * stride) as u64;
+				let (whole, place) = if skews.len() > 1 { (start / 4 * 4, start % 4) } else { (start, 0) };
+				// Interleaved rows put word w of a lane's row w pitches on.
+				let whole = if interleaved { whole / 4 * pitch } else { whole };
+				let block_base = if whole == 0 { base.clone() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} {base}, i64 {whole}")) };
+				let value = {
+					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: block_base, align: word_align, words: &mut words, skew: place, pitch };
+					native.decode(&mut run)
+				};
+				// The weight rounds to the model type as the per-value decoder does.
+				let model = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({state} {value})"));
+				let weight = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {model})"));
+				let offset = operations.instruction(format!("mul i32 %stride, {j}"));
+				for (column, sum) in columns.iter().zip(sums.iter_mut()) {
+					let address = operations.instruction(format!("getelementptr {ty}, {shared} {column}, i32 {offset}"));
+					let input = operations.instruction(format!("load {ty}, {shared} {address}"));
+					let input = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {input})"));
+					*sum = operations.instruction(format!("call {state} @recipe.state.madd{suffix}({state} {sum}, {state} {weight}, {state} {input})"));
+				}
+			}
+			if positions == 1 {
+				operations.ir.push_str(&format!("ret {state} {}\n", sums[0]));
+			} else {
+				let mut vector = "poison".to_owned();
+				for (position, sum) in sums.iter().enumerate() {
+					vector = operations.instruction(format!("insertelement <{positions} x {state}> {vector}, {state} {sum}, i32 {position}"));
+				}
+				operations.ir.push_str(&format!("ret <{positions} x {state}> {vector}\n"));
+			}
+		}
+		if positions == 1 {
+			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+		} else {
+			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\n{}}}\n", operations.ir)
+		}
+	}
 	/// Selects the decoder of the bytes the load kernel reads for one node: a
 	/// requantized node's file bytes, or the stored weight an unpacked node
 	/// expands, each plane in its own format.
@@ -7322,14 +8040,14 @@ impl NativeModelIr {
 		};
 		match quantizer {
 			DeviceQuantizer::Iq4Nl => {
-				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).table().map(NativeQuantTable::name).unwrap_or("iq4");
+				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).tables().first().map(|table| table.name()).unwrap_or("iq4");
 				ir.push_str(&format!("%{p}.tiny = fcmp olt float %{p}.ext, {tiny}\n%{p}.inv.raw = fdiv float {first}, %{p}.e32\n%{p}.inv = select i1 %{p}.tiny, float {zero}, float %{p}.inv.raw\n%{p}.num0 = fadd float {zero}, {zero}\n%{p}.den0 = fadd float {zero}, {zero}\n", tiny = lit(1.0e-15), first = lit(f32::from(IQ4[0])), zero = lit(0.0)));
 				for i in 0..32 {
 					ir.push_str(&format!("%{p}.q{i} = fmul float %{p}.v{i}, %{p}.inv\n%{p}.c{i}.0 = add i32 0, 0\n"));
 					for (k, mid) in IQ4_MID.iter().enumerate() {
 						ir.push_str(&format!("%{p}.c{i}.k{k} = fcmp ogt float %{p}.q{i}, {mid}\n%{p}.c{i}.z{k} = zext i1 %{p}.c{i}.k{k} to i32\n%{p}.c{i}.{next} = add i32 %{p}.c{i}.{k}, %{p}.c{i}.z{k}\n", mid = lit(*mid), next = k + 1));
 					}
-					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr %{p}.l{i}.ptr, align 1\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
+					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr addrspace(1) @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr addrspace(1) %{p}.l{i}.ptr, align 1, !invariant.load !{{}}\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
 				}
 				ir.push_str(&format!("%{p}.den.pos = fcmp ogt float %{p}.den32, {zero}\n%{p}.scale.raw = fdiv float %{p}.num32, %{p}.den32\n%{p}.scale.fit = select i1 %{p}.den.pos, float %{p}.scale.raw, float {zero}\n%{p}.scale = select i1 %{p}.tiny, float {zero}, float %{p}.scale.fit\n", zero = lit(0.0)));
 				for i in 0..32 {
@@ -7441,6 +8159,7 @@ impl NativeModelIr {
 				.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
 				.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
 				.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
+
 				.replace("RECIPE_CHUNK_VALUES", &self.schedule.chunk_values.to_string())
 				.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 				.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
@@ -7449,11 +8168,15 @@ impl NativeModelIr {
 		};
 		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.state.bytes());
 		ir = strip_definition(ir, "recipe.model.decode");
+		ir = strip_definition(ir, "recipe.model.dot.run");
+		ir = strip_definition(ir, "recipe.model.dot.run4");
 		// A block that names another arithmetic calls that template's bodies, linked
 		// beside the run's under its own suffix.
 		for variant in &self.variants {
 			// The matrix-core template exists only for the arithmetics the cores take.
 			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.state.bytes()), "recipe.model.decode");
+			let template = strip_definition(template, "recipe.model.dot.run");
+			let template = strip_definition(template, "recipe.model.dot.run4");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
 		}
@@ -7474,10 +8197,16 @@ impl NativeModelIr {
 		ir.push_str(&self.emit_recurrent_body_functions(backend)?);
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&weight_decode);
+		ir.push_str(&self.emit_dot_run(backend)?);
 		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
 		ir.push_str(&int_activation_support);
 		ir.push_str(&self.emit_tile_bytes());
+		if self.graph.nodes.iter().any(|node| node.op == Primitive::Exchange) {
+			// The mapped machine RAM the dies of a tensor split exchange through,
+			// and how many exchanges this die has finished.
+			ir.push_str("@recipe_exchange_host = addrspace(1) externally_initialized global i64 0, align 8\n@recipe_exchange_epoch = addrspace(1) externally_initialized global i32 0, align 4\n");
+		}
 		ir.push_str(&self.emit_plane_support(backend));
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
@@ -7487,31 +8216,20 @@ impl NativeModelIr {
 		let (kernel, thread) = native_entry(backend)?;
 		let timing_start = |prefix: &str, slot: usize| format!("%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.write, label %{prefix}.done\n{prefix}.write:\n%{prefix}.clock = call i64 @recipe.clock()\n%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {slot}\nstore i64 %{prefix}.clock, {pointer} %{prefix}.base, align 8\nbr label %{prefix}.done\n{prefix}.done:\n");
 		let timing_end = |prefix: &str, slot: usize| format!("%{prefix}.clock = call i64 @recipe.clock()\n%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {slot}\n%{prefix}.prior = atomicrmw umax {pointer} %{prefix}.base, i64 %{prefix}.clock monotonic\n");
-		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false, &mut ir)?;
+		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
-		let bounded = self.layout.window_positions < self.graph.input.length;
-		if bounded {
-			body.push_str(&format!("define internal void @recipe_model_inference_chunk({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
-			self.emit_request_begin(backend, &mut body)?;
-			body.push_str(&inference_forward);
-			self.emit_request_end(backend, &mut body)?;
-			body.push_str("ret void\n}\n");
-		}
+		let (prelude, blocks) = block_functions(&inference_forward, &forward_args)?;
+		body.push_str(&blocks.definitions);
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
-		if bounded {
-			let chunk_args = forward_args.replace("i32 %begin", "i32 %window.begin").replace("i32 %end", "i32 %window.end");
-			body.push_str(&format!("br label %window.loop\nwindow.loop:\n%window.begin = phi i32 [ %begin, %timing.inference.start.done ], [ %window.end, %window.next ]\n%window.more = icmp ult i32 %window.begin, %end\nbr i1 %window.more, label %window.run, label %window.done\nwindow.run:\n%window.remaining = sub i32 %end, %window.begin\n%window.full = icmp ugt i32 %window.remaining, {capacity}\n%window.span = select i1 %window.full, i32 {capacity}, i32 %window.remaining\n%window.end = add i32 %window.begin, %window.span\ncall void @recipe_model_inference_chunk({chunk_args})\n", capacity = self.layout.window_positions));
-			body.push_str(barrier(backend));
-			body.push_str("br label %window.next\nwindow.next:\nbr label %window.loop\nwindow.done:\n");
-		} else {
-			body.push_str(&inference_forward);
-		}
+		body.push_str(&prelude);
+		body.push_str(&blocks.calls);
+		body.push_str(&self.emit_last_column(backend)?);
 		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
-			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true, &mut ir)?;
+			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
 			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
 			body.push_str(&timing_start("timing.training.start", self.layout.timing));
 			body.push_str(&training_forward);
@@ -7520,7 +8238,14 @@ impl NativeModelIr {
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
 		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
-			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
+			// An NVIDIA step may cap its registers so more warps stay resident to hide the
+			// latency of its weight reads; 0 leaves the choice to the compiler.
+			let registers = natural("nvidia step registers", env!("RECIPE_NVIDIA_STEP_REGISTERS")).unwrap_or(0);
+			let step_attributes = match backend {
+				Backend::Amd => "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }".to_owned(),
+				Backend::Nvidia if registers != 0 => format!("{{ nounwind \"nvvm.maxnreg\"=\"{registers}\" }}"),
+				_ => "{ nounwind }".to_owned(),
+			};
 			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
 			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
@@ -7528,12 +8253,14 @@ impl NativeModelIr {
 		if loss.is_some() {
 			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
+			// An inference window runs as wide as the step, so it takes the step's register budget.
+			let attributes = if matches!(backend, Backend::Amd | Backend::Nvidia) { "#4" } else { "#0" };
 			body.push_str(&format!(
-				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) {attributes} {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
 			));
 		}
 		if let Some(loss) = loss.filter(|_| epoch) {
-			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false, &mut ir)?;
+			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = self.layout.gradient_bytes;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.layout.input_adjoint_precision.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
@@ -7563,9 +8290,10 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		ir.push_str(&body);
-		self.specialize_contractions(backend, matrix.is_some(), &mut ir)?;
-		self.specialize_experts(backend, &mut ir)?;
-		self.emit_topk_shared(backend, &mut ir)?;
+		let ir = self.specialize_lane_bodies(ir)?;
+		// A value table several decoders read is defined once.
+		let mut defined = BTreeSet::new();
+		let ir = ir.split_inclusive('\n').filter(|line| !(line.starts_with("@recipe_model_") && line.contains(" constant [") && !defined.insert(line.to_owned()))).collect::<String>();
 		let mut ir = prune_internal_definitions(ir);
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
@@ -7634,7 +8362,11 @@ impl NativeModelIr {
 		let mut previous = "optimizer.entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
 			let node = &plan.node;
-			if node.parameters == 0 || plan.packed || plan.stored.is_some() {
+			// A weight bound to file bytes owns no parameter span, so no optimizer
+			// state sits at its offset. Training gives an int block no stored plan,
+			// bound or not, so the binding itself decides.
+			let bound = self.graph.stored.get(index).and_then(Option::as_ref).is_some_and(|weight| weight.arithmetic.is_empty());
+			if node.parameters == 0 || plan.packed || plan.stored.is_some() || bound {
 				continue;
 			}
 			let precision = self.node_precision(node);
@@ -7741,12 +8473,12 @@ struct IndexerGeometry {
 	/// Whether key representatives need the trained post-pooling transform.
 	pooled: bool,
 	base: f64,
-	key_weights: usize,
+	key_weights: String,
 }
 
 impl IndexerGeometry {
 	fn none(index: usize) -> Self {
-		Self { mode: 4, dims: 0, pooled: false, base: 1.0, key_weights: index }
+		Self { mode: 4, dims: 0, pooled: false, base: 1.0, key_weights: format!("%n{index}.weights") }
 	}
 }
 
@@ -7779,7 +8511,7 @@ impl NativeModelIr {
 					}
 					mode_seen = true;
 					if geometry.pooled && candidate.parameters > query_channels {
-						geometry.key_weights = cursor as usize;
+						geometry.key_weights = format!("%n{cursor}.weights");
 					}
 				}
 				Primitive::Rope if !dims_seen => {
@@ -7811,13 +8543,12 @@ fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { no
 fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
 	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
-		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
+		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		values = attention_value_heads(node),
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
 		block = block,
-		gate = node.argument[2] != 0.0,
 		model_ty = precision.model_type,
 		state_ty = precision.state_type,
 		epsilon = native_literal(precision.model, precision.model_type, node.argument[7]),
@@ -8024,7 +8755,7 @@ fn token_id(value: f64, vocabulary: f64) -> Result<i32> {
 /// The positions the first node consumes. A gather reads one token id per input
 /// element; every other opening block reads the input sequence.
 fn graph_positions(graph: &Graph) -> usize {
-	if graph.nodes.first().is_some_and(Node::token_input) { graph.input.elements() } else { graph.input.length }
+	if graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { graph.input.elements() } else { graph.input.length }
 }
 
 /// The output positions one forward writes, named in the emitted IR.
@@ -8056,6 +8787,8 @@ struct PartitionedLoop<'a> {
 	count: usize,
 	partitions: usize,
 	columns: usize,
+	/// Whether the body adds channel parameter adjoints into the row at runtime.
+	dynamic: bool,
 	value_type: &'a str,
 	/// The template variant suffix of the node's arithmetic.
 	suffix: &'a str,
@@ -8070,11 +8803,11 @@ struct PartitionedLoop<'a> {
 /// `[t * q + min(t, r), (t + 1) * q + min(t + 1, r))` for the quotient `q` and
 /// remainder `r` of the element count over the partition count, so both the
 /// boundaries and the number of rows are fixed by the program.
-fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	// The body owns the `n{index}.{name}` namespace, so every value this function
 	// introduces sits under a suffix of its own.
 	let prefix = format!("n{index}.{name}.partition");
-	let PartitionedLoop { suffix: v, count, partitions, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
+	let PartitionedLoop { suffix: v, count, partitions, columns, dynamic, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
 	require(partitions != 0 && columns != 0, "native partitioned loop is empty")?;
 	require(gradients.iter().all(|(parameter, _)| *parameter < columns), "native partitioned loop parameter is out of range")?;
 	let (whole, extra) = (narrow(count / partitions, "native partition span")?, narrow(count % partitions, "native partition remainder")?);
@@ -8087,7 +8820,8 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
 	// A body with no fixed sums accumulates into its partition's scratch row at
 	// `%{prefix}.row`, so the row starts at zero and keeps what the body left.
-	let entry = if gradients.is_empty() {
+	let zeroed = gradients.is_empty() || dynamic;
+	let entry = if zeroed {
 		ir.push_str(&format!("br label %{prefix}.zero\n{prefix}.zero:\n%{prefix}.zero.c = phi i32 [ 0, %{prefix}.body ], [ %{prefix}.zero.next, %{prefix}.zero.step ]\n%{prefix}.zero.more = icmp ult i32 %{prefix}.zero.c, {columns}\nbr i1 %{prefix}.zero.more, label %{prefix}.zero.step, label %{prefix}.zeroed\n{prefix}.zero.step:\n%{prefix}.zero.index = add i32 %{prefix}.row, %{prefix}.zero.c\n%{prefix}.zero.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.zero.index\nstore {ty} {zero}, {pointer} %{prefix}.zero.ptr, align {align}\n%{prefix}.zero.next = add i32 %{prefix}.zero.c, 1\nbr label %{prefix}.zero\n{prefix}.zeroed:\n"));
 		"zeroed"
 	} else {
@@ -8098,7 +8832,7 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.{entry} ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
 	}
 	ir.push_str(&format!("%{prefix}.inner.more = icmp ult i32 %{prefix}.p, %{prefix}.limit\nbr i1 %{prefix}.inner.more, label %{prefix}.inner.body, label %{prefix}.store\n{prefix}.inner.body:\n"));
-	body(ir, &format!("%{prefix}.p"));
+	body(ir, &format!("%{prefix}.p"), &format!("%{prefix}.row"));
 	ir.push_str(&format!("br label %{prefix}.fold\n{prefix}.fold:\n"));
 	for (parameter, value) in gradients {
 		ir.push_str(&format!("%{prefix}.sum.{parameter}.next = call {ty} @recipe.state.add{v}({ty} %{prefix}.sum.{parameter}, {ty} {value})\n"));
@@ -8108,10 +8842,33 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	// never touches, so the fold below never reads an uninitialised slot.
 	for column in 0..if gradients.is_empty() { 0 } else { columns } {
 		let stored = gradients.iter().find(|(parameter, _)| *parameter as i32 == column).map_or_else(|| zero.to_owned(), |(parameter, _)| format!("%{prefix}.sum.{parameter}"));
-		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\nstore {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\n"));
+		if dynamic {
+			// Channel adjoints already sit in the row, so the static sum joins them.
+			ir.push_str(&format!("%{prefix}.old.{column} = load {ty}, {pointer} %{prefix}.column.{column}, align {align}\n%{prefix}.total.{column} = call {ty} @recipe.state.add{v}({ty} %{prefix}.old.{column}, {ty} {stored})\nstore {ty} %{prefix}.total.{column}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		} else {
+			ir.push_str(&format!("store {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		}
 	}
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.advance = add i32 %{prefix}.t, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
+}
+
+/// Whether a scalar program reads its element's channel.
+fn scalar_uses_channel(code: &[f64]) -> bool {
+	code.chunks_exact(3).any(|instruction| matches!(instruction[0] as i32, 19 | 20))
+}
+
+/// Whether a scalar program reads a channel parameter, which gives its
+/// gradient a runtime column.
+fn scalar_uses_channel_parameter(code: &[f64]) -> bool {
+	code.chunks_exact(3).any(|instruction| instruction[0] as i32 == 20)
+}
+
+/// Defines the channel of the element at `element`, the row-relative or
+/// global index, in a shape of `shape.channels` by `shape.length` per row.
+fn emit_channel(ir: &mut String, name: &str, element: &str, shape: Shape) {
+	ir.push_str(&format!("{name}.within = urem i32 {element}, {}\n{name} = udiv i32 {name}.within, {}\n", shape.channels * shape.length, shape.length));
 }
 
 /// Walk the elements of one window of output positions. The positions of a
@@ -8138,28 +8895,68 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 /// launch, while the position window remains a runtime value for autoregressive
 /// decode. This is used by rotary and indexed-attention helpers, whose compiled
 /// artifacts are shared by training and holdout launches.
-fn emit_runtime_window_loop(ir: &mut String, index: usize, name: &str, shape: Shape, window: &NodeWindow, body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
-	emit_runtime_window_loop_workers(ir, index, name, shape, window, "%tid", "%threads", body)
+/// The line an inference pass puts before each block's nodes.
+const BLOCK_MARK: &str = "; recipe.block ";
+struct BlockFunctions {
+	definitions: String,
+	calls: String,
 }
-
-/// A wave owns one expert output and distributes its dot product over lanes.
-/// CPU and training calls retain their scalar reduction.
-fn emit_expert_window_loop(ir: &mut String, index: usize, name: &str, shape: Shape, window: &NodeWindow, wave: bool, mut body: impl FnMut(&mut String, &str, &str, &str)) -> Result<()> {
-	if !wave { return emit_runtime_window_loop(ir, index, name, shape, window, |ir, _, wide| body(ir, wide, "0", "1")); }
-	let prefix = format!("n{index}.{name}.wave");
-	let (width, lane, worker, workers) = (format!("%{prefix}.width"), format!("%{prefix}.lane"), format!("%{prefix}.worker"), format!("%{prefix}.workers"));
-	ir.push_str(&format!("{width} = call i32 @recipe.wavefront.width()\n{lane} = urem i32 %tid, {width}\n{worker} = udiv i32 %tid, {width}\n{workers} = udiv i32 %threads, {width}\n"));
-	emit_runtime_window_loop_workers(ir, index, name, shape, window, &worker, &workers, |ir, _, wide| body(ir, wide, &lane, &width))
+/// Every block of an inference pass as its own function, so a deep model
+/// compiles in time linear in its blocks rather than as one function whose
+/// optimization grows faster than its length. The windows before the first
+/// block stay in the caller; each block takes the ones it reads.
+fn block_functions(pass: &str, forward_args: &str) -> Result<(String, BlockFunctions)> {
+	let mut parts = pass.split(BLOCK_MARK);
+	let prelude = parts.next().unwrap_or_default().to_owned();
+	// The type each prelude value is defined with.
+	let mut types = HashMap::new();
+	for line in prelude.lines() {
+		let Some((name, rest)) = line.split_once(" = ") else { continue };
+		let words = rest.split_whitespace().collect::<Vec<_>>();
+		let ty = match words.first().copied() {
+			Some("icmp") => "i1",
+			Some("select") => words.get(3).copied().unwrap_or("i32"),
+			Some("zext" | "sext" | "trunc") => words.iter().position(|word| *word == "to").and_then(|at| words.get(at + 1)).copied().unwrap_or("i32"),
+			Some(_) => words.get(1).copied().unwrap_or("i32"),
+			None => continue,
+		};
+		types.insert(name.trim().to_owned(), ty.trim_end_matches(',').to_owned());
+	}
+	let base = ["%samples", "%weights", "%values", "%contexts", "%rows", "%threads", "%begin", "%end", "%tid"];
+	let (mut definitions, mut calls) = (String::new(), String::new());
+	for part in parts {
+		let (block, code) = part.split_once('\n').unwrap_or((part, ""));
+		// Values the block defines, and its labels, which branches name with a %.
+		let mut defined = code.lines().filter_map(|line| line.split_once(" = ").map(|(name, _)| name.trim().to_owned())).collect::<std::collections::HashSet<_>>();
+		defined.extend(code.lines().filter_map(|line| line.strip_suffix(':').filter(|label| !label.contains(' ')).map(|label| format!("%{label}"))));
+		let mut taken = Vec::new();
+		for word in code.split(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '%' | '.' | '_'))) {
+			let name = word.trim_end_matches('.');
+			if !name.starts_with('%') || base.contains(&name) || defined.contains(name) || taken.iter().any(|(taken, _): &(String, String)| taken == name) {
+				continue;
+			}
+			let ty = types.get(name).ok_or_else(|| RecipeError::new(format!("block {block} reads {name} from another block")))?;
+			taken.push((name.to_owned(), ty.clone()));
+		}
+		let parameters = taken.iter().map(|(name, ty)| format!(", {ty} {name}")).collect::<String>();
+		definitions.push_str(&format!("define internal void @recipe_model_block{block}({forward_args}, i32 %tid{parameters}) #3 {{\nentry:\n{code}ret void\n}}\n"));
+		// The caller holds the same typed names, so its arguments read as the parameters.
+		calls.push_str(&format!("call void @recipe_model_block{block}({forward_args}, i32 %tid{parameters})\n"));
+	}
+	Ok((prelude, BlockFunctions { definitions, calls }))
 }
-
-fn emit_runtime_window_loop_workers(ir: &mut String, index: usize, name: &str, shape: Shape, window: &NodeWindow, worker: &str, workers: &str, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
+/// The bytes before a tensor split's exchange planes: one flag per die, each
+/// on its own line.
+const EXCHANGE_FLAG_STRIDE: usize = 128;
+const EXCHANGE_FLAG_BYTES: usize = 8192;
+fn emit_runtime_window_loop(ir: &mut String, index: usize, name: &str, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	let elements = i64::try_from(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?)
 		.map_err(|_| RecipeError::new(format!("native {name} row elements exceed i64")))?;
 	let (channels, length) = (narrow(shape.channels, "native loop channels")?, narrow(shape.length, "native loop length")?);
 	let (begin, span) = (&window.begin, &window.span);
 	ir.push_str(&format!(
-		"%{prefix}.at.channels = zext i32 {channels} to i64\n%{prefix}.at.length = zext i32 {length} to i64\n%{prefix}.at.begin = zext i32 {begin} to i64\n%{prefix}.at.span = zext i32 {span} to i64\n%{prefix}.at.threads = zext i32 {workers} to i64\n%{prefix}.at.tid = zext i32 {worker} to i64\n%{prefix}.at.plane = mul i64 %{prefix}.at.channels, %{prefix}.at.span\n%{prefix}.at.rows = zext i32 %rows to i64\n%{prefix}.at.count = mul i64 %{prefix}.at.rows, %{prefix}.at.plane\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.at.q = phi i64 [ %{prefix}.at.tid, %{prefix}.entry ], [ %{prefix}.at.next, %{prefix}.step ]\n%{prefix}.at.more = icmp ult i64 %{prefix}.at.q, %{prefix}.at.count\nbr i1 %{prefix}.at.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.row = udiv i64 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i64 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i64 %{prefix}.at.within, %{prefix}.at.span\n%{prefix}.at.offset = urem i64 %{prefix}.at.within, %{prefix}.at.span\n%{prefix}.at.position = add i64 %{prefix}.at.offset, %{prefix}.at.begin\n%{prefix}.at.row.base = mul i64 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i64 %{prefix}.at.channel, %{prefix}.at.length\n%{prefix}.at.local = add i64 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i64 %{prefix}.at.row.base, %{prefix}.at.local\n%{prefix}.at.p.i32 = trunc i64 %{prefix}.at.p to i32\n"
+		"%{prefix}.at.channels = zext i32 {channels} to i64\n%{prefix}.at.length = zext i32 {length} to i64\n%{prefix}.at.begin = zext i32 {begin} to i64\n%{prefix}.at.span = zext i32 {span} to i64\n%{prefix}.at.threads = zext i32 %threads to i64\n%{prefix}.at.tid = zext i32 %tid to i64\n%{prefix}.at.plane = mul i64 %{prefix}.at.channels, %{prefix}.at.span\n%{prefix}.at.rows = zext i32 %rows to i64\n%{prefix}.at.count = mul i64 %{prefix}.at.rows, %{prefix}.at.plane\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.at.q = phi i64 [ %{prefix}.at.tid, %{prefix}.entry ], [ %{prefix}.at.next, %{prefix}.step ]\n%{prefix}.at.more = icmp ult i64 %{prefix}.at.q, %{prefix}.at.count\nbr i1 %{prefix}.at.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.row = udiv i64 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i64 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i64 %{prefix}.at.within, %{prefix}.at.span\n%{prefix}.at.offset = urem i64 %{prefix}.at.within, %{prefix}.at.span\n%{prefix}.at.position = add i64 %{prefix}.at.offset, %{prefix}.at.begin\n%{prefix}.at.row.base = mul i64 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i64 %{prefix}.at.channel, %{prefix}.at.length\n%{prefix}.at.local = add i64 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i64 %{prefix}.at.row.base, %{prefix}.at.local\n%{prefix}.at.p.i32 = trunc i64 %{prefix}.at.p to i32\n"
 	));
 	body(ir, &format!("%{prefix}.at.p.i32"), &format!("%{prefix}.at.p"));
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i64 %{prefix}.at.q, %{prefix}.at.threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
@@ -8183,19 +8980,17 @@ fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut 
 	Ok(())
 }
 
-/// The delta rule arguments both directions share, and the context offset of the
-/// per-pair decay partials that follow every other region.
+/// The delta rule arguments both directions share.
 struct DeltaShape {
 	heads: i32,
 	key_heads: i32,
 	chunks: i32,
-	partials: i32,
 	arguments: String,
 }
 
 /// A delta node's key and value extents. The queries and keys span the key
-/// heads, and the values and recurrence output span the value heads. Each
-/// head's state is `key width` by `value width`.
+/// heads, the values and the recurrence output the value heads, and one thread
+/// owns one row and value head, so its state is `key width` by `value width`.
 fn delta_extent(node: &Node) -> Result<(i32, i32, i32, i32)> {
 	let (heads, width) = (integer_argument(node.argument[0], "delta heads")?, integer_argument(node.argument[1], "delta width")?);
 	let key_heads = integer_argument(node.argument[3], "delta key heads")?;
@@ -8206,19 +9001,14 @@ fn delta_extent(node: &Node) -> Result<(i32, i32, i32, i32)> {
 fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 	let (key_heads, key_width, heads, width) = delta_extent(node)?;
 	let chunk = integer_argument(node.argument[2], "delta chunk")?;
-	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?);
+	let pairs = checked_mul(rows, heads as usize, "delta pairs")?;
 	let chunks = node.output.length.div_ceil(chunk as usize);
-	let partials = narrow(
-		checked_mul(pairs, checked_add(state, checked_mul(2, width as usize, "delta vectors")?, "delta backward pair span")?, "delta partials")?,
-		"delta partials",
-	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
 	Ok(DeltaShape {
 		heads,
 		key_heads,
 		chunks: blocks,
-		partials,
-		arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}, i32 {}", integer_argument(node.argument[6], "delta tiled heads")?),
+		arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}"),
 	})
 }
 
@@ -8469,13 +9259,13 @@ fn native_nvidia_codegen() -> Result<&'static str> {
 /// reports it (11040 for 11.4); zero until a device is opened in this process.
 static NVIDIA_DRIVER_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The toolkit assembler that turns the PTX into the device object at
-/// compile time, so a run never waits on the driver to assemble it. A driver
-/// loads only objects from an assembler no newer than itself, so an assembler
-/// past the driver is left alone and the PTX goes to the driver as before.
+/// compile time, so ranges assemble in parallel instead of waiting on the
+/// driver, which assembles one module at a time. A driver loads only objects
+/// from an assembler no newer than itself, so this is the newest configured
+/// assembler at or below the driver; without one the PTX goes to the driver.
 fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
-	static RELEASE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-	static TARGETS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-	let path = option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())?;
+	static RELEASES: OnceLock<Vec<(u32, &'static str)>> = OnceLock::new();
+	static TARGETS: OnceLock<Mutex<HashMap<String, Option<&'static str>>>> = OnceLock::new();
 	fn release_of(path: &str) -> Option<u32> {
 		let output = Command::new(path).arg("--version").output().ok()?;
 		let text = String::from_utf8_lossy(&output.stdout);
@@ -8484,12 +9274,18 @@ fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
 		let (major, minor) = (parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?);
 		Some(major * 1000 + minor * 10)
 	}
-	let release = (*RELEASE.get_or_init(|| release_of(path)))?;
 	let driver = NVIDIA_DRIVER_VERSION.load(Ordering::Relaxed);
-	if driver == 0 || release > driver { return None; }
+	if driver == 0 { return None; }
+	let releases = RELEASES.get_or_init(|| {
+		let paths = option_env!("RECIPE_NV_ASSEMBLER").unwrap_or("").split('\x3b').filter(|path| Path::new(path).is_file());
+		let mut releases = paths.filter_map(|path| Some((release_of(path)?, path))).collect::<Vec<_>>();
+		releases.sort_by(|left, right| right.0.cmp(&left.0));
+		releases
+	});
 	let mut targets = TARGETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
-	let supported = *targets.entry(architecture.to_owned()).or_insert_with(|| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()));
-	supported.then_some(path)
+	*targets.entry(architecture.to_owned()).or_insert_with(|| {
+		releases.iter().filter(|(release, _)| *release <= driver).map(|(_, path)| *path).find(|path| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()))
+	})
 }
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
@@ -8613,7 +9409,41 @@ fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
 		.or_else(|| diagnostic.lines().any(ignored).then(|| "unknown remote CPU feature".to_owned()))
 }
 
+/// Machine RAM the compiles running at once may claim: each claims its IR's
+/// size times the configured factor, so parallel compiles of a deep model
+/// queue instead of exhausting memory. One compile always runs.
+struct CompileBudget {
+	claimed: Mutex<(u64, usize)>,
+	freed: std::sync::Condvar,
+}
+static COMPILE_BUDGET: CompileBudget = CompileBudget { claimed: Mutex::new((0, 0)), freed: std::sync::Condvar::new() };
+/// The machine's available RAM as the kernel reports it; unbounded where it cannot be read.
+fn machine_available_bytes() -> u64 {
+	fs::read_to_string("/proc/meminfo")
+		.ok()
+		.and_then(|text| text.lines().find(|line| line.starts_with("MemAvailable:")).and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok()))
+		.map_or(u64::MAX, |kilobytes| kilobytes.saturating_mul(1024))
+}
 fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
+	let factor = natural("compile memory per IR byte", env!("RECIPE_COMPILE_MEMORY_PER_IR_BYTE"))? as u64;
+	let claim = fs::metadata(source).map_or(0, |metadata| metadata.len()).saturating_mul(factor);
+	{
+		let mut claimed = COMPILE_BUDGET.claimed.lock().map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+		// A running compile grows into its claim, so every claim counts against what is available now.
+		while claimed.1 != 0 && claimed.0.saturating_add(claim) > machine_available_bytes() {
+			claimed = COMPILE_BUDGET.freed.wait(claimed).map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+		}
+		claimed.0 += claim;
+		claimed.1 += 1;
+	}
+	let result = compile_native_artifact_within(target, source, output, key);
+	let mut claimed = COMPILE_BUDGET.claimed.lock().map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+	claimed.0 -= claim;
+	claimed.1 -= 1;
+	COMPILE_BUDGET.freed.notify_all();
+	result
+}
+fn compile_native_artifact_within(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
@@ -8702,11 +9532,31 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
-				let mut command = Command::new(assembler);
-				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
-				let assembled = native_command(command, "NVIDIA PTX assembler", key);
+				// Whole-program assembly specializes every shared body for each call
+				// site, which on a deep model runs for many minutes in tens of GB.
+				// Each function assembles once as relocatable code instead, and the
+				// linker beside the assembler joins them into the loadable object.
+				let object = output.with_extension("o.cubin");
+				let linker = Path::new(assembler).with_file_name("nvlink");
+				require(linker.is_file(), format!("the NVIDIA assembler {assembler} has no nvlink beside it"))?;
+				// A kernel whose optimizer constants overflow their bank links only when
+				// the assembler leaves them in the code; every other kernel keeps them.
+				let mut linked = Err(RecipeError::new("NVIDIA link did not run"));
+				for flags in [&["-O3", "-c"][..], &["-O3", "-c", "--disable-optimizer-constants"][..]] {
+					let mut command = Command::new(assembler);
+					command.arg(format!("-arch={architecture}")).args(flags).arg("-o").arg(&object).arg(&ptx);
+					native_command(command, "NVIDIA PTX assembler", key)?;
+					let mut command = Command::new(&linker);
+					command.arg(format!("-arch={architecture}")).arg(&object).arg("-o").arg(output);
+					linked = native_command(command, "NVIDIA linker", key);
+					match &linked {
+						Err(error) if error.to_string().contains("compiler-generated constants") => continue,
+						_ => break,
+					}
+				}
 				fs::remove_file(&ptx).map_err(|error| RecipeError::new(format!("cannot remove native PTX: {error}")))?;
-				assembled?;
+				fs::remove_file(&object).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA object: {error}")))?;
+				linked?;
 				return Ok(Vec::new());
 			}
 			fs::read(output)
@@ -8720,11 +9570,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, epoch: bool, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, epoch: bool, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	let compile_started = Instant::now();
 	require(!epoch || loss.is_some(), "an epoch requires a loss function")?;
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none(), target.backend() == Backend::Cpu)?;
+	if tracing() {
+		model.trace_precision_nodes(device)?;
+	}
 	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
 	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
 	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
@@ -8770,7 +9623,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: epoch, step, llvm, compile_seconds: compile_started.elapsed().as_secs_f64(), cache_hit: cached })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: epoch, step, llvm, compile_seconds: compile_started.elapsed().as_secs_f64() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8790,6 +9643,13 @@ impl FloatLayout {
 		self.sign + self.exp + self.man
 	}
 	fn pack(self, value: f64) -> u64 {
+		// A finite value rounds to IEEE single or double exactly as the hardware does.
+		if value.abs() <= f64::from(f32::MAX) && (self.exp, self.man) == (8, 23) && self.bias() == 127 {
+			return u64::from((value as f32).to_bits());
+		}
+		if (self.exp, self.man) == (11, 52) && self.bias() == 1023 {
+			return value.to_bits();
+		}
 		let sign = value.to_bits() >> (u64::BITS - 1) << (self.exp + self.man);
 		let exponent_limit = (1u64 << self.exp) - 1;
 		let mantissa_limit = 1u64 << self.man;
@@ -8826,6 +9686,13 @@ impl FloatLayout {
 		}
 	}
 	fn unpack(self, bits: u64) -> f64 {
+		// IEEE single and double decode exactly by the hardware conversion.
+		if (self.exp, self.man) == (8, 23) && self.bias() == 127 {
+			return f64::from(f32::from_bits(bits as u32));
+		}
+		if (self.exp, self.man) == (11, 52) && self.bias() == 1023 {
+			return f64::from_bits(bits);
+		}
 		let negative = bits >> (self.exp + self.man) != 0;
 		let exponent_limit = (1u64 << self.exp) - 1;
 		let mantissa_limit = 1u64 << self.man;
@@ -8993,13 +9860,14 @@ mod gguf {
 		pub fn blocked(&self) -> bool {
 			layout(self.kind).is_ok_and(|(_, _, _, format)| format.is_some())
 		}
-		/// A contiguous mapped view of `count` output rows from `start`.
-		pub fn rows(&self, start: usize, count: usize) -> Result<Self> {
+		/// The output rows `start..start + count`, read as one mapped view with
+		/// `view` or repeated across the tensor with `every`.
+		pub fn rows(&self, start: usize, count: usize) -> Result<GgufRows<'_>> {
 			require(self.shape.len() >= 2, format!("tensor {} has {} dimensions; a row slice takes at least [k, n]", self.name, self.shape.len()))?;
 			let rows = self.elements() / self.shape[0] as usize;
 			let end = start.checked_add(count).ok_or_else(|| RecipeError::new(format!("tensor {} row slice overflows", self.name)))?;
 			require(count != 0 && end <= rows, format!("tensor {} holds {rows} rows, so rows {start}..{end} are absent", self.name))?;
-			self.slice(vec![self.shape[0], count as u64], start, count)
+			Ok(GgufRows { tensor: self, start, count })
 		}
 		/// A view of `count` rows of `self.shape[0]` elements each, `before` rows in.
 		fn slice(&self, shape: Vec<u64>, before: usize, count: usize) -> Result<Self> {
@@ -9008,6 +9876,37 @@ mod gguf {
 			let (skipped, elements) = (before * width, count * width);
 			require(skipped % block == 0 && elements % block == 0, format!("tensor {} rows of {width} do not divide its {block}-element block, so a slice would cut one", self.name))?;
 			Ok(Self { name: self.name.clone(), shape, kind: self.kind, offset: self.offset + skipped / block * stride, bytes: elements / block * stride, shard: self.shard })
+		}
+	}
+
+	/// A run of output rows from a tensor, before it is read as one view or
+	/// repeated periodically across the tensor.
+	#[derive(Clone, Copy)]
+	pub struct GgufRows<'a> {
+		tensor: &'a GgufTensor,
+		start: usize,
+		count: usize,
+	}
+
+	impl GgufRows<'_> {
+		/// The run as one mapped view.
+		pub fn view(&self) -> Result<GgufTensor> {
+			self.tensor.slice(vec![self.tensor.shape[0], self.count as u64], self.start, self.count)
+		}
+		/// The run repeated every `period` rows from its start, one mapped view per
+		/// repetition, through the last row that holds a whole run. Runs may not
+		/// overlap, so `period` is at least the run's row count.
+		pub fn every(&self, period: usize) -> Result<Vec<GgufTensor>> {
+			require(period >= self.count, format!("tensor {} repeats a {}-row run every {period} rows, so runs overlap", self.tensor.name, self.count))?;
+			let rows = self.tensor.elements() / self.tensor.shape[0] as usize;
+			let shape = vec![self.tensor.shape[0], self.count as u64];
+			let mut views = Vec::new();
+			let mut start = self.start;
+			while start + self.count <= rows {
+				views.push(self.tensor.slice(shape.clone(), start, self.count)?);
+				start = checked_add(start, period, "tensor row period")?;
+			}
+			Ok(views)
 		}
 	}
 
@@ -9154,6 +10053,7 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
+		pub(crate) paths: Vec<PathBuf>,
 	}
 	impl Gguf {
 		/// Open one GGUF file or the complete split model it names.
@@ -9161,8 +10061,11 @@ mod gguf {
 			let first = Self::shard(path, 0)?;
 			let count = first.1.iter().find(|(key, _)| key == "split.count").and_then(|(_, value)| value.integer()).unwrap_or(1);
 			let mut shards = vec![first];
+			let mut paths = vec![path.to_path_buf()];
 			for index in 1..count {
-				shards.push(Self::shard(&sibling(path, index, count)?, index)?);
+				let next = sibling(path, index, count)?;
+				shards.push(Self::shard(&next, index)?);
+				paths.push(next);
 			}
 			let (metadata, mut tensors) = (shards[0].1.clone(), Vec::new());
 			let declared = metadata.iter().find(|(key, _)| key == "split.tensors.count").and_then(|(_, value)| value.integer());
@@ -9175,7 +10078,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, paths })
 		}
 		/// Parses one shard's header.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -9299,11 +10202,11 @@ mod gguf {
 		/// plane of the same node contains an ordinary bias or rewritten scale.
 		fn bound_plane(&self, plane: &Plane) -> Result<StoredWeight> {
 			let values = match plane {
+				Plane::Stored { weight, .. } => return Ok(weight.clone()),
 				Plane::Mapped(tensor) if tensor.blocked() => return self.stored(tensor),
 				Plane::Mapped(tensor) if matches!(tensor.kind, 0 | 1) => return self.embedding_stored(tensor),
 				Plane::Mapped(tensor) => self.values(tensor)?,
 				Plane::Owned { values, .. } => values.clone(),
-				Plane::Stored { .. } => return Err(RecipeError::new("a stored source requires one binding plane")),
 			};
 			require(values.iter().all(|value| f64::from(*value as f32).to_bits() == value.to_bits()), format!("{} cannot join a mapped quantized plane without losing its stored precision", plane.name()))?;
 			let format = StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 decoder layout is unavailable"))?;
@@ -9321,11 +10224,7 @@ mod gguf {
 				.enumerate()
 				.map(|(entry, planes)| {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
-					if let Plane::Stored { name, weight } = first {
-						require(planes.len() == 1, "a stored source requires one binding plane")?;
-						return Ok(BoundNode { names: name.clone(), elements: weight.count, weight: BoundWeight::Stored(weight.clone()) });
-					}
-					let packed = planes.iter().filter_map(Plane::mapped).any(GgufTensor::blocked);
+					let packed = planes.iter().any(|plane| matches!(plane, Plane::Stored { .. })) || planes.iter().filter_map(Plane::mapped).any(GgufTensor::blocked);
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
 					let mut names = Vec::new();
 					for plane in planes {
@@ -9336,7 +10235,7 @@ mod gguf {
 					let names = match (planes.len(), first) {
 						(1, Plane::Mapped(tensor)) => format!("tensor {} {:?}", tensor.name, tensor.shape),
 						(1, Plane::Owned { name, .. }) => format!("values {name}"),
-						(1, Plane::Stored { .. }) => unreachable!(),
+						(1, Plane::Stored { name, .. }) => format!("stored {name}"),
 						(count, _) => format!("{count} views of {}", names.join(", ")),
 					};
 					let weight = match packed {
@@ -9367,7 +10266,7 @@ mod gguf {
 								match plane {
 									Plane::Mapped(tensor) => values.extend(self.values(tensor)?),
 									Plane::Owned { values: owned, .. } => values.extend_from_slice(owned),
-									Plane::Stored { .. } => return Err(RecipeError::new("a stored source requires one binding plane")),
+									Plane::Stored { .. } => unreachable!(),
 								}
 							}
 							BoundWeight::Values(values)
@@ -9418,12 +10317,12 @@ mod gguf {
 		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
 	}
 }
-pub use gguf::{Gguf, GgufTensor, GgufValue};
+pub use gguf::{Gguf, GgufRows, GgufTensor, GgufValue};
 mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
 	//! special ids, and the chat template.
-	use super::{Gguf, GgufValue, RecipeError, Result, require};
+	use super::{Gguf, GgufValue, RecipeError, Result, adds_bos_token, require};
 	use std::{cmp::Ordering, collections::HashMap};
 
 	/// The pre-tokenizer `tokenizer.ggml.pre` names: the passes that cut text
@@ -9435,7 +10334,8 @@ mod tokenizer {
 		Gpt2,
 		Llama3,
 		Qwen2,
-		Gemma4,
+		/// A SentencePiece vocabulary (`tokenizer.ggml.model` of `llama` or `gemma4`): spaces become `▁` and bytes without a piece fall back to `<unk>`.
+		SentencePiece,
 		/// Every digit on its own, then the GPT-2 words.
 		Digits,
 		/// Punctuation runs, the GPT-2 words, then digits in threes.
@@ -9622,7 +10522,7 @@ mod tokenizer {
 		/// The passes llama.cpp applies for this family, in order.
 		fn passes(self) -> &'static [Pass] {
 			match self {
-				Self::Gemma4 => &[],
+				Self::SentencePiece => &[],
 				Self::Gpt2 => &[Pass::Words(Self::Gpt2)],
 				Self::Llama3 => &[Pass::Words(Self::Llama3)],
 				Self::Qwen2 => &[Pass::Words(Self::Qwen2)],
@@ -9684,7 +10584,7 @@ mod tokenizer {
 			run(chars, at, space).max(1)
 		}
 		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
-			if self == Self::Gemma4 {
+			if self == Self::SentencePiece {
 				let mut pieces = Vec::new();
 				let mut start = 0;
 				while start < text.len() {
@@ -9778,6 +10678,8 @@ mod tokenizer {
 		family: Family,
 		template: Option<String>,
 		add_bos: bool,
+		/// Whether `encode` prepends a space to the text at the start and after each added token, as llama.cpp does for a `llama` vocabulary.
+		add_prefix: bool,
 		add_eos: bool,
 		bos: Option<u32>,
 		eos: Option<u32>,
@@ -9788,7 +10690,9 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
-			let family = if kind == "gemma4" { Family::Gemma4 } else {
+			// `llama` vocabularies prefix by default; a file turns it off with `tokenizer.ggml.add_space_prefix`, and `gemma4` never prefixes.
+			let add_prefix = kind == "llama" && !matches!(model.value("tokenizer.ggml.add_space_prefix"), Some(GgufValue::Bool(false)));
+			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
 			};
@@ -9816,9 +10720,9 @@ mod tokenizer {
 				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
 			};
 			let map = byte_map();
-			let mut bytes = [if family == Family::Gemma4 { *ids.get("<unk>").unwrap_or(&0) } else { ABSENT }; 256];
+			let mut bytes = [if family == Family::SentencePiece { *ids.get("<unk>").unwrap_or(&0) } else { ABSENT }; 256];
 			let mut byte_of = HashMap::new();
-			if family != Family::Gemma4 {
+			if family != Family::SentencePiece {
 				for (byte, symbol) in map.iter().enumerate() { bytes[byte] = ids.get(&symbol.to_string()).copied().unwrap_or(ABSENT); }
 				byte_of = map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect();
 			}
@@ -9845,7 +10749,8 @@ mod tokenizer {
 				bytes,
 				family,
 				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
-				add_bos: flag("tokenizer.ggml.add_bos_token"),
+				add_bos: adds_bos_token(model),
+				add_prefix,
 				add_eos: flag("tokenizer.ggml.add_eos_token"),
 				bos: special_id("tokenizer.ggml.bos_token_id"),
 				eos: special_id("tokenizer.ggml.eos_token_id"),
@@ -9873,12 +10778,18 @@ mod tokenizer {
 		/// when the model asks for them. Added tokens written out in the text are
 		/// matched whole, longest first, before the pre-tokenizer sees the rest.
 		pub fn encode(&self, text: &str) -> Vec<u32> {
-			let mut output = self.bos.filter(|_| self.add_bos).into_iter().collect::<Vec<_>>();
+			self.encode_words(text).into_iter().flatten().collect()
+		}
+		/// `encode` with the ids grouped by word. The beginning- and end-of-sequence
+		/// ids and each added token form a group of their own, and each pre-tokenizer
+		/// word of the plain text forms one group.
+		pub fn encode_words(&self, text: &str) -> Vec<Vec<u32>> {
+			let mut output = self.bos.filter(|_| self.add_bos).map(|id| vec![id]).into_iter().collect::<Vec<_>>();
 			let (mut start, mut at) = (0, 0);
 			while at < text.len() {
 				if let Some((added, id)) = self.added.iter().find(|(added, _)| text[at..].starts_with(added.as_str())) {
 					self.encode_plain(&text[start..at], &mut output);
-					output.push(*id);
+					output.push(vec![*id]);
 					at += added.len();
 					start = at;
 				} else {
@@ -9886,7 +10797,7 @@ mod tokenizer {
 				}
 			}
 			self.encode_plain(&text[start..], &mut output);
-			output.extend(self.eos.filter(|_| self.add_eos));
+			output.extend(self.eos.filter(|_| self.add_eos).map(|id| vec![id]));
 			output
 		}
 		/// The rank and id of the piece that joins `left` to `right`, the lowest
@@ -9901,11 +10812,11 @@ mod tokenizer {
 			};
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
-		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
-			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
+		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
+			let normalized = (self.family == Family::SentencePiece).then(|| if self.add_prefix && !text.is_empty() { format!("▁{}", text.replace(' ', "▁")) } else { text.replace(' ', "▁") });
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
-				let mut symbols = if self.family == Family::Gemma4 {
+				let mut symbols = if self.family == Family::SentencePiece {
 					if word.chars().all(|value| value == '\n') && let Some(id) = self.ids.get(word) {
 						vec![*id]
 					} else {
@@ -9919,7 +10830,7 @@ mod tokenizer {
 				if self.family == Family::Llama3
 					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
 				{
-					output.push(*id);
+					output.push(vec![*id]);
 					continue;
 				}
 				while let Some((index, merged)) = (0..symbols.len().saturating_sub(1))
@@ -9930,7 +10841,9 @@ mod tokenizer {
 					symbols[index] = merged;
 					symbols.remove(index + 1);
 				}
-				output.extend(symbols);
+				if !symbols.is_empty() {
+					output.push(symbols);
+				}
 			}
 		}
 		fn byte_of_token(&self, byte: u8) -> char {
@@ -9941,12 +10854,18 @@ mod tokenizer {
 		/// keep their own text.
 		pub fn decode(&self, ids: &[u32]) -> String {
 			let mut bytes = Vec::new();
+			// The prefix `encode` adds is not part of the text: the first piece after the start or an added token loses it.
+			let mut after_special = true;
 			for id in ids {
 				if self.is_added[*id as usize] {
 					bytes.extend(self.tokens[*id as usize].as_bytes());
+					after_special = true;
 					continue;
 				}
-				for symbol in self.tokens[*id as usize].chars() {
+				let token = self.tokens[*id as usize].as_str();
+				let token = if after_special && self.add_prefix { token.strip_prefix('▁').unwrap_or(token) } else { token };
+				after_special = false;
+				for symbol in token.chars() {
 					match self.byte_of.get(&symbol) {
 						Some(byte) => bytes.push(*byte),
 						None => bytes.extend(symbol.to_string().as_bytes()),
@@ -9954,7 +10873,7 @@ mod tokenizer {
 				}
 			}
 			let text = String::from_utf8_lossy(&bytes).into_owned();
-			if self.family == Family::Gemma4 { text.replace('▁', " ") } else { text }
+			if self.family == Family::SentencePiece { text.replace('▁', " ") } else { text }
 		}
 		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
 		/// content. `generation` sets `add_generation_prompt`, which the template
@@ -9963,7 +10882,7 @@ mod tokenizer {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
-			if self.family == Family::Gemma4 {
+			if self.family == Family::SentencePiece {
 				let mut prompt = String::new();
 				for (role, content) in messages {
 					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
@@ -9986,7 +10905,7 @@ mod tokenizer {
 				("bos_token".to_owned(), Value::Text(token(self.bos))),
 				("eos_token".to_owned(), Value::Text(token(self.eos))),
 			];
-			let mut scope = Scope { frames: vec![globals], macros: Vec::new() };
+			let mut scope = Scope { frames: vec![globals] };
 			let (pieces, mut out, mut at) = (parse(template)?, String::new(), 0);
 			render(&pieces, &mut at, &mut out, &mut scope, true, &[])?;
 			Ok(out)
@@ -9999,7 +10918,6 @@ mod tokenizer {
 
 	/// One piece of a chat template: literal text, a `{{ ... }}` substitution, or
 	/// a `{% ... %}` statement. A `{# ... #}` comment leaves no piece.
-	#[derive(Clone)]
 	enum Piece {
 		Text(String),
 		Write(String),
@@ -10221,43 +11139,10 @@ mod tokenizer {
 
 	/// The names a chat template resolves, innermost frame first: the globals,
 	/// then one frame per `for` body.
-	struct TemplateMacro {
-		parameters: Vec<(String, Option<String>)>,
-		body: Vec<Piece>,
-	}
-	#[derive(Clone)]
 	struct Scope {
 		frames: Vec<Vec<(String, Value)>>,
-		macros: Vec<(String, std::rc::Rc<TemplateMacro>)>,
 	}
 	impl Scope {
-		fn call(&self, name: &str, arguments: Vec<(Option<String>, Value)>) -> Result<Value> {
-			if name == "raise_exception" { return Err(RecipeError::new(arguments.first().map_or_else(|| "chat template exception".to_owned(), |(_, value)| value.text()))); }
-			let definition = self.macros.iter().rev().find(|(key, _)| key == name).map(|(_, value)| value.clone()).ok_or_else(|| RecipeError::new(format!("chat template function {name:?} is not defined")))?;
-			require(self.frames.len() < 64, "chat template macro nesting exceeds 64 scopes")?;
-			let mut values = vec![None; definition.parameters.len()];
-			let mut positional = 0;
-			let mut named = false;
-			for (key, value) in arguments {
-				let index = match key {
-					Some(key) => { named = true; definition.parameters.iter().position(|(name, _)| name == &key).ok_or_else(|| RecipeError::new(format!("macro {name} has no parameter {key}")))? }
-					None => { require(!named, "macro positional argument follows a named argument")?; let index = positional; positional += 1; index }
-				};
-				require(index < values.len(), format!("macro {name} received too many arguments"))?;
-				require(values[index].is_none(), format!("macro {name} received a duplicate argument"))?;
-				values[index] = Some(value);
-			}
-			let mut frame = Vec::new();
-			for ((parameter, default), value) in definition.parameters.iter().zip(values) {
-				let value = match value { Some(value) => value, None => match default { Some(expression) => evaluate(expression, self, true)?, None => return Err(RecipeError::new(format!("macro {name} requires {parameter}"))) } };
-				frame.push((parameter.clone(), value));
-			}
-			let mut scope = self.clone();
-			scope.frames.push(frame);
-			let mut output = String::new();
-			render(&definition.body, &mut 0, &mut output, &mut scope, true, &[])?;
-			Ok(Value::Text(output))
-		}
 		fn get(&self, name: &str) -> Value {
 			self.frames.iter().rev().find_map(|frame| frame.iter().find(|(key, _)| key == name)).map_or(Value::Undefined, |(_, value)| value.clone())
 		}
@@ -10647,14 +11532,10 @@ mod tokenizer {
 						};
 						Ok(Value::List((start..end).map(Value::Int).collect()))
 					}
-					_ if self.eat_op("(") => {
-						let mut arguments = Vec::new();
-						while !self.eat_op(")") {
-							if !arguments.is_empty() { self.expect_op(",")?; }
-							let key = if matches!((self.tokens.get(self.at), self.tokens.get(self.at + 1)), (Some(Token::Name(_)), Some(Token::Op("=")))) { let key = self.name()?; self.expect_op("=")?; Some(key) } else { None };
-							arguments.push((key, self.expression(live)?));
-						}
-						if live { self.scope.call(&name, arguments) } else { Ok(Value::Undefined) }
+					"raise_exception" if self.eat_op("(") => {
+						let arguments = self.arguments(live)?;
+						if live { return Err(RecipeError::new(arguments.first().map(Value::text).unwrap_or_else(|| "chat template raise_exception needs a message".to_owned()))); }
+						Ok(Value::Undefined)
 					}
 					_ => Ok(self.scope.get(&name)),
 				},
@@ -10767,17 +11648,6 @@ mod tokenizer {
 						return Ok(source.clone());
 					}
 					match head {
-						"macro" => {
-							let (name, parameters) = rest.split_once('(').ok_or_else(|| RecipeError::new("macro definition requires parentheses"))?;
-							let parameters = parameters.trim().strip_suffix(')').ok_or_else(|| RecipeError::new("macro parameter list is unclosed"))?;
-							let parameters = parameters.split(',').filter(|part| !part.trim().is_empty()).map(|part| {
-								let (name, default) = assignment(part).map_or((part, None), |(name, value)| (name, Some(value.trim().to_owned())));
-								(name.trim().to_owned(), default)
-							}).collect();
-							let start = *at;
-							render(pieces, at, &mut String::new(), scope, false, &["endmacro"])?;
-							if emit { scope.macros.push((name.trim().to_owned(), std::rc::Rc::new(TemplateMacro { parameters, body: pieces[start..*at - 1].to_vec() }))); }
-						}
 						"if" => {
 							// Each branch renders in turn; only the first whose condition
 							// holds writes, and the others parse with `emit` off.
@@ -11002,6 +11872,13 @@ mod ngram {
 
 	impl<'a> Ngram<'a> {
 		pub(super) fn new(model: &'a Gguf) -> Result<Self> {
+			let mut table = Self::layout(model)?;
+			let name = model.value("ngram.conv").and_then(GgufValue::text).unwrap_or("ngram.conv");
+			table.taps = model.tensor(name).map(|tensor| model.values(tensor)).transpose()?.unwrap_or_default();
+			Ok(table)
+		}
+		/// Read the table and hash description without decoding any tensor values.
+		fn layout(model: &'a Gguf) -> Result<Self> {
 			let integer = |key: &str| model.value(key).and_then(GgufValue::integer);
 			let named = |key: &str, fallback| model.value(key).and_then(GgufValue::text).unwrap_or(fallback);
 			let architecture = model.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
@@ -11063,11 +11940,16 @@ mod ngram {
 			let (width, rows) = (table.shape[0] as usize, table.shape[1] as usize);
 			require(width != 0 && hash.rows() <= rows, format!("n-gram table {name:?} holds {rows} rows of {width}, the hash reaches row {}", hash.rows()))?;
 			require(kernel != 0, "n-gram convolution kernel must be positive")?;
-			let taps = match model.tensor(named("ngram.conv", "ngram.conv")) {
-				Some(tensor) => model.values(tensor)?,
-				None => Vec::new(),
-			};
-			Ok(Self { model, table, taps, hash, layer, kernel, width, rows })
+			Ok(Self { model, table, taps: Vec::new(), hash, layer, kernel, width, rows })
+		}
+		pub(super) fn report(model: &'a Gguf) -> Result<Option<NgramReport>> {
+			let architecture = model.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
+			if model.value("ngram.heads").is_none() && model.value(&format!("{architecture}.ple.ngram_size")).is_none() { return Ok(None); }
+			let table = Self::layout(model)?;
+			Ok(Some(NgramReport {
+				table: table.table, ngram_size: table.hash.ngram, heads_per_ngram: table.hash.per_order,
+				layer: table.layer, kernel: table.kernel, head_offsets: table.hash.offsets, head_vocab_sizes: table.hash.vocabularies,
+			}))
 		}
 		/// Heads per n-gram order.
 		pub fn heads(&self) -> usize {
@@ -11127,7 +12009,7 @@ mod ngram {
 		/// per token, a `kernel`-wide depthwise convolution dilated by the n-gram
 		/// size, and the table's row count.
 		pub(super) fn block(&self) -> PleBlock {
-			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone() }
+			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone(), math: None }
 		}
 		/// The rows one token addresses, concatenated, decoded from their own bytes.
 		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
@@ -11291,18 +12173,18 @@ mod bundle {
 					}
 				}
 			}
-			return Ok(ProductBranch { blocks: blocks.into(), exclusions });
+			return Ok(ProductBranch { blocks, exclusions });
 		}
 		if let Some((exclusions, blocks)) = value.split_once(':')
 			&& let Ok(exclusions) = exclusions.parse::<u8>()
 		{
 			return Ok(ProductBranch {
-				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into(),
+				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
 				exclusions,
 			});
 		}
 		Ok(ProductBranch {
-			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into(),
+			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
 			exclusions: 0,
 		})
 	}
@@ -11312,6 +12194,13 @@ mod bundle {
 		T::Err: fmt::Display,
 	{
 		value.ok_or_else(|| RecipeError::new(format!("{role} is absent")))?.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
+	}
+	fn scoring(value: u8) -> Result<Scoring> {
+		match value {
+			0 => Ok(Scoring::Softmax),
+			1 => Ok(Scoring::Sigmoid),
+			_ => Err(RecipeError::new(format!("invalid scoring {value}"))),
+		}
 	}
 	/// The saved form of an activation: its code, and for a parameterized one the
 	/// values after it. Every other field of the block record is one token, so the
@@ -11348,6 +12237,7 @@ mod bundle {
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
 			17 => Ok(Activation::Sqrt),
+			18 => Ok(Activation::Softplus),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
 			}?
 		};
@@ -11356,6 +12246,7 @@ mod bundle {
 	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
+			Operation::Join(lanes) => format!("join,{lanes}"),
 			Operation::Layer(width) => format!("layer,{width}"),
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
@@ -11368,16 +12259,17 @@ mod bundle {
 				let window = (attention.window != 0).then(|| format!(",w={}", attention.window)).unwrap_or_default();
 				let factors = if attention.factors { ",f=1" } else { "" };
 				let unscaled = if attention.unscaled { ",s=1" } else { "" };
+				let attn_factor = if attention.attn_factor == 1.0f64.to_bits() { String::new() } else { format!(",a={}", attention.attn_factor) };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,v2,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
+					"attn,v3,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}{attn_factor}",
 					attention.heads,
 					attention.keys,
 					index.heads,
 					index.width,
 					index.block,
 					index.keep,
-					u8::from(attention.gate),
+					u8::from(attention.project),
 					attention.width,
 					normalization_text(score_normalization)
 				)
@@ -11389,23 +12281,46 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
-			Operation::Sum(left, right) => format!("sum,{},{}", product_branch_text(left), product_branch_text(right)),
-			Operation::Sequence(parts) => format!("sequence,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
-			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
+				let (kind, count, gate) = match shared {
+					SharedExpert::None => (0, 0, "-".to_owned()),
+					SharedExpert::Ungated { count } => (1, *count, "-".to_owned()),
+					SharedExpert::Gated { count, gate } => (2, *count, activation_text(*gate)),
+				};
+				format!("moe,v2,{experts},{top_k},{hidden},{},{},{},{},{},{kind},{count},{gate}", activation.code(), *scoring as u8, u8::from(*renormalize), f64::from_bits(*scale_bits), u8::from(*selection_bias))
+			}
+			Operation::Hyper(lanes, rank, blocks, gate, mean) => {
+				let branch = blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";");
+				let (read, write) = gate.as_ref().map_or_else(|| ("-".to_owned(), "-".to_owned()), |gate| (product_branch_text(&gate.read), product_branch_text(&gate.write)));
+				format!("hyper,v3,{lanes},{rank},{branch},{read},{write},{mean:016x}")
+			},
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,{},{},{},{},{},{},{},{}",
-					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
+				"delta,v4,{},{},{},{},{},{},{},{},{},{},{},{}",
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
+				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
+				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
+				delta.decay_gate.map_or("-".to_owned(), |decay| decay.code().to_string()),
+				delta.write_gate.map_or("-".to_owned(), |write| write.code().to_string()),
+				normalization_text(delta.qk_norm), normalization_text(delta.value_norm)
 			),
-			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Ple(ple) => {
+				let math = match ple.math {
+					None => "-".to_owned(),
+					Some(math) => {
+						let PleGate::SignedRootSigmoid { floor_bits, width_scaled } = math.gate;
+						format!("v2,{},{},{},{},sr,{floor_bits},{}", normalization_text(Some(math.key_norm)), normalization_text(Some(math.query_norm)), normalization_text(Some(math.output_norm)), math.convolution.code(), u8::from(width_scaled))
+					}
+				};
+				format!("ple,{},{},{},{},{},{},{math}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text())
+			},
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
+			Operation::ChannelScale(period, values) => format!("channel_scale,{period}{}", values.iter().map(|bits| format!(",{bits}")).collect::<String>()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared)),
-			Operation::Join(lanes) => format!("join,{lanes}"),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -11432,7 +12347,7 @@ mod bundle {
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
 				let mut fields = rest.split(',');
-				require(fields.next() == Some("v2"), "saved attention record is not current format")?;
+				require(fields.next() == Some("v3"), "saved attention record is not current format")?;
 				let heads = value_at(fields.next(), "attention heads")?;
 				let keys = value_at(fields.next(), "attention key-value heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
@@ -11444,7 +12359,7 @@ mod bundle {
 					keep: value_at(fields.next(), "indexer blocks kept")?,
 					..Indexer::NONE
 				};
-				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
+				let project = value_at::<u8>(fields.next(), "attention output projection")? != 0;
 				let width = value_at(fields.next(), "attention head width")?;
 				let score_normalization = normalization(fields.next(), "indexer scoring normalization")?;
 				let score_dims = value_at(fields.next(), "indexer rotary dimensions")?;
@@ -11469,6 +12384,7 @@ mod bundle {
 				};
 				let mut values = keys;
 				let (mut window, mut factors, mut unscaled) = (0, false, false);
+				let mut attn_factor = 1.0f64.to_bits();
 				for marker in first_marker.into_iter().chain(fields) {
 					if let Some(value) = marker.strip_prefix("v=") {
 						values = value.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?;
@@ -11478,6 +12394,8 @@ mod bundle {
 						factors = true;
 					} else if marker == "s=1" {
 						unscaled = true;
+					} else if let Some(value) = marker.strip_prefix("a=") {
+						attn_factor = value.parse().map_err(|error| RecipeError::new(format!("invalid attention scale: {error}")))?;
 					} else {
 						return Err(RecipeError::new("attention record has extra fields"));
 					}
@@ -11490,50 +12408,78 @@ mod bundle {
 					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
 					yarn,
 					index: (index.block != 0).then_some(index),
-					gate,
+					project,
 					window,
 					factors,
 					unscaled,
+					attn_factor,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
-			"recur" => Ok(Operation::Recur(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
+			"recur" => Ok(Operation::Recur(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"identity" => Ok(Operation::Identity),
 			"last" => Ok(Operation::Last),
-			"residual" => Ok(Operation::Residual(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
-			"sequence" => Ok(Operation::Sequence(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
-			"ensemble" => Ok(Operation::Ensemble(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
-			"product" | "sum" => {
+			"join" => Ok(Operation::Join(value_at(Some(rest), "MTP joined lanes")?)),
+			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
+			"ensemble" => Ok(Operation::Ensemble(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
+			"product" => {
 				let branches = split_escaped(rest, ',');
-				require(branches.len() == 2, "parallel composition must contain two branches")?;
-				let (left, right) = (product_branch(&branches[0])?, product_branch(&branches[1])?);
-				Ok(if name == "sum" { Operation::Sum(left, right) } else { Operation::Product(left, right) })
+				require(branches.len() == 2, "product must contain two branches")?;
+				Ok(Operation::Product(product_branch(&branches[0])?, product_branch(&branches[1])?))
 			}
 			"moe_blocks" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into()))
+				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
-			"join" => Ok(Operation::Join(value_at(Some(rest), "MTP joined lanes")?)),
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
-				require(fields.len() == 7, "MoE record requires seven fields")?;
-				let scoring = match value_at::<u8>(fields.get(4).copied(), "MoE scoring")? {
-					0 => Scoring::Softmax, 1 => Scoring::Sigmoid,
-					_ => return Err(RecipeError::new("MoE scoring is invalid")),
-				};
-				Ok(Operation::Moe(value_at(fields.first().copied(), "MoE experts")?, value_at(fields.get(1).copied(), "MoE top-k")?, value_at(fields.get(2).copied(), "MoE expert width")?, activation(fields[3])?, scoring, bool_value(fields[5], "MoE renormalization")?, bool_value(fields[6], "MoE shared expert")?))
+				if fields.first() == Some(&"v2") {
+					require(fields.len() >= 12, "saved MoE record is not current format")?;
+					let shared = match value_at::<u8>(fields.get(9).copied(), "MoE shared expert kind")? {
+						0 => SharedExpert::None,
+						1 => SharedExpert::Ungated { count: value_at(fields.get(10).copied(), "MoE shared expert count")? },
+						2 => SharedExpert::Gated { count: value_at(fields.get(10).copied(), "MoE shared expert count")?, gate: activation(&fields[11..].join(","))? },
+						other => return Err(RecipeError::new(format!("MoE shared expert kind {other} is unknown"))),
+					};
+					Ok(Operation::Moe(
+						value_at(fields.get(1).copied(), "MoE experts")?,
+						value_at(fields.get(2).copied(), "MoE top-k")?,
+						value_at(fields.get(3).copied(), "MoE expert width")?,
+						activation(fields.get(4).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
+						scoring(value_at(fields.get(5).copied(), "MoE scoring")?)?,
+						bool_value(fields.get(6).copied().unwrap_or(""), "MoE renormalization")?,
+						shared,
+						value_at::<f64>(fields.get(7).copied(), "MoE routed scale")?.to_bits(),
+						bool_value(fields.get(8).copied().unwrap_or(""), "MoE selection bias")?,
+					))
+				} else if fields.len() >= 9 {
+					Err(RecipeError::new("saved MoE record is not current format"))
+				} else {
+					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
+					Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				}
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"hyper" => {
-				let (lanes, rest) = rest.split_once(',').unwrap_or((rest, ""));
-				let (rank, blocks) = rest.split_once(',').unwrap_or((rest, ""));
+				let fields = split_escaped(rest, ',');
+				require(fields.len() == 7 && fields[0] == "v3", "saved hyper-connection record is not current format")?;
+				let mean = u64::from_str_radix(&fields[6], 16).map_err(|_| RecipeError::new("saved hyper-connection mean is not a bit pattern"))?;
+				let lanes = value_at(Some(&fields[1]), "hyper-connection lanes")?;
+				let rank = value_at(Some(&fields[2]), "hyper-connection rank")?;
+				let blocks = split_escaped(&fields[3], ';').iter().filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?;
+				let gate = if fields[4] == "-" && fields[5] == "-" { None } else {
+					Some(HyperGateBlocks { read: product_branch(&fields[4])?, write: product_branch(&fields[5])? })
+				};
+				require((rank == 0) == gate.is_none(), "hyper-connection rank and gate disagree")?;
 				Ok(Operation::Hyper(
-					value_at(Some(lanes), "hyper-connection lanes")?,
-					value_at(Some(rank), "hyper-connection rank")?,
-					blocks.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?.into(),
+					lanes,
+					rank,
+					blocks,
+					gate,
+					mean,
 				))
 			}
 			// A bundle written before the taps could sit apart names no dilation, so an
@@ -11543,17 +12489,18 @@ mod bundle {
 				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
 			)),
 			"delta" => {
+				require(fields.next() == Some("v4"), "saved delta record is not current format")?;
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
-				// A bundle written before the extents were separable names neither, so
-				// an absent field takes the extent from the stream, as the builder does.
-				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
-				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
-				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
-				// Older bundles always used a linear convolution and sigmoid output gate.
-				// Keep those defaults when the optional activation selectors are absent.
-				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
-				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
+				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
+				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
+				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let decay_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let write_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let qk_norm = normalization(fields.next(), "delta query/key normalization")?;
+				let value_norm = normalization(fields.next(), "delta value normalization")?;
+				require(fields.next().is_none(), "delta record has extra fields")?;
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, decay_gate, write_gate, qk_norm, value_norm }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -11561,8 +12508,30 @@ mod bundle {
 				let dilation = value_at(fields.next(), "per-layer embedding dilation")?;
 				let hash = RowHash::parse(&mut fields)?;
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
-				Ok(Operation::Ple(intern_ple(PleBlock { heads, width, rows, kernel, dilation, hash })))
+				let math = match fields.next() {
+					Some("-") => None,
+					Some("v2") => {
+						let key_norm = normalization(fields.next(), "per-layer embedding key normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding key normalization is absent"))?;
+						let query_norm = normalization(fields.next(), "per-layer embedding query normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding query normalization is absent"))?;
+						let output_norm = normalization(fields.next(), "per-layer embedding output normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding output normalization is absent"))?;
+						let convolution = activation(fields.next().ok_or_else(|| RecipeError::new("per-layer embedding convolution activation is absent"))?)?;
+						require(fields.next() == Some("sr"), "per-layer embedding gate is not a signed-root sigmoid")?;
+						let floor_bits = value_at(fields.next(), "per-layer embedding gate floor")?;
+						let width_scaled = match value_at::<u8>(fields.next(), "per-layer embedding gate width scale")? { 0 => false, 1 => true, _ => return Err(RecipeError::new("per-layer embedding gate width scale is invalid")) };
+						require(f64::from_bits(floor_bits).is_finite() && f64::from_bits(floor_bits) > 0.0, "per-layer embedding gate floor is invalid")?;
+						Some(PleMath { key_norm, query_norm, output_norm, convolution, gate: PleGate::SignedRootSigmoid { floor_bits, width_scaled } })
+					}
+					_ => return Err(RecipeError::new("saved per-layer embedding math is not current format")),
+				};
+				require(fields.next().is_none(), "per-layer embedding record has extra fields")?;
+				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash, math }))
 			}
+			"channel_scale" => {
+					let period: usize = value_at(fields.next(), "channel scale period")?;
+					let values = (0..period).map(|_| value_at::<u64>(fields.next(), "channel scale value")).collect::<Result<Vec<_>>>()?;
+					require(fields.next().is_none(), "channel scale record has extra fields")?;
+					Ok(Operation::ChannelScale(period, values))
+				}
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -11612,7 +12581,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, hyper_tensors: None, hyper_head: None, ple_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -12160,17 +13129,6 @@ mod bundle {
 		}
 		Ok(result)
 	}
-	#[cfg(test)]
-	mod tests {
-		use super::*;
-		#[test]
-		fn operation_precisions_round_trip() {
-			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
-			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 11);
-			assert_eq!(block(&text).unwrap(), original);
-		}
-	}
 }
 #[cfg(unix)]
 use std::os::unix::{
@@ -12184,7 +13142,7 @@ use std::{
 	error::Error,
 	ffi::{OsStr, c_void},
 	fmt, fs,
-	io::{IsTerminal, Read, Write},
+	io::{IsTerminal, Read, Seek, SeekFrom, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
@@ -12349,8 +13307,93 @@ impl Drop for ChatInput {
 }
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
 static TRACE: AtomicBool = AtomicBool::new(false);
+fn lane_tuning() -> bool {
+	env!("RECIPE_LANE_TUNING") == "1"
+}
+/// The team widths a packed sum can take: zero is the body's own choice.
+const LANE_TEAMS: [i32; 6] = [0, 1, 2, 4, 8, 16];
+/// Chooses each packed sum's team width from its measured node clocks. Nodes of
+/// one operation, shape, and format share a class, so every one of them adds to
+/// the estimate their class steps on. Each step draws a width per class from a
+/// softmax over the candidates' mean clocks in a rolling window, relative to the
+/// best; a width not yet run is drawn as though it matched the best.
+struct LaneTuner {
+	classes: Vec<Option<usize>>,
+	history: Vec<Vec<std::collections::VecDeque<f64>>>,
+	chosen: Vec<usize>,
+	random: u64,
+	window: usize,
+	temperature: f64,
+}
+impl LaneTuner {
+	fn new(graph: &Graph) -> Result<Self> {
+		let mut keys = Vec::<(u32, usize, usize, String)>::new();
+		let mut classes = Vec::with_capacity(graph.nodes.len());
+		for (index, node) in graph.nodes.iter().enumerate() {
+			let packed = matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) && packed_weight(graph, index, true).is_some();
+			classes.push(packed.then(|| {
+				let format = graph.stored.get(index).and_then(Option::as_ref).and_then(|stored| stored.format_segments().first().and_then(|(segment, _)| segment.spec()).map(|spec| spec.codec.quantization().name.to_owned())).unwrap_or_default();
+				let key = (node.op as u32, node.shard.terms.local(node.input.channels), node.shard.rows.local(node.output.channels), format);
+				keys.iter().position(|known| *known == key).unwrap_or_else(|| {
+					keys.push(key);
+					keys.len() - 1
+				})
+			}));
+		}
+		let window = natural("lane tuning window", env!("RECIPE_LANE_TUNING_WINDOW"))?.max(1);
+		let temperature = env!("RECIPE_LANE_TUNING_TEMPERATURE").parse::<f64>().map_err(|_| RecipeError::new("lane tuning temperature is not a number"))?;
+		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature })
+	}
+	/// The width each class runs next, and the table of one i32 per node slot.
+	fn choose(&mut self) -> Vec<u8> {
+		for (class, runs) in self.history.iter().enumerate() {
+			let means = runs.iter().map(|window| (!window.is_empty()).then(|| window.iter().sum::<f64>() / window.len() as f64)).collect::<Vec<_>>();
+			let best = means.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+			let weights = means.iter().map(|mean| if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 }).collect::<Vec<_>>();
+			let total = weights.iter().sum::<f64>();
+			let mut draw = (next_random(&mut self.random) >> 11) as f64 / (1_u64 << 53) as f64 * total;
+			let mut pick = weights.len() - 1;
+			for (candidate, weight) in weights.iter().enumerate() {
+				if draw < *weight {
+					pick = candidate;
+					break;
+				}
+				draw -= weight;
+			}
+			self.chosen[class] = pick;
+		}
+		// Slot n + 1 holds node n's knob: the kernels number nodes from one.
+		let mut table = vec![0_u8; (self.classes.len() + 2) * 4];
+		for (index, class) in self.classes.iter().enumerate() {
+			if let Some(class) = class {
+				table[(index + 1) * 4..(index + 2) * 4].copy_from_slice(&LANE_TEAMS[self.chosen[*class]].to_le_bytes());
+			}
+		}
+		table
+	}
+	/// Adds a step's node clocks: node n ran from clock n to clock n + 1.
+	fn observe(&mut self, ticks: &[i64]) {
+		let mut sums = vec![(0.0, 0_usize); self.history.len()];
+		for (index, class) in self.classes.iter().enumerate() {
+			if let (Some(class), Some(end)) = (class, ticks.get(index + 1)) {
+				sums[*class].0 += end.wrapping_sub(ticks[index]).max(0) as f64;
+				sums[*class].1 += 1;
+			}
+		}
+		for (class, (sum, count)) in sums.into_iter().enumerate() {
+			if count != 0 {
+				let window = &mut self.history[class][self.chosen[class]];
+				window.push_back(sum / count as f64);
+				if window.len() > self.window {
+					window.pop_front();
+				}
+			}
+		}
+	}
+}
 fn tracing() -> bool {
-	TRACE.load(Ordering::Relaxed)
+	static ENV_TRACE: OnceLock<bool> = OnceLock::new();
+	TRACE.load(Ordering::Relaxed) || *ENV_TRACE.get_or_init(|| std::env::var("RECIPE_TRACE").is_ok_and(|value| value == "1"))
 }
 fn trace(message: &str) -> Result<()> {
 	if !tracing() {
@@ -12396,6 +13439,7 @@ pub struct Data {
 	autoregressive: bool,
 	target: Vec<String>,
 	features: FeatureSelection,
+	schema_file: Option<String>,
 	normalize: bool,
 	split: f64,
 	/// Whether `.split()` was called: the rolling RAT policy reads its window from it.
@@ -12404,7 +13448,7 @@ pub struct Data {
 	/// The GGUF model file `recipe.data` opened, which `recipe.infer` runs.
 	file: Option<Gguf>,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FeatureSelection {
 	All,
 	Include(Vec<String>),
@@ -12585,6 +13629,13 @@ pub fn pool(size: usize) -> Block {
 pub fn attn(heads: usize) -> Block {
 	Block::of(Operation::Attention(AttentionBlock::new(heads)))
 }
+/// Attention before its output projection, for a product in the head plane.
+pub fn attn_heads(heads: usize) -> Block {
+	let mut block = attn(heads);
+	let Operation::Attention(attention) = &mut block.operation else { unreachable!() };
+	attention.project = false;
+	block
+}
 pub fn rnn(width: usize) -> Block {
 	Block::of(Operation::Rnn(width))
 }
@@ -12625,7 +13676,7 @@ pub fn lgbm(trees: usize) -> Block {
 }
 /// A fragment as one step, so a branch nests inside a branch.
 /// A composition needs a block: an empty branch is rejected where it is written.
-fn branch<const N: usize>(blocks: [Block; N]) -> BlockList {
+fn branch<const N: usize>(blocks: [Block; N]) -> Vec<Block> {
 	const { assert!(N != 0, "a composition must contain a block") }
 	blocks.into()
 }
@@ -12636,8 +13687,8 @@ pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
 	Block::of(Operation::Ensemble(branch(members)))
 }
-pub fn moe<const N: usize, E: Into<Block>>(top_k: usize, experts: [E; N]) -> Block {
-	Block::of(Operation::MoeBlocks(top_k, branch(experts.map(Into::into))))
+pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
+	Block::of(Operation::MoeBlocks(top_k, branch(experts)))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -12691,7 +13742,8 @@ struct AttentionBlock {
 	rope: Option<(RopeLayout, usize, u64)>,
 	yarn: Option<(u64, usize, u64, u64)>,
 	index: Option<Indexer>,
-	gate: bool,
+	/// `attn` projects back to the input width; `attn_heads` leaves the head plane for composition.
+	project: bool,
 	/// A sliding layer attends fully only up to this many positions. Longer
 	/// contexts are rejected until the attention kernel carries the mask.
 	window: usize,
@@ -12699,10 +13751,12 @@ struct AttentionBlock {
 	factors: bool,
 	/// Whether attention uses the raw QK dot instead of dividing by sqrt(width).
 	unscaled: bool,
+	/// The scale the file names for rotary embedding, as float bits; 1.0 when it names none.
+	attn_factor: u64,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false, unscaled: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, project: true, window: 0, factors: false, unscaled: false, attn_factor: 1.0f64.to_bits() }
 	}
 
 
@@ -12718,17 +13772,20 @@ struct DeltaBlock {
 	key_width: usize,
 	value_width: usize,
 	output: usize,
-	/// Activation applied after the causal convolution. Existing hand-built
-	/// models default to linear for compatibility; GGUF Qwen delta blocks set
-	/// this to SiLU from their architecture row.
-	conv_activation: Activation,
-	/// Activation applied to the output gate. Existing hand-built models
-	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
-	output_activation: Activation,
+	/// Activation applied after the causal convolution, named by the model.
+	conv_activation: Option<Activation>,
+	/// Activation applied to the output gate, named by the model.
+	output_activation: Option<Activation>,
+	/// Decay gate of the recurrence, named by the model.
+	decay_gate: Option<Activation>,
+	/// Write gate of the recurrence, named by the model.
+	write_gate: Option<Activation>,
+	qk_norm: Option<BlockNormalization>,
+	value_norm: Option<BlockNormalization>,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, output_activation: None, decay_gate: None, write_gate: None, qk_norm: None, value_norm: None }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -12759,6 +13816,27 @@ struct PleBlock {
 	kernel: usize,
 	dilation: usize,
 	hash: RowHash,
+	math: Option<PleMath>,
+}
+/// The transform applied to a per-layer embedding gate's folded score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PleGate {
+	SignedRootSigmoid { floor_bits: u64, width_scaled: bool },
+}
+impl PleGate {
+	pub fn signed_root_sigmoid(floor: f64, width_scaled: bool) -> Self {
+		assert!(floor.is_finite() && floor > 0.0, "per-layer embedding gate floor must be positive and finite");
+		Self::SignedRootSigmoid { floor_bits: floor.to_bits(), width_scaled }
+	}
+}
+/// The normalization, gate, and convolution choices of a per-layer embedding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PleMath {
+	pub key_norm: BlockNormalization,
+	pub query_norm: BlockNormalization,
+	pub output_norm: BlockNormalization,
+	pub gate: PleGate,
+	pub convolution: Activation,
 }
 impl PleBlock {
 	/// Values the table holds: its rows of the head width.
@@ -12766,38 +13844,20 @@ impl PleBlock {
 		self.rows.saturating_mul(self.width)
 	}
 }
-#[derive(Clone, Debug, PartialEq)]
-struct BlockList(Vec<Block>);
-impl std::ops::Deref for BlockList {
-	type Target = Vec<Block>;
-	fn deref(&self) -> &Vec<Block> { &self.0 }
+/// The shared expert every position takes beside the routed experts. `count` names how many
+/// experts it merges, so its feed-forward width is `count` times the routed expert width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExpert {
+	/// No shared expert.
+	None,
+	/// The shared feed-forward sums with weight one at every position.
+	Ungated { count: usize },
+	/// The shared feed-forward scales by `gate`, applied to a `[width]` projection of each position.
+	Gated { count: usize, gate: Activation },
 }
-impl std::ops::DerefMut for BlockList {
-	fn deref_mut(&mut self) -> &mut Vec<Block> { &mut self.0 }
-}
-impl<'a> IntoIterator for &'a BlockList {
-	type Item = &'a Block;
-	type IntoIter = std::slice::Iter<'a, Block>;
-	fn into_iter(self) -> Self::IntoIter { self.0.iter() }
-}
-impl From<Vec<Block>> for BlockList {
-	fn from(blocks: Vec<Block>) -> Self { Self(blocks) }
-}
-impl<const N: usize> From<[Block; N]> for BlockList {
-	fn from(blocks: [Block; N]) -> Self { Vec::from(blocks).into() }
-}
-fn intern_ple(ple: PleBlock) -> &'static PleBlock {
-	static DEFINITIONS: Mutex<Vec<&'static PleBlock>> = Mutex::new(Vec::new());
-	let mut definitions = DEFINITIONS.lock().unwrap();
-	if let Some(previous) = definitions.iter().find(|previous| ***previous == ple) { return previous; }
-	let stored = Box::leak(Box::new(ple));
-	definitions.push(stored);
-	stored
-}
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Join(usize),
-	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
@@ -12808,21 +13868,24 @@ enum Operation {
 	Lstm(usize),
 	/// A recurrent body applied at every sequence position with one shared
 	/// parameter set.
-	Recur(BlockList),
-	Residual(BlockList),
-	Sequence(BlockList),
-	Ensemble(BlockList),
-	Sum(ProductBranch, ProductBranch),
+	Recur(Vec<Block>),
+	Residual(Vec<Block>),
+	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
-	MoeBlocks(usize, BlockList),
+	/// The routed scale is kept as its bits, so the operation stays `Eq`.
+	Moe(usize, usize, usize, Activation, Scoring, bool, SharedExpert, u64, bool),
+	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
-	Hyper(usize, usize, BlockList),
+	/// Lanes, rank, branch blocks, the optional gate, and the lane mean as its bit pattern.
+	Hyper(usize, usize, Vec<Block>, Option<HyperGateBlocks>, u64),
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
-	Ple(&'static PleBlock),
+	Ple(PleBlock),
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
+	/// Multiplies channel `c` by its trainable value `c mod period`; the values are their bit patterns.
+	ChannelScale(usize, Vec<u64>),
 	/// Computes nothing. It carries a step that is only an activation or only
 	/// a normalization, so those need no operation of their own.
 	Identity,
@@ -12853,6 +13916,7 @@ pub enum Activation {
 	/// activation stays comparable. Owns no weights and preserves shape.
 	Scale(u64),
 	Sqrt,
+	Softplus,
 }
 impl Activation {
 	/// The saved code of the activation. A parameterized activation writes its
@@ -12877,9 +13941,11 @@ impl Activation {
 			Self::Prelu => 15,
 			Self::Scale(_) => 16,
 			Self::Sqrt => 17,
+			Self::Softplus => 18,
 		}
 	}
 }
+/// How the router turns its scores into routing weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Scoring {
@@ -13025,6 +14091,20 @@ pub struct Block {
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
 
+	/// Tensors a script names for the planes of the block's non-L2 normalizations, in order.
+	scale_tensors: Vec<String>,
+	/// Tensors a script names for the planes of a delta block.
+	delta_tensors: Option<DeltaTensors>,
+	/// Tensors a script names for the planes of an attention block.
+	attention_tensors: Option<AttentionTensors>,
+	/// Tensors a script names for the planes of a mixture-of-experts block.
+	moe_tensors: Option<MoeTensors>,
+	/// Tensors a script names for the gate planes of a hyper-connection block, and for the head
+	/// mixer that collapses its lanes.
+	hyper_tensors: Option<HyperTensors>,
+	hyper_head: Option<HyperTensors>,
+	/// Tensors a script names for the planes of a per-layer embedding block.
+	ple_tensors: Option<PleTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -13049,7 +14129,7 @@ impl Suffix {
 			// These operations lower their declared arithmetic through a sum,
 			// table lookup, or attention node. Their trailing suffix therefore
 			// names the block's primary numeric operation, not a later activation.
-			Operation::Layer(_) | Operation::Conv(..) | Operation::Perceptron(_) | Operation::Embed(..) | Operation::Attention(..) | Operation::Glu(..) | Operation::Moe(..) | Operation::MoeBlocks(..) => Self::Blck,
+			Operation::Layer(_) | Operation::Conv(..) | Operation::Perceptron(_) | Operation::Embed(..) | Operation::Attention(..) | Operation::Glu(..) | Operation::Moe(..) => Self::Blck,
 			// Every other operation lowers its primary node through the ordinary
 			// operation precision. Weight ownership alone does not choose a slot:
 			// a depthwise convolution owns taps but is not a matrix sum.
@@ -13076,10 +14156,15 @@ impl Eq for Block {}
 /// The blocks and model-level forward settings captured by one product branch.
 /// Product lowering applies exclusions locally, so one branch cannot alter the
 /// bias configuration of its sibling.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductBranch {
-	blocks: BlockList,
+	blocks: Vec<Block>,
 	exclusions: u8,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HyperGateBlocks {
+	read: ProductBranch,
+	write: ProductBranch,
 }
 /// The blocks and model-level forward settings captured by one product branch.
 /// Product lowering applies exclusions locally, so one branch cannot alter the
@@ -13093,12 +14178,50 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, hyper_tensors: None, hyper_head: None, ple_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
 		self.suffix = Suffix::Map;
 		self.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
+		self
+	}
+	/// Names the GGUF tensors this attention block reads, and marks its rotary factors when a tensor holds them.
+	pub fn attention_from(mut self, tensors: AttentionTensors) -> Self {
+		let Operation::Attention(attention) = &mut self.operation else { panic!("attention_from requires an attention block") };
+		attention.factors |= tensors.factors.is_some();
+		self.attention_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors of this hyper-connection block's gates.
+	pub fn hyper_from(mut self, tensors: HyperTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Hyper(..)), "hyper_from requires a hyper-connection block");
+		self.hyper_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors of the head mixer that collapses this hyper-connection block's lanes.
+	pub fn hyper_head_from(mut self, tensors: HyperTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Hyper(..)), "hyper_head_from requires a hyper-connection block");
+		self.hyper_head = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors this per-layer embedding block reads.
+	pub fn ple_from(mut self, tensors: PleTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Ple(..)), "ple_from requires a per-layer embedding block");
+		self.ple_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors this mixture-of-experts block reads.
+	pub fn moe_from(mut self, tensors: MoeTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Moe(..)), "moe_from requires a gguf_moe block");
+		self.moe_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
+	pub fn scale_from(mut self, name: impl Into<String>) -> Self {
+		let normalizations = self.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).count();
+		assert!(self.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
+		self.scale_tensors.push(name.into());
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -13174,10 +14297,6 @@ impl Block {
 			None => panic!("score requires a preceding index"),
 		})
 	}
-	/// Sigmoid gate on the output of this `attn` block.
-	pub fn gate(self) -> Self {
-		self.attention("gate", |attention| attention.gate = true)
-	}
 	block_activations! {
 		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn sqrt = Sqrt; fn huber = Huber;
 		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
@@ -13212,6 +14331,177 @@ pub struct Model {
 	inner: Arc<ModelData>,
 	/// `model.frozen.layer(n)`: the next block trains no weight.
 	pub frozen: Frozen,
+}
+/// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors of a hyper-connection mixer, spelled by the script: the scale of the gate
+/// normalization, the read gate's down and up projections and the write gate's `inject`
+/// projection. The head mixer that collapses the lanes has no write gate, so its `inject` is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HyperTensors {
+	pub norm: String,
+	pub down: String,
+	pub up: String,
+	pub inject: Option<String>,
+}
+impl HyperTensors {
+	/// The mixer of block `layer`'s `part` (`"attn"` or `"ffn"`) under the names GGUF files give it.
+	pub fn mixer(layer: usize, part: &str) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		Self { norm: name("norm"), down: name("down"), up: name("up"), inject: Some(name("inject")) }
+	}
+	/// The head mixer under the names GGUF files give it.
+	pub fn head() -> Self {
+		Self { norm: "output_hc_norm.weight".to_owned(), down: "output_hc_down.weight".to_owned(), up: "output_hc_up.weight".to_owned(), inject: None }
+	}
+}
+/// The GGUF tensors a per-layer embedding block reads besides its n-gram table, which the file's
+/// metadata names: the key and value projections, the three scales and the convolution taps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PleTensors {
+	pub key: String,
+	pub norm_key: String,
+	pub norm_query: String,
+	pub value: String,
+	pub norm_conv: String,
+	pub conv: String,
+}
+impl PleTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self { key: name("ple_key.weight"), norm_key: name("ple_norm_key.weight"), norm_query: name("ple_norm_query.weight"), value: name("ple_value.weight"), norm_conv: name("ple_norm_conv.weight"), conv: name("ple_conv1d.weight") }
+	}
+}
+/// The GGUF tensors a mixture-of-experts block reads, spelled by the script: the router, the
+/// expert banks, the selection bias when the block selects with one, and the shared expert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoeTensors {
+	pub router: String,
+	pub selection_bias: Option<String>,
+	pub gate: String,
+	pub up: String,
+	pub down: String,
+	pub shared: Option<SharedTensors>,
+}
+impl MoeTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			router: name("ffn_gate_inp.weight"),
+			selection_bias: Some(name("exp_probs_b.bias")),
+			gate: name("ffn_gate_exps.weight"),
+			up: name("ffn_up_exps.weight"),
+			down: name("ffn_down_exps.weight"),
+			shared: Some(SharedTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors of a shared expert: its projections and, when the shared path is gated, the
+/// per-position gate vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedTensors {
+	pub gate_input: Option<String>,
+	pub gate: String,
+	pub up: String,
+	pub down: String,
+}
+impl SharedTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self { gate_input: Some(name("ffn_gate_inp_shexp.weight")), gate: name("ffn_gate_shexp.weight"), up: name("ffn_up_shexp.weight"), down: name("ffn_down_shexp.weight") }
+	}
+}
+/// The GGUF tensors an attention block reads, spelled by the script. `q` holds the query rows,
+/// interleaved with the gate rows when the block is gated; a missing `v` reads `k` as the values;
+/// the biases, the query and key scales and the rotary factors are present only when named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionTensors {
+	pub q: String,
+	pub k: String,
+	pub v: Option<String>,
+	pub q_bias: Option<String>,
+	pub k_bias: Option<String>,
+	pub v_bias: Option<String>,
+	pub q_norm: Option<String>,
+	pub k_norm: Option<String>,
+	pub factors: Option<String>,
+	pub out: String,
+	pub indexer: Option<IndexerTensors>,
+}
+impl AttentionTensors {
+	/// The tensors of block `layer` under the names GGUF files give them, each optional one named
+	/// and bound only when the file holds it.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			q: name("attn_q.weight"),
+			k: name("attn_k.weight"),
+			v: Some(name("attn_v.weight")),
+			q_bias: Some(name("attn_q.bias")),
+			k_bias: Some(name("attn_k.bias")),
+			v_bias: Some(name("attn_v.bias")),
+			q_norm: Some(name("attn_q_norm.weight")),
+			k_norm: Some(name("attn_k_norm.weight")),
+			factors: Some("rope_freqs.weight".to_owned()),
+			out: name("attn_output.weight"),
+			indexer: Some(IndexerTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors the token indexer of an attention block reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexerTensors {
+	pub q_proj: String,
+	pub k_proj: String,
+	pub q_norm: String,
+	pub k_norm: String,
+}
+impl IndexerTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+		Self { q_proj: name("q_proj.weight"), k_proj: name("k_proj.weight"), q_norm: name("q_norm.weight"), k_norm: name("k_norm.weight") }
+	}
+}
+/// The GGUF tensors a delta block reads, spelled by the script: the gate projection halves
+/// (`alpha` for the decay, `beta` for the write), the optional decay bias, the stored decay
+/// `-exp(A)`, the query-key-value projection, the convolution taps, the output scale, the
+/// output gate and the output projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaTensors {
+	pub alpha: String,
+	pub beta: String,
+	pub decay_bias: Option<String>,
+	pub decay: String,
+	pub qkv: String,
+	pub conv: String,
+	pub norm: String,
+	pub gate: String,
+	pub out: String,
+}
+impl DeltaTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			alpha: name("ssm_alpha.weight"),
+			beta: name("ssm_beta.weight"),
+			decay_bias: Some(name("ssm_dt.bias")),
+			decay: name("ssm_a"),
+			qkv: name("attn_qkv.weight"),
+			conv: name("ssm_conv1d.weight"),
+			norm: name("ssm_norm.weight"),
+			gate: name("attn_gate.weight"),
+			out: name("ssm_out.weight"),
+		}
+	}
+}
+#[derive(Clone)]
+pub struct HyperGate {
+	pub read: Model,
+	pub write: Model,
+	/// Scale of the lane sum, which the read applies after its gated sum; the model spells 1 / lanes.
+	pub mean: f64,
 }
 #[derive(Clone)]
 pub struct ModelData {
@@ -13265,12 +14555,14 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn dconv(&self, kernel: usize) -> Model { self.model().dconv(kernel) }
 	pub fn delta(&self, heads: usize, kernel: usize) -> Model { self.model().delta(heads, kernel) }
 	pub fn attn(&self, heads: usize) -> Model { self.model().attn(heads) }
+	pub fn attn_heads(&self, heads: usize) -> Model { self.model().attn_heads(heads) }
 	pub fn glu(&self, hidden: usize, activation: Activation) -> Model { self.model().glu(hidden, activation) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().res(parts) }
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().recur(parts) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Model { self.model().ensemble(members) }
-	pub fn moe<const N: usize, E: Into<Block>>(&self, top_k: usize, experts: [E; N]) -> Model { self.model().moe(top_k, experts) }
-	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Model { self.model().hyper(lanes, rank, branch) }
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Model { self.model().moe(top_k, experts) }
+	pub fn hyper(&self, lanes: usize, branch: &Model, mean: f64) -> Model { self.model().hyper(lanes, branch, mean) }
+	pub fn hyper_gate(&self, lanes: usize, branch: &Model, gate: HyperGate) -> Model { self.model().hyper_gate(lanes, branch, gate) }
 })+ }; }
 qualified_blocks! { Frozen }
 /// `frozen` before a part inside a composition: `frozen.layer(n)`.
@@ -13313,6 +14605,15 @@ impl Exclusion for Bias {
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
 impl Model {
+	/// Append a composed block, including a product, without adding a residual.
+	pub fn block(&self, mut block: Block) -> Self {
+		assert!(block.operation.weighted() || !self.pending_frozen, "{} owns no weights to qualify", block.operation.name());
+		self.edit(|model| {
+			block.frozen |= model.pending_frozen;
+			model.blocks.push(block);
+			model.pending_frozen = false;
+		})
+	}
 	fn push(&self, operation: Operation) -> Self {
 		assert!(operation.weighted() || !self.pending_frozen, "{} owns no weights to qualify", operation.name());
 		self.edit(|model| {
@@ -13329,6 +14630,13 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
+				scale_tensors: Vec::new(),
+				delta_tensors: None,
+				attention_tensors: None,
+				moe_tensors: None,
+				hyper_tensors: None,
+				hyper_head: None,
+				ple_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -13386,6 +14694,12 @@ impl Model {
 	pub fn attn(&self, heads: usize) -> Self {
 		self.push(Operation::Attention(AttentionBlock::new(heads)))
 	}
+	/// Leave the attention result in its head plane for a subsequent block product.
+	pub fn attn_heads(&self, heads: usize) -> Self {
+		let mut attention = AttentionBlock::new(heads);
+		attention.project = false;
+		self.push(Operation::Attention(attention))
+	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(branch(parts)))
 	}
@@ -13395,12 +14709,14 @@ impl Model {
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
 		self.push(Operation::Ensemble(branch(members)))
 	}
-	pub fn moe<const N: usize, E: Into<Block>>(&self, top_k: usize, experts: [E; N]) -> Self {
-		self.push(Operation::MoeBlocks(top_k, branch(experts.map(Into::into))))
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
+		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
-	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
-	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
-		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
+	/// Routed packed expert tables with the shared expert `shared` selects.
+	/// `scale` multiplies every routing weight. `selection_bias` adds a per-expert bias to the
+	/// scores that choose the top-k experts; the weights themselves stay unbiased.
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: SharedExpert, scale: f64, selection_bias: bool) -> Self {
+		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale.to_bits(), selection_bias))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
 	/// and a standalone `attn(...)` block share one configuration path.
@@ -13412,6 +14728,58 @@ impl Model {
 			model.blocks.push(apply(block));
 		})
 	}
+	/// Names the GGUF tensors the preceding delta block reads, in place of the names the file's
+	/// block index would give them.
+	pub fn delta_from(&self, tensors: DeltaTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
+			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
+			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensors of the preceding hyper-connection block's gates.
+	pub fn hyper_from(&self, tensors: HyperTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("hyper_from requires a preceding hyper-connection block"));
+			*block = block.clone().hyper_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors of the head mixer that collapses the preceding hyper-connection block's lanes.
+	pub fn hyper_head_from(&self, tensors: HyperTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("hyper_head_from requires a preceding hyper-connection block"));
+			*block = block.clone().hyper_head_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding per-layer embedding block reads.
+	pub fn ple_from(&self, tensors: PleTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("ple_from requires a preceding per-layer embedding block"));
+			*block = block.clone().ple_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding gguf_moe block reads.
+	pub fn moe_from(&self, tensors: MoeTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("moe_from requires a preceding gguf_moe block"));
+			*block = block.clone().moe_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding attention block reads.
+	pub fn attention_from(&self, tensors: AttentionTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("attention_from requires a preceding attention block"));
+			*block = block.clone().attention_from(tensors);
+		})
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of the preceding block.
+	pub fn scale_from(&self, name: impl Into<String>) -> Self {
+		let name = name.into();
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("scale_from requires a preceding normalization"));
+			*block = block.clone().scale_from(name);
+		})
+	}
 	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
 		self.suffix().edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding delta block"));
@@ -13419,12 +14787,6 @@ impl Model {
 				Operation::Delta(delta) => apply(delta),
 				_ => panic!("{selector} requires a preceding delta block"),
 			}
-		})
-	}
-	pub fn delta_activations(&self, convolution: Activation, output: Activation) -> Self {
-		self.delta_block("delta_activations", |delta| {
-			delta.conv_activation = convolution;
-			delta.output_activation = output;
 		})
 	}
 	/// Tap spacing of the preceding `dconv` block: tap `j` of a `kernel`-wide
@@ -13465,6 +14827,17 @@ impl Model {
 	pub fn values(&self, width: usize) -> Self {
 		self.delta_block("values", |delta| delta.value_width = width)
 	}
+	/// Activations of the preceding delta block's convolution and output gate.
+	pub fn delta_activations(&self, convolution: Activation, output: Activation) -> Self {
+		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (Some(convolution), Some(output)))
+	}
+	pub fn delta_norms(&self, query_key: impl NormalizationSelector, value: impl NormalizationSelector) -> Self {
+		self.delta_block("delta_norms", |delta| (delta.qk_norm, delta.value_norm) = (Some(query_key.normalization()), Some(value.normalization())))
+	}
+	/// Decay and write gates of the preceding delta block, named by the model.
+	pub fn delta_gates(&self, decay: Activation, write: Activation) -> Self {
+		self.delta_block("delta_gates", |delta| (delta.decay_gate, delta.write_gate) = (Some(decay), Some(write)))
+	}
 	/// Output width of the preceding `delta` block's closing projection.
 	pub fn out(&self, width: usize) -> Self {
 		self.delta_block("out", |delta| delta.output = width)
@@ -13496,23 +14869,31 @@ impl Model {
 	pub fn score(&self, normalization: impl NormalizationSelector, dims: usize) -> Self {
 		self.attention("score", |block| block.score(normalization, dims))
 	}
-	/// Sigmoid gate on the output of the preceding `attn` block, from its own
-	/// projection of the block input.
-	pub fn gate(&self) -> Self {
-		self.attention("gate", |block| block.gate())
-	}
-	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
-	/// through a gated read and takes its output back through gated writes.
-	/// `rank` sizes the gate bottleneck; zero fixes every gate at one.
-	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Self {
+	/// Static hyper-connections read `mean` times the sum over `lanes` and add the branch result.
+	pub fn hyper(&self, lanes: usize, branch: &Model, mean: f64) -> Self {
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
-		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone().into()))
+		assert!(mean.is_finite(), "hyper-connection lane mean must be finite");
+		self.push(Operation::Hyper(lanes, 0, branch.blocks.clone(), None, mean.to_bits()))
+	}
+	/// Read and write gates are separate block lists over the same stream.
+	pub fn hyper_gate(&self, lanes: usize, branch: &Model, gate: HyperGate) -> Self {
+		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
+		let rank = gate.read.blocks.iter().find_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).expect("hyper read gate needs a bottleneck layer");
+		let read = ProductBranch { blocks: gate.read.blocks.clone(), exclusions: gate.read.exclusions };
+		let write = ProductBranch { blocks: gate.write.blocks.clone(), exclusions: gate.write.exclusions };
+		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone(), Some(HyperGateBlocks { read, write }), gate.mean.to_bits()))
 	}
 	/// Per-layer embedding: every token gathers `table`'s rows on the host, and the
 	/// block projects, gates and convolves them into the stream it sits on, at
 	/// whatever width the stream has there.
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
-		self.push(Operation::Ple(intern_ple(table.block())))
+		self.push(Operation::Ple(table.block()))
+	}
+	pub fn ple_math(&self, math: PleMath) -> Self {
+		self.edit(|model| match &mut model.blocks.last_mut().expect("ple_math needs a preceding ple block").operation {
+			Operation::Ple(ple) => ple.math = Some(math),
+			_ => panic!("ple_math needs a preceding ple block"),
+		})
 	}
 	/// Normalizes the preceding block's output. Leading a model, it normalizes
 	/// the model input before the first block, which is the pre-normalization
@@ -13530,6 +14911,13 @@ impl Model {
 	/// returning to the block input width.
 	pub fn glu(&self, hidden: usize, activation: Activation) -> Self {
 		self.push(Operation::Glu(hidden, activation))
+	}
+	/// Multiplies each channel by a trainable value, where channel `c` takes
+	/// `values[c % values.len()]`. Each value is one parameter, so a per-head gain
+	/// takes one value per head.
+	pub fn channel_scale(&self, values: &[f64]) -> Self {
+		assert!(!values.is_empty() && values.iter().all(|value| value.is_finite()), "channel scale needs finite values");
+		self.push(Operation::ChannelScale(values.len(), values.iter().map(|value| value.to_bits()).collect()))
 	}
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
@@ -13562,20 +14950,20 @@ impl Model {
 	}
 	fn for_file(&self, file: &Gguf) -> Self {
 		let model = if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) };
-		let Some((vocabulary, width)) = model.blocks.iter().find_map(|block| match block.operation { Operation::Embed(rows, width) => Some((rows, width)), _ => None }) else { return model };
+		let Some(vocabulary) = model.blocks.iter().find_map(|block| match block.operation { Operation::Embed(rows, _) => Some(rows), _ => None }) else { return model };
 		model.edit(|model| {
 			let mut layers = 0;
 			for block in &mut model.blocks {
 				let (parts, plain) = match &mut block.operation {
 					Operation::Residual(parts) => (parts, true),
-					Operation::Hyper(_, _, parts) => (parts, false),
+					Operation::Hyper(_, _, parts, _, _) => (parts, false),
 					_ => continue,
 				};
 				let attends = mixes(parts);
 				if attends { layers += 1; }
 				if layers == 0 { continue; }
 				let part = if attends { "attn" } else { "ffn" };
-				adapt_file_branch(file, parts, layers - 1, part, width, plain);
+				adapt_file_branch(file, parts, layers - 1, part, plain);
 			}
 			let output_scale = file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight"));
 			if output_scale.is_none() { return; }
@@ -13614,12 +15002,13 @@ impl Model {
 	}
 	fn describe_block(block: &Block) -> String {
 		let mut text = match &block.operation {
+			Operation::Join(lanes) => format!("join({lanes})"),
 			Operation::Layer(width) => format!("layer({width})"),
 			Operation::Conv(filters, kernel) => format!("conv({filters},{kernel})"),
 			Operation::Pool(size) => format!("pool({size})"),
 			Operation::Estimator(estimator) if estimator.param == 0 => format!("{}()", estimator.name()),
 			Operation::Estimator(estimator) => format!("{}({})", estimator.name(), estimator.param),
-			Operation::Attention(attention) => format!("attn({})", attention.heads),
+			Operation::Attention(attention) => format!("{}({})", if attention.project { "attn" } else { "attn_heads" }, attention.heads),
 			Operation::Rnn(width) => format!("rnn({width})"),
 			Operation::Gru(width) => format!("gru({width})"),
 			Operation::Lstm(width) => format!("lstm({width})"),
@@ -13627,19 +15016,17 @@ impl Model {
 			Operation::Residual(parts) => format!("res([{}])", Self::describe_parts(parts)),
 			Operation::Ensemble(parts) => format!("ensemble([{}])", Self::describe_parts(parts)),
 			Operation::Product(left, right) => format!("({} * {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared})", activation.name())
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
+				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared:?},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
 			}
 			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
 			Operation::Perceptron(width) => format!("perc({width})"),
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
-			Operation::Hyper(lanes, rank, parts) => format!("hyper({lanes},{rank},[{}])", Self::describe_parts(parts)),
+			Operation::Hyper(lanes, _, parts, gate, _) => format!("{}({lanes},[{}])", if gate.is_some() { "hyper_gate" } else { "hyper" }, Self::describe_parts(parts)),
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
+			Operation::ChannelScale(period, _) => format!("channel_scale({period})"),
 			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
-			Operation::Join(lanes) => format!("join({lanes})"),
-			Operation::Sequence(parts) => format!("seq([{}])", Self::describe_parts(parts)),
-			Operation::Sum(left, right) => format!("({} + {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
 			Operation::Identity => String::new(),
 			Operation::Last => "last()".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu({hidden},{})", activation.name()),
@@ -13679,15 +15066,15 @@ impl Model {
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("binding requires GGUF data"))?;
 		conventional_plan(file, &with_last_projection(self).for_file(file))
 	}
-	/// Inspect planned inference buffers before compiling kernels or allocating
-	/// device memory. This uses the same graph and buffer layout as execution.
+	/// Inspect the planned inference arenas before compiling or allocating GPU
+	/// kernels. This uses the same graph and arena layout as a real run.
 	pub fn memory(&self, data: &Data, positions: usize) -> Result<DeviceMemory> {
 		require(positions > 0, "memory inspection requires context positions")?;
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("memory inspection requires GGUF data"))?;
 		let model = with_last_projection(self).for_file(file);
 		let plan = conventional_plan(file, &model)?;
 		let gpu = selected_gpu()?;
-		let graph = bound_graph_shape(file, &model, &plan, Shape { channels: 1, length: positions }, gpu)?;
+		let graph = bound_graph_on(file, &model, &plan, &vec![0.0; positions], 1, gpu)?;
 		let mut memory = part_memory(&graph, Config::load()?.precision)?;
 		memory.device = gpu.name.clone();
 		Ok(memory)
@@ -13846,6 +15233,10 @@ const IQ3_S: [u16; 512] = [
 	3159, 3188, 3210, 3228, 3234, 3245, 3250, 3256, 3264, 3276, 3281, 3296, 3349, 3363, 3378, 3392, 3395, 3420, 3440, 3461, 3488, 3529, 3531, 3584, 3588, 3591, 3600, 3602, 3614, 3616, 3628, 3634,
 	3650, 3657, 3668, 3683, 3685, 3713, 3716, 3720, 3726, 3729, 3736, 3753, 3778, 3802, 3805, 3819, 3841, 3845, 3851, 3856, 3880, 3922, 3938, 3970, 3993, 4032,
 ];
+/// ggml's IQ2 grid bytes for levels 0 to 2, IQ3_XXS's for levels 0 to 7, and IQ3_S's.
+const IQ2_LEVELS: [u16; 3] = [8, 25, 43];
+const IQ3_XXS_LEVELS: [u16; 8] = [4, 12, 20, 28, 36, 44, 52, 62];
+const IQ3_S_LEVELS: [u16; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 const IQ2_XXS: [u16; 256] = [
 	0, 2, 5, 8, 10, 17, 20, 32, 34, 40, 42, 65, 68, 80, 88, 97, 100, 128, 130, 138, 162, 257, 260, 272, 277, 320, 388, 408, 512, 514, 546, 642, 1025, 1028, 1040, 1057, 1060, 1088, 1090, 1096, 1120,
 	1153, 1156, 1168, 1188, 1280, 1282, 1288, 1312, 1350, 1385, 1408, 1425, 1545, 1552, 1600, 1668, 1700, 2048, 2053, 2056, 2068, 2088, 2113, 2116, 2128, 2130, 2184, 2308, 2368, 2562, 2580, 4097,
@@ -14334,12 +15725,12 @@ impl NativeDequant {
 		}
 	}
 
-	fn table(self) -> Option<NativeQuantTable> {
+	/// The constant tables the decoder reads: a grid, and for grids of levels, each level's value.
+	fn tables(self) -> Vec<NativeQuantTable> {
 		match self {
-			Self::Iq4(layout) => Some(NativeQuantTable::Signed(layout.table_name, layout.table)),
-			Self::Iq1(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
-			Self::Iq(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
-			_ => None,
+			Self::Iq4(layout) => vec![NativeQuantTable::Signed(layout.table_name, layout.table)],
+			Self::Iq1(layout) => vec![NativeQuantTable::Unsigned(layout.table_name, layout.table)],
+			_ => Vec::new(),
 		}
 	}
 }
@@ -14360,12 +15751,12 @@ impl NativeQuantTable {
 	fn definition(self) -> String {
 		match self {
 			Self::Unsigned(name, values) => format!(
-				"@recipe_model_{name} = private unnamed_addr constant [{} x i16] [{}]\n",
+				"@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i16] [{}]\n",
 				values.len(),
 				values.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")
 			),
 			Self::Signed(name, values) => {
-				format!("@recipe_model_{name} = private unnamed_addr constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", "))
+				format!("@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", "))
 			}
 		}
 	}
@@ -14429,13 +15820,13 @@ quantizations! {
 	Q8K { code: (0, 8, [3]), block: 256, stride: 292, name: "q8k", quant: Quantizer::Q8K, native: Some(NativeDequant::Q8K) }
 	IQ4NL { code: (1, 4, [5]), block: 32, stride: 18, name: "iq4nl", quant: Quantizer::Iq4Nl, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 })) }
 	IQ4XS { code: (1, 4, [2]), block: 256, stride: 136, name: "iq4xs", quant: Quantizer::Iq4Xs, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 6, man: 4, xs: true, table_name: "iq4", table: &IQ4 })) }
-	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS })) }
-	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS })) }
-	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS })) }
-	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S })) }
+	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS, levels: &IQ3_XXS_LEVELS })) }
+	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS, levels: &IQ2_LEVELS })) }
+	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS, levels: &IQ2_LEVELS })) }
+	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S, levels: &IQ2_LEVELS })) }
 	IQ1S { code: (1, 1, [3]), block: 256, stride: 50, name: "iq1s", quant: Quantizer::Iq1 { medium: false }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: false, table_name: "iq1", table: &IQ1 })) }
 	IQ1M { code: (1, 1, [4]), block: 256, stride: 56, name: "iq1m", quant: Quantizer::Iq1 { medium: true }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: true, table_name: "iq1", table: &IQ1 })) }
-	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S })) }
+	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S, levels: &IQ3_S_LEVELS })) }
 }
 
 fn nf4_codebook(codebook: &[f64], count: usize, bytes: usize) -> Result<(usize, &[f64], &[f64])> {
@@ -14478,23 +15869,27 @@ enum StoredSegment {
 	/// Bytes the load kernel writes on the device: they take their place in the
 	/// run but exist on no host page.
 	Absent(usize),
+	/// `count` pieces of `length` mapped bytes, `pitch` apart from `at`: one
+	/// die's rows or inputs of every row of a split weight.
+	Strided { mapping: Arc<gguf::Mapping>, at: usize, length: usize, pitch: usize, count: usize },
 }
 impl StoredSegment {
 	fn length(&self) -> usize {
 		match self {
 			Self::Owned(bytes) => bytes.len(),
 			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
+			Self::Strided { length, count, .. } => length * count,
 		}
 	}
-}
-impl std::ops::Deref for StoredSegment {
-	type Target = [u8];
-	fn deref(&self) -> &[u8] {
-		match self {
-			Self::Owned(bytes) => bytes,
-			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
-			Self::Absent(_) => &[],
-		}
+	/// The contiguous host pieces of the run, in order.
+	fn pieces(&self) -> impl Iterator<Item = &[u8]> {
+		let (bytes, at, length, pitch, count): (&[u8], usize, usize, usize, usize) = match self {
+			Self::Owned(bytes) => (bytes, 0, bytes.len(), 0, 1),
+			Self::Mapped(mapping, at, length) => (mapping.bytes(), *at, *length, 0, 1),
+			Self::Absent(_) => (&[], 0, 0, 0, 0),
+			Self::Strided { mapping, at, length, pitch, count } => (mapping.bytes(), *at, *length, *pitch, *count),
+		};
+		(0..count).map(move |piece| &bytes[at + piece * pitch..at + piece * pitch + length])
 	}
 }
 /// One node's stored bytes as the ordered runs they are assembled from, each
@@ -14512,9 +15907,70 @@ impl StoredBytes {
 	fn joined(parts: Vec<Self>) -> Self {
 		Self(Arc::new(parts.iter().flat_map(|part| part.0.iter().cloned()).collect()))
 	}
+	/// Tells the kernel the mapped runs are read at scattered places, so a read
+	/// brings in its own page and not the pages around it.
+	fn scattered(&self) {
+		#[cfg(unix)]
+		self.advise(1);
+	}
+	#[cfg(unix)]
+	fn advise(&self, advice: i32) {
+		for segment in self.0.iter() {
+			let (mapping, at, length) = match segment {
+				StoredSegment::Mapped(mapping, at, length) => (mapping, at, *length),
+				StoredSegment::Strided { mapping, at, length, pitch, count } => (mapping, at, (count - 1) * pitch + length),
+				_ => continue,
+			};
+			{
+				let page = usize::try_from(unsafe { getpagesize() }).unwrap_or(4096).max(1);
+				let start = mapping.bytes().as_ptr() as usize + at;
+				let aligned = start / page * page;
+				unsafe { madvise(aligned as Ptr, length + (start - aligned), advice) };
+			}
+		}
+	}
 	/// A run of `length` bytes the load kernel writes on the device.
 	fn absent(length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Absent(length)]))
+	}
+	/// `count` views of `length` bytes, `pitch` apart from `first`: one
+	/// strided run when the bytes are one mapped run, so splitting a table of
+	/// many rows costs one segment, not one per row.
+	fn strided(&self, first: usize, length: usize, pitch: usize, count: usize) -> Self {
+		match self.0.as_slice() {
+			[StoredSegment::Mapped(mapping, at, total)] if count > 1 && first + (count - 1) * pitch + length <= *total => {
+				Self(Arc::new(vec![StoredSegment::Strided { mapping: mapping.clone(), at: at + first, length, pitch, count }]))
+			}
+			[StoredSegment::Absent(_)] => Self::absent(length * count),
+			_ => Self::joined((0..count).map(|piece| self.view(first + piece * pitch, length)).collect()),
+		}
+	}
+	/// Bytes `from` to `from + length` of the runs, sharing every mapped run.
+	fn view(&self, from: usize, length: usize) -> Self {
+		let (mut at, mut parts) = (0, Vec::new());
+		for run in self.0.iter() {
+			let (start, end) = (at, at + run.length());
+			at = end;
+			let (low, high) = (from.max(start), (from + length).min(end));
+			if low >= high {
+				continue;
+			}
+			let (offset, count) = (low - start, high - low);
+			parts.push(match run {
+				StoredSegment::Owned(bytes) => StoredSegment::Owned(bytes[offset..offset + count].to_vec()),
+				StoredSegment::Mapped(mapping, base, _) => StoredSegment::Mapped(mapping.clone(), base + offset, count),
+				StoredSegment::Absent(_) => StoredSegment::Absent(count),
+				StoredSegment::Strided { mapping, at, length, pitch, .. } => {
+					// Each piece the range touches becomes its own mapped run.
+					for piece in offset / length..(offset + count).div_ceil(*length) {
+						let (low, high) = (offset.max(piece * length), (offset + count).min((piece + 1) * length));
+						parts.push(StoredSegment::Mapped(mapping.clone(), at + piece * pitch + low - piece * length, high - low));
+					}
+					continue;
+				}
+			});
+		}
+		Self(Arc::new(parts))
 	}
 	/// Whether any run is written on the device rather than held on the host.
 	fn absent_runs(&self) -> bool {
@@ -14527,13 +15983,10 @@ impl StoredBytes {
 	/// device writes is skipped.
 	fn runs(&self) -> impl Iterator<Item = (usize, &[u8])> {
 		let mut at = 0;
-		self.0.iter().filter_map(move |run| {
+		self.0.iter().flat_map(|run| run.pieces()).filter_map(move |piece| {
 			let offset = at;
-			at += run.length();
-			match run {
-				StoredSegment::Absent(_) => None,
-				_ => Some((offset, &**run)),
-			}
+			at += piece.len();
+			(!piece.is_empty()).then_some((offset, piece))
 		})
 	}
 	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
@@ -14555,16 +16008,11 @@ impl StoredBytes {
 	/// Every run end to end, which is the only point a mapped weight is copied.
 	fn to_vec(&self) -> Result<Vec<u8>> {
 		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
-		let mut out = Vec::new();
-		out.try_reserve_exact(self.len()).map_err(|error| RecipeError::new(format!("cannot allocate {} bytes of machine RAM for stored data: {error}", self.len())))?;
+		let mut out = Vec::with_capacity(self.len());
 		for (_, run) in self.runs() {
 			out.extend_from_slice(run);
 		}
 		Ok(out)
-	}
-	fn in_ram(&self) -> Result<Self> {
-		if self.0.iter().all(|run| matches!(run, StoredSegment::Owned(_))) { return Ok(self.clone()); }
-		Ok(Self::from(self.to_vec()?))
 	}
 }
 impl From<Vec<u8>> for StoredBytes {
@@ -15099,6 +16547,7 @@ impl Estimator {
 impl Operation {
 	const fn name(&self) -> &'static str {
 		match self {
+			Self::Join(_) => "join",
 			Self::Layer(_) => "layer",
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
@@ -15109,14 +16558,12 @@ impl Operation {
 			Self::Lstm(_) => "lstm",
 			Self::Recur(_) => "recur",
 			Self::Residual(_) => "residual",
-			Self::Sequence(_) => "sequence",
-			Self::Sum(..) => "sum",
 			Self::Product(..) => "product",
 			Self::Ensemble(_) => "ensemble",
 			Self::Identity => "identity",
 			Self::Last => "last",
-			Self::Moe(..) | Self::MoeBlocks(..) => "moe",
-			Self::Join(_) => "join",
+			Self::Moe(..) => "moe",
+			Self::MoeBlocks(..) => "moe",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
@@ -15124,6 +16571,7 @@ impl Operation {
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
 			Self::Glu(..) => "glu",
+			Self::ChannelScale(..) => "channel_scale",
 		}
 	}
 	/// Reports whether the operation owns weights that a qualifier can govern.
@@ -15132,10 +16580,10 @@ impl Operation {
 		match self {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
-			Self::Residual(parts) | Self::Sequence(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
-			Self::Product(left, right) | Self::Sum(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
+			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
+			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
-			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
+			Self::Hyper(_, rank, blocks, _, _) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
 			_ => true,
 		}
 	}
@@ -15161,6 +16609,7 @@ impl Activation {
 			Self::Prelu => "prelu",
 			Self::Scale(_) => "scale",
 			Self::Sqrt => "sqrt",
+			Self::Softplus => "softplus",
 		}
 	}
 }
@@ -15213,46 +16662,15 @@ impl std::ops::Mul for Model {
 		assert!(!left.pending_frozen && !right.pending_frozen, "product branch qualifier requires a following block");
 		assert!(left.epsilon.to_bits() == right.epsilon.to_bits(), "product branches must use the same normalization epsilon");
 		Block::of(Operation::Product(
-			ProductBranch { blocks: left.blocks.into(), exclusions: left.exclusions },
-			ProductBranch { blocks: right.blocks.into(), exclusions: right.exclusions },
+			ProductBranch { blocks: left.blocks, exclusions: left.exclusions },
+			ProductBranch { blocks: right.blocks, exclusions: right.exclusions },
 		))
 	}
 }
 impl From<Model> for Block {
 	fn from(model: Model) -> Self {
 		let mut blocks = model.blocks.clone();
-		if blocks.len() == 1 { blocks.pop().unwrap() } else { Block::of(Operation::Sequence(blocks.into())) }
-	}
-}
-impl<const N: usize> From<[Block; N]> for Block {
-	fn from(blocks: [Block; N]) -> Self { Block::of(Operation::Sequence(branch(blocks))) }
-}
-impl From<Block> for Model {
-	fn from(block: Block) -> Self { recipe.model().edit(|model| model.blocks.push(block)) }
-}
-impl<R: Into<Block>> std::ops::Add<R> for Block {
-	type Output = Block;
-	fn add(self, right: R) -> Block {
-		Block::of(Operation::Sum(ProductBranch { blocks: [self].into(), exclusions: 0 }, ProductBranch { blocks: [right.into()].into(), exclusions: 0 }))
-	}
-}
-impl<const N: usize> std::ops::Mul<Block> for [Block; N] {
-	type Output = Block;
-	fn mul(self, right: Block) -> Block { Block::from(self) * right }
-}
-impl<const N: usize> std::ops::Add<Block> for [Block; N] {
-	type Output = Block;
-	fn add(self, right: Block) -> Block { Block::from(self) + right }
-}
-impl std::ops::Add for Model {
-	type Output = Block;
-	fn add(self, right: Self) -> Block {
-		assert!(!self.pending_frozen && !right.pending_frozen, "sum branch qualifier requires a following block");
-		assert!(self.epsilon.to_bits() == right.epsilon.to_bits(), "sum branches must use the same normalization epsilon");
-		Block::of(Operation::Sum(
-			ProductBranch { blocks: self.blocks.clone().into(), exclusions: self.exclusions },
-			ProductBranch { blocks: right.blocks.clone().into(), exclusions: right.exclusions },
-		))
+		if blocks.len() == 1 { blocks.pop().unwrap() } else { Block::of(Operation::Residual(blocks)) }
 	}
 }
 /// Rust multiplication also composes two standalone blocks. Their modifiers
@@ -15261,8 +16679,8 @@ impl std::ops::Mul for Block {
 	type Output = Self;
 	fn mul(self, right: Self) -> Self {
 		Block::of(Operation::Product(
-			ProductBranch { blocks: [self].into(), exclusions: 0 },
-			ProductBranch { blocks: [right].into(), exclusions: 0 },
+			ProductBranch { blocks: vec![self], exclusions: 0 },
+			ProductBranch { blocks: vec![right], exclusions: 0 },
 		))
 	}
 }
@@ -15457,6 +16875,9 @@ pub const all: Metric = Metric(16);
 pub const dev: Metric = Metric(17);
 /// Capture actual Hyper mixer value buffers in `report.tensors`.
 pub const hc_values: Metric = Metric(18);
+const GGUF_METADATA: u8 = 19;
+const GGUF_TENSORS: u8 = 20;
+const GGUF_NGRAM: u8 = 21;
 const TENSOR_HYPER: u8 = 1;
 /// Lowercase field selectors for `.log(...)`; groups and the uncommon `blck`
 /// and `tile` selectors remain available from the crate root.
@@ -15470,6 +16891,12 @@ pub mod log {
 	pub const score: Metric = super::Score;
 	pub const choices: Metric = super::Choices;
 	pub const window: Metric = super::Window;
+	/// Metadata from the GGUF opened by this inference run.
+	pub const metadata: Metric = Metric(super::GGUF_METADATA);
+	/// GGUF tensor names, shapes, and storage types.
+	pub const tensors: Metric = Metric(super::GGUF_TENSORS);
+	/// The GGUF n-gram table and head ranges.
+	pub const ngram: Metric = Metric(super::GGUF_NGRAM);
 }
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
@@ -15488,7 +16915,7 @@ impl<const N: usize> IntoMetrics for [Metric; N] {
 fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
 	const ALL: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
 	const DEV: [Metric; 4] = [tile, Score, Choices, Window];
-	const ORDER: [Metric; 13] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug, hc_values];
+	const ORDER: [Metric; 16] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug, hc_values, log::metadata, log::tensors, log::ngram];
 	let mut selected = Vec::new();
 	for metric in metrics {
 		match metric {
@@ -15546,9 +16973,11 @@ impl LossFunction {
 	}
 }
 impl Recipe {
+	/// Opens a GGUF file for metadata and tensor-shape decisions in a model script.
+	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf { open_script_file(path.as_ref()) }
 	/// The data a model reads: table, image and text sources, or one GGUF model
-	/// file, whose metadata the `gemma3.*` and `tokenizer.*` identifiers then
-	/// read and whose weights `recipe.infer` binds.
+	/// file, whose metadata and tensors named paths then read and whose weights
+	/// `recipe.infer` binds.
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
 		let sources = sources.into_data_sources();
 		let models = sources.iter().filter(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))).collect::<Vec<_>>();
@@ -15557,7 +16986,7 @@ impl Recipe {
 			[path] if sources.len() == 1 => Some(open_script_file(Path::new(path))),
 			_ => panic!("a GGUF model file is the only source of its data"),
 		};
-		Data { sources, tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), features: FeatureSelection::All, normalize: false, split: 1.0, split_supplied: false, prepared: OnceLock::new(), file }
+		Data { sources, tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), features: FeatureSelection::All, schema_file: None, normalize: false, split: 1.0, split_supplied: false, prepared: OnceLock::new(), file }
 	}
 	/// An empty model. Its normalization epsilon is the one the opened GGUF file
 	/// declares, or the Cargo default when no file is open.
@@ -15585,7 +17014,7 @@ fn infer_ids(path: &Path, sequences: &[&[u32]], device: &'static Gpu) -> Result<
 	let ids = sequences.concat();
 	let input = vec![0.0; width];
 	let graph = materialize_saved_graph(stored, &input, device, Config::load()?)?;
-	require(graph.nodes.first().is_some_and(Node::token_input), "model does not read token ids: its first block is not an embedding")?;
+	require(graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather), "model does not read token ids: its first block is not an embedding")?;
 	let tape = NativeTape::new(&graph, TapeInput::Ids(&ids), &[], &[], device, stored.precision, None)?;
 	tape.inject_bn_stats(&stored.bn_stats)?;
 	tape.forward(ForwardMode::Inference)?;
@@ -15624,7 +17053,8 @@ impl Recipe {
 
 fn key_color(name: &str, color: bool) -> String {
 	if !color { return name.to_owned(); }
-	name.split('.').enumerate().map(|(index, part)| format!("\x1b[{}m{part}\x1b[0m", [96, 95, 94, 93, 92, 91][index % 6])).collect::<Vec<_>>().join(".")
+	const COLORS: [&str; 5] = ["242;40;60", "0;174;107", "39;125;255", "255;194;0", "135;90;251"];
+	name.split('.').enumerate().map(|(index, part)| format!("\x1b[38;2;{}m{part}\x1b[0m", COLORS[index % COLORS.len()])).collect::<Vec<_>>().join(".")
 }
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	use GgufValue::*;
@@ -15767,7 +17197,13 @@ impl Gguf {
 #[derive(Clone, Default)]
 pub struct Binding {
 	tensors: BTreeSet<String>,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`.
+	defaulted: Vec<String>,
+	/// Tensors of the file that no node reads.
+	unread: Vec<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
+	/// Rotary factor groups with a long tensor: the group index, the long tensor, and the original context its graph must exceed.
+	rope_long: Vec<(usize, GgufTensor, usize)>,
 }
 /// One plane of a node's weight: a view of a stored tensor, or values the host
 /// rewrote once from a tensor the file stores in another parametrization, which
@@ -15775,22 +17211,27 @@ pub struct Binding {
 #[derive(Clone)]
 pub(crate) enum Plane {
 	Mapped(GgufTensor),
-	Owned { name: String, values: Vec<f64> },
 	Stored { name: String, weight: StoredWeight },
+	Owned { name: String, values: Vec<f64> },
+}
+impl From<GgufTensor> for Plane {
+	fn from(tensor: GgufTensor) -> Self {
+		Self::Mapped(tensor)
+	}
 }
 impl Plane {
 	fn elements(&self) -> usize {
 		match self {
 			Self::Mapped(tensor) => tensor.elements(),
-			Self::Owned { values, .. } => values.len(),
 			Self::Stored { weight, .. } => weight.count,
+			Self::Owned { values, .. } => values.len(),
 		}
 	}
 	fn name(&self) -> &str {
 		match self {
 			Self::Mapped(tensor) => &tensor.name,
-			Self::Owned { name, .. } => name,
 			Self::Stored { name, .. } => name,
+			Self::Owned { name, .. } => name,
 		}
 	}
 	fn mapped(&self) -> Option<&GgufTensor> {
@@ -15805,6 +17246,25 @@ impl Binding {
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
 	pub fn nodes(&self) -> usize { self.nodes.len() }
+	/// The plan for a graph of `positions`. Factor groups whose graph exceeds the original context bind the long tensor.
+	fn for_positions(&self, positions: usize) -> Self {
+		let mut plan = self.clone();
+		for (group, long, original) in &self.rope_long {
+			if positions > *original { plan.nodes[*group] = vec![Plane::Mapped(long.clone())]; }
+		}
+		plan
+	}
+	/// Tensors bound as zeros or ones, as `zeros: name (why)`.
+	pub fn defaulted(&self) -> &[String] { &self.defaulted }
+	/// Tensors of the file that no node reads.
+	pub fn unread(&self) -> &[String] { &self.unread }
+	fn mark_unread(&mut self, file: &Gguf) {
+		self.unread = file.tensors().iter().filter(|tensor| !self.tensors.contains(&tensor.name)).map(|tensor| tensor.name.clone()).collect();
+	}
+	/// The plan as text, one line per node naming each plane and its element count.
+	pub fn listing(&self) -> Vec<String> {
+		self.nodes.iter().enumerate().map(|(index, planes)| format!("node {index}: {}", planes.iter().map(|plane| format!("{}[{}]", plane.name(), plane.elements())).collect::<Vec<_>>().join(" "))).collect()
+	}
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
@@ -15895,22 +17355,24 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 	let graph = bound_graph_on(model, blocks, plan, input, channels, device)?;
 	Ok((graph, device))
 }
+/// The attention scale the file names for rotary embedding, as float bits. A file that names none keeps the unscaled rotation.
+fn rope_attn_factor(file: &Gguf, architecture: &str) -> u64 {
+	file.value(&format!("{architecture}.rope.scaling.attn_factor")).and_then(GgufValue::float).unwrap_or(1.0).to_bits()
+}
 fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
-	bound_graph_shape(model, blocks, plan, shape, device)
-}
-fn bound_graph_shape(model: &Gguf, blocks: &Model, plan: &Binding, shape: Shape, device: &'static Gpu) -> Result<Graph> {
+	let plan = &plan.for_positions(shape.length);
 	let config = Config::load()?;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
-		samples: Vec::new(),
+		samples: input.to_vec(),
 		targets: Vec::new(),
 		target_width: 0,
 		rows: 1,
 		source_rows: 1,
-		features: checked_mul(shape.channels, shape.length, "bound input values")?,
+		features: input.len(),
 		schema: DataSchema::default(),
 		sequence: Some((shape, shape)),
 		target_categorical: false,
@@ -15946,19 +17408,243 @@ impl RopeSelector for RopePairs {
 /// `token_embd`, `output_norm` and `output` names, so a row adds no path of
 /// its own.
 struct Architecture {
-	names: &'static [&'static str],
+	name: String,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
+	delta_gates: Option<(Activation, Activation)>,
+	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+	ple_math: Option<PleMath>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
+	/// The tensor conventions the row declares, by key of `CONVENTIONS`.
+	conventions: BTreeMap<String, String>,
 }
-const ARCHITECTURES: &[Architecture] = &[
-	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
-	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["gemma4"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
-	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedChoice { None, Ungated, Gated }
+#[derive(Clone, Copy)]
+enum PleGateChoice { SignedRootSigmoid }
+#[derive(Default)]
+struct ArchitectureDraft {
+	name: String,
+	rope: Option<RopePairs>,
+	convolution: Option<Activation>,
+	output: Option<Activation>,
+	delta_decay: Option<Activation>,
+	delta_write: Option<Activation>,
+	qk_norm: Option<BlockNormalization>,
+	value_norm: Option<BlockNormalization>,
+	ple_key_norm: Option<BlockNormalization>,
+	ple_query_norm: Option<BlockNormalization>,
+	ple_output_norm: Option<BlockNormalization>,
+	ple_convolution: Option<Activation>,
+	ple_gate: Option<PleGateChoice>,
+	ple_floor: Option<u64>,
+	ple_width_scaled: Option<bool>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
+	conventions: BTreeMap<String, String>,
+}
+impl ArchitectureDraft {
+	fn finish(self) -> Result<Architecture> {
+		let rope = self.rope.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no rope pairing", self.name)))?;
+		require(self.convolution.is_some() == self.output.is_some(), format!("architecture {:?} names only one delta activation", self.name))?;
+		require(self.delta_decay.is_some() == self.delta_write.is_some() && self.delta_decay.is_some() == self.convolution.is_some(), format!("architecture {:?} has an incomplete delta gate profile", self.name))?;
+		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
+		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
+		require(self.expert_scoring.is_some() == self.expert_renormalize.is_some(), format!("architecture {:?} has an incomplete expert routing profile", self.name))?;
+		require(self.expert_shared.is_none() || self.expert_scoring.is_some(), format!("architecture {:?} names an expert-shared profile without expert routing", self.name))?;
+		match (self.expert_shared, self.expert_shared_gate) {
+			(Some(SharedChoice::Gated), None) => return Err(RecipeError::new(format!("architecture {:?} names a gated expert-shared profile but no expert-shared-gate", self.name))),
+			(Some(choice), Some(_)) if choice != SharedChoice::Gated => return Err(RecipeError::new(format!("architecture {:?} names expert-shared-gate without a gated expert-shared profile", self.name))),
+			_ => {}
+		}
+		let ple_fields = [self.ple_key_norm.is_some(), self.ple_query_norm.is_some(), self.ple_output_norm.is_some(), self.ple_convolution.is_some(), self.ple_gate.is_some(), self.ple_floor.is_some(), self.ple_width_scaled.is_some()];
+		require(ple_fields.iter().all(|present| *present == ple_fields[0]), format!("architecture {:?} has an incomplete per-layer embedding profile", self.name))?;
+		let ple_math = if ple_fields[0] {
+			Some(PleMath {
+				key_norm: self.ple_key_norm.unwrap(), query_norm: self.ple_query_norm.unwrap(), output_norm: self.ple_output_norm.unwrap(),
+				convolution: self.ple_convolution.unwrap(),
+				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
+			})
+		} else { None };
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate, conventions: self.conventions })
+	}
+}
+fn architecture_activation(value: &str) -> Result<Activation> {
+	match value {
+		"linear" => Ok(Activation::Linear),
+		"relu" => Ok(Activation::Relu),
+		"silu" => Ok(Activation::Silu),
+		"softplus" => Ok(Activation::Softplus),
+		"sigmoid" => Ok(Activation::Sigmoid),
+		"tanh" => Ok(Activation::Tanh),
+		"gelu" => Ok(Activation::Gelu),
+		"elu" => Ok(Activation::Elu),
+		"selu" => Ok(Activation::Selu),
+		_ => Err(RecipeError::new(format!("architecture activation {value:?} is not supported"))),
+	}
+}
+fn architecture_normalization(value: &str) -> Result<BlockNormalization> {
+	match value {
+		"rms" => Ok(BlockNormalization::Rms),
+		"l2" => Ok(BlockNormalization::L2),
+		"layer" => Ok(BlockNormalization::Layer),
+		"batch" => Ok(BlockNormalization::Batch),
+		_ => Err(RecipeError::new(format!("architecture normalization {value:?} is not supported"))),
+	}
+}
+/// The tensor conventions an architecture row declares and a file's tensors can be read for, each
+/// with the values it takes. `-` means the architecture has no such block. A row states them so a
+/// definition builds from the row, not from which tensors a file happens to hold.
+const CONVENTIONS: [(&str, &[&str]); 14] = [
+	("attention-gate", &["-", "none", "interleaved"]),
+	("qk-norm", &["-", "none", "rms"]),
+	("rope-factors", &["-", "none", "tensor", "optional"]),
+	("attention-bias", &["-", "none", "qkv"]),
+	("values-from-keys", &["-", "false", "true"]),
+	("attn-pre-norm", &["-", "false", "true"]),
+	("attn-post-norm", &["-", "false", "true"]),
+	("ffn-pre-norm", &["-", "none", "ffn_norm", "post_attention_norm"]),
+	("ffn-post-norm", &["-", "false", "true"]),
+	("output", &["tied", "untied", "optional"]),
+	("output-norm", &["none", "output_norm", "token_embd_norm"]),
+	("selection-bias", &["-", "false", "true"]),
+	("decay-bias", &["-", "false", "true"]),
+	("indexer-score-norm", &["-", "none", "rms"]),
 ];
+/// What a file's tensors say each convention is, by the rules `Gguf::model` guesses with. A
+/// convention that differs between layers reads `mixed(a, b)`.
+fn guessed_conventions(file: &Gguf) -> Result<BTreeMap<&'static str, String>> {
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new("the file names no general.architecture"))?.to_owned();
+	let key = |suffix: &str| format!("{architecture}.{suffix}");
+	let layers = file.integer_at(&key("block_count"))?;
+	let width = file.integer_at(&key("embedding_length"))?;
+	let heads = file.integer_at(&key("attention.head_count")).unwrap_or(1).max(1);
+	let head = if file.value(&key("attention.key_length")).is_some() { file.integer_at(&key("attention.key_length"))? } else { width / heads };
+	let has = |name: &str| file.tensor(name).is_some();
+	let mut seen: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+	let mut note = |name: &'static str, value: String| { seen.entry(name).or_default().insert(value); };
+	let flag = |value: bool| if value { "true" } else { "false" }.to_owned();
+	for layer in 0..layers {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let (attention, delta) = (has(&name("attn_q.weight")), has(&name("ssm_a")));
+		if attention {
+			let gated = file.tensor(&name("attn_q.weight")).and_then(|query| query.shape.get(1)).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+			note("attention-gate", if gated { "interleaved" } else { "none" }.to_owned());
+			note("qk-norm", if has(&name("attn_q_norm.weight")) { "rms" } else { "none" }.to_owned());
+			note("rope-factors", if has("rope_freqs.weight") { "tensor" } else { "none" }.to_owned());
+			note("attention-bias", if has(&name("attn_q.bias")) || has(&name("attn_k.bias")) || has(&name("attn_v.bias")) { "qkv" } else { "none" }.to_owned());
+			note("values-from-keys", flag(!has(&name("attn_v.weight"))));
+			if has(&name("indexer.q_proj.weight")) {
+				note("indexer-score-norm", if has(&name("indexer.q_norm.weight")) || has(&name("indexer.k_norm.weight")) { "rms" } else { "none" }.to_owned());
+			}
+		}
+		if delta {
+			note("decay-bias", flag(has(&name("ssm_dt.bias"))));
+		}
+		if attention || delta {
+			note("attn-pre-norm", flag(has(&name("attn_norm.weight"))));
+			note("attn-post-norm", flag(has(&name("post_attention_norm.weight"))));
+		}
+		if has(&name("ffn_gate.weight")) || has(&name("ffn_gate_inp.weight")) || has(&name("ffn_gate_exps.weight")) {
+			note("ffn-pre-norm", if has(&name("ffn_norm.weight")) { "ffn_norm" } else if has(&name("post_attention_norm.weight")) { "post_attention_norm" } else { "none" }.to_owned());
+			note("ffn-post-norm", flag(has(&name("post_ffw_norm.weight"))));
+		}
+		if has(&name("ffn_gate_inp.weight")) {
+			note("selection-bias", flag(has(&name("exp_probs_b.bias"))));
+		}
+	}
+	note("output", if has("output.weight") { "untied" } else { "tied" }.to_owned());
+	note("output-norm", if has("output_norm.weight") { "output_norm" } else if has("token_embd_norm.weight") { "token_embd_norm" } else { "none" }.to_owned());
+	Ok(CONVENTIONS.iter().map(|(name, _)| {
+		let value = match seen.get(name) {
+			None => "-".to_owned(),
+			Some(values) if values.len() == 1 => values.iter().next().unwrap().clone(),
+			Some(values) => format!("mixed({})", values.iter().cloned().collect::<Vec<_>>().join(", ")),
+		};
+		(*name, value)
+	}).collect())
+}
+/// Compares the conventions a file's architecture row declares with what the file's tensors say,
+/// one line per convention, and counts the disagreements. Reads only the header.
+pub fn conventions(path: impl AsRef<Path>) -> Result<(String, usize)> {
+	let file = Gguf::open(&resolve_path(path)?)?;
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new("the file names no general.architecture"))?.to_owned();
+	let row = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?;
+	let guessed = guessed_conventions(&file)?;
+	let (mut text, mut mismatches) = (format!("architecture {architecture}\n"), 0);
+	for (name, _) in CONVENTIONS {
+		let declared = row.conventions.get(name).map_or("(undeclared)", String::as_str);
+		let found = guessed[name].as_str();
+		let agree = declared == found || declared == "optional" && matches!(found, "none" | "tensor" | "tied" | "untied");
+		mismatches += usize::from(!agree);
+		text.push_str(&format!("{} {name}: declared {declared}, file {found}\n", if agree { "ok      " } else { "MISMATCH" }));
+	}
+	Ok((text, mismatches))
+}
+fn architectures() -> Result<Vec<Architecture>> {
+	let (mut rows, mut current) = (Vec::new(), None::<ArchitectureDraft>);
+	for raw in include_str!("Cargo.toml").lines() {
+		let line = raw.split('#').next().unwrap_or("").trim();
+		if line.starts_with('[') {
+			if let Some(previous) = current.take() { rows.push(previous.finish()?); }
+			current = line.strip_prefix("[architecture.").and_then(|value| value.strip_suffix(']')).map(|name| ArchitectureDraft { name: name.to_owned(), ..Default::default() });
+			continue;
+		}
+		let Some(current) = current.as_mut() else { continue };
+		if line.is_empty() { continue; }
+		let (key, value) = line.split_once('=').ok_or_else(|| RecipeError::new(format!("architecture {:?} contains an invalid field", current.name)))?;
+		let value = value.trim().strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| RecipeError::new(format!("architecture {:?} field {key:?} is not a string", current.name)))?;
+		match key.trim() {
+			"rope-pairs" => current.rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid rope pairing {value:?}", current.name))) }),
+			"delta-convolution" => current.convolution = Some(architecture_activation(value)?),
+			"delta-output" => current.output = Some(architecture_activation(value)?),
+			"delta-decay" => current.delta_decay = Some(architecture_activation(value)?),
+			"delta-write" => current.delta_write = Some(architecture_activation(value)?),
+			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
+			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
+			"feed-forward-activation" => current.feed_forward_activation = Some(architecture_activation(value)?),
+			"expert-activation" => current.expert_activation = Some(architecture_activation(value)?),
+			"expert-scoring" => current.expert_scoring = Some(match value { "softmax" => Scoring::Softmax, "sigmoid" => Scoring::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert scoring {value:?}", current.name))) }),
+			"expert-renormalize" => current.expert_renormalize = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert renormalization {value:?}", current.name))) }),
+			"expert-scale" => current.expert_scale = Some(value.parse().map_err(|_| RecipeError::new(format!("architecture {:?} has invalid expert weights scale {value:?}", current.name)))?),
+			"expert-shared" => current.expert_shared = Some(match value { "none" => SharedChoice::None, "ungated" => SharedChoice::Ungated, "gated" => SharedChoice::Gated, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert shared expert {value:?}", current.name))) }),
+			"expert-shared-gate" => current.expert_shared_gate = Some(architecture_activation(value)?),
+			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
+			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
+			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
+			"ple-convolution" => current.ple_convolution = Some(architecture_activation(value)?),
+			"ple-gate" => current.ple_gate = Some(match value { "signed-root-sigmoid" => PleGateChoice::SignedRootSigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding gate {value:?}", current.name))) }),
+			"ple-floor" => {
+				let floor = value.parse::<f64>().map_err(|error| RecipeError::new(format!("architecture {:?} has invalid per-layer embedding floor: {error}", current.name)))?;
+				require(floor.is_finite() && floor > 0.0, "per-layer embedding floor must be positive and finite")?;
+				current.ple_floor = Some(floor.to_bits());
+			},
+			"ple-width-scaled" => current.ple_width_scaled = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding width scaling {value:?}", current.name))) }),
+			key if CONVENTIONS.iter().any(|(name, _)| *name == key) => {
+				let (name, values) = CONVENTIONS.iter().find(|(name, _)| *name == key).unwrap();
+				require(values.contains(&value), format!("architecture {:?} has invalid {name} {value:?}; it takes {}", current.name, values.join(", ")))?;
+				current.conventions.insert(key.to_owned(), value.to_owned());
+			}
+			key => return Err(RecipeError::new(format!("architecture {:?} has unknown field {key:?}", current.name))),
+		}
+	}
+	if let Some(previous) = current { rows.push(previous.finish()?); }
+	require(!rows.is_empty(), "Cargo.toml names no model architectures")?;
+	let mut seen = BTreeSet::new();
+	for row in &rows { require(seen.insert(row.name.clone()), format!("architecture {:?} is duplicated", row.name))?; }
+	Ok(rows)
+}
 /// A model built from a GGUF file: the blocks its architecture metadata declares
 /// and the plan that binds every weighted node to the file's tensors by name.
 pub struct Bound {
@@ -15968,6 +17654,16 @@ pub struct Bound {
 	blocks: usize,
 	tensors: usize,
 	vocabulary: usize,
+}
+fn visit_attention(blocks: &[Block], callback: &mut impl FnMut(&AttentionBlock)) {
+	for block in blocks {
+		match &block.operation {
+			Operation::Attention(attention) => callback(attention),
+			Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts, _, _) | Operation::Recur(parts) => visit_attention(parts, callback),
+			Operation::Product(left, right) => { visit_attention(&left.blocks, callback); visit_attention(&right.blocks, callback); }
+			_ => {}
+		}
+	}
 }
 struct MtpHead {
 	bound: Bound,
@@ -15984,7 +17680,10 @@ impl MtpHead {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("MTP architecture is not a string"))?;
 		require(matches!(architecture, "qwen35" | "qwen4exp"), format!("MTP binding does not support architecture {architecture:?}"))?;
 		require(target.value("general.architecture").and_then(GgufValue::text) == Some(architecture), "MTP and main-model architectures differ")?;
-		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default() };
+		let descriptions = architectures()?;
+		let row = descriptions.iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new("MTP architecture has no declaration"))?;
+		let mut builder = Builder { file: &file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, expert_shared: row.expert_shared, expert_shared_gate: row.expert_shared_gate, plan: Binding::default() };
+
 		require(builder.integer("nextn_predict_layers")? == 1, "Qwen MTP requires one prediction layer")?;
 		let layer = builder.integer("block_count")?.checked_sub(1).ok_or_else(|| RecipeError::new("MTP block count is zero"))?;
 		require(target.integer_at(&format!("{architecture}.block_count"))? == layer, "MTP layer does not follow the main model's layers")?;
@@ -16079,48 +17778,16 @@ impl MtpHead {
 		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, lookup_hash, width, lanes, tokens, probs })
 	}
 	fn graph(&self, positions: usize, device: &'static Gpu) -> Result<Graph> {
-		let stream = checked_mul(self.lanes, self.width, "MTP hidden stream")?;
-		let channels = checked_add(self.width, stream, "MTP input width")?;
-		let mut graph = bound_graph_shape(&self.bound.file, &self.bound.model, &self.bound.plan, Shape { channels, length: positions }, device)?;
-		let first = graph.nodes.first().ok_or_else(|| RecipeError::new("MTP lane join is absent"))?;
-		let table = self.embedding.clone();
-		let input = Shape { channels: stream + 1, length: positions };
-		let mut gather = first.clone();
-		gather.op = Primitive::Gather;
-		gather.input = input;
-		gather.output = graph.input;
-		gather.parameters = 0;
-		gather.offset = 0;
-		gather.argument = [self.bound.vocabulary as f64, self.width as f64, self.width as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-		gather.storage = table.format.0;
-		gather.precision = Compute::FP32;
-		gather.acc = Compute::FP32;
-		gather.kv_precision = Compute::FP32;
-		gather.block_kind = "mtp_input";
-		gather.block_index = 0;
-		gather.source = -1;
-		gather.second = -2;
-		gather.program_offset = 0;
-		gather.program_count = 0;
-		for node in &mut graph.nodes {
-			if node.source >= -1 { node.source += 1; }
-			if node.second >= -1 { node.second += 1; }
-			node.block_index += 1;
-		}
-		for (index, _) in &mut graph.bound_values { *index += 1; }
-		graph.nodes.insert(0, gather);
-		graph.stored.insert(0, Some(table));
-		graph.requantize.insert(0, None);
-		graph.source += 1;
-		graph.block_index += 1;
-		graph.input = input;
-		Ok(graph)
+		let channels = checked_mul(self.width, self.lanes + 1, "MTP input channels")?;
+		bound_graph_on(&self.bound.file, &self.bound.model, &self.bound.plan, &vec![0.0; checked_mul(channels, positions, "MTP input values")?], channels, device)
 	}
+
 }
 /// Resolve an explicit user declaration before assigning checkpoint planes.
-fn explicit_bound(file: &Gguf, model: &Model, projection: bool) -> Result<Bound> {
-	let projected = if projection { with_last_projection(model) } else { model.clone() };
-	let model = projected.for_file(file);
+/// Binds `model` to `file`. A scored pass keeps the projection over every
+/// position, so `last_position` is false there.
+fn explicit_bound(file: &Gguf, model: &Model, last_position: bool) -> Result<Bound> {
+	let model = if last_position { with_last_projection(model) } else { model.clone() }.for_file(file);
 	let plan = conventional_plan(file, &model)?;
 	Ok(Bound { file: file.clone(), blocks: model.blocks.len(), tensors: plan.tensors.len(), vocabulary: 0, model, plan })
 }
@@ -16135,6 +17802,39 @@ impl Gguf {
 	}
 }
 impl Bound {
+	/// The blocks the architecture declares, each an attention or delta block
+	/// and its feed-forward, both on the residual stream.
+	pub fn blocks(&self) -> usize {
+		self.blocks
+	}
+	/// Top-level Recipe blocks the placement splitter assigns across devices.
+	/// This can exceed the architecture layer count because each transformer
+	/// layer has separate attention and feed-forward residual blocks.
+	pub fn placement_blocks(&self) -> usize {
+		self.model.blocks.len()
+	}
+	/// The stored tensors the plan reads, each counted once: as a mapped view, or
+	/// as the values the host rewrote from it.
+	pub fn tensors(&self) -> usize {
+		self.tensors
+	}
+	pub fn vocabulary(&self) -> usize {
+		self.vocabulary
+	}
+	/// The Recipe model the blocks lower through.
+	pub fn model(&self) -> &Model {
+		&self.model
+	}
+	/// The plan that fills the model's weighted nodes.
+	pub fn plan(&self) -> &Binding {
+		&self.plan
+	}
+	/// One forward over `ids`: the logit of every id at every position, laid out
+	/// as `vocabulary` rows of one value per position.
+	pub fn infer(&self, ids: &[u32]) -> Vec<f64> {
+		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+		self.file.infer(&self.model, &self.plan, &input, 1)
+	}
 	/// `infer` with each id's position on every rotary axis, as `Gguf::infer_at`.
 	pub fn infer_at(&self, ids: &[u32], positions: &[u32]) -> Vec<f64> {
 		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
@@ -16145,6 +17845,15 @@ impl Bound {
 	/// an empty split is measured from each device's free memory.
 	pub fn place(&self, positions: usize, split: &[usize]) -> Placed {
 		selected_gpus().and_then(|devices| place_bound(self, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Decode through this bound model after placing it across the selected devices.
+	pub fn decode(&self, positions: usize, split: &[usize], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		self.place(positions, split).decode(prompt, sampler, stop, budget)
+	}
+	/// Serve `requests` decodes through this bound model after placing it across
+	/// the selected devices.
+	pub fn serve(&self, positions: usize, split: &[usize], address: &str, requests: usize) {
+		self.place(positions, split).serve(address, requests);
 	}
 }
 fn retain_mtp_hidden(graph: &mut Graph) -> Result<()> {
@@ -16163,41 +17872,19 @@ fn retain_mtp_hidden(graph: &mut Graph) -> Result<()> {
 fn mtp_hidden(placed: &Placed, begin: usize, end: usize) -> Result<Vec<Vec<f64>>> {
 	require(begin <= end, "MTP hidden-state window is reversed")?;
 	for tape in placed.tapes.iter().flatten() {
-		if let Some((index, node)) = tape.nodes.iter().enumerate().find(|(_, node)| node.retain_output) {
-			let layout = &tape.program.artifact.layout;
-			let precision = layout.precisions[index];
-			require(end <= node.output.length, "MTP hidden-state window exceeds its stored positions")?;
-			let mut rows = vec![vec![0.0; node.output.channels]; end - begin];
-			let request = tape.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-			let (buffer, length, origin, base) = if let Some(request) = request.as_ref() {
-				require(begin >= request.begin as usize && end <= request.begin as usize + request.positions, "MTP hidden-state window is outside the request")?;
-				(&request.hidden, request.positions, request.begin as usize, 0)
-			} else { (&tape.values, node.output.length, 0, layout.values[index]) };
-			if begin == origin && end - begin == length {
-				let values = buffer.download_float_bytes(base, checked_mul(node.output.channels, length, "MTP hidden values")?, precision)?;
-				for (channel, values) in values.chunks_exact(length).enumerate() {
-					for (row, value) in rows.iter_mut().zip(values) { row[channel] = *value; }
-				}
-				return Ok(rows);
-			}
-			for channel in 0..node.output.channels {
-				let first = checked_add(checked_mul(channel, length, "MTP hidden channel")?, begin - origin, "MTP hidden position")?;
-				let offset = checked_add(base, checked_mul(first, precision.bytes(), "MTP hidden byte offset")?, "MTP hidden buffer offset")?;
-				let values = buffer.download_float_bytes(offset, end - begin, precision)?;
-				for (row, value) in rows.iter_mut().zip(values) { row[channel] = value; }
-			}
-			return Ok(rows);
+		if tape.nodes.iter().any(|node| node.retain_output) {
+			let hidden = tape.mtp_hidden.lock().map_err(|_| RecipeError::new("MTP hidden state is poisoned"))?;
+			return hidden.get(begin..end).map(|rows| rows.to_vec()).ok_or_else(|| RecipeError::new("MTP hidden-state window was not captured"));
 		}
 	}
 	Err(RecipeError::new("MTP hidden state was not retained"))
 }
 struct MtpTapeState {
+	hidden: Vec<Vec<f64>>,
 	values: Vec<u8>,
 	contexts: Vec<u8>,
 	samples: Vec<u8>,
 	tokens: Vec<f64>,
-	saved_output: Vec<f64>,
-	request: Option<NativeRequest>,
 	reached: u32,
 	begin: u32,
 }
@@ -16209,41 +17896,30 @@ struct MtpCheckpoint {
 impl MtpCheckpoint {
 	fn keep(placed: &Placed) -> Result<Self> {
 		let tapes = placed.tapes.iter().flatten().collect::<Vec<_>>();
-		let mut requests = tapes.iter().map(|tape| tape.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))).collect::<Result<Vec<_>>>()?;
 		let mut states = Vec::with_capacity(tapes.len());
-		let mut shadows = Vec::with_capacity(tapes.len());
-		for (tape, request) in tapes.iter().zip(&requests) {
+		for tape in &tapes {
 			states.push(MtpTapeState {
+				hidden: tape.mtp_hidden.lock().map_err(|_| RecipeError::new("MTP hidden state is poisoned"))?.clone(),
 				values: tape.values.download(tape.values.bytes)?, contexts: tape.contexts.download(tape.contexts.bytes)?, samples: tape.samples.download(tape.samples.bytes)?,
 				tokens: tape.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?.clone(),
-				saved_output: tape.saved_output.lock().map_err(|_| RecipeError::new("saved outputs are poisoned"))?.clone(),
-				request: None, reached: tape.reached.load(Ordering::Acquire), begin: tape.window_begin.load(Ordering::Acquire),
+				reached: tape.reached.load(Ordering::Acquire), begin: tape.window_begin.load(Ordering::Acquire),
 			});
-			shadows.push(request.as_ref().map(NativeRequest::shadow).transpose()?);
 		}
 		let decode = placed.decode.lock().map_err(|_| RecipeError::new("decode state is poisoned"))?.clone();
-		// Complete every fallible capture before transferring ownership. A trial may
-		// grow its shadow request without freeing addresses kept by this checkpoint.
-		for ((state, request), shadow) in states.iter_mut().zip(&mut requests).zip(shadows) {
-			state.request = std::mem::replace(&mut **request, shadow);
-		}
 		Ok(Self { tapes: states, decode })
 	}
 	fn restore(self, placed: &Placed) -> Result<()> {
 		let tapes = placed.tapes.iter().flatten().collect::<Vec<_>>();
 		require(self.tapes.len() == tapes.len(), "MTP checkpoint tape count differs")?;
-		let mut requests = tapes.iter().map(|tape| tape.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))).collect::<Result<Vec<_>>>()?;
 		for (state, tape) in self.tapes.iter().zip(&tapes) {
 			require(state.values.len() == tape.values.bytes && state.contexts.len() == tape.contexts.bytes && state.samples.len() == tape.samples.bytes, "MTP checkpoint buffer sizes differ")?;
 		}
-		for ((state, tape), request) in self.tapes.into_iter().zip(tapes.iter().copied()).zip(&mut requests) {
-			// Restore the original owned addresses before pointer-bearing control bytes.
-			**request = state.request;
+		for (state, tape) in self.tapes.into_iter().zip(tapes.iter().copied()) {
 			tape.values.write_bytes(0, &state.values)?;
+			*tape.mtp_hidden.lock().map_err(|_| RecipeError::new("MTP hidden state is poisoned"))? = state.hidden;
 			tape.contexts.write_bytes(0, &state.contexts)?;
 			tape.samples.write_bytes(0, &state.samples)?;
 			*tape.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))? = state.tokens;
-			*tape.saved_output.lock().map_err(|_| RecipeError::new("saved outputs are poisoned"))? = state.saved_output;
 			tape.reached.store(state.reached, Ordering::Release);
 			tape.window_begin.store(state.begin, Ordering::Release);
 		}
@@ -16395,12 +18071,19 @@ impl MtpRuntime {
 			Some("0") => false,
 			Some(_) => return Err(RecipeError::new("RECIPE_MTP_LOOKUP must be 0 or 1")),
 		};
-		let devices = &devices[..1];
 		let mut graph = head.graph(sequence, devices[0])?;
 		retain_mtp_hidden(&mut graph)?;
-		let (split, ranges, resident, movement, moved) = place_ranges(&graph, &[], devices, Config::load()?.precision, &[])?;
+		let tensor = match env!("RECIPE_DEVICE_SPLIT") { "tensor" => true, "auto" => devices[0].reaches(devices), _ => false };
+		if tensor && devices.len() > 1 {
+			let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
+			let (tapes, exchange, resident) = place_tensor(&graph, devices, Config::load()?.precision)?;
+			let placed = Placed { source: PlacedSource::Bound(graph.input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: vec![blocks; devices.len()], tapes: vec![tapes], resident, movement: vec![0; devices.len()], moved: 0, exchange: Some(exchange) };
+			return Ok(Self { head, lookup, lookup_enabled, placed, samples: Vec::new(), hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false });
+		}
+
+let (split, ranges, resident, movement, moved) = place_ranges(&graph, &[], devices, Config::load()?.precision, &[], None)?;
 		let samples = Vec::new();
-		let placed = Placed { source: PlacedSource::Bound(graph.input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved };
+		let placed = Placed { source: PlacedSource::Bound(graph.input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None };
 		Ok(Self { head, lookup, lookup_enabled, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false })
 	}
 	fn clear(&mut self) {
@@ -16413,11 +18096,10 @@ impl MtpRuntime {
 		self.placed.clear();
 	}
 	fn input(&mut self, position: usize, positions: usize, id: u32, hidden: &[f64]) -> Result<()> {
-		require(hidden.len() == self.head.width * self.head.lanes, "MTP hidden state has the wrong width")?;
-		require(position < positions, "MTP input position is outside its request")?;
+		require(hidden.len() == self.head.width * self.head.lanes && position < positions, "MTP input has an invalid hidden stream or position")?;
 		require((id as usize) < self.head.bound.vocabulary, "MTP token id exceeds its embedding vocabulary")?;
-		self.samples[position] = f64::from(id);
-		for (channel, value) in hidden.iter().copied().enumerate() { self.samples[(channel + 1) * positions + position] = value; }
+		let embedding = ngram::table_row(&self.head.embedding, self.head.width, id as usize)?;
+		for (channel, value) in embedding.iter().chain(hidden).copied().enumerate() { self.samples[channel * positions + position] = value; }
 		Ok(())
 	}
 	fn release_hidden(&mut self, end: usize) -> Result<()> {
@@ -16429,8 +18111,8 @@ impl MtpRuntime {
 	fn refresh(&mut self, ids: &[u32], begin: usize, end: usize) -> Result<()> {
 		if begin >= end { return Ok(()); }
 		let positions = end - begin;
-		self.samples.resize(checked_mul(self.head.width * self.head.lanes + 1, positions, "MTP request input")?, 0.0);
-		for position in begin..end { self.input(position - begin, positions, ids[position + 1], &self.hidden[position].clone())?; }
+		self.samples.resize(checked_mul(self.head.width * (self.head.lanes + 1), self.sequence, "MTP request input")?, 0.0);
+		for position in begin..end { self.input(position, self.sequence, ids[position + 1], &self.hidden[position].clone())?; }
 		self.placed.run_window(&self.samples, begin as u32, end as u32)?;
 		self.head_valid = end;
 		self.release_hidden(end)?;
@@ -16470,7 +18152,7 @@ impl MtpRuntime {
 		let mut samples = vec![0.0; self.sequence];
 		for (slot, id) in samples.iter_mut().zip(prompt) { *slot = f64::from(*id); }
 		if cached < prompt.len() {
-			let predictions = main.run_window_observed(&samples, cached as u32, prompt.len() as u32, progress)?;
+			let predictions = main.run_window_observed(&samples, cached as u32, prompt.len() as u32, progress, false)?;
 			self.logits = main.last_logits(&predictions, cached as u32, prompt.len() as u32)?;
 			self.hidden.resize_with(prompt.len(), Vec::new);
 			for (slot, hidden) in self.hidden[cached..prompt.len()].iter_mut().zip(mtp_hidden(main, cached, prompt.len())?) { *slot = hidden; }
@@ -16506,8 +18188,8 @@ impl MtpRuntime {
 			let mut head_prefix = None;
 			for offset in 0..if from_lookup { 0 } else { limit } {
 				let position = base + offset - 1;
-				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
-				self.input(0, 1, proposed[offset], &hidden)?;
+				self.samples.resize((self.head.width * (self.head.lanes + 1)) * self.sequence, 0.0);
+				self.input(position, self.sequence, proposed[offset], &hidden)?;
 				let output = self.placed.run_window(&self.samples, position as u32, position as u32 + 1)?;
 				if offset == 0 {
 					self.head_valid = position + 1;
@@ -16628,6 +18310,16 @@ struct Builder<'a> {
 	architecture: &'a str,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
+	delta_gates: Option<(Activation, Activation)>,
+	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+	ple_math: Option<PleMath>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -16664,15 +18356,18 @@ struct ExpertDims {
 	hidden: usize,
 	scoring: Scoring,
 	renormalize: bool,
+	scale: f64,
+	shared: SharedExpert,
 }
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
-		let row = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).ok_or_else(|| {
-			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
+		let rows = architectures()?;
+		let row = rows.iter().find(|row| row.name == architecture).ok_or_else(|| {
+			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, expert_shared: row.expert_shared, expert_shared_gate: row.expert_shared_gate, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -16701,7 +18396,8 @@ impl<'a> Builder<'a> {
 		let ple = if builder.present("ple.ngram_size") { Some(Ngram::new(file)?) } else { None };
 		for layer in 0..blocks {
 			if let Some(ple) = ple.as_ref().filter(|ple| ple.layer() == layer) {
-				model = model.ple(ple);
+				let math = builder.ple_math.ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} names no per-layer embedding math")))?;
+				model = model.ple(ple).ple_math(math);
 				builder.ple(layer, ple, &dimensions)?;
 			}
 			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
@@ -16751,8 +18447,7 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+		builder.plan.mark_unread(file);
 		let tensors = builder.plan.tensors.len();
 		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
 	}
@@ -16830,21 +18525,38 @@ impl<'a> Builder<'a> {
 		};
 		let experts = match self.integer_or("expert_count", 0)? {
 			0 => None,
-			count => Some(ExpertDims {
-				count,
-				used: self.integer("expert_used_count")?,
-				hidden: self.integer("expert_feed_forward_length")?,
-				scoring: match self.integer_or("expert_gating_func", 1)? {
-					1 => Scoring::Softmax,
-					2 => Scoring::Sigmoid,
-					other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))),
-				},
-				renormalize: match self.file.value(&self.key("expert_weights_norm")) {
-					Some(GgufValue::Bool(value)) => *value,
-					Some(_) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
-					None => true,
-				},
-			}),
+			count => {
+				// The gating function, when the file names one, selects the scoring. Value 3 is top-k
+				// before softmax, whose kept scores always renormalize.
+				let gating = match self.file.value(&self.key("expert_gating_func")) {
+					Some(_) => Some(self.integer("expert_gating_func")?),
+					None => None,
+				};
+				let hidden = self.integer("expert_feed_forward_length")?;
+				Some(ExpertDims {
+					count,
+					used: self.integer("expert_used_count")?,
+					hidden,
+					shared: self.shared_expert(hidden)?,
+					scoring: match gating {
+						Some(1) => Scoring::Softmax,
+						Some(2) => Scoring::Sigmoid,
+						Some(3) => Scoring::Softmax,
+						Some(other) => return Err(RecipeError::new(format!("expert_gating_func {other} is unknown; the file names 1 (softmax), 2 (sigmoid), or 3 (top-k softmax)"))),
+						None => self.expert_scoring.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert scoring", self.architecture)))?,
+					},
+					renormalize: match (gating, self.file.value(&self.key("expert_weights_norm"))) {
+						(Some(3), _) => true,
+						(_, Some(GgufValue::Bool(value))) => *value,
+						(_, Some(_)) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
+						(_, None) => self.expert_renormalize.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert renormalization", self.architecture)))?,
+					},
+					scale: match self.file.value(&self.key("expert_weights_scale")) {
+						Some(value) => value.float().filter(|scale| scale.is_finite()).ok_or_else(|| RecipeError::new("expert_weights_scale is not a finite float"))?,
+						None => self.expert_scale.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert weights scale", self.architecture)))?,
+					},
+				})
+			}
 		};
 		let feed_forward = if self.present("feed_forward_length") { Some(self.integer("feed_forward_length")?) } else { None };
 		require(experts.is_some() || feed_forward.is_some(), "the architecture names neither a feed-forward width nor experts")?;
@@ -16868,9 +18580,18 @@ impl<'a> Builder<'a> {
 		self.plan.tensors.insert(name.to_owned());
 		Some(tensor)
 	}
+	/// Record a tensor that binds as `kind` values: the file lacks `name`, or stores it in another shape than `expected`.
+	fn default_note(&mut self, name: &str, kind: &str, expected: &str) {
+		let why = match self.file.tensor(name) {
+			Some(tensor) => format!("shape {:?}, expected {expected}", tensor.shape),
+			None => "absent".to_owned(),
+		};
+		let note = format!("{kind}: {name} ({why})");
+		if !self.plan.defaulted.contains(&note) { self.plan.defaulted.push(note); }
+	}
 	/// The next parameterized node, filled from mapped views.
-	fn mapped(&mut self, planes: Vec<GgufTensor>) {
-		self.slot(planes.into_iter().map(Plane::Mapped).collect());
+	fn mapped<T: Into<Plane>>(&mut self, planes: Vec<T>) {
+		self.slot(planes.into_iter().map(Into::into).collect());
 	}
 	fn slot(&mut self, planes: Vec<Plane>) {
 		self.plan.nodes.push(planes);
@@ -16881,21 +18602,34 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![tensor]);
 		Ok(())
 	}
-	/// A projection `[inputs, outputs]` of the given name, checked against the
-	/// widths the node contracts over.
-	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
-		let tensor = self.tensor(name, role)?;
-		require(
-			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
-			format!("{name} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.shape),
-		)?;
-		Ok(tensor)
+	/// The gate and up projections of a feed-forward: two tensors, or one `ffn_up.weight` that stores the gate rows and then the up rows.
+	fn gate_and_up(&mut self, layer: usize, role: &str, inputs: usize, outputs: usize) -> Result<[Plane; 2]> {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		if self.file.tensor(&name("ffn_gate.weight")).is_none() && self.file.tensor(&name("ffn_up.weight")).is_some_and(|tensor| tensor.shape == [inputs as u64, 2 * outputs as u64]) {
+			let fused = self.tensor(&name("ffn_up.weight"), role)?;
+			return Ok([Plane::Mapped(fused.rows(0, outputs)?.view()?), Plane::Mapped(fused.rows(outputs, outputs)?.view()?)]);
+		}
+		Ok([self.projection(&name("ffn_gate.weight"), role, inputs, outputs)?, self.projection(&name("ffn_up.weight"), role, inputs, outputs)?])
+	}
+	/// A projection `[inputs, outputs]` of the given name. A tensor the file lacks,
+	/// or stores in another shape, binds as zeros: the node takes its default
+	/// parameters and the rest of the model still runs.
+	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<Plane> {
+		match self.optional(name).filter(|tensor| tensor.shape == [inputs as u64, outputs as u64]) {
+			Some(tensor) => Ok(Plane::Mapped(tensor)),
+			None => {
+				self.default_note(name, "zeros", &format!("[{inputs}, {outputs}]"));
+				Ok(Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![0.0; checked_mul(inputs, outputs, "projection elements")?] })
+			}
+		}
 	}
 	/// A normalization scale of `width` values, repeated over `groups` groups of
 	/// the span it normalizes, in the order `order` reads each group's channels.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
-		let tensor = self.tensor(name, role)?;
-		require(tensor.elements() == width, format!("{name} holds {} values; {role} scales {width} channels", tensor.elements()))?;
+		let Some(tensor) = self.optional(name).filter(|tensor| tensor.elements() == width) else {
+			self.default_note(name, "ones", &format!("{width} elements"));
+			return Ok(vec![Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![1.0; width] }; groups]);
+		};
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
 			return Ok(vec![Plane::Mapped(tensor); groups]);
 		}
@@ -16913,11 +18647,26 @@ impl<'a> Builder<'a> {
 	}
 	/// The rows of one head at `base`, as one view when they are read in place
 	/// and as one view per row otherwise.
-	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
+	fn head_rows(weight: &Plane, base: usize, order: &[usize], inputs: usize) -> Result<Vec<Plane>> {
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![tensor.rows(base, order.len())?]);
+			return Ok(vec![Self::rows_of(weight, base, order.len(), inputs)?]);
 		}
-		order.iter().map(|channel| tensor.rows(base + channel, 1)).collect()
+		order.iter().map(|channel| Self::rows_of(weight, base + channel, 1, inputs)).collect()
+	}
+	/// The `count` rows from `base` of a projection that reads `inputs` values per
+	/// row. A defaulted projection holds zeros of that span.
+	fn rows_of(weight: &Plane, base: usize, count: usize, inputs: usize) -> Result<Plane> {
+		match weight {
+			Plane::Mapped(tensor) => Ok(Plane::Mapped(tensor.rows(base, count)?.view()?)),
+			Plane::Stored { .. } => Err(RecipeError::new("stored projection rows must be bound through their mapped source")),
+			Plane::Owned { name, .. } => Ok(Plane::Owned { name: name.clone(), values: vec![0.0; checked_mul(count, inputs, "projection rows")?] }),
+		}
+	}
+	/// The values of an attention projection bias row, or zeros when the file holds none.
+	fn bias_values(file: &Gguf, tensor: Option<GgufTensor>, outputs: usize, role: &str) -> Result<Vec<f64>> {
+		let Some(tensor) = tensor else { return Ok(vec![0.0; outputs]) };
+		require(tensor.shape == [outputs as u64], format!("{} has shape {:?}; {role} adds one bias per {outputs} outputs", tensor.name, tensor.shape))?;
+		file.values(&tensor)
 	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
@@ -16925,16 +18674,19 @@ impl<'a> Builder<'a> {
 		let (width, heads) = (dimensions.width, dimensions.heads);
 		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		let query = self.file.tensor(&name("attn_q.weight")).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
-		let mut block = branch.attn(heads).kv(kv).head(head);
-		if query.shape.get(1).is_some_and(|outputs| *outputs as usize == 2 * heads * head) { block = block.gate(); }
+		let fused = self.file.tensor(&name("attn_q.weight")).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
+		let query = self.file.tensor(&name(if fused { "attn_qkv.weight" } else { "attn_q.weight" })).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
+		let gated = !fused && query.shape.get(1).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+		let mut block = if gated { branch.attn_heads(heads) } else { branch.attn(heads) }.kv(kv).head(head);
 		let normalized = self.file.tensor(&name("attn_q_norm.weight")).is_some();
 		if normalized { block = block.qk(rms); }
 		block = block.rope(self.rope, rope_dims, rope_base);
+		let (short, attn_factor) = (self.file.tensor("rope_factors_short.weight").is_some(), rope_attn_factor(self.file, self.architecture));
 		block = block.edit(|model| {
 			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
 			attention.window = if dimensions.swa[layer] { dimensions.window } else { 0 };
-			attention.factors = !dimensions.swa[layer] && self.file.tensor("rope_freqs.weight").is_some();
+			attention.factors = short || (!dimensions.swa[layer] && self.file.tensor("rope_freqs.weight").is_some());
+			attention.attn_factor = attn_factor;
 		});
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
@@ -16942,7 +18694,22 @@ impl<'a> Builder<'a> {
 			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
 		}
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
-		self.attention_planes(layer, attention, normalized, width)?;
+		self.attention_planes(layer, attention, normalized, width, None)?;
+		if gated {
+			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
+			self.attention_gate_planes(layer, heads, head, gate_biased, None)?;
+			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
+			self.mapped(vec![output]);
+			block = block.edit(|model| {
+				let attention = model.blocks.pop().unwrap();
+				let gate = Block::of(Operation::Layer(heads * head)).sigmoid();
+				model.blocks.push(Block::of(Operation::Product(
+					ProductBranch { blocks: vec![attention], exclusions: 0 },
+					ProductBranch { blocks: vec![gate], exclusions: if gate_biased { 0 } else { bias.mask() } },
+				)));
+			});
+			block = block.layer(width);
+		}
 		Ok(block)
 	}
 
@@ -16956,9 +18723,9 @@ impl<'a> Builder<'a> {
 		let role = format!("block {layer_index} short convolution");
 		let input = self.tensor(&name("shortconv.in_proj.weight"), &role)?;
 		require(input.shape == [width as u64, (3 * width) as u64], format!("{} has shape {:?}; {role} projects three {width}-wide planes", input.name, input.shape))?;
-		let b = input.rows(0, width)?;
-		let c = input.rows(width, width)?;
-		let x = input.rows(2 * width, width)?;
+		let b = input.rows(0, width)?.view()?;
+		let c = input.rows(width, width)?.view()?;
+		let x = input.rows(2 * width, width)?.view()?;
 		let taps = self.tensor(&name("shortconv.conv.weight"), &role)?;
 		require(taps.shape == [kernel as u64, width as u64], format!("{} has shape {:?}; {role} holds {kernel} taps for {width} channels", taps.name, taps.shape))?;
 		let output = self.projection(&name("shortconv.out_proj.weight"), &role, width, width)?;
@@ -16972,8 +18739,8 @@ impl<'a> Builder<'a> {
 		let bx = layer(width) * layer(width);
 		let dconv = Block::of(Operation::Dconv(kernel, 1));
 		let short = Block::of(Operation::Product(
-			ProductBranch { blocks: [bx, dconv].into(), exclusions: 0 },
-			ProductBranch { blocks: [layer(width)].into(), exclusions: 0 },
+			ProductBranch { blocks: vec![bx, dconv], exclusions: 0 },
+			ProductBranch { blocks: vec![layer(width)], exclusions: 0 },
 		));
 		let branch = branch.edit(|model| model.blocks.push(short));
 		Ok(branch.layer(width))
@@ -16984,49 +18751,51 @@ impl<'a> Builder<'a> {
 	fn delta(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
 		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
 		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
-		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
-		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation, output_activation };
-		self.delta_planes(layer, &delta, dimensions.width)?;
+		let (conv_activation, output_activation) = self.delta_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta activations", self.architecture)))?;
+		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
+		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
+		self.delta_planes(layer, &delta, dimensions.width, None)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
 	/// Bind the planes of the declared delta block in lowering order.
-	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize) -> Result<()> {
+	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize, spelled: Option<&DeltaTensors>) -> Result<()> {
 		let (key_heads, key_width, value_width, output) = delta.extent(width)?;
 		let (heads, kernel) = (delta.heads, delta.kernel);
 		let inner = heads * value_width;
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| DeltaTensors::block(layer));
 		let role = format!("block {layer} delta");
-		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
-		let beta = self.projection(&name("ssm_beta.weight"), &role, width, heads)?;
-		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
+		let alpha = self.projection(&named.alpha, &role, width, heads)?;
+		let beta = self.projection(&named.beta, &role, width, heads)?;
+		let mut gates = vec![alpha, beta];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
-		if let Some(decay_bias) = self.optional(&name("ssm_dt.bias")) {
+		if let Some(decay_bias) = named.decay_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
 			require(decay_bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", decay_bias.name, decay_bias.elements()))?;
 			gates.push(Plane::Mapped(decay_bias));
-			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
+			gates.push(Plane::Owned { name: format!("{} (zero)", named.beta), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
+		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
+		let decay = self.tensor(&named.decay, &role)?;
+		let values = self.file.values(&decay)?;
+		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
+		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let conv_width = 2 * key_heads * key_width + inner;
-		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
+		let qkv = self.projection(&named.qkv, &role, width, conv_width)?;
 		self.mapped(vec![qkv]);
-		let taps = self.tensor(&name("ssm_conv1d.weight"), &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == kernel && taps.shape[1] as usize == conv_width,
 			format!("{} has shape {:?}; {role} convolves {conv_width} channels with {kernel} taps", taps.name, taps.shape),
 		)?;
 		self.mapped(vec![taps]);
-		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
-		let decay = self.tensor(&name("ssm_a"), &role)?;
-		let values = self.file.values(&decay)?;
-		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
-		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let order = (0..value_width).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
+		let scales = self.scale(&named.norm, &role, value_width, heads, &order)?;
 		self.slot(scales);
-		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
+		let gate = self.projection(&named.gate, &role, width, inner)?;
 		self.mapped(vec![gate]);
-		let output = self.projection(&name("ssm_out.weight"), &role, inner, output)?;
+		let output = self.projection(&named.out, &role, inner, output)?;
 		self.mapped(vec![output]);
 		Ok(())
 	}
@@ -17036,40 +18805,87 @@ impl<'a> Builder<'a> {
 		let hidden = dimensions.feed_forward.ok_or_else(|| RecipeError::new("the architecture names no feed-forward width"))?;
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} feed-forward");
-		for (suffix, inputs, outputs) in [("ffn_gate.weight", width, hidden), ("ffn_up.weight", width, hidden), ("ffn_down.weight", hidden, width)] {
-			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
-			self.mapped(vec![tensor]);
-		}
-		Ok(branch.glu(hidden, Activation::Silu))
+		for tensor in self.gate_and_up(layer, &role, width, hidden)? { self.mapped(vec![tensor]); }
+		let down = self.projection(&name("ffn_down.weight"), &role, hidden, width)?;
+		self.mapped(vec![down]);
+		let activation = self.feed_forward_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no feed-forward activation", self.architecture)))?;
+		Ok(branch.glu(hidden, activation))
 	}
+	/// The shared expert the architecture row selects. A gated profile names its gate
+	/// activation, and the row names no count, which comes from `expert_shared_count`.
+	fn shared_expert(&self, hidden: usize) -> Result<SharedExpert> {
+		let choice = self.expert_shared.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert-shared profile; add expert-shared to its Cargo.toml routing profile", self.architecture)))?;
+		match choice {
+			SharedChoice::None => Ok(SharedExpert::None),
+			SharedChoice::Ungated => Ok(SharedExpert::Ungated { count: self.shared_count(hidden)? }),
+			SharedChoice::Gated => {
+				let gate = self.expert_shared_gate.ok_or_else(|| RecipeError::new(format!("architecture {:?} names a gated expert-shared profile but no expert-shared-gate", self.architecture)))?;
+				Ok(SharedExpert::Gated { count: self.shared_count(hidden)?, gate })
+			}
+		}
+	}
+	/// The shared expert count: `expert_shared_count` when the file names it, else the
+	/// shared feed-forward width in whole routed-expert widths.
+	fn shared_count(&self, hidden: usize) -> Result<usize> {
+		let count = if self.present("expert_shared_count") {
+			self.integer("expert_shared_count")?
+		} else {
+			let width = self.integer("expert_shared_feed_forward_length")?;
+			require(hidden != 0 && width % hidden == 0, format!("expert_shared_feed_forward_length {width} is not a whole number of {hidden}-wide experts, and the file names no expert_shared_count"))?;
+			width / hidden
+		};
+		require(count != 0, "the shared expert count is zero; a shared expert needs at least one")?;
+		Ok(count)
+	}
+	/// One mixture of experts and the plan of its router, its expert tables and
+	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
-		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
-		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
-		self.expert_planes(layer, count, hidden, shared, dimensions.width)?;
-		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+		let ExpertDims { count, used, hidden, scoring, renormalize, scale, shared } = *experts;
+		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
+		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width, None)?;
+		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
+		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, width: usize) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize, spelled: Option<&MoeTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| MoeTensors::block(layer));
 		let role = format!("block {layer} experts");
-		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
+		let router = self.projection(&named.router, &role, width, count)?;
 		self.mapped(vec![router]);
-		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
-			let table = self.tensor(&name(suffix), &role)?;
+		if selection_bias {
+			// The routing node reads this span right after the router scores.
+			let bias_role = format!("block {layer} expert selection bias");
+			let bias_name = named.selection_bias.as_deref().ok_or_else(|| RecipeError::new(format!("{bias_role} names no tensor")))?;
+			let tensor = self.tensor(bias_name, &bias_role)?;
+			require(tensor.elements() == count, format!("{} holds {} values; {bias_role} takes {count}", tensor.name, tensor.elements()))?;
+			self.mapped(vec![tensor]);
+		}
+		for (bank, inputs, outputs) in [(&named.gate, width, hidden), (&named.up, width, hidden), (&named.down, hidden, width)] {
+			let table = self.tensor(bank, &role)?;
 			require(
 				table.shape.len() == 3 && table.shape[0] as usize == inputs && table.shape[1] as usize == outputs && table.shape[2] as usize == count,
 				format!("{} has shape {:?}; {role} holds {count} experts of [{inputs}, {outputs}]", table.name, table.shape),
 			)?;
 			self.mapped(vec![table]);
 		}
-		if shared {
+		let (shared_count, gated) = match shared {
+			SharedExpert::None => (0, false),
+			SharedExpert::Ungated { count } => (count, false),
+			SharedExpert::Gated { count, .. } => (count, true),
+		};
+		if shared != SharedExpert::None {
 			let shared_role = format!("block {layer} shared expert");
-			// The per-position gate is the first weighted node in the shared path.
-			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
-			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
-			self.mapped(vec![gate]);
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, hidden), ("ffn_up_shexp.weight", width, hidden), ("ffn_down_shexp.weight", hidden, width)] {
-				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
+			let shared_hidden = checked_mul(shared_count, hidden, "shared expert width")?;
+			let shared_named = named.shared.clone().ok_or_else(|| RecipeError::new(format!("{shared_role} names no tensors")))?;
+			if gated {
+				// The per-position gate is the first weighted node in the shared path.
+				let gate_name = shared_named.gate_input.as_deref().ok_or_else(|| RecipeError::new(format!("{shared_role} is gated and names no gate tensor")))?;
+				let gate = self.tensor(gate_name, &shared_role)?;
+				require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
+				self.mapped(vec![gate]);
+			}
+			for (projection, inputs, outputs) in [(&shared_named.gate, width, shared_hidden), (&shared_named.up, width, shared_hidden), (&shared_named.down, shared_hidden, width)] {
+				let tensor = self.projection(projection, &shared_role, inputs, outputs)?;
 				self.mapped(vec![tensor]);
 			}
 		}
@@ -17078,24 +18894,24 @@ impl<'a> Builder<'a> {
 	/// One per-layer embedding and the plan of its host table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
 	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, dimensions: &Dimensions) -> Result<()> {
-		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes))
+		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes), None)
 	}
-	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize) -> Result<()> {
+	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize, spelled: Option<&PleTensors>) -> Result<()> {
 		let role = format!("block {layer} per-layer embedding");
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| PleTensors::block(layer));
 		let (table_name, _, _) = ple.table();
 		let table = self.tensor(table_name, &role)?;
 		self.mapped(vec![table]);
 		let stream = checked_mul(lanes, width, "per-layer embedding stream")?;
 		let gathered = ple.width();
-		let key = self.projection(&name("ple_key.weight"), &role, gathered, stream)?;
+		let key = self.projection(&named.key, &role, gathered, stream)?;
 		self.mapped(vec![key]);
-		self.whole(&name("ple_norm_key.weight"), &role)?;
-		self.whole(&name("ple_norm_query.weight"), &role)?;
-		let value = self.projection(&name("ple_value.weight"), &role, gathered, width)?;
+		self.whole(&named.norm_key, &role)?;
+		self.whole(&named.norm_query, &role)?;
+		let value = self.projection(&named.value, &role, gathered, width)?;
 		self.mapped(vec![value]);
-		self.whole(&name("ple_norm_conv.weight"), &role)?;
-		let taps = self.tensor(&name("ple_conv1d.weight"), &role)?;
+		self.whole(&named.norm_conv, &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == ple.kernel() && taps.shape[1] as usize == stream,
 			format!("{} has shape {:?}; {role} convolves {stream} channels with {} taps", taps.name, taps.shape, ple.kernel()),
@@ -17143,11 +18959,6 @@ impl<'a> Builder<'a> {
 	/// the branch, before the residual add. Architectures without that tensor keep
 	/// the branch unchanged.
 	fn post(&mut self, layer: usize, part: &str, branch: Model, dimensions: &Dimensions) -> Result<Model> {
-		// Without a separate FFN norm, post_attention_norm is the FFN's
-		// pre-normalization after the attention residual, not inside that residual.
-		if part == "attn" && dimensions.hyper.is_none() && self.file.tensor(&format!("blk.{layer}.ffn_norm.weight")).is_none() {
-			return Ok(branch);
-		}
 		let suffix = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
 		let name = format!("blk.{layer}.{suffix}");
 		let Some(scale) = self.optional(&name) else { return Ok(branch) };
@@ -17159,10 +18970,17 @@ impl<'a> Builder<'a> {
 	/// one ungated lane, the plain residual, otherwise.
 	fn close(&self, model: Model, branch: Model, dimensions: &Dimensions) -> Model {
 		match dimensions.hyper {
-			Some((lanes, rank)) => model.hyper(lanes, rank, &branch),
-			None => model.push(Operation::Residual(branch.blocks.clone().into())),
+			Some((lanes, 0)) => model.hyper(lanes, &branch, 1.0 / lanes as f64),
+			Some((lanes, rank)) => model.hyper_gate(lanes, &branch, hyper_gate_model(lanes, rank, dimensions.width)),
+			None => model.push(Operation::Residual(branch.blocks.clone())),
 		}
 	}
+}
+fn hyper_gate_model(lanes: usize, rank: usize, width: usize) -> HyperGate {
+	let scale = 1.0 / lanes as f64;
+	let read = recipe.model().no(bias).norm(rms).layer(rank).scale(scale).silu().layer(lanes * width).sigmoid();
+	let write = recipe.model().no(bias).norm(rms).layer(lanes).scale(scale).sigmoid().scale(2.0);
+	HyperGate { read, write, mean: scale }
 }
 /// The GGUF a model file opens through `recipe.data`, whose metadata the
 /// identifiers below and `recipe.model()` read. One process describes one
@@ -17265,13 +19083,26 @@ impl ArchitectureKeys {
 			None => Vec::new(),
 			_ => panic!("attention.compress_ratios must be an array"),
 		};
+		let policy = architectures().unwrap_or_else(|error| panic!("{error}")).into_iter().find(|row| row.name == prefix);
+		let expert_count = count("expert_count");
+		let expert_gating_func = match file.value(&format!("{prefix}.expert_gating_func")) {
+			Some(value) => value.integer().and_then(|value| usize::try_from(value).ok()).expect("expert_gating_func is invalid"),
+			None if expert_count == 0 => policy.as_ref().and_then(|row| row.expert_scoring).map_or(0, |scoring| match scoring { Scoring::Softmax => 1, Scoring::Sigmoid => 2 }),
+			None => match policy.as_ref().and_then(|row| row.expert_scoring).expect("expert scoring is absent from GGUF and architecture profile") { Scoring::Softmax => 1, Scoring::Sigmoid => 2 },
+		};
+		let expert_weights_norm = match file.value(&format!("{prefix}.expert_weights_norm")) {
+			Some(GgufValue::Bool(value)) => *value,
+			Some(_) => panic!("expert_weights_norm must be a boolean"),
+			None if expert_count == 0 => policy.as_ref().and_then(|row| row.expert_renormalize).unwrap_or(false),
+			None => policy.as_ref().and_then(|row| row.expert_renormalize).expect("expert renormalization is absent from GGUF and architecture profile"),
+		};
 		Self {
-			expert_count: count("expert_count"),
+			expert_count,
 			expert_used_count: count("expert_used_count"),
 			expert_feed_forward_length: count("expert_feed_forward_length"),
 			expert_shared_feed_forward_length: count("expert_shared_feed_forward_length"),
-			expert_gating_func: file.value(&format!("{prefix}.expert_gating_func")).and_then(GgufValue::integer).unwrap_or(1) as usize,
-			expert_weights_norm: match file.value(&format!("{prefix}.expert_weights_norm")) { Some(GgufValue::Bool(value)) => *value, None => true, _ => panic!("expert_weights_norm must be a boolean") },
+			expert_gating_func,
+			expert_weights_norm,
 			full_attention_interval: count("full_attention_interval"),
 			hyper_connection: HyperKeys { count: count("hyper_connection.count"), low_rank: count("hyper_connection.low_rank") },
 			ssm: SsmKeys {
@@ -17328,7 +19159,7 @@ impl std::ops::Deref for Namespace {
 	}
 }
 macro_rules! namespaces { ($($name:ident)+) => { $(pub static $name: Namespace = Namespace { prefix: stringify!($name), keys: OnceLock::new() };)+ }; }
-namespaces! { gemma3 llama qwen2 qwen3 qwen35 qwen4exp phi3 deepseek2 glm4 granite }
+namespaces! { gemma3 gemma4 llama lfm2 qwen2 qwen3 qwen2moe qwen3moe qwen35 qwen3next qwen4exp phi3 deepseek2 glm4 granite }
 /// The `tokenizer.*` keys: `tokenizer.ggml.tokens` is the vocabulary, and the
 /// ids and the chat template sit beside it.
 pub struct TokenizerKeys {
@@ -17376,7 +19207,7 @@ impl std::ops::Deref for TokenizerNamespace {
 					pre: text("tokenizer.ggml.pre"),
 					bos_token_id: id("tokenizer.ggml.bos_token_id"),
 					eos_token_id: id("tokenizer.ggml.eos_token_id"),
-					add_bos_token: matches!(file.value("tokenizer.ggml.add_bos_token"), Some(GgufValue::Bool(true))),
+					add_bos_token: adds_bos_token(file),
 				},
 				chat_template: text("tokenizer.chat_template"),
 			}
@@ -17429,8 +19260,11 @@ pub struct Infer {
 	log: Vec<Metric>,
 	tokens: Option<usize>,
 	chat: Option<Vec<ChatMetric>>,
-	mtp: Option<PathBuf>,
 	positions: Option<Vec<u32>>,
+	mtp: Option<PathBuf>,
+	score: bool,
+	scored_ids: Option<Vec<u32>>,
+	prompt_ids: Option<Vec<u32>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -17444,6 +19278,9 @@ pub mod infer {
 	pub const cached: ChatMetric = ChatMetric(5);
 	pub const time: ChatMetric = ChatMetric(6);
 	pub const mtp: ChatMetric = ChatMetric(7);
+	pub const metadata: ChatMetric = ChatMetric(super::GGUF_METADATA);
+	pub const tensors: ChatMetric = ChatMetric(super::GGUF_TENSORS);
+	pub const ngram: ChatMetric = ChatMetric(super::GGUF_NGRAM);
 }
 pub trait IntoChatMetrics { fn into_chat_metrics(self) -> Vec<ChatMetric>; }
 impl IntoChatMetrics for ChatMetric {
@@ -17460,7 +19297,7 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None, mtp: None, positions: None }
+		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, mtp: None, score: false, scored_ids: None, prompt_ids: None }
 	}
 }
 impl Infer {
@@ -17478,9 +19315,10 @@ impl Infer {
 		let bound = explicit_bound(file, model, false)?;
 		let devices = selected_gpus()?;
 		let runtime = MtpRuntime::place(head, positions, devices)?;
-		let main = place_bound_observed(&bound, positions, split, devices, 5, tensor_observation_mask(&self.log))?;
+		let main = place_bound_mtp(&bound, positions, split, devices, tensor_observation_mask(&self.log))?;
 		Ok(MtpPlaced { main, runtime })
 	}
+
 	/// Keep the explicit Model+Data declaration resident for full forwards,
 	/// incremental decode, or serving through the same persistent stepper.
 	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
@@ -17493,6 +19331,26 @@ impl Infer {
 	}
 	/// Supplies each prompt token's rotary axes. Generated tokens continue after the largest preceding axis.
 	pub fn positions(mut self, positions: impl AsRef<[u32]>) -> Self { self.positions = Some(positions.as_ref().to_vec()); self }
+	/// Scores the input text in one teacher-forced pass and reports its token and
+	/// word log probabilities in `InferenceReport::score`, instead of generating a
+	/// reply. The text is tokenized as written, without the chat template.
+	pub fn score(mut self) -> Self {
+		self.score = true;
+		self
+	}
+	/// Scores the given token ids in place of text. The ids must be exactly what the tokenizer produces for their decoded text, so the words match the text's word boundaries.
+	pub fn score_ids(mut self, ids: impl AsRef<[u32]>) -> Self {
+		self.score = true;
+		self.scored_ids = Some(ids.as_ref().to_vec());
+		self
+	}
+	/// Generates from these prompt token ids in place of the chat prompt. The ids
+	/// reach the model exactly as given: no chat template renders, and no
+	/// beginning-of-sequence id is added or removed.
+	pub fn prompt_ids(mut self, ids: impl AsRef<[u32]>) -> Self {
+		self.prompt_ids = Some(ids.as_ref().to_vec());
+		self
+	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
@@ -17514,88 +19372,99 @@ impl Infer {
 		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPTED.store(false, Ordering::Release);
 		let load_started = Instant::now();
-		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
-		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
+		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| (infer::pp.0..=infer::time.0).contains(&metric.0)).collect::<Vec<_>>();
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
+		let gguf = GgufReport::collect(&file)?;
+		gguf.print(self.log.iter().map(|metric| metric.0).chain(self.chat.iter().flatten().map(|metric| metric.0)))?;
+		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let head = self.mtp.as_ref().map(|path| MtpHead::open(path, &file, model)).transpose()?;
-		let bound = explicit_bound(&file, model, head.is_none())?;
+		let bound = explicit_bound(&file, model, (!self.score) && head.is_none())?;
+		for note in bound.plan.defaulted() { eprintln!("bound as {note}"); }
+		for name in bound.plan.unread() { eprintln!("unread: {name}"); }
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
-		let native = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
-		let mut scaled = None;
-		visit_attention(&model.blocks, &mut |attention| {
-			let limit = attention.yarn.map_or(native, |(factor, context, _, _)| (f64::from_bits(factor) * context as f64) as usize);
-			scaled = Some(scaled.map_or(limit, |previous: usize| previous.min(limit)));
-		});
-		let ceiling = scaled.unwrap_or(native);
+		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
 		let requested = std::env::var("RECIPE_CONTEXT").ok().map(|value| value.parse::<usize>().map_err(|_| RecipeError::new("RECIPE_CONTEXT must be a positive integer"))).transpose()?;
 		if let Some(context) = requested { require(context > 0 && context <= ceiling, format!("requested context {context} is outside this model's 1..={ceiling} positions"))?; }
 		let coder = file.tokenizer();
 		let supplied = std::env::var("RNJ_PROMPT_FILE").ok().map(|path| fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read prompt file {path}: {error}")))).transpose()?;
 		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1));
-		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
+		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none() && self.prompt_ids.is_none();
+		if let Some(ids) = &self.prompt_ids {
+			require(!self.score, "prompt ids cannot be combined with a score")?;
+			require(!ids.is_empty(), "prompt ids are empty")?;
+			require(ids.iter().all(|id| (*id as usize) < coder.vocabulary()), "prompt ids exceed the tokenizer vocabulary")?;
+		}
 		require(!interactive || self.positions.is_none(), "explicit rotary positions require a supplied prompt")?;
 		let stop = stop_ids(&coder)?;
+		let scored = if self.score {
+			Some(match &self.scored_ids {
+				Some(ids) => token_groups(&coder, ids)?,
+				None => {
+					let text = supplied.as_deref().or(message.as_deref()).ok_or_else(|| RecipeError::new("scoring needs a text: pass -p <text> or set RNJ_PROMPT_FILE"))?;
+					coder.encode_words(text)
+				}
+			})
+		} else {
+			None
+		};
+		// A scored text needs only its own positions, so its output stays as small as the text.
+		let scored_positions = scored.as_ref().map_or(0, |groups| groups.iter().map(Vec::len).sum::<usize>());
 		let sequence = match requested {
 			Some(context) => context,
+			None if scored.is_some() => scored_positions,
 			None if devices.len() == 1 => fitting_context(&file, &bound.model, &bound.plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
 			None => ceiling,
 		};
-		let checkpoints = head.as_ref().map_or(0, |head| head.tokens + 1);
 		let mut mtp = head.map(|head| MtpRuntime::place(head, sequence, devices)).transpose()?;
-		let placed = place_bound_observed(&bound, sequence, &[], devices, checkpoints, tensor_observation_mask(&self.log))?;
+		let placed = if mtp.is_some() { place_bound_mtp(&bound, sequence, &[], devices, tensor_observation_mask(&self.log))? } else { place_bound_observed(&bound, sequence, &[], devices, tensor_observation_mask(&self.log))? };
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
 		let input = ChatInput::new(interactive)?;
-		let resident_memory = |mtp: Option<&MtpRuntime>| {
-			let mut memory = placed.memory();
-			if let Some(mtp) = mtp {
-				for head in mtp.placed.memory() {
-					if let Some(total) = memory.iter_mut().find(|part| part.device == head.device) {
-						total.input += head.input;
-						total.weights += head.weights;
-						total.values += head.values;
-						total.contexts += head.contexts;
-						total.scratch += head.scratch;
-						total.dead += head.dead;
-						total.dead_buffers += head.dead_buffers;
-					} else { memory.push(head); }
-				}
-			}
-			memory
-		};
-		let mut memory = resident_memory(mtp.as_ref());
+		let memory = placed.memory();
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history = Vec::new();
+		let mut score = None;
 		loop {
+			if let Some(groups) = &scored {
+				score = Some(score_groups(&placed, &coder, groups, sequence)?);
+				break;
+			}
 			let start_progress = |started| {
 				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
 			};
 			let progress;
 			let request_started;
-			let text = if interactive {
-				if INTERRUPTED.load(Ordering::Acquire) { break; }
-				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
-				let Some(line) = input.read()? else { break };
-				if line.trim() == "/exit" { break; }
-				if line.trim() == "/clear" { conversation.clear(); placed.clear(); if let Some(mtp) = &mut mtp { mtp.clear(); } continue; }
-				if line.trim().is_empty() { continue; }
+			let mut prompt = if let Some(ids) = &self.prompt_ids {
 				request_started = Instant::now();
 				progress = start_progress(request_started);
-				conversation.push(("user".to_owned(), line.trim_end().to_owned()));
-				coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
+				ids.clone()
 			} else {
-				request_started = Instant::now();
-				progress = start_progress(request_started);
-				match &supplied {
-					Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
-					Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
-					None => coder.prompt(&[("user", message.as_deref().unwrap_or("What is the capital of France?"))], true)?,
-				}
+				let text = if interactive {
+					if INTERRUPTED.load(Ordering::Acquire) { break; }
+					if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
+					let Some(line) = input.read()? else { break };
+					if line.trim() == "/exit" { break; }
+					if line.trim() == "/clear" { conversation.clear(); placed.clear(); if let Some(mtp) = &mut mtp { mtp.clear(); } continue; }
+					if line.trim().is_empty() { continue; }
+					request_started = Instant::now();
+					progress = start_progress(request_started);
+					conversation.push(("user".to_owned(), line.trim_end().to_owned()));
+					coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
+				} else {
+					request_started = Instant::now();
+					progress = start_progress(request_started);
+					match &supplied {
+						Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
+						Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
+						None => coder.prompt(&[("user", message.as_deref().unwrap_or("What is the capital of France?"))], true)?,
+					}
+				};
+				let mut prompt = coder.encode(&text);
+				if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
+				prompt
 			};
-			let mut prompt = coder.encode(&text);
-			if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
 			if let Some(progress) = &progress { progress.prompt(prompt.len()); }
 			if prompt.len() >= sequence && interactive {
 				conversation.pop();
@@ -17633,54 +19502,74 @@ impl Infer {
 				Some(mtp) => mtp.decode(&placed, &prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit)?,
 				None => placed.decode_observed(&prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit)?,
 			};
+
 			let seconds = progress.as_ref().map_or_else(|| request_started.elapsed().as_secs_f64(), InferenceLive::finish);
-			memory = resident_memory(mtp.as_ref());
 			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
 			drop(progress);
 			let reply = coder.decode(&ids);
-			let mut operations = placed.take_operations("main");
-			if let Some(mtp) = &mtp { operations.extend(mtp.placed.take_operations("mtp")); }
 			let tensors = placed.take_tensors()?;
 			print_tensor_observations(&tensors)?;
 			request_history.push(Arc::new(InferenceRequest {
 				time: DurationReport(seconds),
 				input: prompt.len(), out: ids.len(), cached: generation.cached, reply_limit: budget,
 				input_ids: prompt, output_ids: ids, logits: generation.logits, prediction: reply.clone(),
-				pp_seconds: generation.prefill_seconds, tg_seconds: generation.generation_seconds, tensors,
-				mtp: generation.mtp,
-				reference: generation.reference,
-				operations,
+				pp_seconds: generation.prefill_seconds, tg_seconds: generation.generation_seconds, tensors, mtp: generation.mtp,
 			}));
 			if !interactive { break; }
 			conversation.push(("assistant".to_owned(), reply));
 		}
-		let placement_report = |collect: fn(&Placed) -> Result<ReportLines>| -> Result<ReportLines> {
-			let mut lines = collect(&placed)?.0;
-			if let Some(mtp) = &mtp {
-				for line in &mut lines { line.push_str(" model main"); }
-				lines.extend(collect(&mtp.placed)?.0.into_iter().map(|line| format!("{line} model mtp")));
-			}
-			Ok(ReportLines::new(lines))
-		};
 		Ok(InferenceReport {
+			gguf,
 			llvm: placed.llvm_report(),
 			path: data.report_path()?,
-			formats: placement_report(Placed::format_report)?,
-			memory: placement_report(Placed::memory_report)?,
+			formats: placed.format_report()?,
+			memory: placed.memory_report()?,
 			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
 			dead_bytes: memory.iter().map(|memory| memory.dead).sum(),
-			links: placement_report(Placed::link_report)?,
-			aot: placement_report(Placed::aot_report)?,
-			tiles: placement_report(Placed::tile_report)?,
-			grids: placement_report(Placed::grid_report)?,
+			defaulted: ReportLines::new(bound.plan.defaulted().iter().cloned()),
+			unread: ReportLines::new(bound.plan.unread().iter().cloned()),
+			links: placed.link_report()?,
+			aot: placed.aot_report()?,
+			tiles: placed.tile_report()?,
+			grids: placed.grid_report()?,
 			load: DurationReport(load_seconds),
-			compile: DurationReport(placed.compile_seconds() + mtp.as_ref().map_or(0.0, |mtp| mtp.placed.compile_seconds())),
+			compile: DurationReport(placed.compile_seconds()),
+			timings: placed.timings(),
+			residency: placed.residency(),
 			context: sequence,
 			requests: request_history.len(),
 			last: request_history.last().cloned().unwrap_or_default(),
 			history: request_history,
+			score,
 		})
 	}
+}
+/// The `add_bos` default when `tokenizer.ggml.add_bos_token` is absent. Among
+/// Recipe's BPE vocabularies, only the Llama 3 pre-tokenizer names prepend the
+/// beginning-of-sequence id by default, as llama.cpp does.
+fn adds_bos_token(file: &Gguf) -> bool {
+	match file.value("tokenizer.ggml.add_bos_token") {
+		Some(GgufValue::Bool(value)) => *value,
+		_ => matches!(file.value("tokenizer.ggml.pre").and_then(GgufValue::text), Some("llama3" | "llama-v3" | "llama-bpe")),
+	}
+}
+/// The word groups of `ids`: the tokenizer must reproduce the ids from their
+/// decoded text, with or without the leading beginning-of-sequence id.
+fn token_groups(coder: &Tokenizer, ids: &[u32]) -> Result<Vec<Vec<u32>>> {
+	let groups = coder.encode_words(&coder.decode(ids));
+	let encoded = groups.concat();
+	let reproduced = encoded == ids || coder.bos().is_some_and(|bos| ids.first() == Some(&bos) && encoded.get(1..) == Some(ids) && encoded.first() == Some(&bos));
+	require(reproduced, "token ids do not round-trip through the tokenizer; pass the text instead")?;
+	Ok(if encoded == ids { groups } else { groups.into_iter().skip(1).collect() })
+}
+/// Runs `groups` once with no generation and scores every id after the first
+/// from the logits of the position before it.
+fn score_groups(placed: &Placed, coder: &Tokenizer, groups: &[Vec<u32>], sequence: usize) -> Result<TextScore> {
+	let ids = groups.concat();
+	require(ids.len() <= sequence, format!("{} scored tokens exceed the {sequence} context positions", ids.len()))?;
+	let generation = placed.decode_observed(&ids, &mut recipe.sampler().temperature(0.0), &[], 0, None, |_| Ok(()))?;
+	let output = placed.output_shape()?;
+	TextScore::from_logits(&generation.logits, output.channels, output.length, groups, |ids| coder.decode(ids))
 }
 /// The ids a reply ends with: the end-of-sequence id, and the token the chat
 /// template closes an assistant turn with.
@@ -17773,38 +19662,25 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// `post_ffw_norm`, then `output_norm` and `output`, the last tied to the
 /// embedding when the file has none. The walk follows the order the lowering
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
-fn visit_attention(blocks: &[Block], visit: &mut impl FnMut(&AttentionBlock)) {
-	for block in blocks {
-		match &block.operation {
-			Operation::Attention(attention) => visit(attention),
-			Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Hyper(_, _, parts) | Operation::Recur(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => visit_attention(parts, visit),
-			Operation::Product(left, right) | Operation::Sum(left, right) => { visit_attention(&left.blocks, visit); visit_attention(&right.blocks, visit); }
-			_ => {}
-		}
-	}
-}
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
-	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
+	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, plan: Binding::default() };
 	builder.plan_model(model)?;
-	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+	builder.plan.mark_unread(file);
 	Ok(builder.plan)
 }
 /// Resolve optional source planes inside the model builder. The user declares
 /// each branch's operation and dimensions; the file determines its trained
-/// gates and normalization scales.
-fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, width: usize, plain: bool) {
+/// normalization scales and rotary factors.
+fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, plain: bool) {
 	let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	for block in parts.iter_mut() {
 		if let Operation::Attention(attention) = &mut block.operation {
-			let head = if attention.width == 0 { width.div_ceil(attention.heads.max(1)) } else { attention.width };
-			if file.tensor(&name("attn_q.weight")).and_then(|tensor| tensor.shape.get(1)).is_some_and(|rows| *rows as usize == 2 * attention.heads * head) {
-				attention.gate = true;
-			}
 			if block.qk.is_none() && (file.tensor(&name("attn_q_norm.weight")).is_some() || file.tensor(&name("attn_k_norm.weight")).is_some()) { block.qk = Some(BlockNormalization::Rms); }
-			attention.factors |= attention.rope.is_some() && attention.window == 0 && file.tensor("rope_freqs.weight").is_some();
+			attention.factors |= attention.rope.is_some() && (file.tensor("rope_factors_short.weight").is_some() || (attention.window == 0 && file.tensor("rope_freqs.weight").is_some()));
+			attention.attn_factor = rope_attn_factor(file, architecture);
 			if let Some(index) = &mut attention.index {
 				if index.score.is_none() && (file.tensor(&name("indexer.q_norm.weight")).is_some() || file.tensor(&name("indexer.k_norm.weight")).is_some()) {
 					index.score = Some((BlockNormalization::Rms, attention.rope.map_or(0, |(_, dims, _)| dims)));
@@ -17826,8 +19702,8 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 		}
 	}
 }
-/// A branch that mixes positions starts a GGUF block; its feed-forward reads
-/// the tensors at the same block index.
+/// A branch that mixes positions is the attention of a GGUF block; its
+/// feed-forward is the block's other branch, in either order.
 fn mixes(parts: &[Block]) -> bool {
 	parts.iter().any(|part| match &part.operation {
 		Operation::Attention(_) | Operation::Delta(_) | Operation::Dconv(..) => true,
@@ -17842,10 +19718,12 @@ impl Builder<'_> {
 		let embedding = self.tensor("token_embd.weight", "the embedding")?;
 		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-		let (mut layers, mut lanes, mut rank) = (0, 0, 0);
+		let (mut lanes, mut rank) = (0, 0);
+		let (mut mixers, mut feeds) = (0, 0);
+		let mut head_spelled = None;
 		for block in &model.blocks {
 			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-				self.head_planes(lanes, rank, width)?;
+				self.head_planes(lanes, rank, width, head_spelled.as_ref())?;
 				lanes = 0;
 			}
 			match &block.operation {
@@ -17855,56 +19733,64 @@ impl Builder<'_> {
 				}
 				Operation::Ple(formula) => {
 					let table = Ngram::new(self.file)?;
-					require(**formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
-					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
+				let mut expected = table.block();
+				expected.math = formula.math;
+				require(*formula == expected, "per-layer embedding definition differs from the GGUF table metadata")?;
+					self.ple_planes(table.layer(), &table, width, lanes.max(1), block.ple_tensors.as_ref())?;
 				}
-				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
+				Operation::Residual(parts) | Operation::Hyper(_, _, parts, _, _) => {
+					// A block holds one mixing and one feed-forward branch in either order, so each kind numbers its own blocks.
 					let attends = mixes(parts);
-					if attends { layers += 1; }
-					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
-					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
-					if let Operation::Hyper(count, bottleneck, _) = block.operation {
+					let (part, layer) = if attends { mixers += 1; ("attn", mixers - 1) } else { feeds += 1; ("ffn", feeds - 1) };
+					if let Operation::Hyper(count, bottleneck, _, _, _) = block.operation {
 						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
 						(lanes, rank) = (count, bottleneck);
-						self.mixer_planes(layer, part, lanes, rank, width)?;
+						if block.hyper_head.is_some() { head_spelled = block.hyper_head.clone(); }
+						self.mixer_planes(layer, part, lanes, rank, width, block.hyper_tensors.as_ref())?;
 					}
 					self.plan_branch(parts, layer, part, width)?;
 				}
 				Operation::Layer(outputs) => {
 					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
 					require(!block.has_normalization(), "a normalization after the vocabulary projection has no tensor name")?;
-					let output = self.optional("output.weight").unwrap_or_else(|| embedding.clone());
-					require(output.shape == [width as u64, vocabulary as u64], format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
+					let output = if self.file.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+					let output = self.projection(output, "the vocabulary projection", width, vocabulary)?;
 					self.mapped(vec![output]);
 				}
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
-				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
+			for (index, _) in block.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
+				let name = match block.scale_tensors.get(index) {
+					Some(spelled) => spelled.as_str(),
+					None if self.file.tensor("output_norm.weight").is_some() => "output_norm.weight",
+					None => "token_embd_norm.weight",
+				};
 				self.norm_scale(name, width)?;
 			}
 		}
-		if lanes != 0 { self.head_planes(lanes, rank, width)?; }
+		if lanes != 0 { self.head_planes(lanes, rank, width, head_spelled.as_ref())?; }
 		Ok(())
 	}
-	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize) -> Result<()> {
+	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize, spelled: Option<&HyperTensors>) -> Result<()> {
 		if rank == 0 { return Ok(()); }
 		let role = format!("block {layer} {part} mixer");
-		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		let named = spelled.cloned().unwrap_or_else(|| HyperTensors::mixer(layer, part));
+		let inject = named.inject.as_deref().ok_or_else(|| RecipeError::new(format!("{role} names no write projection")))?;
 		let stream = checked_mul(lanes, width, "hyper-connection stream")?;
-		self.norm_scale(&name("norm"), stream)?;
-		for (suffix, inputs, outputs) in [("down", stream, rank), ("up", rank, stream), ("inject", stream, lanes)] {
-			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
+		self.norm_scale(&named.norm, stream)?;
+		for (tensor_name, inputs, outputs) in [(named.down.as_str(), stream, rank), (named.up.as_str(), rank, stream), (inject, stream, lanes)] {
+			let tensor = self.projection(tensor_name, &role, inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
 		Ok(())
 	}
-	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize) -> Result<()> {
+	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize, spelled: Option<&HyperTensors>) -> Result<()> {
 		if rank == 0 { return Ok(()); }
+		let named = spelled.cloned().unwrap_or_else(HyperTensors::head);
 		let stream = checked_mul(lanes, width, "head mixer stream")?;
-		self.norm_scale("output_hc_norm.weight", stream)?;
-		for (name, inputs, outputs) in [("output_hc_down.weight", stream, rank), ("output_hc_up.weight", rank, stream)] {
+		self.norm_scale(&named.norm, stream)?;
+		for (name, inputs, outputs) in [(named.down.as_str(), stream, rank), (named.up.as_str(), rank, stream)] {
 			let tensor = self.projection(name, "the head mixer", inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
@@ -17918,45 +19804,79 @@ impl Builder<'_> {
 			match &step.operation {
 				Operation::Identity => {}
 				Operation::Attention(attention) => {
-					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
+					self.attention_planes(layer, attention, step.qk.is_some(), width, step.attention_tensors.as_ref())?;
+					if !attention.project {
+						hidden = attention.heads * if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
+					}
 					weighted = true;
 				}
 				Operation::Delta(delta) => {
-					self.delta_planes(layer, delta, width)?;
+					self.delta_planes(layer, delta, width, step.delta_tensors.as_ref())?;
 					weighted = true;
 				}
-				Operation::Moe(count, _, hidden_width, _, _, _, shared) => {
-					self.expert_planes(layer, *count, *hidden_width, *shared, width)?;
+				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
+					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width, step.moe_tensors.as_ref())?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
-					// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
-					let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.has_scalar_map());
-					let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
-					for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
-						let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
-						require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
-						hidden = widths[0];
-						let tensor = self.projection(&name(suffix), &role, width, hidden)?;
-						self.mapped(vec![tensor]);
+					if part == "attn" {
+						require(left.blocks.len() == 1 && right.blocks.len() == 1, "an attention product needs one block in each branch")?;
+						let attention_left = matches!(&left.blocks[0].operation, Operation::Attention(attention) if !attention.project);
+						let (attention_branch, gate_branch) = if attention_left { (left, right) } else { (right, left) };
+						let attention = match &attention_branch.blocks[0].operation {
+							Operation::Attention(attention) if !attention.project => attention,
+							_ => return Err(RecipeError::new("an attention product needs attn_heads in one branch")),
+						};
+						let head = if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
+						hidden = attention.heads * head;
+						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden), "an attention product's gate is a layer over its head plane")?;
+						let normalized = attention_branch.blocks[0].qk.is_some();
+						let spelled = attention_branch.blocks[0].attention_tensors.as_ref();
+						let gate_biased = gate_branch.exclusions & bias.mask() == 0;
+						if attention_left {
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
+						} else {
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
+						}
+						weighted = true;
+					} else {
+						// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
+						let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.has_scalar_map());
+						let mut branch_widths = Vec::new();
+						for branch in [left, right] {
+							let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
+							require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
+							branch_widths.push(widths[0]);
+						}
+						require(branch_widths[0] == branch_widths[1], format!("block {layer} feed-forward product branches differ in width"))?;
+						hidden = branch_widths[0];
+						let [gate, up] = self.gate_and_up(layer, &role, width, hidden)?;
+						let pair = if activated(right) && !activated(left) { [up, gate] } else { [gate, up] };
+						for tensor in pair { self.mapped(vec![tensor]); }
+						weighted = true;
 					}
-					weighted = true;
 				}
 				Operation::Glu(inner, _) => {
-					for (suffix, inputs, outputs) in [("ffn_gate.weight", width, *inner), ("ffn_up.weight", width, *inner), ("ffn_down.weight", *inner, width)] {
-						let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
-						self.mapped(vec![tensor]);
-					}
+					for tensor in self.gate_and_up(layer, &role, width, *inner)? { self.mapped(vec![tensor]); }
+					let down = self.projection(&name("ffn_down.weight"), &role, *inner, width)?;
+					self.mapped(vec![down]);
 					weighted = true;
 				}
 				Operation::Layer(outputs) => {
-					require(part == "ffn" && hidden != 0 && *outputs == width, format!("layer({outputs}) in block {layer} follows no feed-forward product, so no tensor name is its convention"))?;
-					let tensor = self.projection(&name("ffn_down.weight"), &role, hidden, width)?;
+					require(hidden != 0 && *outputs == width, format!("layer({outputs}) in block {layer} follows no matching product, so no output tensor name is its convention"))?;
+					let output_name = if part == "attn" { "attn_output.weight" } else { "ffn_down.weight" };
+					let tensor = self.projection(&name(output_name), &role, hidden, width)?;
 					self.mapped(vec![tensor]);
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for _ in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+			for (index, _) in step.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
+				if let Some(spelled) = step.scale_tensors.get(index) {
+					self.norm_scale(spelled, width)?;
+					continue;
+				}
 				let suffix = match (part, weighted) {
 					("attn", false) => "attn_norm.weight",
 					("attn", true) => "post_attention_norm.weight",
@@ -17972,90 +19892,153 @@ impl Builder<'_> {
 
 	/// Bind the same side projection and deferred key scales for architecture
 	/// models and script-defined resident attention.
-	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer, named: &IndexerTensors) -> Result<()> {
 		let role = format!("block {layer} indexer");
-		let query = self.projection(&name("q_proj.weight"), &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
-		let key = self.projection(&name("k_proj.weight"), &role, width, index.width)?;
+		let query = self.projection(&named.q_proj, &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
+		let key = self.projection(&named.k_proj, &role, width, index.width)?;
 		let dims = index.score.map_or(0, |(_, dims)| dims);
 		let order = self.head_order(index.width, dims);
 		let mut planes = Vec::new();
 		for head in 0..index.heads {
-			planes.extend(Self::head_rows(&query, head * index.width, &order)?);
+			planes.extend(Self::head_rows(&query, head * index.width, &order, width)?);
 		}
-		planes.extend(Self::head_rows(&key, 0, &order)?);
+		planes.extend(Self::head_rows(&key, 0, &order, width)?);
 		self.mapped(planes);
 		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
-			let mut scales = self.scale(&name("q_norm.weight"), &role, index.width, index.heads, &order)?;
-			scales.extend(self.scale(&name("k_norm.weight"), &role, index.width, 1, &order)?);
+			let mut scales = self.scale(&named.q_norm, &role, index.width, index.heads, &order)?;
+			scales.extend(self.scale(&named.k_norm, &role, index.width, 1, &order)?);
 			self.slot(scales);
 		}
 		Ok(())
 	}
 	/// One normalization scale of `width` values.
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
-		let tensor = self.tensor(name, "a normalization")?;
-		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;
-		self.mapped(vec![tensor]);
+		let plane = match self.optional(name).filter(|tensor| tensor.elements() == width) {
+			Some(tensor) => Plane::Mapped(tensor),
+			None => {
+				self.default_note(name, "ones", &format!("{width} elements"));
+				Plane::Owned { name: format!("{name} unbound"), values: vec![1.0; width] }
+			}
+		};
+		self.slot(vec![plane]);
 		Ok(())
 	}
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and its
 	/// output projection, as `attention` lays them out for a built one.
-	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize) -> Result<()> {
+	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
+		let fused = spelled.is_none() && self.file.tensor(&named.q).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
+		let query = self.tensor(&if fused { name("attn_qkv.weight") } else { named.q.clone() }, &role)?;
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
-		let gated = match query.shape[1] as usize {
-			outputs if outputs == heads * head => false,
-			outputs if outputs == 2 * heads * head => true,
-			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
+		// A fused tensor stores the query, key and value heads as consecutive rows.
+		let (gated, key_base) = if fused {
+			require(query.shape[1] as usize == (heads + 2 * kv) * head, format!("{} projects {} outputs; {role} splits them into {heads} query and {kv} key and value heads of {head}", query.name, query.shape[1]))?;
+			(false, heads * head)
+		} else {
+			let gated = match query.shape[1] as usize {
+				outputs if outputs == heads * head => false,
+				outputs if outputs == 2 * heads * head => true,
+				outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
+			};
+			(gated, 0)
 		};
-		require(gated == attention.gate, format!("{} {} an output gate, and the attention block {}", query.name, if gated { "holds" } else { "holds no" }, if attention.gate { "declares one" } else { "declares none" }))?;
-		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = match self.optional(&name("attn_v.weight")) {
-			Some(value) => {
-				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
-				value
+		let key = if fused { Plane::Mapped(query.clone()) } else { self.projection(&named.k, &role, width, kv * head)? };
+		let value = if fused {
+			Plane::Mapped(query.rows(key_base + kv * head, kv * head)?.view()?)
+		} else {
+			match named.v.as_deref() {
+				Some(value_name) if self.file.tensor(value_name).is_some() => self.projection(value_name, &role, width, kv * head)?,
+				_ => key.clone(),
 			}
-			None => key.clone(),
 		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+			planes.extend(Self::head_rows(&Plane::Mapped(query.clone()), index * stride, &order, width)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
+			planes.extend(Self::head_rows(&key, key_base + index * head, &order, width)?);
 		}
 		planes.push(value);
-		if gated {
+		let mut slot = planes;
+		let (query_bias, key_bias, value_bias) = (named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.k_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.v_bias.as_deref().and_then(|bias_name| self.optional(bias_name)));
+		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
+			// The bias row follows the matrix rows, in the order the planes read them.
+			let query_values = Self::bias_values(self.file, query_bias, query.shape[1] as usize, &role)?;
+			let key_values = Self::bias_values(self.file, key_bias, kv * head, &role)?;
+			let value_values = Self::bias_values(self.file, value_bias, kv * head, &role)?;
+			let mut row = Vec::with_capacity(query_values.len() + 2 * kv * head);
 			for index in 0..heads {
-				planes.push(query.rows(index * stride + head, head)?);
+				row.extend(order.iter().map(|channel| query_values[index * stride + channel]));
 			}
+			for index in 0..kv {
+				row.extend(order.iter().map(|channel| key_values[index * head + channel]));
+			}
+			row.extend(value_values);
+			slot.push(Plane::Owned { name: format!("{} (bias row)", named.q), values: row });
 		}
-		self.mapped(planes);
+		self.slot(slot);
 		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			let (q_norm, k_norm) = named.q_norm.as_deref().zip(named.k_norm.as_deref()).ok_or_else(|| RecipeError::new(format!("{role} normalizes its queries and keys, and names no scale tensors for them")))?;
+			let mut scales = self.scale(q_norm, &role, head, heads, &order)?;
+			scales.extend(self.scale(k_norm, &role, head, kv, &order)?);
 			self.slot(scales);
 		}
 		if attention.factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
-			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
-			self.mapped(vec![factors]);
+			let factors_name = named.factors.as_deref().unwrap_or("rope_freqs.weight");
+			if self.file.tensor(factors_name).is_none() && self.file.tensor("rope_factors_short.weight").is_some() {
+				let original = self.integer_or("rope.scaling.original_context_length", self.integer_or("context_length", 0)?)?;
+				require(original != 0, format!("{role} selects short or long rotary factors by context, but the file names no context length"))?;
+				let (short, long) = (self.tensor("rope_factors_short.weight", &role)?, self.tensor("rope_factors_long.weight", &role)?);
+				let fits = |tensor: &GgufTensor| attention.rope.is_some() && tensor.elements() == rope_dims / 2;
+				require(fits(&short) && fits(&long), format!("{} holds {} values; {role} rotates {} channel pairs", short.name, short.elements(), rope_dims / 2))?;
+				let group = self.plan.nodes.len();
+				self.slot(vec![Plane::Mapped(short)]);
+				self.plan.rope_long.push((group, long, original));
+			} else {
+				let factors = match self.optional(factors_name).filter(|tensor| tensor.elements() == rope_dims / 2) {
+					Some(factors) => Plane::Mapped(factors),
+					None => {
+						self.default_note(factors_name, "ones", &format!("{} elements", rope_dims / 2));
+						Plane::Owned { name: format!("rope factors unbound in {role}"), values: vec![1.0; rope_dims / 2] }
+					}
+				};
+				self.slot(vec![factors]);
+			}
 		}
 		if let Some(index) = attention.index {
-			self.indexer_planes(layer, width, index)?;
+			let indexer = named.indexer.clone().ok_or_else(|| RecipeError::new(format!("{role} indexes tokens, and names no indexer tensors")))?;
+			self.indexer_planes(layer, width, index, &indexer)?;
 		}
-		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
-		self.mapped(vec![output]);
+		if attention.project {
+			let output = self.projection(&named.out, &role, heads * head, width)?;
+			self.mapped(vec![output]);
+		}
+		Ok(())
+	}
+	/// The gate layer's rows, and its bias row when the layer takes a bias and the file holds `attn_q.bias`.
+	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
+		let name = named.q.clone();
+		let query = self.tensor(&name, "the attention gate")?;
+		require(query.shape.len() == 2 && query.shape[1] as usize == 2 * heads * head, format!("{name} has no separate gate rows"))?;
+		let mut rows = Vec::with_capacity(heads);
+		for index in 0..heads { rows.push(query.rows(index * 2 * head + head, head)?.view()?); }
+		let mut planes = rows.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		if biased && let Some(tensor) = named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
+			let values = Self::bias_values(self.file, Some(tensor), 2 * heads * head, "the attention gate")?;
+			let row = (0..heads).flat_map(|index| values[index * 2 * head + head..(index + 1) * 2 * head].iter().copied()).collect();
+			planes.push(Plane::Owned { name: format!("blk.{layer}.attn_gate.bias"), values: row });
+		}
+		self.slot(planes);
 		Ok(())
 	}
 }
@@ -18220,7 +20203,80 @@ fn print_tensor_observations(tensors: &[TensorObservation]) -> Result<()> {
 	}
 	Ok(())
 }
+/// GGUF contents observed by an inference run. Values retain their declared
+/// types; live selections summarize large arrays and cap the displayed rows.
+#[derive(Clone, Debug)]
+pub struct GgufReport {
+	pub metadata: Vec<(String, GgufValue)>,
+	pub tensors: Vec<GgufTensor>,
+	pub ngram: Option<NgramReport>,
+}
+/// The parsed table layout, without gathering or decoding embedding values.
+#[derive(Clone, Debug)]
+pub struct NgramReport {
+	pub table: GgufTensor,
+	pub ngram_size: usize,
+	pub heads_per_ngram: usize,
+	pub layer: usize,
+	pub kernel: usize,
+	pub head_offsets: Vec<u64>,
+	pub head_vocab_sizes: Vec<u64>,
+}
+impl GgufReport {
+	fn collect(file: &Gguf) -> Result<Self> {
+		Ok(Self { metadata: file.metadata().to_vec(), tensors: file.tensors().to_vec(), ngram: Ngram::report(file)? })
+	}
+	fn print(&self, metrics: impl IntoIterator<Item = u8>) -> Result<()> {
+		const ROWS: usize = 32;
+		const CHARS: usize = 160;
+		let selected = metrics.into_iter().collect::<Vec<_>>();
+		if !selected.iter().any(|metric| matches!(*metric, GGUF_METADATA | GGUF_TENSORS | GGUF_NGRAM)) { return Ok(()); }
+		let text = |value: &str| {
+			let mut chars = value.chars().flat_map(char::escape_debug);
+			let mut text = chars.by_ref().take(CHARS).collect::<String>();
+			if chars.next().is_some() { text.push_str("..."); }
+			text
+		};
+		let printed = (|| -> std::io::Result<()> {
+			let mut output = std::io::stdout().lock();
+			if selected.contains(&GGUF_METADATA) {
+				writeln!(output, "gguf metadata {} entries, {} shown", self.metadata.len(), self.metadata.len().min(ROWS))?;
+				for (key, value) in self.metadata.iter().take(ROWS) {
+					let value = match value {
+						GgufValue::String(value) => format!("\"{}\"", text(value)),
+						GgufValue::Array(values) => format!("array[{}]", values.len()),
+						value => format!("{value:?}"),
+					};
+					writeln!(output, "{} {}", text(key), value)?;
+				}
+			}
+			if selected.contains(&GGUF_TENSORS) {
+				writeln!(output, "gguf tensors {} entries, {} shown", self.tensors.len(), self.tensors.len().min(ROWS))?;
+				for tensor in self.tensors.iter().take(ROWS) {
+					writeln!(output, "{} shape {:?} kind {} bytes {}", text(&tensor.name), &tensor.shape[..tensor.shape.len().min(8)], tensor.kind, tensor.bytes)?;
+				}
+			}
+			if selected.contains(&GGUF_NGRAM) {
+				match &self.ngram {
+					Some(table) => {
+						writeln!(output, "gguf ngram {} shape {:?} kind {} size {} heads-per-ngram {} layer {} kernel {}", text(&table.table.name), table.table.shape, table.table.kind,
+							table.ngram_size, table.heads_per_ngram, table.layer, table.kernel)?;
+						writeln!(output, "head offsets {:?} vocab sizes {:?} of {} heads", &table.head_offsets[..table.head_offsets.len().min(8)],
+							&table.head_vocab_sizes[..table.head_vocab_sizes.len().min(8)], table.head_offsets.len())?;
+					}
+					None => writeln!(output, "gguf ngram absent")?,
+				}
+			}
+			output.flush()?;
+			Ok(())
+		})();
+		printed.map_err(|error| RecipeError::new(format!("cannot print GGUF observations: {error}")))
+	}
+}
+
 pub struct InferenceReport {
+	/// File observations from this run, distinct from captured execution buffers.
+	pub gguf: GgufReport,
 	pub llvm: LlvmReport,
 	pub path: String,
 	pub formats: ReportLines,
@@ -18229,56 +20285,63 @@ pub struct InferenceReport {
 	pub dead_buffers: usize,
 	/// Dead storage bytes already included in the reported memory allocations.
 	pub dead_bytes: usize,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`; empty for a model the file describes.
+	pub defaulted: ReportLines,
+	/// Tensors of the file that no node reads; empty for a model the file describes.
+	pub unread: ReportLines,
 	pub links: ReportLines,
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
 	pub grids: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
+	/// Predicted and measured time per node, summed over the run's forward windows.
+	pub timings: Vec<NodeTiming>,
+	/// Each tape's weight buffer: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
+	pub residency: Vec<WeightResidency>,
 	pub context: usize,
 	pub requests: usize,
 	/// Completed requests in execution order, retained across `/clear`.
 	pub history: Vec<Arc<InferenceRequest>>,
+	/// Teacher-forced log probabilities of the scored text, set by `Infer::score`.
+	pub score: Option<TextScore>,
 	last: Arc<InferenceRequest>,
+}
+/// A node whose measured time exceeds its prediction by more than the margin.
+#[derive(Clone, Debug)]
+pub struct NodeGap {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub op: &'static str,
+	pub predicted_seconds: f64,
+	pub measured_seconds: f64,
+	/// Measured time divided by predicted time.
+	pub ratio: f64,
+}
+impl InferenceReport {
+	/// The nodes whose measured time is more than `margin` times their predicted
+	/// time, largest ratio first. `margin` is a ratio, so 2.0 selects nodes that
+	/// ran more than twice as long as predicted. Nodes without a prediction are omitted.
+	pub fn gaps(&self, margin: f64) -> Vec<NodeGap> {
+		let mut gaps = self.timings.iter().filter_map(|timing| {
+			let predicted = timing.predicted_seconds?;
+			let ratio = if predicted > 0.0 { timing.measured_seconds / predicted } else if timing.measured_seconds > 0.0 { f64::INFINITY } else { 0.0 };
+			(ratio > margin).then(|| NodeGap { device: timing.device.clone(), node: timing.node, block: timing.block, kind: timing.kind, op: timing.op, predicted_seconds: predicted, measured_seconds: timing.measured_seconds, ratio })
+		}).collect::<Vec<_>>();
+		gaps.sort_by(|left, right| right.ratio.total_cmp(&left.ratio));
+		gaps
+	}
 }
 impl std::ops::Deref for InferenceReport {
 	type Target = InferenceRequest;
 	fn deref(&self) -> &Self::Target { &self.last }
 }
 /// Observations from one request. The flat report fields refer to its last request.
-#[derive(Clone, Debug)]
-pub struct OperationReport {
-	pub device: String,
-	pub model: String,
-	pub block: usize,
-	pub node: usize,
-	pub operation: String,
-	pub begin: u32,
-	pub end: u32,
-	pub positions: usize,
-	/// Device clock ticks accumulated inside the executed operation.
-	pub ticks: u64,
-	/// GPU clocks use nanoseconds. CPU cycle counters have no fixed duration.
-	pub seconds: Option<f64>,
-	/// Logical position and output-bit fingerprint from a reference run.
-	/// These cover the final bounded window and position-preserving outputs,
-	/// including a final length-one output. Other outputs have no fingerprints.
-	pub fingerprints: Vec<(u32, u64)>,
-	/// Stored K/V bit fingerprints after an attention operation in a reference run.
-	/// These cover up to one bounded window ending at `end`, including retained
-	/// positions before `begin`. Hashing runs inside the existing invocation.
-	pub cache_fingerprints: Vec<(u32, u64)>,
-	/// K/V channel and stored-bit fingerprint over the same retained window.
-	/// Device-side hashes distinguish channel-local changes without copying KV tensors.
-	pub cache_channel_fingerprints: Vec<(u32, u64)>,
-}
-/// Observations from one request. The flat report fields refer to its last request.
 #[derive(Default)]
 pub struct InferenceRequest {
-	pub operations: Vec<OperationReport>,
 	pub mtp: MtpReport,
-	/// Per-step reference comparison, or recording counts when writing a reference.
-	pub reference: ReferenceReport,
 	/// Elapsed request time, from submission through the end of generation.
 	pub time: DurationReport,
 	pub reply_limit: usize,
@@ -18296,6 +20359,75 @@ pub struct InferenceRequest {
 impl InferenceRequest {
 	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.input.saturating_sub(self.cached) as f64 / self.pp_seconds } }
 	pub fn tg(&self) -> f64 { if self.tg_seconds == 0.0 { 0.0 } else { self.out as f64 / self.tg_seconds } }
+}
+/// Teacher-forced log probabilities of one text, from `InferenceReport::score`.
+pub struct TextScore {
+	/// One entry per token after the first, in text order.
+	pub tokens: Vec<TokenScore>,
+	/// One entry per word that holds a scored token, in text order.
+	pub words: Vec<WordScore>,
+	/// Sum of the scored tokens' log probabilities.
+	pub logprob: f64,
+	/// `exp` of the negative mean of the scored tokens' log probabilities.
+	pub perplexity: f64,
+}
+/// One scored token of a text.
+pub struct TokenScore {
+	pub id: u32,
+	/// The token's text, decoded on its own.
+	pub piece: String,
+	/// Natural log of the token's probability given every earlier token.
+	pub logprob: f64,
+	/// One plus the number of vocabulary entries whose logit is strictly higher.
+	pub rank: usize,
+}
+/// The scored tokens of one tokenizer word.
+pub struct WordScore {
+	pub text: String,
+	/// Scored tokens in the word. The first token of a text has no score.
+	pub tokens: usize,
+	/// Sum of the word's scored token log probabilities.
+	pub logprob: f64,
+}
+impl TextScore {
+	/// Scores `groups` from teacher-forced `logits`, stored channel-major with
+	/// `positions` entries per channel. Position `p` predicts the id after it.
+	pub fn from_logits(logits: &[f64], channels: usize, positions: usize, groups: &[Vec<u32>], text: impl Fn(&[u32]) -> String) -> Result<Self> {
+		let ids = groups.concat();
+		require(ids.len() >= 2, "scoring needs at least two tokens")?;
+		require(ids.len() <= positions, format!("{} scored tokens exceed {positions} output positions", ids.len()))?;
+		require(logits.len() >= channels * positions, format!("native output has {} values, expected at least {}", logits.len(), channels * positions))?;
+		let mut tokens = Vec::with_capacity(ids.len() - 1);
+		for position in 0..ids.len() - 1 {
+			let id = ids[position + 1];
+			require((id as usize) < channels, format!("token id {id} is outside the {channels} output channels"))?;
+			let column = (0..channels).map(|channel| logits[channel * positions + position]).collect::<Vec<_>>();
+			require(column.iter().all(|value| value.is_finite()), format!("nonfinite logit at position {position}"))?;
+			let max = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+			let sum = column.iter().map(|value| (value - max).exp()).sum::<f64>();
+			let target = column[id as usize];
+			tokens.push(TokenScore {
+				id,
+				piece: text(&ids[position + 1..position + 2]),
+				logprob: target - (max + sum.ln()),
+				rank: 1 + column.iter().filter(|value| **value > target).count(),
+			});
+		}
+		let mut words = Vec::new();
+		let mut start = 0;
+		for group in groups {
+			let end = start + group.len();
+			let first = start.max(1);
+			if end > first {
+				let logprob = tokens[first - 1..end - 1].iter().map(|token| token.logprob).sum();
+				words.push(WordScore { text: text(group), tokens: end - first, logprob });
+			}
+			start = end;
+		}
+		let logprob = tokens.iter().map(|token| token.logprob).sum::<f64>();
+		let perplexity = (-logprob / tokens.len() as f64).exp();
+		Ok(Self { tokens, words, logprob, perplexity })
+	}
 }
 /// Measured inference state passed to the model script's live formatter.
 #[derive(Clone, Default)]
@@ -18344,12 +20476,15 @@ impl InferenceProgress {
 				5 if self.in_tokens != 0 => values.push(format!("cached {}", self.cached)),
 				5 => values.push("cached ...".to_owned()),
 				6 => values.push(format!("time {:.3}s", self.seconds)),
-				7 => if let Some(mtp) = self.mtp { values.push(format!("drafted {}  accepted {}  verifications {}", mtp.drafted, mtp.accepted, mtp.verifications)); },
+				7 => if let Some(mtp) = self.mtp { values.push(format!("drafted {} accepted {} verifications {}", mtp.drafted, mtp.accepted, mtp.verifications)); },
 				_ => {}
 			}
 		}
 		values.join("  ")
 	}
+}
+impl InferenceLive {
+	fn mtp(&self, report: MtpReport) { self.state.lock().unwrap().mtp = Some(report); }
 }
 struct InferenceLive {
 	state: Arc<Mutex<InferenceProgress>>,
@@ -18519,11 +20654,6 @@ impl InferenceLive {
 		let mut state = self.state.lock().unwrap();
 		state.in_tokens = tokens;
 		state.phase = "prefill";
-		state.version += 1;
-	}
-	fn mtp(&self, report: MtpReport) {
-		let mut state = self.state.lock().unwrap();
-		state.mtp = Some(report);
 		state.version += 1;
 	}
 	fn prefilled(&self, tokens: usize) {
@@ -18770,7 +20900,7 @@ fn decode_sequence(
 	// A shorter prompt needs its own terminal logits. Earlier KV positions are
 	// still valid, but the last position must produce that output again.
 	if cached == prompt.len() && cached != state.ids.len() { cached = cached.saturating_sub(1); }
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), cached, prefill_seconds: 0.0, generation_seconds: 0.0, mtp: MtpReport::default(), reference: ReferenceReport::default() };
+	let mut generation = Generation { mtp: MtpReport::default(), reference: ReferenceReport::default(), ids: prompt.to_vec(), logits: Vec::new(), cached, prefill_seconds: 0.0, generation_seconds: 0.0 };
 	let prefill_started = Instant::now();
 	let mut generation_started = None;
 	let mut ended = None;
@@ -18822,8 +20952,7 @@ fn decode_sequence(
 	let ended = ended.unwrap_or_else(Instant::now);
 	if let Some(started) = generation_started { generation.generation_seconds = ended.duration_since(started).as_secs_f64(); }
 	if let Some(progress) = progress { progress.phase("done", ended); }
-	generation.reference = reference.finish().map_err(RecipeError::new)?;
-	require(generation.reference.ok(), "reference logits comparison failed")?;
+	require(reference.finish().map_err(RecipeError::new)?.ok(), "reference logits comparison failed")?;
 	Ok(generation)
 }
 /// The interface in front of placed tapes: a saved semantic pipeline applies
@@ -18832,6 +20961,82 @@ enum PlacedSource {
 	Saved(Vec<bundle::SemanticGraph>),
 	Bound(Shape, Vec<u32>),
 }
+/// Device functions for a persistent Flash-Next token kernel. Append this text
+/// after the caller's PTX header and call `p2p_wait` and `p2p_publish` in that kernel.
+/// Every payload writer must call publication; launch no more than one CTA per SM.
+pub fn p2p_functions() -> &'static str {
+	let source = include_str!("barrier.ptx");
+	let start = source.find("// Hand-owned sm_52 peer publication.").expect("owned P2P functions");
+	let end = source[start..].find("// Persistent all-SM packed layer chain.").expect("owned P2P function boundary") + start;
+	&source[start..end]
+}
+/// A receiving die's resident peer packet and local CTA completion slots.
+/// Allocate alongside the weight holder and retain across tokens. Before reuse
+/// or destruction, finish both dies' previous token. Sequence zero means empty.
+pub struct PeerPacket {
+	gpu: &'static Gpu,
+	packet: u64,
+	slots: u64,
+	ctas: u32,
+	sequence: u32,
+}
+impl PeerPacket {
+	pub const PAYLOAD_BYTES: usize = 16384;
+	pub const SEQUENCE_OFFSET: u64 = 16384;
+	pub const SLOT_STRIDE: usize = 128;
+	pub const PACKET_BYTES: usize = 16452;
+
+	/// Use a local named NVIDIA device from `RECIPE_DEVICE`.
+	pub fn new(name: &str) -> Result<Self> {
+		#[cfg(nvidia)]
+		{
+			let gpu = device(Some(name))?;
+			let ctas = match &gpu.driver { Driver::Cuda(driver) => driver.cus, _ => return Err(RecipeError::new("P2P requires a local NVIDIA device")) };
+			require(ctas != 0 && ctas <= 32, "P2P coordinator supports one CTA per SM on devices with 1..32 SMs")?;
+			let packet = gpu.allocate_bytes(Self::PACKET_BYTES)?;
+			let slots = match gpu.allocate_bytes(ctas as usize * Self::SLOT_STRIDE) {
+				Ok(slots) => slots,
+				Err(error) => { gpu.free(packet); return Err(error); }
+			};
+			let value = Self { gpu, packet, slots, ctas, sequence: 0 };
+			gpu.clear(packet, Self::PACKET_BYTES)?;
+			gpu.clear(slots, ctas as usize * Self::SLOT_STRIDE)?;
+			Ok(value)
+		}
+		#[cfg(not(nvidia))]
+		{ let _ = name; Err(RecipeError::new("P2P requires the NVIDIA backend")) }
+	}
+	pub fn address(&self) -> u64 { self.packet }
+	pub fn sequence_address(&self) -> u64 { self.packet + Self::SEQUENCE_OFFSET }
+	pub fn completion_address(&self) -> u64 { self.slots }
+	pub fn resident_ctas(&self) -> u32 { self.ctas }
+	/// Reserve a token's strictly increasing sequence range. The return value is
+	/// its base; hop h uses base+h. Exhaustion requires a new packet after completion.
+	pub fn reserve_sequences(&mut self, hops: u32) -> Result<u32> {
+		require(hops != 0, "P2P token must contain a hop")?;
+		let base = self.sequence;
+		self.sequence = base.checked_add(hops).ok_or_else(|| RecipeError::new("P2P sequence exhausted; allocate a new packet after completion"))?;
+		Ok(base)
+	}
+	/// Enable the sender's access to this receiving packet. No machine-memory fallback.
+	pub fn enable_sender(&self, sender: &Self) -> Result<()> {
+		require(!std::ptr::eq(self.gpu, sender.gpu), "P2P requires distinct dies")?;
+		require(self.gpu.reaches(&[self.gpu, sender.gpu]), "CUDA peer access is unavailable")
+	}
+	/// Select the packet's CUDA context for the caller's resident weights and kernel.
+	pub fn activate(&self) -> Result<()> { self.gpu.activate() }
+	/// Borrow the CUDA context handle for a forward kernel's driver integration.
+	/// The handle remains owned by Recipe and must not be released by the caller.
+	pub fn context_address(&self) -> usize {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.gpu.driver { return driver.context as usize; }
+		0
+	}
+}
+impl Drop for PeerPacket {
+	fn drop(&mut self) { self.gpu.free(self.slots); self.gpu.free(self.packet); }
+}
+
 /// A model placed across the selected devices: contiguous block ranges, each
 /// held by one persistent tape on its own device, run in sequence with the
 /// stream moved at every hop. The tapes are the model's state, so a decode
@@ -18846,6 +21051,184 @@ pub struct Placed {
 	resident: Vec<usize>,
 	movement: Vec<usize>,
 	moved: usize,
+	/// A tensor split's shared machine RAM: its tapes are dies that each run
+	/// every layer at once rather than ranges run one after another.
+	exchange: Option<ExchangeBuffer>,
+}
+/// The memory a tensor split's exchanges write and read: the first die's own
+/// memory when every other die reaches it peer to peer, else pinned machine
+/// RAM mapped into every die.
+struct ExchangeBuffer {
+	/// The pinned machine RAM, when the dies share that.
+	pointer: Ptr,
+	/// The first die's buffer the others reach directly, or zero.
+	device: u64,
+	gpu: &'static Gpu,
+}
+// The buffer is plain pinned memory; each die reaches it through its own mapping.
+unsafe impl Send for ExchangeBuffer {}
+unsafe impl Sync for ExchangeBuffer {}
+impl Drop for ExchangeBuffer {
+	fn drop(&mut self) {
+		match &self.gpu.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe {
+				if self.device != 0 {
+					(driver.set)(driver.context);
+					(driver.free)(self.device);
+				} else {
+					(driver.host_free)(self.pointer);
+				}
+			},
+			_ => {}
+		}
+	}
+}
+impl Gpu {
+	/// Whether every other die of `peers` reaches this die's memory directly,
+	/// enabling that access on the way.
+	fn reaches(&'static self, peers: &[&'static Gpu]) -> bool {
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => peers.iter().filter(|peer| !std::ptr::eq(**peer, self)).all(|peer| match &peer.driver {
+				Driver::Cuda(other) => unsafe {
+					(other.set)(other.context);
+					// 704: peer access is already on.
+					matches!((other.enable_peer)(driver.context, 0), 0 | 704)
+				},
+				_ => false,
+			}),
+			_ => false,
+		}
+	}
+	/// `bytes` of zeroed exchange memory for this die and `peers`: this die's
+	/// own memory when every peer reaches it directly, so exchanges never wait on
+	/// the machine's memory controller; else pinned machine RAM every context maps.
+	fn exchange_buffer(&'static self, bytes: usize, peers: &[&'static Gpu]) -> Result<ExchangeBuffer> {
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe {
+				let reach = self.reaches(peers);
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				if reach {
+					let mut device = 0_u64;
+					driver_status(Backend::Nvidia, (driver.allocate)(&mut device, bytes), "exchange allocation")?;
+					driver_status(Backend::Nvidia, (driver.clear)(device, 0, bytes), "exchange clear")?;
+					return Ok(ExchangeBuffer { pointer: ptr::null_mut(), device, gpu: self });
+				}
+				let mut pointer = ptr::null_mut();
+				// Portable to every context, and mapped into each device's addresses.
+				driver_status(Backend::Nvidia, (driver.host_alloc)(&mut pointer, bytes, 0x01 | 0x02), "exchange allocation")?;
+				ptr::write_bytes(pointer.cast::<u8>(), 0, bytes);
+				Ok(ExchangeBuffer { pointer, device: 0, gpu: self })
+			},
+			_ => Err(RecipeError::new(format!("{} cannot hold a tensor split's exchange", self.name))),
+		}
+	}
+}
+/// Every die of a tensor split over `devices` with its tape, and the machine
+/// RAM their exchanges go through. Each die holds its share of the split
+/// nodes' weights and the whole of every other node's.
+fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Compute) -> Result<(Vec<NativeTape>, ExchangeBuffer, Vec<usize>)> {
+	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	// A region saves each die the weights it reads a share of and costs an
+	// exchange. One a position reads few bytes of stays whole on every die,
+	// the fewest first, while every die still holds its weights.
+	let mut whole = std::collections::BTreeSet::new();
+	// The plan keeps 1/64 of each die free: setting up the dies takes some of
+	// it before the weights go up.
+	let available = devices.iter().map(|device| device.free_bytes().map(|bytes| { let room = bytes.saturating_sub(reserve); room - room / 64 })).collect::<Result<Vec<_>>>()?;
+	let dies = devices.len();
+	let items = split_items(graph, dies, &whole)?;
+	let shard = |plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>| (0..dies).map(|die| shard_graph(graph, die, dies, plan, whole)).collect::<Result<Vec<_>>>();
+	let sizes = |parts: &[Graph]| parts.iter().map(|part| part_bytes(part, precision).map(|bytes| bytes as u64)).collect::<Result<Vec<_>>>();
+	// The first plan fills each die's free memory; every later one fills the
+	// room past what the die measured holding whole.
+	let mut plan = plan_split(&items, &available.iter().map(|room| *room as f64).collect::<Vec<_>>());
+	let mut split = shard(&plan, &whole)?;
+	let mut used = sizes(&split)?;
+	for _ in 0..8 {
+		if used.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
+			break;
+		}
+		let rooms = (0..dies).map(|die| {
+			let held = items.iter().map(|(key, units, bytes)| plan[key][die] as f64 * *bytes as f64 / *units as f64).sum::<f64>();
+			available[die] as f64 - (used[die] as f64 - held)
+		}).collect::<Vec<_>>();
+		plan = plan_split(&items, &rooms);
+		drop(split);
+		split = shard(&plan, &whole)?;
+		used = sizes(&split)?;
+	}
+	if used.iter().zip(&available).any(|(bytes, room)| bytes > room) {
+		let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+		let dies = devices.iter().zip(used.iter().zip(&available)).map(|(device, (bytes, room))| format!("{} {:.3} of {:.3} GiB", device.name, gib(*bytes), gib(*room))).collect::<Vec<_>>();
+		return Err(RecipeError::new(format!("no tensor split fits every die: {}", dies.join(", "))));
+	}
+	let threshold = natural("tensor split region bytes", env!("RECIPE_TENSOR_SPLIT_REGION_BYTES"))?;
+	let mut candidates = split_regions(graph, devices.len())?.into_iter().filter(|region| region.read < threshold).collect::<Vec<_>>();
+	candidates.sort_by_key(|region| region.read);
+	let mut kept = Vec::new();
+	for region in candidates {
+		let counts = &plan[&region.end];
+		let grown = used.iter().zip(counts).map(|(bytes, count)| bytes + (region.stored as f64 * (1.0 - *count as f64 * region.unit as f64 / region.period as f64)) as u64).collect::<Vec<_>>();
+		if grown.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
+			whole.insert(region.end);
+			kept.push(region.end);
+			used = grown;
+		}
+	}
+	// The first shards go before the second are cut, so the machine holds one
+	// set. The estimate above can miss a die's real size: while a die does not
+	// fit, the region kept last is split again.
+	let mut graphs = split;
+	while !whole.is_empty() {
+		drop(graphs);
+		graphs = shard(&plan, &whole)?;
+		let fits = graphs.iter().zip(&available).map(|(part, room)| part_bytes(part, precision).map(|bytes| bytes as u64 <= *room)).collect::<Result<Vec<_>>>()?;
+		if fits.iter().all(|fit| *fit) {
+			break;
+		}
+		let Some(last) = kept.pop() else { break };
+		whole.remove(&last);
+		if whole.is_empty() {
+			drop(graphs);
+			graphs = shard(&plan, &whole)?;
+		}
+	}
+	for (part, device) in graphs.iter().zip(devices) {
+		let required = part_bytes(part, precision)? as u64;
+		let available = device.free_bytes()?.saturating_sub(reserve);
+		if required > available {
+			return Err(RecipeError::new(format!("{}: {}", device.name, placement_memory_error(part, precision, available)?)));
+		}
+	}
+	std::thread::scope(|scope| {
+		let compiles = graphs.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None, false))).collect::<Vec<_>>();
+		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a die compile panicked"))?)
+	})?;
+	// Every die uploads its weights at once, each from its own thread.
+	let tokens = vec![0.0; graph_positions(graph)];
+	let tapes = std::thread::scope(|scope| {
+		let builds = graphs.iter().zip(devices).map(|(part, device)| {
+			let tokens = &tokens;
+			scope.spawn(move || range_tape(part, &vec![0.0; part.input.elements()], tokens, device, precision, &[], &mut 0, None))
+		}).collect::<Vec<_>>();
+		builds.into_iter().map(|build| build.join().map_err(|_| RecipeError::new("a die's tape build panicked"))?).collect::<Result<Vec<_>>>()
+	})?;
+	// The largest exchange: its planes in the model type, over the window a tape holds.
+	let mut largest = 0;
+	for (part, tape) in graphs.iter().zip(&tapes) {
+		for node in part.nodes.iter().filter(|node| node.op == Primitive::Exchange) {
+			let plane = window_shape(node.output, part.input.length, tape.program.artifact.layout.window_positions).elements();
+			let planes = if node.argument[0] != 0.0 { devices.len() } else { 1 };
+			largest = largest.max(plane * planes * NativePrecision::new(node.precision, node.acc)?.model.bytes());
+		}
+	}
+	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest, devices)?;
+	tapes.iter().try_for_each(|tape| tape.bind_exchange(&buffer))?;
+	let resident = tapes.iter().map(NativeTape::resident_bytes).collect();
+	Ok((tapes, buffer, resident))
 }
 /// The saved statistics a batch normalization carries into inference, as the
 /// node index and the values it holds, out of what every node declares.
@@ -18892,9 +21275,9 @@ impl DeviceMemory {
 }
 fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
-	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
-	let input_element = if part.nodes.first().is_some_and(Node::token_input) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
-	let input = checked_mul(checked_mul(part.input.channels, layout.window_positions, "part input positions")?, input_element, "part input bytes")?;
+	let layout = NativeLayout::for_graph(part, 1, precision, true, false)?;
+	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
+	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
 	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part), dead: layout.dead_bytes, dead_buffers: layout.dead_buffers })
 }
 fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
@@ -18997,7 +21380,7 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 			resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		}
 		if resident > free {
-			return Err(RecipeError::new(format!("{}; node {} range starts at block {}, reaches block {}, needs {resident} bytes with {free} bytes available; preceding split {split:?}", placement_memory_error(graph, precision, free)?, device_label(devices[split.len()])?, graph.nodes[first].block_index, graph.nodes[start].block_index)));
+			return Err(placement_memory_error(graph, precision, free)?);
 		}
 		taken += 1;
 	}
@@ -19024,7 +21407,11 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		.iter()
 		.map(|node| {
 			require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-			Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+			let mut node = Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() };
+			if let Some(body) = node.body_start() {
+				*body -= start as f64;
+			}
+			Ok(node)
 		})
 		.collect::<Result<Vec<_>>>()?;
 	let last = &graph.nodes[end - 1];
@@ -19039,6 +21426,8 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		programs: graph.programs.clone(),
 		lanes: graph.lanes,
 		rank: graph.rank,
+		hyper_gate: graph.hyper_gate.clone(),
+		hyper_mean: graph.hyper_mean,
 		stored: graph.stored[start..end].to_vec(),
 		requantize: graph.requantize[start..end].to_vec(),
 		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
@@ -19054,11 +21443,374 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_qk_precision: None,
 		block_rope_precision: None,
 		profile: graph.profile,
+		config: graph.config,
 		bound: None,
 		bound_values: Vec::new(),
 		bias: graph.bias,
 		epsilon: graph.epsilon,
 	})
+}
+/// A stored weight a split can slice: packed, one format, every byte on the
+/// machine, with its block of values and the bytes the block takes.
+fn sliceable(graph: &Graph, index: usize) -> Option<(&StoredWeight, usize, usize)> {
+	let rows = graph.nodes[index].output.channels;
+	let weight = graph.stored[index]
+		.as_ref()
+		.filter(|weight| graph.nodes[index].packed && !weight.bytes.absent_runs() && (weight.format_segments().len() == 1 || bias_tail(weight).is_some_and(|(_, count, _)| count == rows)))?;
+	let spec = weight.format.spec()?;
+	Some((weight, spec.block, spec.stride))
+}
+/// A sum's bias stored after its matrix as a raw segment of one value per
+/// output row: its format, its values, and its bytes.
+fn bias_tail(weight: &StoredWeight) -> Option<(StorageFormat, usize, usize)> {
+	match weight.format_segments()[..] {
+		[_, (format, count)] => format.spec().filter(|spec| spec.block == 1).map(|spec| (format, count, count * spec.stride)),
+		_ => None,
+	}
+}
+/// Whether node `index` is a plain sum of its inputs onto its outputs, with or
+/// without a bias row, so a split can take shares of its rows or its inputs.
+fn plain_sum(graph: &Graph, index: usize) -> bool {
+	let node = &graph.nodes[index];
+	let offsets = graph.stored[index].as_ref().and_then(bias_tail).map_or(0, |(_, count, _)| count);
+	node.op == Primitive::Contraction && node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels + offsets
+}
+/// Nodes that keep a split region together: a sum whose outputs a die can take
+/// a share of, ops that read and write only their own channels, and the sum over
+/// a share of its inputs that ends the region. `period` channels repeat the same
+/// pattern of shares and `unit` channels are the least a die takes.
+struct SplitRegion {
+	starts: Vec<usize>,
+	end: usize,
+	period: usize,
+	unit: usize,
+	/// The weight bytes one position reads of the region, and the bytes it stores.
+	read: usize,
+	stored: usize,
+}
+/// Every region of `graph` a split can keep apart: grown back from each sum that
+/// can split its inputs, through ops that keep channels apart, to the sums that
+/// split their outputs. A region whose nodes feed anything outside it, or that
+/// reaches any other op, is not split.
+fn split_regions(graph: &Graph, dies: usize) -> Result<Vec<SplitRegion>> {
+	let mut consumers = vec![Vec::new(); graph.nodes.len()];
+	for (index, node) in graph.nodes.iter().enumerate() {
+		for operand in [node.source, node.second] {
+			if let Ok(operand) = usize::try_from(operand) && operand < index {
+				consumers[operand].push(index);
+			}
+		}
+	}
+	let gcd = |mut a: usize, mut b: usize| {
+		while b != 0 {
+			(a, b) = (b, a % b);
+		}
+		a
+	};
+	let (mut regions, mut claimed) = (Vec::new(), vec![false; graph.nodes.len()]);
+	for (end, node) in graph.nodes.iter().enumerate() {
+		let sums = plain_sum(graph, end) || node.op == Primitive::ExpertOut;
+		let Some((_, block, _)) = sliceable(graph, end).filter(|_| sums) else { continue };
+		let (mut inside, mut starts, mut stack, mut whole) = (Vec::new(), Vec::new(), vec![node.source], true);
+		let (mut head, mut widths) = (None, vec![block]);
+		while let Some(operand) = stack.pop() {
+			let Ok(at) = usize::try_from(operand) else {
+				whole = false;
+				break;
+			};
+			if inside.contains(&at) || claimed[at] {
+				whole &= !claimed[at];
+				continue;
+			}
+			let producer = &graph.nodes[at];
+			let row_split = match producer.op {
+				Primitive::Contraction => plain_sum(graph, at),
+				Primitive::ExpertIn => true,
+				_ => false,
+			} && sliceable(graph, at).is_some();
+			inside.push(at);
+			if row_split {
+				starts.push(at);
+				continue;
+			}
+			match producer.op {
+				Primitive::Elementwise | Primitive::Dconv => {}
+				Primitive::Normalize if normalize_mode(producer.argument[0]).is_ok_and(|mode| mode.per_row()) && normalize_width(producer) < producer.output.channels => widths.push(normalize_width(producer)),
+				Primitive::Delta if producer.argument[5] == 1.0 => {
+					let (key_heads, key_width, _, width) = delta_extent(producer)?;
+					if key_width != width {
+						whole = false;
+						break;
+					}
+					head = Some((key_heads * key_width) as usize);
+					widths.push(width as usize);
+				}
+				_ => {
+					whole = false;
+					break;
+				}
+			}
+			// An elementwise op carries the channels of its operands of its own
+			// shape (others are whole on every die); the rest carry their source's.
+			if producer.op == Primitive::Elementwise {
+				for operand in [producer.source, producer.second] {
+					if usize::try_from(operand).is_ok_and(|operand| graph.nodes[operand].output == producer.output) {
+						stack.push(operand);
+					}
+				}
+			} else {
+				stack.push(producer.source);
+			}
+		}
+		if !whole || starts.is_empty() || inside.iter().any(|at| consumers[*at].iter().any(|consumer| *consumer != end && !inside.contains(consumer))) {
+			continue;
+		}
+		let period = match (head, node.op) {
+			(Some(period), _) => period,
+			(None, Primitive::ExpertOut) => node.argument[2] as usize,
+			(None, _) => node.input.channels,
+		};
+		let unit = widths.iter().fold(1, |unit, width| unit / gcd(unit, *width) * width);
+		let channels_fit = inside.iter().all(|at| graph.nodes[*at].output.channels % period == 0);
+		if period == 0 || period % unit != 0 || period / unit < dies || !channels_fit {
+			continue;
+		}
+		let read = starts.iter().chain(std::iter::once(&end)).map(|at| position_weight_bytes(graph, *at)).sum::<usize>();
+		let stored = starts.iter().chain(std::iter::once(&end)).map(|at| graph.stored.get(*at).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len())).sum::<usize>();
+		for at in &inside {
+			claimed[*at] = true;
+		}
+		claimed[end] = true;
+		regions.push(SplitRegion { starts, end, period, unit, read, stored });
+	}
+	Ok(regions)
+}
+/// The stored weight bytes one position reads of node `index`: all of a sum's,
+/// and of an expert table the share its routed experts hold.
+fn position_weight_bytes(graph: &Graph, index: usize) -> usize {
+	let (node, bytes) = (&graph.nodes[index], graph.stored.get(index).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len()));
+	match node.op {
+		Primitive::ExpertIn | Primitive::ExpertOut if node.argument[0] >= 1.0 => (bytes as f64 * node.argument[1] / node.argument[0]) as usize,
+		_ => bytes,
+	}
+}
+/// Rows `run` of a row-major weight of `rows` rows repeated `repeats` times
+/// (once per expert), as views of the stored bytes.
+fn weight_rows(weight: &StoredWeight, repeats: usize, rows: usize, run: Run) -> Result<StoredWeight> {
+	let tail = bias_tail(weight);
+	let (tail_count, tail_bytes) = tail.map_or((0, 0), |(_, count, bytes)| (count, bytes));
+	let (matrix_bytes, matrix_count) = (weight.bytes.len() - tail_bytes, weight.count - tail_count);
+	let matrix = weight.bytes.view(0, matrix_bytes);
+	let row_bytes = matrix_bytes / (repeats * rows);
+	let row_count = matrix_count / (repeats * rows);
+	require(row_bytes * repeats * rows == matrix_bytes, "a split weight does not divide into its rows")?;
+	let periods = if run.period == 0 { 1 } else { rows / run.period };
+	// Every repeat's periods are the same rows apart, so the share is one strided view.
+	let period_rows = if run.period == 0 { rows } else { run.period };
+	let bytes = matrix.strided(run.first * row_bytes, run.count * row_bytes, period_rows * row_bytes, repeats * periods);
+	let count = row_count * run.count * periods * repeats;
+	let format = weight.format_segments()[0].0;
+	let Some((tail_format, _, _)) = tail else {
+		return Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] });
+	};
+	// The bias keeps the same rows as the matrix, one value each.
+	let value = tail_bytes / (repeats * rows);
+	let offsets = weight.bytes.view(matrix_bytes, tail_bytes).strided(run.first * value, run.count * value, period_rows * value, repeats * periods);
+	let biased = run.count * periods * repeats;
+	Ok(StoredWeight { format, count: count + biased, bytes: StoredBytes::joined(vec![bytes, offsets]), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count), (tail_format, biased)] })
+}
+/// Inputs `run` of every row of a row-major weight of `rows` rows by `terms`
+/// inputs repeated `repeats` times, whole blocks at a time: each row's share
+/// is its own view of the stored bytes, so a die's share copies nothing.
+fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize, run: Run, block: usize, stride: usize) -> Result<StoredWeight> {
+	require(run.first % block == 0 && run.count % block == 0 && (run.period == 0 || run.period % block == 0), "a split of a sum's inputs must fall on whole blocks")?;
+	let tail = bias_tail(weight);
+	let matrix_bytes = weight.bytes.len() - tail.map_or(0, |(_, _, bytes)| bytes);
+	let row_bytes = terms / block * stride;
+	require(row_bytes * repeats * rows == matrix_bytes, "a split weight does not divide into its rows")?;
+	let periods = if run.period == 0 { 1 } else { terms / run.period };
+	// Every row's periods are the same bytes apart, so the share is one strided view.
+	let bytes = weight.bytes.view(0, matrix_bytes).strided(run.first / block * stride, run.count / block * stride, row_bytes / periods, repeats * rows * periods);
+	let count = repeats * rows * periods * run.count;
+	let format = weight.format_segments()[0].0;
+	// The dies' partial sums add up to the whole sum, so only the die holding the
+	// first inputs adds the bias; the others carry none.
+	match tail.filter(|_| run.first == 0) {
+		Some((tail_format, biased, tail_bytes)) => Ok(StoredWeight {
+			format,
+			count: count + biased,
+			bytes: StoredBytes::joined(vec![bytes, weight.bytes.view(matrix_bytes, tail_bytes)]),
+			codebook: weight.codebook.clone(),
+			arithmetic: Vec::new(),
+			segments: vec![(format, count), (tail_format, biased)],
+		}),
+		None => Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] }),
+	}
+}
+/// How many units of each split item every die takes, keyed by the item's
+/// node: a region by its end, a sum or expert table split alone by itself.
+type SplitPlan = BTreeMap<usize, Vec<usize>>;
+/// The units node `index` outside every region splits into and the period its
+/// rows repeat with, when it is large enough to split alone.
+fn lone_split(graph: &Graph, index: usize, dies: usize) -> Option<(usize, usize)> {
+	let node = &graph.nodes[index];
+	let (weight, _, _) = sliceable(graph, index)?;
+	match node.op {
+		Primitive::Contraction if plain_sum(graph, index) && weight.bytes.len() >= 16 << 20 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		Primitive::ExpertIn if node.argument[0] as usize > 1 && node.argument[2] as usize >= dies => Some((node.argument[2] as usize, node.argument[2] as usize)),
+		Primitive::ExpertOut if node.argument[0] as usize > 1 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		_ => None,
+	}
+}
+/// Every item a split over `dies` cuts, as its key, its units and its stored
+/// bytes: each region not kept `whole`, then each large node outside them.
+fn split_items(graph: &Graph, dies: usize, whole: &std::collections::BTreeSet<usize>) -> Result<Vec<(usize, usize, usize)>> {
+	let regions = split_regions(graph, dies)?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
+	let inside = regions.iter().flat_map(|region| region.starts.iter().copied().chain([region.end])).collect::<std::collections::BTreeSet<_>>();
+	let mut items = regions.iter().map(|region| (region.end, region.period / region.unit, region.stored)).collect::<Vec<_>>();
+	for index in (0..graph.nodes.len()).filter(|index| !inside.contains(index)) {
+		if let Some((units, _)) = lone_split(graph, index, dies) {
+			items.push((index, units, graph.stored[index].as_ref().map_or(0, |weight| weight.bytes.len())));
+		}
+	}
+	Ok(items)
+}
+/// Each item's units over the dies, largest unit first, in proportion to the
+/// room each die has left: the coarse items go first and the fine ones even
+/// out what their whole units left over.
+fn plan_split(items: &[(usize, usize, usize)], rooms: &[f64]) -> SplitPlan {
+	let mut order = (0..items.len()).collect::<Vec<_>>();
+	let unit = |index: usize| items[index].2 as f64 / items[index].1 as f64;
+	order.sort_by(|a, b| unit(*b).total_cmp(&unit(*a)).then(a.cmp(b)));
+	let mut left = rooms.to_vec();
+	let mut plan = SplitPlan::new();
+	for index in order {
+		let (key, units, _) = items[index];
+		let weights = left.iter().map(|room| room.max(0.0)).collect::<Vec<_>>();
+		let total = weights.iter().sum::<f64>();
+		let exact = weights.iter().map(|weight| if total > 0.0 { units as f64 * weight / total } else { units as f64 / weights.len() as f64 }).collect::<Vec<_>>();
+		let counts = apportion(units, &exact);
+		for (room, count) in left.iter_mut().zip(&counts) {
+			*room -= *count as f64 * unit(index);
+		}
+		plan.insert(key, counts);
+	}
+	plan
+}
+/// Whole units summing to `count` near `exact`: each takes its whole part, at
+/// least one while there are enough to go round, and the units left go to the
+/// largest remainders.
+fn apportion(count: usize, exact: &[f64]) -> Vec<usize> {
+	let floor = usize::from(count >= exact.len());
+	let mut counts = exact.iter().map(|units| (*units as usize).max(floor)).collect::<Vec<_>>();
+	let mut order = (0..exact.len()).collect::<Vec<_>>();
+	order.sort_by(|a, b| (exact[*b] - counts[*b] as f64).total_cmp(&(exact[*a] - counts[*a] as f64)).then(a.cmp(b)));
+	for index in order.iter().cycle().take(count.saturating_sub(counts.iter().sum())) {
+		counts[*index] += 1;
+	}
+	// Units over the count leave the ones furthest past their exact share.
+	while counts.iter().sum::<usize>() > count {
+		let index = (0..exact.len()).filter(|index| counts[*index] > floor).max_by(|a, b| (counts[*a] as f64 - exact[*a]).total_cmp(&(counts[*b] as f64 - exact[*b])).then(b.cmp(a))).unwrap_or(0);
+		counts[index] -= 1;
+	}
+	counts
+}
+/// Die `die`'s graph of a tensor split over `dies` dies, each taking the units
+/// `plan` gives it of every split item. Each split region runs apart: its first sums keep this die's share
+/// of their rows, the ops after them keep channels apart, and the last sum adds
+/// this die's share of its inputs, which one exchange then sums over the dies.
+/// A large sum outside any region keeps a share of its rows, gathered after it;
+/// every other node runs whole on every die.
+fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>) -> Result<Graph> {
+	// Die `die`'s first unit and unit count of the item keyed `key`.
+	let part = |key: usize| {
+		plan.get(&key).map(|counts| (counts[..die].iter().sum::<usize>(), counts[die])).ok_or_else(|| RecipeError::new("a split item has no plan"))
+	};
+	let regions = split_regions(graph, dies)?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
+	if tracing() && die == 0 {
+		for region in &regions {
+			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;
+		}
+	}
+	// The rows and inputs each region node splits, and whether a sum follows.
+	let mut plans: Vec<Option<(Shard, Option<f64>)>> = vec![None; graph.nodes.len()];
+	for region in &regions {
+		let (first, count) = part(region.end)?;
+		require(count != 0, "a split region gives a die no channels")?;
+		let run = Run { first: first * region.unit, count: count * region.unit, period: region.period };
+		for start in &region.starts {
+			plans[*start] = Some((Shard { rows: run, terms: Run::default() }, None));
+		}
+		plans[region.end] = Some((Shard { rows: Run::default(), terms: run }, Some(1.0)));
+	}
+	let (mut nodes, mut stored, mut requantize, mut remap) = (Vec::new(), Vec::new(), Vec::new(), Vec::with_capacity(graph.nodes.len()));
+	let map = |index: i32, remap: &[i32]| if index >= 0 { remap[index as usize] } else { index };
+	for (index, original) in graph.nodes.iter().enumerate() {
+		let mut node = original.clone();
+		node.source = map(node.source, &remap);
+		node.second = map(node.second, &remap);
+		// A scan is never split, so it lands next and its body right after it.
+		if let Some(body) = node.body_start() {
+			*body = nodes.len() as f64 + 1.0;
+		}
+		let weight = sliceable(graph, index);
+		// Outside a region, a large sum or expert table keeps a share of its rows
+		// and gathers them after itself; a small one runs whole.
+		let alone = match lone_split(graph, index, dies) {
+			_ if plans[index].is_some() || !plan.contains_key(&index) => None,
+			Some((_, period)) => {
+				let (first, count) = part(index)?;
+				Some(Run { first, count, period })
+			}
+			None => None,
+		};
+		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, Some(0.0))));
+		let Some((shard, exchange)) = plan else {
+			nodes.push(node);
+			stored.push(graph.stored[index].clone());
+			requantize.push(graph.requantize[index].clone());
+			remap.push(nodes.len() as i32 - 1);
+			continue;
+		};
+		let (weight, block, stride) = weight.ok_or_else(|| RecipeError::new("a split node has no stored weight"))?;
+		// An expert table repeats its rows once per expert; a sum is one repeat.
+		let (repeats, rows, terms) = match node.op {
+			Primitive::ExpertIn => (node.argument[0] as usize, node.argument[2] as usize, node.input.channels),
+			Primitive::ExpertOut => (node.argument[0] as usize, node.output.channels, node.argument[2] as usize),
+			_ => (1, node.output.channels, node.input.channels),
+		};
+		let sliced = if shard.terms.count != 0 { weight_terms(weight, repeats, rows, terms, shard.terms, block, stride)? } else { weight_rows(weight, repeats, rows, shard.rows)? };
+		if bias_tail(weight).is_some() && bias_tail(&sliced).is_none() {
+			node.argument[2] = 1.0;
+		}
+		node.parameters = sliced.count;
+		node.shard = shard;
+		stored.push(Some(sliced));
+		requantize.push(None);
+		let (output, template) = (node.output, node.clone());
+		nodes.push(node);
+		if let Some(mode) = exchange {
+			let source = nodes.len() as i32 - 1;
+			nodes.push(Node {
+				op: Primitive::Exchange,
+				source,
+				second: source,
+				input: output,
+				output,
+				parameters: 0,
+				argument: [mode, die as f64, dies as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+				program_offset: 0,
+				program_count: 0,
+				storage: 0,
+				packed: false,
+				..template
+			});
+			stored.push(None);
+			requantize.push(None);
+		}
+		remap.push(nodes.len() as i32 - 1);
+	}
+	Ok(Graph { source: map(graph.source, &remap), nodes, stored, requantize, state: TrainingState::default(), bound: None, bound_values: Vec::new(), ..graph.clone() })
 }
 /// The nodes of the blocks each device takes, rebased so every part is a graph
 /// of its own whose input is the previous part's output.
@@ -19081,7 +21833,7 @@ fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
 	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
 /// Build one persistent tape for every contiguous device range of `graph`.
-fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, Vec<usize>, usize)> {
+fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64], source: Option<&RetainedSource>) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, Vec<usize>, usize)> {
 	let split = if split.is_empty() { measured_split(graph, precision, devices)? } else { split.to_vec() };
 	let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
 	require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
@@ -19099,19 +21851,39 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 			return Err(placement_memory_error(graph, precision, available)?);
 		}
 	}
+	// Every range compiles at once, one thread each, through LLVM and the
+	// driver's own compile; the tapes below then load the cached objects.
+	std::thread::scope(|scope| {
+		let compiles = parts.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None, false))).collect::<Vec<_>>();
+		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a range compile panicked"))?)
+	})?;
 	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
 	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
-		let tape = range_tape(part, TapeInput::Zeroed(part.input.elements()), &tokens, device, precision, bn_stats, &mut statistics)?;
+		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics, source)?;
 		resident[index] = tape.resident_bytes();
 		if index + 1 < split.len() {
 			movement[index] = part.output.channels * precision.bytes();
 			moved += movement[index];
 		}
+		let gathered = gathered_bytes(part)?;
+		movement[index] += gathered;
+		moved += gathered;
 		ranges.push(tape);
 	}
 	require(statistics == bn_stats.len(), "saved batch normalization statistics contain unused values")?;
 	Ok((split, ranges, resident, movement, moved))
+}
+/// Bytes each token reads from the lookup tables of a range: every head's row of
+/// the stored table, which stays in machine RAM rather than in the resident arena.
+fn gathered_bytes(part: &Graph) -> Result<usize> {
+	part.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Lookup).try_fold(0, |total, (index, node)| {
+		let table = part.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?;
+		let stored = table.bytes.runs().map(|(_, bytes)| bytes.len()).sum::<usize>();
+		let rows = (node.argument[2] as usize).max(1);
+		let row = stored / rows;
+		checked_add(total, checked_mul(row, node.argument[0] as usize, "per-layer embedding row bytes")?, "per-layer embedding row bytes")
+	})
 }
 /// Place a saved model over `devices`: every range gets its tape, created once
 /// on its device with the batch normalization statistics its blocks carry.
@@ -19121,7 +21893,7 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 	let (mut chosen, mut tapes, mut resident, mut movement, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		let (next, ranges, bytes, graph_movement, graph_moved) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
+		let (next, ranges, bytes, graph_movement, graph_moved) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats, None)?;
 		if chosen.is_empty() {
 			chosen = next;
 		}
@@ -19134,79 +21906,107 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved, exchange: None })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
 fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
-	place_bound_observed(model, positions, split, devices, 0, 0)
+	place_bound_observed(model, positions, split, devices, 0)
 }
-fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], checkpoints: usize, observations: u8) -> Result<Placed> {
+fn place_bound_mtp(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], observations: u8) -> Result<Placed> {
+	place_bound_retained(model, positions, split, devices, observations, true)
+}
+fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], observations: u8) -> Result<Placed> {
+	place_bound_retained(model, positions, split, devices, observations, false)
+}
+fn place_bound_retained(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], observations: u8, mtp: bool) -> Result<Placed> {
+
 	require(positions != 0, "a placed bound model has no positions")?;
 	let samples = vec![0.0; positions];
 	let mut graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
 	graph.observations = observations;
-	if checkpoints > 0 {
-		retain_mtp_hidden(&mut graph)?;
-		for node in &mut graph.nodes {
-			if node.op == Primitive::Delta { node.argument[5] = checkpoints as f64; }
-		}
-	}
+	if mtp { retain_mtp_hidden(&mut graph)?; }
 	let input = graph.input;
 	let suppressed = match model.file.value("tokenizer.ggml.suppress_tokens") {
 		Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| RecipeError::new("tokenizer suppress_tokens contains an invalid id"))).collect::<Result<Vec<_>>>()?,
 		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
 		None => Vec::new(),
 	};
-	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
+	// Dies that reach each other peer to peer exchange fast enough that every
+	// layer over every die beats layers one die after another.
+	let tensor = match env!("RECIPE_DEVICE_SPLIT") {
+		"tensor" => true,
+		"auto" => devices[0].reaches(devices),
+		_ => false,
+	};
+	if tensor && devices.len() > 1 && split.is_empty() {
+		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
+		let (dies, exchange, resident) = place_tensor(&graph, devices, Config::load()?.precision)?;
+		return Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: vec![blocks; devices.len()], tapes: vec![dies], resident, movement: vec![0; devices.len()], moved: 0, exchange: Some(exchange) });
+	}
+	let retained = retained_source(&model.file)?;
+	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[], retained.as_ref())?;
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None })
 }
 impl Placed {
-	/// Commit an evaluated speculative prefix without replaying model arithmetic.
 	fn commit_mtp_prefix(&self, end: u32) -> Result<()> {
-		let mut images = Vec::new();
+		let mut copies = Vec::new();
+		let mut clears = Vec::new();
+		let mut writes = Vec::new();
 		for tape in self.tapes.iter().flatten() {
-			let mut contexts = tape.contexts.download::<u8>(tape.contexts.bytes)?;
-			let mut values = tape.values.download::<u8>(tape.values.bytes)?;
-			tape.commit_index_prefix(&mut contexts, &mut values, end)?;
-			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Delta) {
-				let slots = integer_argument(node.argument[5], "delta checkpoint slots")? as usize;
-				require(slots != 0, "MTP delta prefix has no checkpoint slots")?;
-				let (_, keys, heads, width) = delta_extent(node)?;
-				let cells = checked_mul(keys as usize, width as usize, "MTP delta state cells")?;
-				let bytes = checked_mul(cells, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "MTP delta state bytes")?;
-				let pairs = checked_mul(tape.rows as usize, heads as usize, "MTP delta state pairs")?;
-				let live = checked_mul(pairs, bytes, "MTP delta live bytes")?;
+			require(end <= tape.reached.load(Ordering::Acquire), "MTP prefix exceeds evaluated positions")?;
+			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
+				let layout = attention_index_layout(node, tape.rows as usize)?;
+				let buffer = if tape.program.artifact.layout.contexts_in_values[index] { &tape.values } else { &tape.contexts };
 				let base = tape.program.artifact.layout.contexts[index];
-				let image = if tape.program.artifact.layout.contexts_in_values[index] { &mut values } else { &mut contexts };
-				let extent = checked_mul(live, checked_add(slots, 1, "MTP delta slots")?, "MTP delta checkpoint extent")?;
-				require(checked_add(base, extent, "MTP delta checkpoint end")? <= image.len(), "MTP delta checkpoint exceeds its image")?;
-				if end == 0 { image[base..base + live].fill(0); continue; }
-				let slot = (end as usize - 1) % slots;
-				for pair in 0..pairs {
-					let cell = checked_add(checked_mul(pair, slots, "MTP delta checkpoint pair")?, slot, "MTP delta checkpoint slot")?;
-					let source = checked_add(checked_add(base, live, "MTP delta checkpoint region")?, checked_mul(cell, bytes, "MTP delta checkpoint offset")?, "MTP delta checkpoint address")?;
-					let target = checked_add(base, checked_mul(pair, bytes, "MTP delta live offset")?, "MTP delta live address")?;
-					image.copy_within(source..source + bytes, target);
+				require(base + layout.bytes <= buffer.bytes, "MTP indexer context exceeds its buffer")?;
+				let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
+				let row_bytes = checked_mul(width, node.precision.bytes(), "MTP indexer row bytes")?;
+				let count_at = base + layout.counts;
+				let mut counts = buffer.download_range::<u64>(count_at / 8, tape.rows as usize * blocks)?;
+				let mut changed = false;
+				for row in 0..tape.rows as usize {
+					for b in 0..blocks {
+						let start = b * block;
+						let count = (end as usize).saturating_sub(start).min(block);
+						let slot = row * blocks + b;
+						require(counts[slot] <= block.min(node.output.length - start) as u64 && counts[slot] >= count as u64, "MTP indexer count was not evaluated")?;
+						if counts[slot] == count as u64 { continue; }
+						changed = true;
+						let destination = base + layout.sums + slot * row_bytes;
+						if count == 0 { clears.push((buffer, destination, row_bytes)); }
+						else {
+							let position = row * node.output.length + start + count - 1;
+							copies.push((buffer, base + layout.prefix_sums + position * row_bytes, destination, row_bytes));
+						}
+						counts[slot] = count as u64;
+					}
 				}
+				if changed { writes.push((buffer, count_at, counts.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>())); }
 			}
-			images.push((tape, contexts, values));
+			let begin = tape.window_begin.load(Ordering::Acquire);
+			let count = end.saturating_sub(begin) as usize;
+			if !tape.program.artifact.layout.kept.is_empty() { require(count > 0 && count <= draft_positions()?, "MTP prefix is outside saved carried states")?; }
+			for &(live, kept, bytes) in &tape.program.artifact.layout.kept {
+				let source = kept + (count - 1) * bytes;
+				require(source + bytes <= tape.contexts.bytes && live + bytes <= tape.contexts.bytes, "MTP carried state exceeds its buffer")?;
+				copies.push((&tape.contexts, source, live, bytes));
+			}
 		}
-		// All images pass their layout and prefix checks before the first device write.
-		for (tape, contexts, values) in &images {
-			tape.contexts.write_bytes(0, contexts)?; tape.values.write_bytes(0, values)?;
-			tape.program.gpu.synchronize()?;
-		}
-		for (tape, _, _) in images { tape.reached.store(end, Ordering::Release); }
+		// Validate the complete prefix before the first state mutation.
+		for (buffer, source, destination, bytes) in copies { buffer.copy_within(source, destination, bytes)?; }
+		for (buffer, destination, bytes) in clears { buffer.clear_range(destination, bytes)?; }
+		for (buffer, destination, bytes) in writes { buffer.write_bytes(destination, &bytes)?; }
+		for tape in self.tapes.iter().flatten() { tape.program.gpu.synchronize()?; tape.reached.store(end, Ordering::Release); }
 		Ok(())
 	}
-	fn take_operations(&self, model: &str) -> Vec<OperationReport> {
-		self.tapes.iter().flatten().flat_map(|tape| {
-			std::mem::take(&mut *tape.operations.lock().unwrap()).into_iter().map(|mut observation| {
-				observation.model = model.to_owned();
-				observation
-			})
-		}).collect()
+
+	/// Predicted and measured time for every node that ran, across all tapes.
+	pub fn timings(&self) -> Vec<NodeTiming> {
+		self.tapes.iter().flatten().flat_map(|tape| tape.timing.lock().map(|timing| timing.totals.iter().filter(|total| total.forwards != 0).cloned().collect::<Vec<_>>()).unwrap_or_default()).collect()
+	}
+	pub fn residency(&self) -> Vec<WeightResidency> {
+		self.tapes.iter().flatten().map(|tape| tape.residency.clone()).collect()
 	}
 	fn take_tensors(&self) -> Result<Vec<TensorObservation>> {
 		let mut tensors = Vec::new();
@@ -19302,24 +22102,20 @@ impl Placed {
 		let mut lines = Vec::with_capacity(self.devices.len());
 		for (index, gpu) in self.devices.iter().enumerate() {
 			let mut bytes = [0_usize; 8];
-			let mut ram_tables = 0;
 			for tape in self.tapes.iter().filter_map(|ranges| ranges.get(index)) {
-				let (input, output) = tape.request_bytes();
-				bytes[0] += tape.samples.bytes + input;
+				bytes[0] += tape.samples.bytes;
 				bytes[1] += tape.weights.bytes;
-				bytes[2] += tape.values.bytes + output;
+				bytes[2] += tape.values.bytes;
 				bytes[3] += tape.contexts.bytes;
 				bytes[4] += tape.adjoints.bytes;
 				bytes[5] += tape.gradient.bytes;
 				bytes[6] += tape.moments.bytes + tape.variances.bytes;
 				bytes[7] += tape.program.artifact.storage.bytes;
-				ram_tables += tape.lookups.iter().map(|lookup| lookup.table.bytes.len()).sum::<usize>();
 			}
 			lines.push(format!(
 				"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
 				device_label(gpu)?, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
 			));
-			if ram_tables != 0 { lines.push(format!("{}  n-gram table: {ram_tables} bytes in owned RAM, outside device allocation total", device_label(gpu)?)); }
 		}
 		Ok(ReportLines::new(lines))
 	}
@@ -19340,14 +22136,6 @@ impl Placed {
 			let tg = if tapes.is_empty() { "none" } else { "vector" };
 			let moved = self.movement[index];
 			lines.push(format!("{}  aot: blocks {blocks} pp {pp} tg {tg} transfer {moved} bytes/token", device_label(gpu)?));
-			for tape in tapes {
-				let artifact = &tape.program.artifact;
-				lines.push(format!("{}  artifact: {} target {} cache-hit {}", device_label(gpu)?, artifact.path.display(), native_target_label(&artifact.backend), artifact.cache_hit));
-				#[cfg(nvidia)]
-				if let NativeBackend::Nvidia(program) = &tape.program.backend {
-					lines.push(format!("{}  module load: {:.6}s", device_label(gpu)?, program.load_seconds));
-				}
-			}
 		}
 		Ok(ReportLines::new(lines))
 	}
@@ -19360,12 +22148,9 @@ impl Placed {
 	fn compile_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.compile_seconds).sum() }
 	/// Actual resident arena sizes, available directly to model scripts.
 	pub fn memory(&self) -> Vec<DeviceMemory> {
-		self.tapes.iter().flatten().map(|tape| {
-			let (input, output) = tape.request_bytes();
-			DeviceMemory {
-				device: tape.device_label().unwrap_or_else(|error| panic!("{error}")), input: tape.samples.bytes + input, weights: tape.weights.bytes,
-				values: tape.values.bytes + output, contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
-			}
+		self.tapes.iter().flatten().map(|tape| DeviceMemory {
+			device: tape.program.gpu.name.clone(), input: tape.samples.bytes, weights: tape.weights.bytes,
+			values: tape.values.bytes, contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
 		}).collect()
 	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
@@ -19399,8 +22184,8 @@ impl Placed {
 	pub fn split(&self) -> &[usize] {
 		&self.split
 	}
-	/// Bytes allocated during placement, in `--device` order. Use `memory()`
-	/// for current allocations, including request buffers created during inference.
+	/// Bytes each device holds, in `--device` order: its ranges' weights,
+	/// input, and the value and context arenas of its inference tape.
 	pub fn resident_bytes(&self) -> &[usize] {
 		&self.resident
 	}
@@ -19433,7 +22218,7 @@ impl Placed {
 			*state = DecodeState::default();
 		}
 		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
-			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None })?;
+			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None }, false)?;
 			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
 				for id in suppressed {
@@ -19447,6 +22232,43 @@ impl Placed {
 		if result.is_err() { *state = DecodeState::default(); }
 		result
 	}
+	/// A window through every die of a tensor split at once: each takes the
+	/// whole input and launches its step, and the dies meet at their exchanges.
+	fn forward_dies(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
+		let last = tapes.last().ok_or_else(|| RecipeError::new("placement has no die"))?;
+		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		for tape in tapes {
+			if begin == 0 {
+				tape.reset_sequence()?;
+			}
+			tape.write_tokens(begin as usize, token_window)?;
+			for (start, count) in tape.input_runs(begin, end) {
+				tape.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
+			}
+		}
+		let count = tapes.len();
+		let gate = std::sync::Barrier::new(count);
+		std::thread::scope(|scope| {
+			let runs = tapes
+				.iter()
+				.enumerate()
+				.map(|(index, tape)| {
+					let gate = &gate;
+					scope.spawn(move || {
+						tape.forward_window_gated(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
+							if index + 1 == count && let Some(progress) = progress { progress.prefilled(reached as usize); }
+						}, Some(gate))
+					})
+				})
+				.collect::<Vec<_>>();
+			runs.into_iter().try_for_each(|run| run.join().map_err(|_| RecipeError::new("a die's window panicked"))?)
+		})?;
+		if last_only { last.last_column() } else { last.predictions() }
+	}
+	fn output_shape(&self) -> Result<Shape> {
+		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		Ok(tape.output)
+	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		tape.last_logits(predictions, begin, end)
@@ -19454,25 +22276,24 @@ impl Placed {
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
 	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
-		self.run_window_observed(samples, begin, end, None)
+		self.run_window_observed(samples, begin, end, None, false)
 	}
-	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	/// The window's output: every position of it, or with `last_only` a bound
+	/// model's last reached position alone.
+	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		match &self.source {
 			PlacedSource::Saved(graphs) => {
 				let mut graph = 0;
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					let predictions = self.forward_window_with_tokens(ranges, prepared, samples, begin as usize, begin, end, if graph == graphs.len() { progress } else { None })?;
-					ranges.last().ok_or_else(|| RecipeError::new("saved graph has no output range"))?.saved_predictions(predictions)
+					self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None }, false)
 				})
 			}
 			PlacedSource::Bound(input, _) => {
-				require(begin <= end && end as usize <= input.length, "bound model input window is outside its context")?;
-				let window_elements = checked_mul(input.channels, (end - begin) as usize, "bound input window")?;
-				require(samples.len() == input.elements() || samples.len() == window_elements, format!("bound model takes {} full-context or {window_elements} window input values, received {}", input.elements(), samples.len()))?;
+				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
 				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
-				self.forward_window(ranges, samples, begin, end, progress)
+				self.forward_window(ranges, samples, begin, end, progress, last_only)
 			}
 		}
 	}
@@ -19481,65 +22302,77 @@ impl Placed {
 	/// `samples` enter the first range, each range writes the positions the
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
-	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
-		let input = tapes.first().ok_or_else(|| RecipeError::new("placement has no range"))?.input;
-		let token_begin = if samples.len() == input.elements() { begin as usize } else { 0 };
-		self.forward_window_with_tokens(tapes, samples, samples, token_begin, begin, end, progress)
+	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
+		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress, last_only)
 	}
 	/// Every part receives the original token IDs, independently of transformed
 	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
-	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		let capacity = tapes.iter().map(|tape| tape.program.artifact.layout.window_positions.min(tape.input.length)).min().unwrap_or(1).max(1) as u32;
+		if end - begin > capacity {
+			let mut cursor = begin;
+			loop {
+				let stop = cursor.saturating_add(capacity).min(end);
+				let values = self.forward_window_with_tokens(tapes, samples, tokens, cursor, stop, progress, last_only)?;
+				if stop == end {
+					return Ok(values);
+				}
+				cursor = stop;
+			}
+		}
+		if self.exchange.is_some() {
+			return self.forward_dies(tapes, samples, begin, end, progress, last_only);
+		}
 		require(begin <= end, "window begins after its end")?;
-		let packed_input = samples.len() != first.input.elements();
-		let positions = (end - begin) as usize;
-		let token_window = tokens.get(token_begin..token_begin + positions).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
-
+		let token_window = tokens.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
 		for tape in tapes {
 			require(end <= tape.positions, "token window exceeds a persistent range")?;
 		}
+		first.window_begin.store(begin, Ordering::Release);
 		for (start, count) in first.input_runs(begin, end) {
-			let source = if packed_input { (start / first.input.length) * positions + start % first.input.length - begin as usize } else { start };
-			require(source.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
+			require(start.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
 		}
-
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
 		tapes.iter().try_for_each(|tape| tape.write_tokens(begin as usize, token_window))?;
-		let mut window = (begin, end);
-		for tape in tapes {
-			tape.prepare_request(window.0, window.1)?;
-			window = tape.output_window(window.0, window.1)?;
+		for (start, count) in first.input_runs(begin, end) {
+			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
 		}
-		if packed_input && first.program.artifact.layout.request_control.is_some() {
-			first.write_samples(begin as usize, samples)?;
-		} else {
-			for (start, count) in first.input_runs(begin, end) {
-				let source = if packed_input { (start / first.input.length) * (end - begin) as usize + start % first.input.length - begin as usize } else { start };
-				first.write_samples(start, samples.get(source..source + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
-			}
-		}
-		let input_end = end;
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
+			let window = (begin, end);
+			let traced = tracing();
+			let window_started = traced.then(Instant::now);
 			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
 				// A token has completed prefill only after the final placed range.
-				if index + 1 == tapes.len() && let Some(progress) = progress {
-					progress.prefilled(if reached == end { input_end } else { reached } as usize);
-				}
+				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize); }
 			})?;
-			let Some(next) = tapes.get(index + 1) else { break };
+			let window_seconds = window_started.map(|started| started.elapsed().as_secs_f64());
+			let Some(next) = tapes.get(index + 1) else {
+				if let Some(window_seconds) = window_seconds {
+					trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6}", tape.device_label()?, window.0, window.1))?;
+				}
+				break;
+			};
 			(begin, end) = tape.output_window(begin, end)?;
-			if tape.program.artifact.layout.request_control.is_some() && next.program.artifact.layout.request_control.is_some() {
-				next.write_samples(begin as usize, &tape.predictions()?)?;
+			let hop_started = traced.then(Instant::now);
+			next.window_begin.store(begin, Ordering::Relaxed);
+			let runs = window_runs(tape.output, begin, end);
+			if runs.len() > 1 && next.vocabulary == 0.0 {
+				// Every channel's run of the window moves in one strided copy each way.
+				next.write_window(begin, end, &tape.output_window_values(begin, end)?)?;
 			} else {
-				for (start, count) in window_runs(tape.output, begin, end) {
+				for (start, count) in runs {
 					next.write_samples(start, &tape.output(start, count)?)?;
 				}
 			}
+			if let (Some(window_seconds), Some(hop_started)) = (window_seconds, hop_started) {
+				trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6} hop_seconds={:.6}", tape.device_label()?, window.0, window.1, hop_started.elapsed().as_secs_f64()))?;
+			}
 		}
-		last.predictions()
+		if last_only { last.last_column() } else { last.predictions() }
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19584,6 +22417,37 @@ enum Primitive {
 	Fold = 21,
 	/// The final position reached by a forward window, collapsed to length one.
 	Last = 22,
+	/// Values the dies of a tensor split share: each die's rows gathered into
+	/// every die (argument 0 = 0), or every die's partial sums added (= 1).
+	Exchange = 23,
+}
+impl Primitive {
+	/// The primitive's name, as node lines print it.
+	const fn name(self) -> &'static str {
+		match self {
+			Primitive::Contraction => "contraction",
+			Primitive::Pool => "pool",
+			Primitive::Attention => "attention",
+			Primitive::Scan => "scan",
+			Primitive::Elementwise => "elementwise",
+			Primitive::Normalize => "normalize",
+			Primitive::Predictor => "predictor",
+			Primitive::Gather => "gather",
+			Primitive::Rope => "rope",
+			Primitive::Expand => "expand",
+			Primitive::Read => "read",
+			Primitive::Outer => "outer",
+			Primitive::TopK => "topk",
+			Primitive::ExpertIn => "expert_in",
+			Primitive::Dconv => "dconv",
+			Primitive::Delta => "delta",
+			Primitive::ExpertOut => "expert_out",
+			Primitive::Lookup => "lookup",
+			Primitive::Fold => "fold",
+			Primitive::Last => "last",
+			Primitive::Exchange => "exchange",
+		}
+	}
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -19617,7 +22481,7 @@ impl Node {
 	// A lookup's table stays on the host and spans its rows of the head width.
 	fn weights(&self) -> usize {
 		match self.op {
-			Primitive::Gather => (self.argument[0] as usize).saturating_mul(self.argument[1] as usize),
+			Primitive::Gather => (self.argument[0] as usize).saturating_mul(self.output.channels),
 			Primitive::Lookup => (self.argument[2] as usize).saturating_mul(self.argument[1] as usize),
 			_ => self.parameters,
 		}
@@ -19626,8 +22490,10 @@ impl Node {
 	fn table(&self) -> bool {
 		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
-	fn token_input(&self) -> bool {
-		self.op == Primitive::Gather && self.argument[2] == 0.0
+	/// The node index a scan's recurrent body starts at, right after the scan. It
+	/// is a node reference like `source`, so it moves wherever the nodes move.
+	fn body_start(&mut self) -> Option<&mut f64> {
+		(self.op == Primitive::Scan && self.argument[5] == 1.0).then_some(&mut self.argument[3])
 	}
 	fn primitive_name(&self) -> &'static str {
 		match self.op {
@@ -19651,6 +22517,7 @@ impl Node {
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
 			Primitive::Last => "Last",
+			Primitive::Exchange => "Exchange",
 		}
 	}
 	fn identity(&self, index: usize) -> String {
@@ -19668,8 +22535,8 @@ struct TensorSite {
 #[derive(Clone)]
 struct Node {
 	observation: Option<TensorSite>,
-	op: Primitive,
 	retain_output: bool,
+	op: Primitive,
 	source: i32,
 	second: i32,
 	input: Shape,
@@ -19700,6 +22567,32 @@ struct Node {
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
 	kv_precision: Compute,
+	/// The part of a tensor-split node this die computes: its output rows and the
+	/// inputs it sums over. A whole run is the whole axis.
+	shard: Shard,
+}
+/// Channels `first` to `first + count` of every `period` channels, or from
+/// `first` on when `period` is zero; no channels named is the whole axis.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Run {
+	first: usize,
+	count: usize,
+	period: usize,
+}
+impl Run {
+	/// How many of `channels` the run holds.
+	fn local(self, channels: usize) -> usize {
+		match (self.count, self.period) {
+			(0, _) => channels,
+			(count, 0) => count,
+			(count, period) => channels / period * count,
+		}
+	}
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Shard {
+	rows: Run,
+	terms: Run,
 }
 #[derive(Clone, Default)]
 struct TrainingState {
@@ -19729,6 +22622,9 @@ struct Graph {
 	block_kind: &'static str,
 	lanes: usize,
 	rank: usize,
+	hyper_gate: Option<HyperGateBlocks>,
+	/// The lane mean the active hyper-connection scales its read by.
+	hyper_mean: f64,
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
@@ -19740,6 +22636,8 @@ struct Graph {
 	block_rope_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
+	/// The run configuration used when a newly pushed integer sum needs storage conversion.
+	config: Option<Config>,
 	/// The weights still to bind while a graph compiles over mapped tensors:
 	/// each parameterized node takes the front entry as it is pushed.
 	bound: Option<std::collections::VecDeque<BoundNode>>,
@@ -19768,6 +22666,8 @@ impl Graph {
 			source: -1,
 			lanes: 0,
 			rank: 0,
+			hyper_gate: None,
+			hyper_mean: 0.0,
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
@@ -19778,6 +22678,7 @@ impl Graph {
 			block_qk_precision: None,
 			block_rope_precision: None,
 			profile: Precisions::default(),
+			config: None,
 			bound: None,
 			bound_values: Vec::new(),
 			bias: true,
@@ -19845,9 +22746,9 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
-		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
-		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
+		Operation::Hyper(_, _, blocks, _, _) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
 }
@@ -19863,6 +22764,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
 	graph.profile = config.profile;
+	graph.config = Some(config);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
 	// Set once. Every lowering below reads it from the graph, so a nested branch
 	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
@@ -19983,6 +22885,9 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 	for node in &mut tail.nodes {
 		node.source = rebase(node.source)?;
 		node.second = rebase(node.second)?;
+		if let Some(body) = node.body_start() {
+			*body -= at as f64;
+		}
 	}
 	tail.input = tail.nodes[0].input;
 	tail.source = tail.nodes.len() as i32 - 1;
@@ -19999,8 +22904,8 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 }
 /// The tape of one part of a split graph on its device, holding the batch
 /// normalization statistics that follow the parts already made.
-fn range_tape(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize) -> Result<NativeTape> {
-	let tape = NativeTape::new(graph, samples, tokens, &[], gpu, precision, None)?;
+fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize, source: Option<&RetainedSource>) -> Result<NativeTape> {
+	let tape = NativeTape::build(graph, TapeInput::Values(samples), tokens, &[], gpu, precision, None, source)?;
 	let count = tape.batch_normalizations.iter().map(|(_, values)| values).sum::<usize>();
 	tape.inject_bn_stats(bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
@@ -20008,7 +22913,7 @@ fn range_tape(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], gpu: &'stat
 }
 /// One part of a split graph run forward on its device.
 fn forward_part(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let tape = range_tape(graph, TapeInput::Values(samples), tokens, gpu, stored.precision, &stored.bn_stats, statistics)?;
+	let tape = range_tape(graph, samples, tokens, gpu, stored.precision, &stored.bn_stats, statistics, None)?;
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
@@ -20022,6 +22927,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 			node.second = source;
 		} else if node.second >= 0 {
 			node.second += node_base
+		}
+		if let Some(body) = node.body_start() {
+			*body += f64::from(node_base);
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
 		if node.program_count != 0 {
@@ -20057,11 +22965,13 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
+		Operation::Join(lanes) => lower_mtp_join(graph, *lanes)?,
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
+		Operation::ChannelScale(period, values) => lower_channel_scale(graph, *period, values)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
@@ -20071,13 +22981,10 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Residual(parts) => lower_residual(graph, parts, block.precision, skip, total, data, targets, rows, gpu, config)?,
 		Operation::Recur(parts) => lower_recur(graph, parts, total, data, targets, rows, gpu, config)?,
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
-		Operation::Sequence(parts) => { for part in parts { lower_block(graph, part, total, data, targets, rows, gpu, config)?; } }
-		Operation::Product(left, right) => lower_product(graph, left, right, ScalarOpcode::Multiply, total, data, targets, rows, gpu, config)?,
-		Operation::Sum(left, right) => lower_product(graph, left, right, ScalarOpcode::Add, total, data, targets, rows, gpu, config)?,
+		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
-		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
-		Operation::Join(lanes) => lower_mtp_join(graph, *lanes)?,
-		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, f64::from_bits(*scale_bits), *selection_bias, config)?,
+		Operation::Hyper(lanes, rank, blocks, gate, mean) => lower_hyper(graph, *lanes, *rank, blocks, gate.as_ref(), f64::from_bits(*mean), total, data, targets, rows, gpu, config)?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
@@ -20110,6 +23017,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let mut parameter = 0;
 		for index in first..graph.nodes.len() {
 			let node = &mut graph.nodes[index];
+			if node.int_bits != 0 { continue; }
 			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.weights() != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				let format = if profile { StorageFormat(quantization).tensor(role, more, false) } else { quantization };
@@ -20119,55 +23027,56 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			}
 		}
 	}
+	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
+	narrow(elements, "GPU node batch")?;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
+	Ok(())
+}
+fn finish_int_sums(graph: &mut Graph, index: usize, config: Config) -> Result<()> {
 	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
 	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
 	// int8 inputs and scaled once per block sum. The sum's own values are what
 	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
-	for index in first..graph.nodes.len() {
-		let Compute::Int(format) = graph.nodes[index].precision else { continue };
-		let node = &graph.nodes[index];
-		let values = node.acc;
-		// int on attn names its sums; the attention itself runs in its accumulator.
-		if node.op == Primitive::Attention {
-			graph.nodes[index].precision = values;
-			continue;
-		}
-		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
-		// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
-		// kernel: a conv names fp or bf.
-		require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
-		require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
-		require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
-		let storage = match format.bits {
-			8 | 16 | 32 => StorageFormat::named("q8_0"),
-			4 => StorageFormat::named("q4_1"),
-			_ => None,
-		}
-		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-		// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
-		// nodes remain together until the load kernel can emit multiple target
-		// layouts for one node; every single noncanonical plane converts at load.
-		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
-			if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
-			let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
-			let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
-			let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
-			canonical || mixed_k
-		});
-		let kept = kept.map(|weight| weight.format);
-		let node = &mut graph.nodes[index];
-		node.storage = kept.unwrap_or(storage).0;
-		node.packed = true;
-		node.int_bits = format.bits;
-		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
-		node.kv_precision = node.precision;
-		if kept.is_none() {
-			requantize_bound(graph, index, storage, config)?;
-		}
+	let Compute::Int(format) = graph.nodes[index].precision else { return Ok(()) };
+	let node = &graph.nodes[index];
+	let values = node.acc;
+	// int on attn names its sums; the attention itself runs in its accumulator.
+	if node.op == Primitive::Attention {
+		graph.nodes[index].precision = values;
+		return Ok(());
 	}
-	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
-	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
+	require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
+	// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
+	// kernel: a conv names fp or bf.
+	require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
+	require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
+	require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
+	let storage = match format.bits {
+		8 | 16 | 32 => StorageFormat::named("q8_0"),
+		4 => StorageFormat::named("q4_1"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
+	// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
+	// nodes remain together until the load kernel can emit multiple target
+	// layouts for one node; every single noncanonical plane converts at load.
+	let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
+		if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
+		let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
+		let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
+		let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
+		canonical || mixed_k
+	});
+	let kept = kept.map(|weight| weight.format);
+	let node = &mut graph.nodes[index];
+	node.storage = kept.unwrap_or(storage).0;
+	node.packed = true;
+	node.int_bits = format.bits;
+	node.precision = if format.bits == 32 { Compute::FP32 } else { values };
+	node.kv_precision = node.precision;
+	if kept.is_none() {
+		requantize_bound(graph, index, storage, config)?;
+	}
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -20198,9 +23107,10 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	// first), so a host requantize is kept and handed back to every later compile
 	// of the same file bytes into the same format.
 	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
-		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
-		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
-		StoredSegment::Absent(length) => (0, 0, *length),
+		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length, 0, 1),
+		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len(), 0, 1),
+		StoredSegment::Absent(length) => (0, 0, *length, 0, 1),
+		StoredSegment::Strided { mapping, at, length, pitch, count } => (Arc::as_ptr(mapping) as usize, *at, *length, *pitch, *count),
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 	if let Some((_, encoded)) = cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.get(&key) {
@@ -20234,7 +23144,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 /// Host requantize results by source runs and target format, kept for the
 /// later compiles of one run.
 #[allow(clippy::type_complexity)]
-static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
+static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
 fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize, argument: [f64; 9], second: i32) -> Result<()> {
 	let (source, offset, index) = (graph.source, graph.parameters.len(), graph.nodes.len());
 	// The block's own suffix for this kind of op, else the run's table.
@@ -20243,11 +23153,10 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	let precision = graph.profile.resolve(named.unwrap_or(graph.profile.of(kind)));
 	let acc = graph.profile.acc_of(kind);
 	let int_step = graph.profile.step;
-	let kv_precision = if op == Primitive::Attention { graph.profile.storage.resolve(graph.block_kv_precision.unwrap_or(graph.profile.storage.kv)) } else { precision };
+	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
-		observation: None,
+		observation: None, retain_output: false,
 		op,
-		retain_output: false,
 		source,
 		second,
 		input: graph.output,
@@ -20267,6 +23176,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		precision,
 		acc,
 		kv_precision,
+		shard: Shard::default(),
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
 	// the next plan entry. Block bytes stay packed and the node reserves no
@@ -20278,6 +23188,9 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		Some(None) => return Err(RecipeError::new(format!("{} takes {weights} values but the plan names no tensor for it", node.identity(index)))),
 		Some(Some(bound)) => {
 			require(bound.elements == weights, format!("{} hold {} values; {} takes {weights}", bound.names, bound.elements, node.identity(index)))?;
+			if tracing() {
+				trace(&format!("bind {} {}", node.identity(index), bound.names))?;
+			}
 			match bound.weight {
 				// A bound contraction or expert decodes the mapped source layout;
 				// compute precision does not expand its stored table.
@@ -20302,9 +23215,6 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	};
 	// A node bound to stored bytes owns no host span: the load kernel writes its
 	// weights on the device from those bytes. Every other node reserves its span here.
-	if matches!(node.op, Primitive::ExpertIn | Primitive::ExpertOut) && stored.is_some() {
-		node.packed = true;
-	}
 	if stored.is_none() {
 		graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
 		graph.frozen.resize(graph.parameters.len(), 0);
@@ -20312,11 +23222,21 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	graph.nodes.push(node);
 	graph.stored.push(stored);
 	graph.requantize.push(None);
+	if matches!(precision, Compute::Int(_)) {
+		let config = graph.config.ok_or_else(|| RecipeError::new("integer sum graph has no run configuration"))?;
+		finish_int_sums(graph, index, config)?;
+	}
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
 	Ok(())
 }
 fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: ScalarProgram) -> Result<()> {
+	for instruction in program.0.chunks_exact(3) {
+		if instruction[0] as i32 == 20 {
+			let (base, period) = (instruction[1], instruction[2]);
+			require(base.fract() == 0.0 && period.fract() == 0.0 && base >= 0.0 && period >= 1.0 && base + period <= initial.len() as f64, "channel parameter span exceeds the node's parameters")?;
+		}
+	}
 	let (program_offset, program_count) = (graph.programs.len(), program.0.len() / 3);
 	graph.programs.extend(program.0);
 	let arguments = arguments(0.0, 0.0);
@@ -20358,6 +23278,16 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		}
 	}
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
+	activation_program(&mut program, x, activation, config, graph.profile.gelu_table)?;
+	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
+	push_program(graph, -2, initial, program)
+}
+/// Appends the program of one activation applied to `x` and returns the index of its result. A
+/// linear activation returns `x` itself, so the caller's program names the source.
+fn activation_program(program: &mut ScalarProgram, x: f64, activation: Activation, config: Config, gelu_table: bool) -> Result<f64> {
+	if activation == Activation::Linear {
+		return Ok(x);
+	}
 	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let positive = program.op(ScalarOpcode::Greater, x, zero);
 	let constant = |program: &mut ScalarProgram, value| program.constant(value);
@@ -20365,6 +23295,17 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Cos => program.unary(ScalarOpcode::Cos, x),
 		Activation::Exp => program.unary(ScalarOpcode::Exp, x),
 		Activation::Sqrt => program.unary(ScalarOpcode::SquareRoot, x),
+		Activation::Softplus => {
+			// log(1 + exp(-|x|)) plus the positive part of x.
+			let magnitude = program.unary(ScalarOpcode::Absolute, x);
+			let negative = program.op(ScalarOpcode::Subtract, zero, magnitude);
+			let exponential = program.unary(ScalarOpcode::Exp, negative);
+			let shifted = program.op(ScalarOpcode::Add, one, exponential);
+			let tail = program.unary(ScalarOpcode::Log, shifted);
+			let positive = program.op(ScalarOpcode::Greater, x, zero);
+			let linear = program.op(ScalarOpcode::Select, positive, x);
+			program.op(ScalarOpcode::Add, linear, tail)
+		}
 		Activation::Log | Activation::Ln => {
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let shifted = program.op(ScalarOpcode::Add, one, absolute);
@@ -20372,18 +23313,18 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let negative = program.op(ScalarOpcode::Subtract, zero, magnitude);
 			let signed = program.choose(positive, magnitude, negative);
 			if activation == Activation::Log {
-				let base = constant(&mut program, std::f64::consts::LN_10);
+				let base = constant(program, std::f64::consts::LN_10);
 				program.op(ScalarOpcode::Divide, signed, base)
 			} else {
 				signed
 			}
 		}
 		Activation::Huber => {
-			let threshold = constant(&mut program, config.activation[7]);
+			let threshold = constant(program, config.activation[7]);
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let large = program.op(ScalarOpcode::Greater, absolute, threshold);
 			let square = program.op(ScalarOpcode::Multiply, x, x);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let small = program.op(ScalarOpcode::Multiply, half, square);
 			let half_threshold = program.op(ScalarOpcode::Multiply, half, threshold);
 			let excess = program.op(ScalarOpcode::Subtract, absolute, half_threshold);
@@ -20399,7 +23340,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Leak | Activation::Elu | Activation::Selu | Activation::Prelu => {
 			let negative = match activation {
 				Activation::Leak => {
-					let slope = constant(&mut program, config.activation[0]);
+					let slope = constant(program, config.activation[0]);
 					program.op(ScalarOpcode::Multiply, slope, x)
 				}
 				Activation::Prelu => {
@@ -20414,20 +23355,20 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 					let masked = program.select(inverse, x);
 					let exponential = program.unary(ScalarOpcode::Exp, masked);
 					let shifted = program.op(ScalarOpcode::Subtract, exponential, one);
-					let alpha = constant(&mut program, config.activation[usize::from(activation == Activation::Selu) + 2]);
+					let alpha = constant(program, config.activation[usize::from(activation == Activation::Selu) + 2]);
 					program.op(ScalarOpcode::Multiply, alpha, shifted)
 				}
 			};
 			let selected = program.choose(positive, x, negative);
 			if activation == Activation::Selu {
-				let scale = constant(&mut program, config.activation[4]);
+				let scale = constant(program, config.activation[4]);
 				program.op(ScalarOpcode::Multiply, scale, selected)
 			} else {
 				selected
 			}
 		}
 		Activation::Sigmoid | Activation::Silu => {
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			let curved = program.unary(ScalarOpcode::Tanh, half_x);
 			let shifted = program.op(ScalarOpcode::Add, curved, one);
@@ -20435,24 +23376,24 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			if activation == Activation::Silu { program.op(ScalarOpcode::Multiply, x, sigmoid) } else { sigmoid }
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
-		Activation::Gelu if graph.profile.gelu_table => {
+		Activation::Gelu if gelu_table => {
 			// llama.cpp's fp16 gelu table: between -10 and 10 the input rounds to
 			// fp16, the tanh form above runs in fp32 on it, and the result rounds
 			// to fp16; at 10 and above the input passes as it is, at -10 and below
 			// the result is zero.
-			let ten = constant(&mut program, 10.0);
-			let minus_ten = constant(&mut program, -10.0);
+			let ten = constant(program, 10.0);
+			let minus_ten = constant(program, -10.0);
 			let rounded = program.unary(ScalarOpcode::Half, x);
-			let cubic = constant(&mut program, config.activation[6]);
+			let cubic = constant(program, config.activation[6]);
 			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, rounded);
 			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, rounded);
 			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
-			let scale = constant(&mut program, config.activation[5]);
+			let scale = constant(program, config.activation[5]);
 			let scale_x = program.op(ScalarOpcode::Multiply, scale, rounded);
 			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, rounded);
 			let value = program.op(ScalarOpcode::Multiply, half_x, shifted);
 			let tabled = program.unary(ScalarOpcode::Half, value);
@@ -20468,30 +23409,29 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			// The tanh form in ggml's order: 0.5x * (1 + tanh((s*x) * fma(a*x, x, 1))),
 			// one fused step where its compiler fuses one, so an fp32 gelu prints
 			// the bits llama.cpp's does.
-			let cubic = constant(&mut program, config.activation[6]);
+			let cubic = constant(program, config.activation[6]);
 			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, x);
 			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, x);
 			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
-			let scale = constant(&mut program, config.activation[5]);
+			let scale = constant(program, config.activation[5]);
 			let scale_x = program.op(ScalarOpcode::Multiply, scale, x);
 			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
 		}
 		Activation::Scale(factor) => {
 			let factor = f64::from_bits(factor);
 			require(factor.is_finite(), "scale factor must be finite")?;
-			let factor = constant(&mut program, factor);
+			let factor = constant(program, factor);
 			program.op(ScalarOpcode::Multiply, factor, x)
 		}
 		Activation::Linear => unreachable!(),
 	};
-	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
 	debug_assert_eq!(result as usize + 1, program.0.len() / 3);
-	push_program(graph, -2, initial, program)
+	Ok(result)
 }
 /// Whether the contraction the graph is about to push carries a bias row. A
 /// trained contraction does when its lowering owns one (`bias`); a gate that
@@ -20600,12 +23540,7 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection works on one row while attention state remains sequence-wide.
 fn lower_last(graph: &mut Graph) -> Result<()> {
 	require(graph.output.channels != 0 && graph.output.length != 0, "last-position selection needs a nonempty stream")?;
-	let precision = graph.block_precision;
-	// Selecting a position does not round its values unless the block asks for it.
-	graph.block_precision = precision.or_else(|| usize::try_from(graph.source).ok().map(|index| graph.nodes[index].precision));
-	let result = push_node(graph, Primitive::Last, Shape { channels: graph.output.channels, length: 1 }, 0, arguments(0.0, 0.0), -2);
-	graph.block_precision = precision;
-	result
+	push_node(graph, Primitive::Last, Shape { channels: graph.output.channels, length: 1 }, 0, arguments(0.0, 0.0), -2)
 }
 fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()> {
 	require(vocabulary != 0 && width != 0, "embedding dimensions must be positive")?;
@@ -20631,7 +23566,18 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 /// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
 /// dilated by the n-gram size and a SiLU form the second term, and both add into
 /// the stream, which keeps its width.
+/// Multiplies each channel by its trainable value at `channel mod period`.
+fn lower_channel_scale(graph: &mut Graph, period: usize, values: &[u64]) -> Result<()> {
+	require(period != 0 && values.len() == period, "channel scale needs one value per period slot")?;
+	let initial = values.iter().map(|bits| f64::from_bits(*bits)).collect::<Vec<_>>();
+	let mut program = ScalarProgram(Vec::new());
+	let x = -1.0;
+	let scale = program.op(ScalarOpcode::ChannelParameter, 0.0, period as f64);
+	program.op(ScalarOpcode::Multiply, x, scale);
+	push_program(graph, -2, &initial, program)
+}
 fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
+	let math = ple.math.ok_or_else(|| RecipeError::new("ple names no normalization, gate, or convolution math; call ple_math"))?;
 	let (stream, shape) = (graph.source, graph.output);
 	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
 	require(ple.heads != 0 && ple.width != 0 && ple.kernel != 0 && ple.dilation != 0, "per-layer embedding dimensions must be positive")?;
@@ -20656,20 +23602,21 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	}
 	let rows = graph.source;
 	lower_project(graph, shape.channels)?;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.key_norm, channels, shape.channels)?;
 	let key = graph.source;
 	reset(graph, stream, shape);
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.query_norm, channels, shape.channels)?;
 	let query = graph.source;
 	binary(graph, key, query, shape, ScalarOpcode::Multiply)?;
 	push_node(graph, Primitive::Fold, Shape { channels: lanes, length: shape.length }, 0, arguments(channels as f64, 0.0), -2)?;
-	// gate = sigmoid(sign(s) * sqrt(max(|s|, 1e-6))) for s the scaled dot product.
+	// gate = sigmoid(sign(s) * sqrt(max(|s|, floor))) for s the scaled dot product, with the floor and width scale the block declares.
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
-	let scale = program.constant(1.0 / (channels as f64).sqrt());
+	let PleGate::SignedRootSigmoid { floor_bits, width_scaled } = math.gate;
+	let scale = program.constant(if width_scaled { 1.0 / (channels as f64).sqrt() } else { 1.0 });
 	let s = program.op(ScalarOpcode::Multiply, x, scale);
 	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let magnitude = program.unary(ScalarOpcode::Absolute, s);
-	let floor = program.constant(1e-6);
+	let floor = program.constant(f64::from_bits(floor_bits));
 	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
 	let clamped = program.choose(above, magnitude, floor);
 	let root = program.unary(ScalarOpcode::SquareRoot, clamped);
@@ -20687,9 +23634,9 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	lower_project(graph, channels)?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), gate)?;
 	let gated = graph.source;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.output_norm, channels, shape.channels)?;
 	lower_dconv(graph, ple.kernel, ple.dilation)?;
-	lower_activation(graph, Activation::Silu, config)?;
+	lower_activation(graph, math.convolution, config)?;
 	let convolved = graph.source;
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
@@ -20738,13 +23685,44 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
 	Ok((f64::from(mscale), f64::from(low), f64::from(high)))
 }
+/// Lowers the delta gates as one elementwise program over the gate projection.
+/// Channels below `heads` take `-exp(rate) * decay(alpha + dt)`, the decay
+/// exponent of the state, and the rest take `write(beta)`. The rate is one
+/// trainable value per head, read through the channel parameter operand.
+fn lower_delta_gates(graph: &mut Graph, heads: usize, decay: Activation, write: Activation, config: Config) -> Result<()> {
+	require(decay != Activation::Prelu && write != Activation::Prelu, "delta gate activations take no parameters")?;
+	let mut program = ScalarProgram(Vec::new());
+	let x = -1.0;
+	let zero = program.constant(0.0);
+	let channel = program.op(ScalarOpcode::Channel, 0.0, 0.0);
+	let boundary = program.constant(heads as f64 - 0.5);
+	let beta = program.op(ScalarOpcode::Greater, channel, boundary);
+	let rate = program.op(ScalarOpcode::ChannelParameter, 0.0, heads as f64);
+	let scale = program.unary(ScalarOpcode::Exp, rate);
+	let decayed = activation_program(&mut program, x, decay, config, graph.profile.gelu_table)?;
+	let exponent = program.op(ScalarOpcode::Multiply, decayed, scale);
+	let negated = program.op(ScalarOpcode::Subtract, zero, exponent);
+	let written = activation_program(&mut program, x, write, config, graph.profile.gelu_table)?;
+	program.choose(beta, written, negated);
+	// The planes hold the decay exponent and the write in double, as the recurrence reads them.
+	let block = graph.block_precision.replace(Compute::FP64);
+	let pushed = push_program(graph, -2, &vec![0.0; heads], program);
+	graph.block_precision = block;
+	pushed
+}
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
 /// stream, a second carries the decay and write gate pre-activations, and the
-/// recurrence reads one value per head. The queries and keys take a per-head unit
-/// length, the output a per-head root mean square and the gate built from a third
-/// projection, and the output projection closes the block.
+/// recurrence reads one value per head. The queries and keys take the normalization
+/// the block names, the values take their own, and the output gate uses the output
+/// activation the block names. The output projection closes the block.
 fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<()> {
+	let conv_activation = delta.conv_activation.ok_or_else(|| RecipeError::new("delta names no convolution activation; call delta_activations"))?;
+	let output_activation = delta.output_activation.ok_or_else(|| RecipeError::new("delta names no output activation; call delta_activations"))?;
+	let decay = delta.decay_gate.ok_or_else(|| RecipeError::new("delta names no decay gate; call delta_gates"))?;
+	let write = delta.write_gate.ok_or_else(|| RecipeError::new("delta names no write gate; call delta_gates"))?;
+	let qk_norm = delta.qk_norm.ok_or_else(|| RecipeError::new("delta names no query/key normalization; call delta_norms"))?;
+	let value_norm = delta.value_norm.ok_or_else(|| RecipeError::new("delta names no value normalization; call delta_norms"))?;
 	let (source, input) = (graph.source, graph.output);
 	let (heads, kernel) = (delta.heads, delta.kernel);
 	let (key_heads, key_width, value_width, output) = delta.extent(input.channels)?;
@@ -20755,36 +23733,36 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let recurrent = Shape { channels: inner, length: input.length };
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
 	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
+	lower_delta_gates(graph, heads, decay, write, config)?;
 	let gates = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
-	if delta.conv_activation != Activation::Linear {
-		// Qwen's gated delta recurrence applies SiLU to the causal convolution
-		// before splitting the query, key, and value planes.
-		lower_activation(graph, delta.conv_activation, config)?;
+	if conv_activation != Activation::Linear {
+		// The convolution activation applies before the query, key, and value planes split.
+		lower_activation(graph, conv_activation, config)?;
 	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
-	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 1.0, 0.0, 0.0];
-	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
+	lower_normalize(graph, qk_norm, key_width, checked_mul(2, keys, "delta query and key span")?)?;
+	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
+	push_node(graph, Primitive::Delta, recurrent, 0, argument, gates)?;
 	// The recurrent read uses the same inverse-root key-width scale as attention.
 	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
-	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
+	lower_normalize(graph, value_norm, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;
-	let (gate, shape) = activation(graph, graph.source, graph.output, delta.output_activation, config)?;
+	let (gate, shape) = activation(graph, graph.source, graph.output, output_activation, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, output)
 }
 /// Lowers one attention block into its projection, the optional query and key
 /// normalization and rotary nodes, the attention node and the output
-/// projection. The projection carries the query, key and value planes, then
-/// the indexer planes, then the gate plane.
+/// projection when selected. The input projection carries the query, key,
+/// and value planes, then any indexer planes.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, project, window, factors, unscaled, attn_factor } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
@@ -20814,8 +23792,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	// width.
 	let inner = checked_mul(heads, width, "attention query plane")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
-	let gated = if gate { inner } else { 0 };
-	lower_project(graph, checked_add(pairs, gated, "attention projection width")?)?;
+	lower_project(graph, pairs)?;
 	if let Some(normalization) = qk {
 		graph.block_precision = graph.block_qk_precision.or(ordinary_precision);
 		// The projection lays the queries and keys out ahead of the values, so the
@@ -20840,6 +23817,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
+		let mscale = mscale * f64::from_bits(attn_factor);
 		// The seventh argument names the angle: 0 direct, 1 chained. Under the
 		// chain the second argument carries base^(-2/dims) from the host's powf
 		// (llama.cpp's theta_scale) instead of the base, so every backend chains
@@ -20911,9 +23889,9 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let epsilon = if unscaled { -graph.epsilon } else { graph.epsilon };
 	graph.block_precision = ordinary_precision;
 	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
-	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
+	let argument = [heads as f64, keys as f64, 0.0, block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, side)?;
-	lower_project(graph, input.channels)
+	if project { lower_project(graph, input.channels) } else { Ok(()) }
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
@@ -21113,64 +24091,19 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 /// graph output at `source`. `routing` is a `[experts, length]` plane of per-position
 /// weights: a nonzero entry takes that expert for the position, and the position's
 /// output is the sum of its `top_k` experts under those weights.
-impl Block {
-	/// The scalar activation among the block's maps, or the identity when it has none.
-	fn activation(&self) -> Activation {
-		self.maps.iter().find_map(|step| match step.map { ActivationMap::Scalar(activation) => Some(activation), ActivationMap::Normalize(_) => None }).unwrap_or(Activation::Linear)
-	}
-	/// The precision named after the block's scalar activation, when present.
-	fn activation_precision(&self) -> Option<Compute> {
-		self.maps.iter().find(|step| matches!(step.map, ActivationMap::Scalar(_))).and_then(|step| step.precision)
-	}
-	/// The normalization among the block's maps, when present.
-	fn normalization(&self) -> Option<BlockNormalization> {
-		self.maps.iter().find_map(|step| step.normalization())
-	}
-}
-fn gated_expert(value: &Block) -> Option<(Block, Block, Block)> {
-	let Operation::Sequence(parts) = &value.operation else { return None };
-	if parts.len() != 2 || value.activation() != Activation::Linear || value.normalization().is_some() { return None; }
-	let Operation::Product(left, right) = &parts[0].operation else { return None };
-	if left.blocks.len() != 1 || right.blocks.len() != 1 || left.exclusions != 0 || right.exclusions != 0 { return None; }
-	let (gate, up, down) = (left.blocks[0].clone(), right.blocks[0].clone(), parts[1].clone());
-	let (Operation::Layer(hidden), Operation::Layer(other), Operation::Layer(_)) = (&gate.operation, &up.operation, &down.operation) else { return None };
-	if *hidden == 0 || hidden != other || up.activation() != Activation::Linear || down.activation() != Activation::Linear { return None; }
-	if [&parts[0], &gate, &up, &down].iter().any(|part| part.normalization().is_some() || part.quantization != 0 || part.frozen) { return None; }
-	if parts[0].activation() != Activation::Linear || parts[0].precision.is_some() { return None; }
-	Some((gate, up, down))
-}
-fn contains_moe(block: &Block) -> bool {
-	match &block.operation {
-		Operation::MoeBlocks(..) => true,
-		Operation::Sequence(parts) | Operation::Residual(parts) => parts.iter().any(contains_moe),
-		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).any(contains_moe),
-		_ => false,
-	}
-}
-fn lower_experts(graph: &mut Graph, source: i32, input: Shape, routing: i32, experts: usize, top_k: usize, hidden: usize, parts: [Block; 3], config: Config) -> Result<()> {
+fn lower_experts(graph: &mut Graph, source: i32, input: Shape, routing: i32, experts: usize, top_k: usize, hidden: usize, activation: Activation, config: Config) -> Result<()> {
 	let routed = Shape { channels: checked_mul(top_k, hidden, "moe routed width")?, length: input.length };
 	let table = checked_mul(experts, checked_mul(hidden, input.channels, "moe expert matrix")?, "moe expert table")?;
 	let dispatch = [experts as f64, top_k as f64, hidden as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-	let outer = (graph.block_blck_precision, graph.block_precision);
 	reset(graph, source, input);
-	graph.block_blck_precision = parts[0].blck_precision.or(outer.0);
 	push_node(graph, Primitive::ExpertIn, routed, table, dispatch, routing)?;
 	let gate = graph.source;
 	reset(graph, source, input);
-	graph.block_blck_precision = parts[1].blck_precision.or(outer.0);
 	push_node(graph, Primitive::ExpertIn, routed, table, dispatch, routing)?;
 	let up = graph.source;
-	graph.block_precision = parts[0].activation_precision().or(outer.1);
-	reset(graph, gate, routed);
-	if parts[0].activation() != Activation::Linear { lower_activation(graph, parts[0].activation(), config)?; }
-	let activated = graph.source;
-	graph.block_precision = outer.1;
-	let product = binary(graph, activated, up, routed, ScalarOpcode::Multiply)?;
+	let product = lower_gated(graph, gate, up, routed, activation, config)?;
 	reset(graph, product, routed);
-	graph.block_blck_precision = parts[2].blck_precision.or(outer.0);
-	let result = push_node(graph, Primitive::ExpertOut, input, table, dispatch, routing);
-	(graph.block_blck_precision, graph.block_precision) = outer;
-	result
+	push_node(graph, Primitive::ExpertOut, input, table, dispatch, routing)
 }
 /// One gated feed-forward over the block input: the gate and up projections,
 /// their activated product, and the down projection back to the input width.
@@ -21187,53 +24120,55 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: SharedExpert, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
 	require(hidden != 0, "moe expert width must be positive")?;
+	require(scale.is_finite(), "moe routed scale must be finite")?;
 	let (source, input) = (graph.source, graph.output);
-	let gate = Block::of(Operation::Layer(hidden)).with_activation(activation);
-	let expert = [gate, Block::of(Operation::Layer(hidden)), Block::of(Operation::Layer(input.channels))];
 	// One router scores every expert per position. The top-k weights name the
 	// experts whose gated feed-forward runs, so a position costs top-k of them.
 	lower_project(graph, experts)?;
-	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
-	let routing = graph.source;
-	lower_experts(graph, source, input, routing, experts, top_k, hidden, expert.clone(), config)?;
-	if !shared {
-		return Ok(());
+	let selection = if selection_bias { experts } else { 0 };
+	push_node(graph, Primitive::TopK, graph.output, selection, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	if scale != 1.0 {
+		lower_scale(graph, scale)?;
 	}
-	// The shared expert is one more expert that every position takes. Its routing
-	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
-	// so the dispatch that runs the routed experts runs it under that per-position
-	// value and its gradient reaches the gate and the input through the same adjoints.
+	let routing = graph.source;
+	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
+	let (count, gate) = match shared {
+		SharedExpert::None => return Ok(()),
+		SharedExpert::Ungated { count } => (count, None),
+		SharedExpert::Gated { count, gate } => (count, Some(gate)),
+	};
+	require(count != 0, "shared expert count must be positive")?;
+	let width = checked_mul(count, hidden, "shared expert width")?;
+	// The shared expert is one more expert that every position takes. Without a gate
+	// it runs densely at weight one. With a gate, its routing weight is the gate
+	// activation of a `[width]` projection over the position, with no bias, so the
+	// dispatch that runs the routed experts runs it under that per-position value and
+	// its gradient reaches the gate and the input through the same adjoints.
 	let dispatched = graph.source;
 	reset(graph, source, input);
-	// The gate is the `[width]` vector alone, trained or bound, so a view of it
-	// must hold exactly that many values.
-	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	let gate = graph.source;
-	lower_experts(graph, source, input, gate, 1, 1, hidden, expert.clone(), config)?;
-	let gated = graph.source;
-	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
+	match gate {
+		None => lower_glu(graph, width, activation, config)?,
+		Some(gate) => {
+			// The gate is the `[width]` vector alone, trained or bound, so a view of it
+			// must hold exactly that many values.
+			push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
+			lower_activation(graph, gate, config)?;
+			let weight = graph.source;
+			lower_experts(graph, source, input, weight, 1, 1, width, activation, config)?;
+		}
+	}
+	let shared_out = graph.source;
+	binary(graph, dispatched, shared_out, input, ScalarOpcode::Add)?;
 	Ok(())
 }
 fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
-	if (graph.bound.is_some() || !graph.bias) && experts.iter().all(|expert| expert == &experts[0]) {
-		if let Some((gate, up, down)) = gated_expert(&experts[0]) {
-			let Operation::Layer(hidden) = gate.operation else { unreachable!() };
-			if down.operation == Operation::Layer(input.channels) {
-				lower_project(graph, experts.len())?;
-				push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
-				let routing = graph.source;
-				return lower_experts(graph, source, input, routing, experts.len(), top_k, hidden, [gate, up, down], config);
-			}
-		}
-	}
 	let mut output = None;
 	for value in experts {
 		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
@@ -21331,6 +24266,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		// The body's blocks name their own precisions or take the run's table,
 		// as the outer blocks do.
 		body.profile = graph.profile;
+		body.config = Some(config);
 		for (index, block) in body_parts.iter().enumerate() {
 			body.block_index = index;
 			body.block_kind = "recur_body";
@@ -21362,16 +24298,16 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
-		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts, _, _) => parts.iter().map(estimator_count).sum(),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
 }
 fn first_estimator(block: &Block) -> Option<&Estimator> {
 	match &block.operation {
 		Operation::Estimator(estimator) => Some(estimator),
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
-		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts, _, _) => parts.iter().find_map(first_estimator),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}
 }
@@ -21437,11 +24373,11 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>
 	graph.block_kind = outer_kind;
 	Ok(())
 }
-/// Lower two fragments from the same input and combine their outputs. A scalar
-/// per position broadcasts across channels; its reverse reduction sums those
-/// channel derivatives before propagating through the scalar branch.
-fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, opcode: ScalarOpcode, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
-	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "a parallel branch must contain an operation")?;
+/// Lower two model fragments from one source and multiply their outputs
+/// elementwise. The scalar-program reverse pass supplies each branch with the
+/// other branch's value, so both branch gradients reach the shared source.
+fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "a product branch must contain an operation")?;
 	let (source, input) = (graph.source, graph.output);
 	let inherited_bias = graph.bias;
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
@@ -21451,7 +24387,7 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
-	let (mut left_source, mut shape) = (graph.source, graph.output);
+	let (left_source, shape) = (graph.source, graph.output);
 	reset(graph, source, input);
 	graph.bias = inherited_bias && right.exclusions & bias.mask() == 0;
 	for block in &right.blocks {
@@ -21461,22 +24397,10 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	}
 	graph.bias = inherited_bias;
 	(graph.block_frozen, graph.block_kind) = (outer_frozen, outer_kind);
-	require(graph.output.length == shape.length, "parallel branches must have the same position count")?;
-	if graph.output.channels == 1 && shape.channels != 1 {
-		push_node(graph, Primitive::Expand, shape, 0, arguments(shape.channels as f64, 0.0), -2)?;
-	} else if shape.channels == 1 && graph.output.channels != 1 {
-		let right_source = graph.source;
-		let output = graph.output;
-		reset(graph, left_source, shape);
-		push_node(graph, Primitive::Expand, output, 0, arguments(output.channels as f64, 0.0), -2)?;
-		left_source = graph.source;
-		shape = output;
-		reset(graph, right_source, shape);
-	}
-	require(graph.output == shape, "parallel branches require equal widths or one scalar per position")?;
-	binary(graph, left_source, graph.source, shape, opcode).map(drop)
+	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
+	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
 }
-fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], gate: Option<&HyperGateBlocks>, mean: f64, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
 	if graph.lanes == 0 {
 		let shape = graph.output;
@@ -21485,11 +24409,14 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	}
 	require(graph.lanes == lanes, format!("hyper-connections with {lanes} lanes follow a stream of {}", graph.lanes))?;
 	graph.rank = rank;
+	graph.hyper_gate = gate.cloned();
+	graph.hyper_mean = mean;
 	let (stream, shape) = (graph.source, graph.output);
 	let width = shape.channels / lanes;
-	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
+	let (source, read, write) = lower_gates(graph, lanes, gate, true, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	lower_scale(graph, mean)?;
 	graph.observe("hc_mixed", TENSOR_HYPER)?;
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.lanes = 0;
@@ -21509,36 +24436,64 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	push_program(graph, stream, &[], program)?;
 	graph.observe("hc_combine", TENSOR_HYPER)
 }
-/// The mixer gates from the stream: per-lane RMS statistics under one trainable
-/// scale over the whole stream give `xn`; the read gate is
-/// `sigmoid(W_up · silu(W_down · xn / lanes))` over the stream, and the write
-/// gate is `2 sigmoid(W_inject · xn / lanes)` per lane, so a zero injection is
-/// the plain residual. No projection carries a bias. Returns the node the read
-/// consumes, the read gate, and the write gate. With `rank` zero no node is
-/// added, every gate is one, and the read takes the raw stream.
-fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config: Config) -> Result<(i32, i32, i32)> {
-	let (stream, shape) = (graph.source, graph.output);
-	if rank == 0 {
-		return Ok((stream, -2, -2));
+/// Lower one explicit gate step. Its own precision and activation travel with
+/// the block; the leading shared RMS is handled by `lower_gates`.
+fn lower_gate_step(graph: &mut Graph, block: &Block, config: Config) -> Result<()> {
+	let outer = (graph.block_kind, graph.block_precision, graph.block_blck_precision);
+	graph.block_kind = block.operation.name();
+	graph.block_precision = block.precision;
+	graph.block_blck_precision = block.blck_precision;
+	match block.operation {
+		Operation::Layer(width) => lower_project(graph, width)?,
+		Operation::Identity => {},
+		_ => return Err(RecipeError::new(format!("{} is not a hyper gate step; use norm, layer, and scalar activations", block.operation.name()))),
 	}
+	for step in &block.maps {
+		let precision = graph.block_precision;
+		graph.block_precision = step.precision.or(precision);
+		match step.map {
+			ActivationMap::Scalar(Activation::Linear) => {},
+			ActivationMap::Scalar(activation) => lower_activation(graph, activation, config)?,
+			ActivationMap::Normalize(normalization) => {
+				let channels = graph.output.channels;
+				lower_normalize(graph, normalization, channels, channels)?;
+			}
+		}
+		graph.block_precision = precision;
+	}
+	(graph.block_kind, graph.block_precision, graph.block_blck_precision) = outer;
+	Ok(())
+}
+/// The two gate lists share their leading per-lane RMS node and its scale.
+/// The read list supplies the stream-wide gate; the write list supplies one
+/// gate per lane. A static connection names no gate and reads the raw stream.
+fn lower_gates(graph: &mut Graph, lanes: usize, gate: Option<&HyperGateBlocks>, write: bool, config: Config) -> Result<(i32, i32, i32)> {
+	let (stream, shape) = (graph.source, graph.output);
+	let Some(gate) = gate else { return Ok((stream, -2, -2)); };
+	require(lanes != 0 && shape.channels % lanes == 0, "hyper gate stream does not split into lanes")?;
+	let leading_rms = |blocks: &[Block]| blocks.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && matches!(block.maps.as_slice(), [step] if step.normalization() == Some(BlockNormalization::Rms)));
+	require(leading_rms(&gate.read.blocks) && leading_rms(&gate.write.blocks), "hyper read and write gates must begin with per-lane rms")?;
+	let outer = (graph.bias, graph.lanes, graph.block_kind, graph.block_precision);
+	graph.bias = outer.0 && gate.read.exclusions & bias.mask() == 0;
+	graph.lanes = 0;
+	graph.block_precision = gate.read.blocks[0].maps[0].precision.or(outer.3);
 	lower_normalize(graph, BlockNormalization::Rms, shape.channels / lanes, shape.channels)?;
 	let normalized = graph.source;
-	lower_contraction(graph, rank, false)?;
-	lower_scale(graph, 1.0 / lanes as f64)?;
-	lower_activation(graph, Activation::Silu, config)?;
-	lower_contraction(graph, shape.channels, false)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
+	for block in &gate.read.blocks[1..] { lower_gate_step(graph, block, config)?; }
+	require(graph.output == shape, "hyper read gate must cover every stream channel")?;
 	let read = graph.source;
-	if !write {
-		return Ok((normalized, read, -2));
+	if write {
+		reset(graph, normalized, shape);
+		graph.bias = outer.0 && gate.write.exclusions & bias.mask() == 0;
+		for (index, block) in gate.write.blocks[1..].iter().enumerate() {
+			lower_gate_step(graph, block, config)?;
+			if index == 0 { graph.observe("hc_inject", TENSOR_HYPER)?; }
+		}
+		require(graph.output.channels == lanes && graph.output.length == shape.length, "hyper write gate must produce one value per lane")?;
 	}
-	reset(graph, normalized, shape);
-	lower_contraction(graph, lanes, false)?;
-	graph.observe("hc_inject", TENSOR_HYPER)?;
-	lower_scale(graph, 1.0 / lanes as f64)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	lower_scale(graph, 2.0)?;
-	Ok((normalized, read, graph.source))
+	let written = if write { graph.source } else { -2 };
+	(graph.bias, graph.lanes, graph.block_kind, graph.block_precision) = outer;
+	Ok((normalized, read, written))
 }
 /// Multiplies the graph output by `factor`.
 fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
@@ -21547,7 +24502,8 @@ fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 	program.op(ScalarOpcode::Multiply, -1.0, factor);
 	push_program(graph, -2, &[], program)
 }
-/// Joins the common embedding with each normalized hidden lane in projection order.
+/// The head read: the stream collapses to the mean of its lanes under its own
+/// read gate.
 fn lower_mtp_join(graph: &mut Graph, lanes: usize) -> Result<()> {
 	let (input, shape) = (graph.source, graph.output);
 	let parts = checked_add(lanes, 1, "MTP input lanes")?;
@@ -21581,65 +24537,16 @@ fn lower_mtp_join(graph: &mut Graph, lanes: usize) -> Result<()> {
 	graph.lanes = if lanes == 1 { 0 } else { lanes };
 	Ok(())
 }
-/// The head read collapses the stream to the mean of its lanes under its read gate.
 fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
-	let first = graph.nodes.len();
-	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
-	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
+	let (lanes, shape) = (graph.lanes, graph.output);
+	let gate = graph.hyper_gate.clone();
+	let (source, read, _) = lower_gates(graph, lanes, gate.as_ref(), false, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	let mean = graph.hyper_mean;
+	lower_scale(graph, mean)?;
 	graph.observe("hc_mixed", TENSOR_HYPER)?;
 	graph.lanes = 0;
-	finalize_integer_nodes(graph, first, config)
-}
-
-fn finalize_integer_nodes(graph: &mut Graph, first: usize, config: Config) -> Result<()> {
-	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
-	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
-	// int8 inputs and scaled once per block sum. The sum's own values are what
-	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
-	for index in first..graph.nodes.len() {
-		let Compute::Int(format) = graph.nodes[index].precision else { continue };
-		let node = &graph.nodes[index];
-		let values = node.acc;
-		// int on attn names its sums; the attention itself runs in its accumulator.
-		if node.op == Primitive::Attention {
-			graph.nodes[index].precision = values;
-			continue;
-		}
-		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
-		// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
-		// kernel: a conv names fp or bf.
-		require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
-		require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
-		require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
-		let storage = match format.bits {
-			8 | 16 | 32 => StorageFormat::named("q8_0"),
-			4 => StorageFormat::named("q4_1"),
-			_ => None,
-		}
-		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-		// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
-		// nodes remain together until the load kernel can emit multiple target
-		// layouts for one node; every single noncanonical plane converts at load.
-		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
-			if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
-			let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
-			let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
-			let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
-			canonical || mixed_k
-		});
-		let kept = kept.map(|weight| weight.format);
-		let node = &mut graph.nodes[index];
-		node.storage = kept.unwrap_or(storage).0;
-		node.packed = true;
-		node.int_bits = format.bits;
-		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
-		node.kv_precision = node.precision;
-		if kept.is_none() {
-			requantize_bound(graph, index, storage, config)?;
-		}
-	}
 	Ok(())
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
@@ -21857,6 +24764,8 @@ struct NativeSchedule {
 	shared_values: u32,
 	contractions: Vec<Option<NativeContractionTiles>>,
 	attention: Vec<Option<Tile>>,
+	/// The lanes of the device's wave: the rows a stored weight interleaves.
+	lanes: u32,
 }
 #[derive(Clone, Copy, Debug)]
 struct NativeContractionTiles {
@@ -21911,54 +24820,6 @@ impl PrecisionKind {
 		matches!(self, Self::Sum | Self::Embed | Self::Attn)
 	}
 }
-/// Formats for retained intermediate values, selected independently of arithmetic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Storage {
-	kv: Compute,
-	fp8: Compute,
-}
-impl Default for Storage {
-	fn default() -> Self {
-		Self { kv: Compute::FP16, fp8: Compute::FP8 }
-	}
-}
-impl Storage {
-	fn resolve(&self, format: Compute) -> Compute {
-		if format == Compute::FP8 { self.fp8 } else { format }
-	}
-	fn load(name: &str) -> Result<Self> {
-		let table = env!("RECIPE_STORAGE_PROFILES").split(';')
-			.find_map(|profile| profile.split_once(':').filter(|(candidate, _)| *candidate == name).map(|(_, body)| body))
-			.ok_or_else(|| RecipeError::new(format!("--config {name} names no [storage.{name}] table in Cargo.toml")))?;
-		let (mut kv, mut fp8) = (None, None);
-		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
-			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[storage.{name}] entry {entry} is not key = value")))?;
-			match key {
-				"kv" => {
-					require(kv.is_none(), format!("[storage.{name}] repeats kv"))?;
-					let format = precision_named(value)?;
-					require(matches!(format, Compute::FP8 | Compute::FP16 | Compute::FP32 | Compute::BF16), format!("[storage.{name}] kv must be fp8, fp16, fp32, or bf16"))?;
-					kv = Some(format);
-				}
-				"fp8" => {
-					require(fp8.is_none(), format!("[storage.{name}] repeats fp8"))?;
-					fp8 = Some(match value {
-						"e4m3" => Compute::FP8,
-						"e5m2" => Compute::FP8_E5M2,
-						_ => return Err(RecipeError::new(format!("[storage.{name}] fp8 must be e4m3 or e5m2"))),
-					});
-				}
-				_ => return Err(RecipeError::new(format!("[storage.{name}] has unknown key {key}"))),
-			}
-		}
-		let mut storage = Self {
-			kv: kv.ok_or_else(|| RecipeError::new(format!("[storage.{name}] names no kv")))?,
-			fp8: fp8.ok_or_else(|| RecipeError::new(format!("[storage.{name}] names no fp8")))?,
-		};
-		storage.kv = storage.resolve(storage.kv);
-		Ok(storage)
-	}
-}
 /// The precision of every kind of op, one named `[precision.<name>]` table in
 /// Cargo.toml chosen by `recipe run --cfg <name>`; a block's own suffix
 /// overrides its op's entry.
@@ -21975,7 +24836,7 @@ pub(crate) struct Precisions {
 	embed: Compute,
 	attn: Compute,
 	rope: Compute,
-	storage: Storage,
+	kv: Compute,
 	atvn: Compute,
 	norm: Compute,
 	res: Compute,
@@ -22011,7 +24872,7 @@ pub(crate) struct Precisions {
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { fp8: Compute::FP8, train: None, tolerance: 0.01_f64.to_bits(), exact_cpu: false, sum: fp16, embed: fp16, attn: fp16, rope: fp16, storage: Storage::default(), atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false, online_softmax: false, libm: false, gelu_table: false }
+		Self { fp8: Compute::FP8, train: None, tolerance: 0.01_f64.to_bits(), exact_cpu: false, sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false, online_softmax: false, libm: false, gelu_table: false }
 	}
 }
 impl Precisions {
@@ -22043,9 +24904,7 @@ impl Precisions {
 			.split(';')
 			.find_map(|profile| profile.split_once(':').filter(|(candidate, _)| *candidate == name).map(|(_, body)| body))
 			.ok_or_else(|| RecipeError::new(format!("--cfg {name} names no [precision.{name}] table in Cargo.toml; the tables are {names}")))?;
-		let mut profile = Self::parse(&name, table)?;
-		profile.storage = Storage::load(&name)?;
-		Ok(profile)
+		Self::parse(&name, table)
 	}
 	fn parse(name: &str, table: &str) -> Result<Self> {
 		// A table names every key: the run takes nothing from a Rust default.
@@ -22127,6 +24986,10 @@ impl Precisions {
 				"embed" => precisions.embed = compute,
 				"attn" => precisions.attn = compute,
 				"rope" => precisions.rope = compute,
+				"kv" => {
+					require(matches!(compute, Compute::FP16 | Compute::FP32 | Compute::BF16), format!("[precision.{name}] kv = {value}: a key-value cache is fp16, fp32 or bf16"))?;
+					precisions.kv = compute
+				}
 				"atvn" => precisions.atvn = compute,
 				"norm" => precisions.norm = compute,
 				"res" => precisions.res = compute,
@@ -22134,488 +24997,15 @@ impl Precisions {
 					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
 					precisions.acc = compute
 				}
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step, rope-angle the rope's angle, attn-softmax the attention's order, math the transcendentals' source and gelu-table the gelu's table"))),
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step, rope-angle the rope's angle, attn-softmax the attention's order, math the transcendentals' source and gelu-table the gelu's table"))),
 			}
 		}
-		let missing = ["fp8", "tolerance", "exact-cpu", "sum", "embed", "attn", "rope", "atvn", "norm", "res", "acc", "step", "rope-angle", "attn-softmax", "math", "gelu-table"].iter().filter(|key| !named.contains(**key)).copied().collect::<Vec<_>>();
+		let missing = ["fp8", "tolerance", "exact-cpu", "sum", "embed", "attn", "rope", "kv", "atvn", "norm", "res", "acc", "step", "rope-angle", "attn-softmax", "math", "gelu-table"].iter().filter(|key| !named.contains(**key)).copied().collect::<Vec<_>>();
 		require(missing.is_empty(), format!("[precision.{name}] names no {}; a table names every key, so nothing about a run's numbers comes from a default", missing.join(", ")))?;
 		Ok(precisions)
 	}
 }
 /// A precision by the name a table writes.
-#[cfg(test)]
-mod precision_contract_checks {
-	use super::*;
-	fn gradient_test_gpu() -> &'static Gpu {
-		if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
-			selected_gpu().unwrap()
-		} else {
-			Box::leak(Box::new(cpu_device().unwrap()))
-		}
-	}
-	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize, gated: bool) -> (Vec<f64>, Vec<f64>) {
-		let config = Config::load().unwrap();
-		let channels = width * (heads + 2 + if gated { heads } else { 0 });
-		assert_eq!(inputs.len(), channels * length);
-		let mut graph = Graph::new(Shape { channels, length }, 1e-5);
-		graph.profile = config.profile;
-		graph.profile.attn = format;
-		graph.profile.atvn = Compute::FP32;
-		let args = [heads as f64, 1.0, f64::from(gated), 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
-		push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, args, -2).unwrap();
-		lower_scale(&mut graph, 2.0_f64.powi(-24)).unwrap();
-		let targets = vec![0.25; width * heads * length];
-		let mut tape = NativeTape::new(&graph, TapeInput::Values(inputs), inputs, &targets, gpu, Compute::FP32, Some(mse)).unwrap();
-		tape.advance().unwrap();
-		tape.gradient_launch(0.01, config).unwrap();
-		(tape.predictions().unwrap(), tape.input_adjoint.download_float(inputs.len(), Compute::FP32).unwrap())
-	}
-	#[test]
-	fn narrow_sharded_training_preserves_wide_gradients() {
-		let gpu = gradient_test_gpu();
-		let devices: &'static [&'static Gpu] = if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
-			selected_gpus().unwrap()
-		} else { Box::leak(vec![gpu, gpu].into_boxed_slice()) };
-		assert_eq!(devices.len(), 2, "the sharded GPU check requires exactly two selected devices");
-		for format in [Compute::FP16, Compute::BF16] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(format);
-			config.multi_device = MultiDevice::Forced;
-			let samples: Vec<_> = (0..257 * 32).map(|i| 2.0_f64.powi(if i / 32 < 128 { -14 } else { -13 })).collect();
-			let prepared = Prepared::matrix(samples, vec![2.0_f64.powi(-14); 257], 257, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-			let mut graph = compile(&model, &prepared, &prepared.targets, 257, gpu, config, false).unwrap();
-			graph.parameters.fill(2.0_f64.powi(-14));
-			graph.refresh_storage(config).unwrap();
-			let mut single = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			single.advance().unwrap();
-			single.gradient_launch(0.01, config).unwrap();
-			let expected = single.download_gradient().unwrap();
-			let mut shards = DeviceTape::new(&graph, &prepared.samples, &prepared.targets, devices, Compute::FP32, mse, config).unwrap();
-			assert_eq!(shards.shards.len(), 2);
-			assert_eq!(shards.placement.gradient_to_primary.bytes, 128);
-			assert_eq!(shards.placement.weights_to_host.bytes, 64);
-			shards.advance().unwrap();
-			shards.epoch(0.01, 0.0, config).unwrap();
-			let actual = shards.shards[0].download_gradient().unwrap();
-			for (got, want) in actual.iter().zip(expected) { assert!((got - want).abs() < want.abs() * 2e-5, "{} sharded gradient {got} vs {want}", format.label()); }
-			assert_eq!(shards.shards[0].weights().unwrap(), shards.shards[1].weights().unwrap());
-		}
-	}
-	#[test]
-	fn narrow_attention_preserves_softmax_and_gate_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP32, Compute::FP16, Compute::BF16] {
-			for heads in [1, 2] {
-				for gated in [false, true] {
-					let mut inputs = vec![0.5; (heads + 2) * 4];
-					inputs[(heads + 1) * 4..].fill(0.0625);
-					if gated { inputs.extend(vec![0.0; heads * 4]); }
-					let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1, gated);
-					let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
-					for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
-					for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
-						let expected = delta * heads as f64 * if gated { 0.5 } else { 1.0 };
-						assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
-					}
-					if gated {
-						for value in &derivative[(heads + 2) * 4..] { assert!((value - delta * 0.0625 * 0.25).abs() < 1e-12, "{} gate gradient {value}", format.label()); }
-					}
-				}
-			}
-			for (q, k0, k1) in [(0.5, 0.0, 0.0), (0.0, 0.5, -0.5)] {
-				let inputs = [0.0, q, k0, k1, 0.25, 0.5];
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2, false);
-				let d0 = (output[0] - 0.25) * scale;
-				let d1 = (output[1] - 0.25) * scale;
-				let score0 = d1 * 0.5 * (0.25 - 0.375);
-				let score1 = d1 * 0.5 * (0.5 - 0.375);
-				let expected = [0.0, score0 * k0 + score1 * k1, score0 * q, score1 * q, d0 + d1 * 0.5, d1 * 0.5];
-				for (i, (got, want)) in derivative.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} softmax gradient {i}: {got} vs {want}", format.label()); }
-			}
-		}
-	}
-	#[test]
-	fn narrow_recurrence_carries_small_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP16, Compute::BF16] {
-			for gates in [1, 3, 4] {
-				let config = Config::load().unwrap();
-				let mut graph = Graph::new(Shape { channels: 1, length: 2 }, 1e-5);
-				graph.profile = config.profile;
-				graph.profile.sum = format;
-				lower_scan(&mut graph, 1, gates).unwrap();
-				graph.parameters.fill(0.0);
-				let candidate = if gates == 1 { 0 } else { gates - 1 };
-				graph.parameters[candidate * 3] = 1.0;
-				graph.parameters[candidate * 3 + 1] = 0.5;
-				graph.block_precision = Some(Compute::FP32);
-				lower_scale(&mut graph, scale).unwrap();
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&[0.0, 0.0]), &[0.0, 0.0], &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let d = -0.25 * scale;
-				let factors = match gates { 1 => [1.5, 1.0], 3 => [0.8125, 0.5], _ => [0.40625, 0.25] };
-				let inputs = tape.input_adjoint.download_float(2, Compute::FP32).unwrap();
-				for (got, factor) in inputs.iter().zip(factors) { assert!((got - d * factor).abs() < 1e-12, "{} {gates}-gate input gradient {got} vs {}", format.label(), d * factor); }
-				let gradients = tape.download_gradient().unwrap();
-				let expected_bias = d * factors.iter().sum::<f64>();
-				assert!((gradients[candidate * 3 + 2] - expected_bias).abs() < 1e-12, "{} {gates}-gate bias {} vs {expected_bias}", format.label(), gradients[candidate * 3 + 2]);
-			}
-		}
-	}
-	#[test]
-	fn narrow_delta_rule_carries_small_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP16, Compute::BF16] {
-			for chunk in [1, 2] {
-				let config = Config::load().unwrap();
-				let shape = Shape { channels: 3, length: 2 };
-				let mut graph = Graph::new(shape, 1e-5);
-				graph.profile = config.profile;
-				graph.profile.sum = format;
-				graph.profile.atvn = format;
-				let gates = constant(&mut graph, -1, Shape { channels: 2, length: 2 }, 0.0).unwrap();
-				reset(&mut graph, -1, shape);
-				push_node(&mut graph, Primitive::Delta, Shape { channels: 1, length: 2 }, 1, [1.0, 1.0, chunk as f64, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], gates).unwrap();
-				graph.parameters.fill(0.0);
-				graph.block_precision = Some(Compute::FP32);
-				lower_scale(&mut graph, scale).unwrap();
-				// The existing forward predicts from the prior state before decay:
-				// S_next = a*S + b*k*(v-k*S). With a=b=k=0.5, carry is 0.375.
-				let inputs = [1.0, 1.0, 0.5, 0.5, 0.25, 0.5];
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&inputs), &inputs, &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let predictions = tape.predictions().unwrap();
-				assert!((predictions[0] - 0.0625 * scale).abs() < 1e-12);
-				assert!((predictions[1] - 0.1484375 * scale).abs() < 1e-12);
-				let d0 = (predictions[0] - 0.25) * scale;
-				let d1 = (predictions[1] - 0.25) * scale;
-				let s0 = d0 + 0.375 * d1;
-				let expected = [0.0625 * d0, 0.1484375 * d1, 0.125 * s0, 0.21875 * d1, 0.25 * s0, 0.25 * d1];
-				let adjoints = tape.input_adjoint.download_float(6, Compute::FP32).unwrap();
-				for (i, (got, want)) in adjoints.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} delta input {i}: {got} vs {want}", format.label()); }
-				let gate_values = tape.adjoints.download_float_bytes(tape.program.artifact.layout.adjoints[gates as usize], 4, Compute::FP32).unwrap();
-				for (i, (got, want)) in gate_values.iter().zip([0.0, -0.015625 * d1, 0.03125 * s0, 0.05859375 * d1]).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} gate {i}: {got} vs {want}", format.label()); }
-				let softplus = format.unpack(format.pack(2.0_f64.ln()));
-				let expected_decay = -0.03125 * softplus * d1;
-				let decay = tape.download_gradient().unwrap()[0];
-				assert!((decay - expected_decay).abs() < 1e-12, "{} chunk {chunk} decay {decay} vs {expected_decay}", format.label());
-			}
-		}
-	}
-	fn table(name: &str) -> &'static str {
-		env!("RECIPE_PRECISION_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(key, _)| *key == name).map(|(_, body)| body)).unwrap()
-	}
-	#[test]
-	fn fp8_selection_and_saved_encoding_are_explicit() {
-		let base = table("recipe");
-		let first = Precisions::parse("recipe", base).unwrap();
-		assert_eq!(first.resolve(fp_format(8)), Compute::FP8);
-		let second = Precisions::parse("e5m2", &base.replace("fp8=e4m3", "fp8=e5m2")).unwrap();
-		assert_eq!(second.resolve(fp_format(8)), Compute::FP8_E5M2);
-		for format in [Compute::FP8, Compute::FP8_E5M2, Compute::INT16, Compute::INT32] {
-			let (family, fields) = format.saved_fields();
-			assert_eq!(Compute::saved(family, fields), Some(format));
-		}
-		assert_eq!(Compute::saved("f", [8, 5, 2, 52]), None);
-		assert_eq!(Compute::saved("int", [1, 0, 0, 0]), None);
-		assert!(Precisions::parse("bad", &base.replace("fp8=e4m3", "fp8=unknown")).is_err());
-		assert!(Precisions::parse("missing", &base.replace("fp8=e4m3,", "")).is_err());
-	}
-	#[test]
-	fn capability_table_drives_routes_and_hard_errors() {
-		let cpu = BackendTarget::Cpu { target: "target=test;compiler=test;cpu=test;features=test".to_owned() };
-		let packed = resolve_capability(&cpu, ContractFormat::Int8).unwrap();
-		assert_eq!(packed.vector, Some("scalar packed dot"));
-		assert!(packed.matrix.is_none());
-		let error = resolve_capability(&cpu, ContractFormat::Fp8).unwrap_err().to_string();
-		assert!(error.contains("no fp8 instruction") && error.contains("Vector:") && error.contains("Matrix: none"));
-		let gfx11 = BackendTarget::Amd { architecture: "gfx1101".to_owned() };
-		let f16 = resolve_capability(&gfx11, ContractFormat::Fp16).unwrap();
-		assert!(matches!(f16.matrix, Some((NativeMatrix::Gfx11, "wmma f16"))));
-		let gfx12 = BackendTarget::Amd { architecture: "gfx1201".to_owned() };
-		assert!(matches!(resolve_capability(&gfx12, ContractFormat::Bf16).unwrap().matrix, Some((NativeMatrix::Gfx12, "wmma bf16"))));
-		let sm52 = BackendTarget::Nvidia { architecture: "sm_52".to_owned() };
-		assert_eq!(resolve_capability(&sm52, ContractFormat::Int8).unwrap().vector, Some("fp32 dot of packed i8 codes"));
-		assert!(resolve_capability(&sm52, ContractFormat::Int4).is_err());
-		let sm61 = BackendTarget::Nvidia { architecture: "sm_61".to_owned() };
-		assert_eq!(resolve_capability(&sm61, ContractFormat::Int8).unwrap().vector, Some("dp4a"));
-	}
-	#[test]
-	fn nvidia_dp4a_replaces_portable_helpers() {
-		let portable = "define internal i32 @recipe.dot4.su(i32 %a, i32 %b) #1 { entry: ret i32 0 }\ndefine internal i32 @recipe.dot4.ss(i32 %a, i32 %b) #1 { entry: ret i32 0 }\n";
-		let replaced = nvidia_dp4a_helpers(portable.to_owned(), &[]);
-		assert!(replaced.contains("call i32 @llvm.nvvm.idp4a.u.s") && replaced.contains("call i32 @llvm.nvvm.idp4a.s.s"));
-		assert!(!replaced.contains("entry: ret i32 0"));
-		let widened = nvidia_float_dot4_helpers(portable.to_owned(), &[]);
-		assert!(widened.contains("sitofp i32") && widened.contains("fmul float") && widened.contains("fptosi float"));
-		assert!(!widened.contains("entry: ret i32 0"));
-	}
-	#[test]
-	fn proportional_rope_factors_match_the_analytic_rotation() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let mut graph = Graph::new(Shape { channels: 4, length: 2 }, 1e-5);
-		graph.profile = Config::load().unwrap().profile;
-		graph.block_precision = Some(Compute::FP32);
-		push_node(&mut graph, Primitive::Rope, Shape { channels: 4, length: 2 }, 2, [4.0, 10000.0, 4.0, 4.0, 1.0, 1.0, 0.0, 0.0, 1.0], -2).unwrap();
-		graph.parameters.copy_from_slice(&[1.0, 2.0]);
-		let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
-		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
-		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
-		assert_eq!(tape.nodes[0].parameters, 2);
-		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false, false).unwrap();
-		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
-		tape.forward(ForwardMode::Inference).unwrap();
-		let output = tape.predictions().unwrap();
-		let expected = [
-			1.0,
-			2.0 * 1.0_f64.cos() - 6.0 * 1.0_f64.sin(),
-			3.0,
-			4.0 * 0.005_f64.cos() - 8.0 * 0.005_f64.sin(),
-			5.0,
-			6.0 * 1.0_f64.cos() + 2.0 * 1.0_f64.sin(),
-			7.0,
-			8.0 * 0.005_f64.cos() + 4.0 * 0.005_f64.sin(),
-		];
-		for (actual, expected) in output.iter().zip(expected) {
-			assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
-		}
-		let mut graph = Graph::new(Shape { channels: 4, length: 5 }, 1e-5);
-		let mut attention = AttentionBlock::new(1);
-		attention.width = 4;
-		attention.window = 4;
-		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
-		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
-	}
-	#[test]
-	fn placement_accepts_both_operands_from_the_immediate_boundary() {
-		let shape = Shape { channels: 1, length: 1 };
-		let mut graph = Graph::new(shape, 1e-5);
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], -2).unwrap();
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
-		assert!(!cuts_connection(&graph, 1));
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
-		assert!(cuts_connection(&graph, 2));
-	}
-	#[test]
-	fn sampler_never_selects_suppressed_tokens() {
-		let mut sampler = recipe.sampler().temperature(0.0);
-		sampler.suppressed = vec![1];
-		assert_eq!(sampler.sample(&[0.0, 10.0, 5.0], &[]), 2);
-	}
-	#[test]
-	fn precision_suffix_scope_is_local_and_explicit() {
-		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
-		assert_eq!(projection.blck_precision, Some(Compute::INT4));
-		assert_eq!(projection.maps[0].precision, Some(Compute::FP16));
-		assert_eq!(projection.maps[1].precision, Some(Compute::FP32));
-		assert_eq!(projection.precision, None);
-		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
-		assert_eq!(attention.blck_precision, Some(Compute::INT8));
-		assert_eq!(attention.kv_precision, Some(Compute::BF16));
-		assert_eq!(attention.qk_precision, Some(Compute::FP16));
-		assert_eq!(attention.rope_precision, Some(Compute::FP32));
-		assert_eq!(attention.precision, None);
-		let mut graph = Graph::new(Shape { channels: 8, length: 2 }, 1e-5);
-		graph.profile = Config::load().unwrap().profile;
-		graph.block_blck_precision = Some(Compute::FP32);
-		graph.block_qk_precision = attention.qk_precision;
-		graph.block_rope_precision = attention.rope_precision;
-		let mut operation = AttentionBlock::new(2);
-		operation.width = 4;
-		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
-		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
-		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
-		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
-		let model = recipe.model().res([projection.clone()]).fp(64);
-		let residual = model.blocks.last().unwrap();
-		assert_eq!(residual.precision, Some(Compute::FP64));
-		let Operation::Residual(parts) = &residual.operation else { panic!("residual block was not preserved") };
-		assert_eq!(parts[0], projection);
-		let depthwise = recipe.model().dconv(3).fp(32);
-		let depthwise = depthwise.blocks.last().unwrap();
-		assert_eq!(depthwise.precision, Some(Compute::FP32));
-		assert_eq!(depthwise.blck_precision, None);
-		assert!(std::panic::catch_unwind(|| layer(1).int(1)).is_err());
-	}
-	#[test]
-	fn reference_policy_and_training_validation() {
-		let base = table("recipe");
-		assert_eq!(f64::from_bits(Precisions::parse("recipe", base).unwrap().tolerance), 0.05);
-		assert!(Precisions::parse("llamacpp", table("llamacpp")).unwrap().exact_cpu);
-		for invalid in ["NaN", "inf", "-1"] {
-			assert!(Precisions::parse("bad", &base.replace("tolerance=0.05", &format!("tolerance={invalid}"))).is_err());
-		}
-		let mut graph = Graph::new(Shape { channels: 32, length: 1 }, 1e-5);
-		push_node(&mut graph, Primitive::Contraction, Shape { channels: 1, length: 1 }, 32, [0.0; 9], -1).unwrap();
-		graph.nodes[0].int_bits = 16;
-		assert!(graph.training_graph().is_err());
-		graph.profile.train = Some(Compute::FP16);
-		let half_training = graph.training_graph().unwrap();
-		assert_eq!(half_training.nodes[0].precision, Compute::FP16);
-		let layout = NativeLayout::for_graph(&half_training, 1, Compute::FP32, false).unwrap();
-		assert_eq!(layout.precisions[0].bytes(), 2);
-		assert_eq!(layout.gradient_precisions[0], Compute::FP32);
-		assert_eq!(layout.gradient_bytes, 32 * 4);
-		assert_eq!(layout.input_adjoint_precision, Compute::FP32);
-		graph.profile.train = Some(Compute::FP64);
-		let training = graph.training_graph().unwrap();
-		assert_eq!(training.nodes[0].precision, Compute::FP64);
-		assert_eq!(training.profile.acc, Compute::FP64);
-		assert_eq!(training.nodes[0].int_bits, 16);
-	}
-	#[test]
-	fn integer_compute_uses_only_canonical_storage() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let config = Config::load().unwrap();
-		let prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
-		for (bits, name, stride) in [(4, "q4_1", 20), (8, "q8_0", 34), (16, "q8_0", 34), (32, "q8_0", 34)] {
-			let model = recipe.model().no(bias).layer(1).int(bits).loss(mse);
-			let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			let stored = graph.stored[0].as_ref().unwrap();
-			assert!(stored.format == StorageFormat::named(name).unwrap());
-			assert_eq!(stored.bytes.len(), stride);
-			assert!(stored.segments == vec![(stored.format, 32)]);
-		}
-	}
-	#[test]
-	fn quantized_source_converts_once_at_device_load() {
-		let gpu = gradient_test_gpu();
-		let config = Config::load().unwrap();
-		let values: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 8.0).collect();
-		let source_format = StorageFormat::named("q4_0").unwrap();
-		let mut source = source_format.encode(&values, &[1.0; 32], config).unwrap();
-		source.arithmetic.clear();
-		let mut prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
-		prepared.bound = Some(vec![BoundNode { names: "source.weight".to_owned(), elements: 32, weight: BoundWeight::Stored(source) }]);
-		let model = recipe.model().no(bias).layer(1).int(4).loss(mse);
-		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-		let target = graph.stored[0].as_ref().unwrap();
-		assert!(target.format == StorageFormat::named("q4_1").unwrap());
-		assert_eq!(target.bytes.len(), 20);
-		assert!(target.bytes.absent_runs());
-		let source = graph.requantize[0].as_ref().unwrap();
-		assert!(source.format == source_format);
-		assert_eq!(source.bytes.len(), 18);
-		let input: Vec<f64> = (0..32).map(|i| (i as f64 + 1.0) / 64.0).collect();
-		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
-		tape.forward(ForwardMode::Inference).unwrap();
-		let actual = tape.predictions().unwrap()[0];
-		let source_bytes = source.bytes.slice(0, source.bytes.len()).unwrap();
-		let source_values = source.format.decompress(&source_bytes, &source.codebook, 32).unwrap();
-		let canonical = StorageFormat::named("q4_1").unwrap().encode(&source_values, &[1.0; 32], config).unwrap();
-		let bytes = canonical.bytes.slice(0, canonical.bytes.len()).unwrap();
-		let decoded = canonical.format.decompress(&bytes, &canonical.codebook, 32).unwrap();
-		let extreme = *input.iter().max_by(|left, right| left.abs().total_cmp(&right.abs())).unwrap();
-		let inverse = -127.0 / extreme;
-		let step = 1.0 / inverse;
-		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
-		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
-	}
-	#[test]
-	fn narrow_training_preserves_small_and_large_gradients() {
-		let gpu = gradient_test_gpu();
-		for format in [Compute::FP16, Compute::BF16] {
-			for (rows, sample, weight, target, scale) in [(1, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (257, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (1, 256.0, 0.0, 256.0, 1.0), (1, 0.0625, 0.0625, 2.0_f64.powi(-14), 2.0_f64.powi(-14))] {
-				let mut config = Config::load().unwrap();
-				config.profile.train = Some(format);
-				let prepared = Prepared::matrix(vec![sample; rows * 32], vec![target; rows], rows, 1).unwrap();
-				let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-				let model = if scale == 1.0 { model } else { model.scale(scale).arithmetic(format) };
-				let mut graph = compile(&model, &prepared, &prepared.targets, rows, gpu, config, false).unwrap();
-				graph.parameters.fill(weight);
-				graph.refresh_storage(config).unwrap();
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let prediction = tape.predictions().unwrap()[0];
-				assert_eq!(tape.weights().unwrap()[0], weight);
-				let expected = 2.0 * (prediction - target) * scale * sample;
-				let gradients = tape.download_gradient().unwrap();
-				assert_eq!(gradients.len(), 32);
-				for value in gradients { assert!((value - expected).abs() <= expected.abs() * 2e-5, "{} rows {rows}: gradient {value} vs {expected}", format.label()); }
-				let input = tape.input_adjoint.download_float(rows * 32, Compute::FP32).unwrap();
-				let expected_input = 2.0 * (prediction - target) * scale * weight / rows as f64;
-				for value in input { assert!((value - expected_input).abs() <= expected_input.abs() * 2e-5, "{} rows {rows}: input gradient {value} vs {expected_input}", format.label()); }
-			}
-		}
-	}
-	#[test]
-	fn narrow_training_with_double_accumulator_preserves_cast_adjoints() {
-		let gpu = gradient_test_gpu();
-		for tail in [false, true] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(Compute::FP16);
-			config.profile.acc = Compute::FP64;
-			let sample = 2.0_f64.powi(-14);
-			let target = sample;
-			let prepared = Prepared::matrix(vec![sample; 32], vec![target], 1, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-			let scale = if tail { 2.0_f64.powi(-14) } else { 1.0 };
-			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			if tail {
-				graph.block_precision = Some(Compute::FP32);
-				graph.profile.acc = Compute::FP32;
-				lower_scale(&mut graph, scale).unwrap();
-			}
-			graph.parameters.fill(sample);
-			graph.refresh_storage(config).unwrap();
-			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
-			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			let expected = 2.0 * (tape.predictions().unwrap()[0] - target) * scale * sample;
-			for value in tape.download_gradient().unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
-			for value in tape.input_adjoint.download_float(32, Compute::FP64).unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
-		}
-	}
-	#[test]
-	fn narrow_normalization_backward_matches_analytic_derivative() {
-		let gpu = gradient_test_gpu();
-		for format in [Compute::FP16, Compute::BF16] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(format);
-			let samples: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 32.0).collect();
-			let prepared = Prepared::matrix(samples.clone(), vec![0.25], 1, 1).unwrap();
-			let scale = 2.0_f64.powi(-24);
-			let model = recipe.model().no(bias).layer(32).int(16).norm(rms).arithmetic(format).layer(1).int(16).scale(scale).fp(32).loss(mse);
-			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			graph.parameters.fill(0.0);
-			for i in 0..32 { graph.parameters[i * 32 + i] = 1.0; }
-			let norm = graph.nodes.iter().position(|node| node.op == Primitive::Normalize).unwrap();
-			let head = graph.nodes.iter().rposition(|node| node.op == Primitive::Contraction).unwrap();
-			let (norm_offset, head_offset) = (graph.nodes[norm].offset, graph.nodes[head].offset);
-			let head_weights: Vec<f64> = (0..32).map(|i| (i as f64 % 3.0 - 1.0) / 16.0).collect();
-			graph.parameters[norm_offset..norm_offset + 32].fill(1.0);
-			graph.parameters[head_offset..head_offset + 32].copy_from_slice(&head_weights);
-			graph.refresh_storage(config).unwrap();
-			let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			let layout = &tape.program.artifact.layout;
-			let normalized = tape.values.download_float_bytes(layout.values[norm], 32, format).unwrap();
-			let inverse = tape.contexts.download_float_bytes(layout.contexts[norm] + format.bytes(), 1, format).unwrap()[0];
-			let delta = 2.0 * (tape.predictions().unwrap()[0] - 0.25) * scale;
-			let projection = head_weights.iter().zip(&normalized).map(|(w, x)| delta * w * x).sum::<f64>() / 32.0;
-			let inputs = tape.input_adjoint.download_float(32, Compute::FP32).unwrap();
-			let gradients = tape.download_gradient().unwrap();
-			for i in 0..32 {
-				let expected = inverse * (delta * head_weights[i] - normalized[i] * projection);
-				assert!((inputs[i] - expected).abs() < 1e-12, "{} input {i}: {} vs {expected}", format.label(), inputs[i]);
-				let gamma = delta * head_weights[i] * normalized[i];
-				assert!((gradients[norm_offset + i] - gamma).abs() < 1e-12, "{} norm weight {i}: {} vs {gamma}", format.label(), gradients[norm_offset + i]);
-			}
-		}
-	}
-}
-
 fn precision_named(name: &str) -> Result<Compute> {
 	Ok(match name {
 		"fp8" => Compute::FP8,
@@ -22639,7 +25029,7 @@ fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
 		Primitive::Attention => PrecisionKind::Attn,
 		Primitive::Rope => PrecisionKind::Rope,
 		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
-		Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut => PrecisionKind::Sum,
+		Primitive::Contraction => PrecisionKind::Sum,
 		_ => PrecisionKind::Atvn,
 	}
 }
@@ -22799,6 +25189,7 @@ struct HostLookup {
 	length: usize,
 }
 struct NativeTape {
+	mtp_hidden: Mutex<Vec<Vec<f64>>>,
 	observations: u8,
 	tensor_history: Mutex<Vec<TensorObservation>>,
 	programs: Vec<f64>,
@@ -22814,12 +25205,14 @@ struct NativeTape {
 	/// The node and value count of every saved batch normalization statistic.
 	batch_normalizations: Vec<(usize, usize)>,
 	samples: Buffer,
-	request: Mutex<Option<NativeRequest>>,
-	saved_output: Mutex<Vec<f64>>,
 	input_adjoint: Buffer,
 	targets: Buffer,
 	weights: Buffer,
 	frozen: Buffer,
+	timing: Mutex<TapeTiming>,
+	residency: WeightResidency,
+	#[allow(dead_code)]
+	hold: Option<RetainedHold>,
 	moments: Buffer,
 	variances: Buffer,
 	gradient: Buffer,
@@ -22838,35 +25231,11 @@ struct NativeTape {
 	compile_seconds: f64,
 	load_seconds: f64,
 	last_device_seconds: AtomicU64,
-	operations: Mutex<Vec<OperationReport>>,
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
 	window_begin: std::sync::atomic::AtomicU32,
-}
-
-struct NativeRequest {
-	input: Buffer,
-	output: Buffer,
-	hidden: Buffer,
-	lookups: Vec<Buffer>,
-	begin: u32,
-	positions: usize,
-}
-impl NativeRequest {
-	fn new(gpu: &'static Gpu) -> Result<Self> {
-		Ok(Self { input: Buffer::zeroed(gpu, 1)?, output: Buffer::zeroed(gpu, 1)?, hidden: Buffer::zeroed(gpu, 1)?, lookups: Vec::new(), begin: 0, positions: 0 })
-	}
-	fn grow(buffer: &mut Buffer, bytes: usize) -> Result<()> {
-		if bytes > buffer.bytes { *buffer = Buffer::zeroed(buffer.runtime, bytes)?; }
-		Ok(())
-	}
-	fn shadow(&self) -> Result<Self> {
-		let copy = |buffer: &Buffer| Buffer::upload(buffer.runtime, &buffer.download::<u8>(buffer.bytes)?);
-		Ok(Self {
-			input: copy(&self.input)?, output: copy(&self.output)?, hidden: copy(&self.hidden)?,
-			lookups: self.lookups.iter().map(copy).collect::<Result<Vec<_>>>()?, begin: self.begin, positions: self.positions,
-		})
-	}
+	/// The lane tuner of an inference tape whose program reads knobs.
+	tuner: Mutex<Option<LaneTuner>>,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -22937,21 +25306,18 @@ impl EpochOperation {
 enum TapeInput<'a> {
 	Values(&'a [f64]),
 	Ids(&'a [u32]),
-	Zeroed(usize),
 }
 impl TapeInput<'_> {
 	fn len(self) -> usize {
 		match self {
 			Self::Values(values) => values.len(),
 			Self::Ids(ids) => ids.len(),
-			Self::Zeroed(count) => count,
 		}
 	}
 	fn label(self) -> &'static str {
 		match self {
 			Self::Values(_) => "values",
 			Self::Ids(_) => "token ids",
-			Self::Zeroed(_) => "zero-initialized values",
 		}
 	}
 }
@@ -22992,20 +25358,18 @@ impl NativeTape {
 		for (index, node) in self.nodes.iter().enumerate() {
 			let storage = &self.storage[index];
 			let operand = if node.int_bits == 32 { "fp32".to_owned() } else if node.int_bits != 0 { format!("int{}", node.int_bits) } else { node.precision.label() };
-			let cache = if node.op == Primitive::Attention { format!(" KV storage {}", node.kv_precision.label()) } else { String::new() };
-			let item = format!("{} {} storage {storage} operand {operand} accumulator {} result {}{cache}", node.block_kind, node.primitive_name(), node.acc.label(), node.precision.label());
+			let item = format!("{} {} storage {storage} operand {operand} accumulator {} result {}", node.block_kind, node.primitive_name(), node.acc.label(), node.precision.label());
 			if seen.insert(item.clone()) { lines.push(format!("{device}  format: {item}")); }
 		}
 		Ok(lines)
 	}
 	fn memory_line(&self) -> Result<String> {
-		let (input, output) = self.request_bytes();
 		Ok(format!(
 			"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
 			self.device_label()?,
-			self.samples.bytes + input,
+			self.samples.bytes,
 			self.weights.bytes,
-			self.values.bytes + output,
+			self.values.bytes,
 			self.contexts.bytes,
 			self.adjoints.bytes,
 			self.gradient.bytes,
@@ -23026,9 +25390,6 @@ impl NativeTape {
 			} else {
 				format!("{device}  tile: {} pp {}x{}x{}", self.nodes[index].identity(index), tiles.forward.m, tiles.forward.n, tiles.forward.k)
 			}))
-			.chain(self.program.schedule.attention.iter().enumerate().filter_map(|(index, extent)| extent.map(|extent| {
-				format!("{device}  tile: {} attention {}x{}x{}", self.nodes[index].identity(index), extent.m, extent.n, extent.k)
-			})))
 			.collect())
 	}
 	fn grid_lines(&self) -> Result<Vec<String>> {
@@ -23045,21 +25406,15 @@ impl NativeTape {
 			}
 		}
 		if let Some(load) = self.program.model_load { lines.push(format!("{device}  grid: load {}x1x1 workgroup {}x1x1", load.geometry.groups, load.geometry.block)); }
-		let mut dispatches = vec![("forward", self.program.forward)];
-		#[cfg(nvidia)]
-		if let NativeBackend::Nvidia(program) = &self.program.backend && let Some(step) = program.step { dispatches.push(("tg", step)); }
-		if let Some(epoch) = self.program.epoch { dispatches.push(("epoch", epoch)); }
-		for (entry, dispatch) in dispatches {
-			if let Some((registers, local)) = dispatch.kernel.nvidia_resources {
-				lines.push(format!("{device}  resources: {entry} registers/thread {registers} local-bytes/thread {local}"));
-			}
-		}
 		Ok(lines)
 	}
 	/// `tokens` are the model's ids, one per position of every row, which the
 	/// lookups of this graph gather rows for; a whole graph reads its own
 	/// samples, and a part of a split graph reads the ids its stream came from.
 	fn new(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+		Self::build(graph, samples, tokens, targets, gpu, precision, loss, None)
+	}
+	fn build(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>, source: Option<&RetainedSource>) -> Result<Self> {
 		let prepare_started = Instant::now();
 		let training_graph;
 		let graph = if loss.is_some() {
@@ -23117,14 +25472,10 @@ impl NativeTape {
 		let adjoints_bytes = if training { layout.adjoints_bytes.max(1) } else { 1 };
 		let input_adjoint_bytes = if training { checked_mul(samples.len(), layout.input_adjoint_precision.bytes(), "native input adjoint allocation")?.max(1) } else { 1 };
 		// A graph that starts with a gather reads its input as i32 token ids.
-		let vocabulary = graph.nodes.first().filter(|node| node.token_input()).map_or(0.0, |node| node.argument[0]);
+		let vocabulary = graph.nodes.first().filter(|node| node.op == Primitive::Gather).map_or(0.0, |node| node.argument[0]);
 		let token_count = tokens.len();
 		let tokens = Mutex::new(tokens.to_vec());
 		let samples = match (samples, vocabulary > 0.0) {
-			(TapeInput::Zeroed(count), ids) => {
-				let count = if layout.request_control.is_some() { checked_mul(graph.input.channels, layout.window_positions, "initial input window")? } else { count };
-				Buffer::zeroed(gpu, checked_mul(count, if ids { size_of::<i32>() } else { layout.input_precision.bytes() }, "initial input bytes")?)?
-			}
 			(TapeInput::Ids(ids), true) => {
 				let ids = ids.iter().map(|id| require(f64::from(*id) < vocabulary, format!("token id {id} is outside the vocabulary of {vocabulary}")).map(|()| *id as i32)).collect::<Result<Vec<_>>>()?;
 				Buffer::upload(gpu, &ids)?
@@ -23133,8 +25484,10 @@ impl NativeTape {
 			(TapeInput::Values(values), true) => Buffer::upload(gpu, &values.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?,
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
-		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
-		if program.model_load.is_some() {
+		let Acquired { mut weights, mut residency, mut load, hold: reused_hold } = acquire_weights(gpu, graph, precision.model, inference, rows, source)?;
+		let reused = residency.outcome == "reused";
+		let mut hold = reused_hold;
+		if program.model_load.is_some() && !reused {
 			let image = &program.artifact.storage;
 			require(!image.is_empty(), "native model-load storage is empty")?;
 			// One node at a time through one scratch the size of the largest
@@ -23144,6 +25497,8 @@ impl NativeTape {
 			for (node, stored) in &image.segments {
 				if tracing() { trace(&format!("load write node {node} bytes {}", stored.len()))?; }
 				storage.write_runs(0, stored)?;
+				residency.read_bytes += stored.len();
+				residency.uploaded_bytes += stored.len();
 				let index = i32::try_from(*node).map_err(|_| RecipeError::new("native model-load node index exceeds i32"))?;
 				if tracing() { trace(&format!("load dispatch node {node} bytes {} threads {threads}", stored.len()))?; }
 				let mut call = ptrs![weights.pointer, storage.pointer, threads, index];
@@ -23170,8 +25525,12 @@ impl NativeTape {
 					trace(&format!("load node {node} {} wrote {written:?} machine {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
 				}
 			}
-		} else {
+		} else if program.model_load.is_none() {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
+		}
+		if let Some(pending) = load.take() {
+			weights.seal();
+			hold = Some(pending.commit(&mut residency)?);
 		}
 		// The arenas are cleared on the device rather than staged whole on the
 		// host: a later position reads the zeros the earlier windows left.
@@ -23183,8 +25542,8 @@ impl NativeTape {
 		let contexts = Buffer::zeroed_guarded(gpu, layout.contexts_bytes, guard)?;
 		// The packed embedding table is the gather's context, so it reaches the
 		// device whole once and the kernel then reads only the rows it addresses.
-		// Keep packed lookup tables in owned machine RAM, not demand-paged file
-		// mappings. Only the gathered rows are staged on the selected device.
+		// A lookup's table never leaves the host: the tape keeps it with its hash
+		// and stages the rows of every forward window from the ids it holds.
 		let (mut lookups, positions) = (Vec::new(), graph_positions(graph));
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if node.op == Primitive::Gather {
@@ -23196,8 +25555,10 @@ impl NativeTape {
 				}
 			}
 			if node.op == Primitive::Lookup {
-				let mut table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
-				table.bytes = table.bytes.in_ram()?;
+				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				// A position reads a few scattered rows of a table far larger than the
+				// machine's memory: each read takes only its own page from the disk.
+				table.bytes.scattered();
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
@@ -23236,6 +25597,7 @@ impl NativeTape {
 			formats.join("+")
 		}).collect();
 		let tape = Self {
+			mtp_hidden: Mutex::new(Vec::new()),
 			observations: graph.observations,
 			tensor_history: Mutex::new(Vec::new()),
 			profile: graph.profile,
@@ -23246,15 +25608,16 @@ impl NativeTape {
 			context_resets,
 			lookups,
 			tokens,
-			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
+			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes, mapped: false, sealed: false },
 			batch_normalizations,
 			samples,
-			request: Mutex::new(None),
-			saved_output: Mutex::new(Vec::new()),
-			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
+			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes, mapped: false, sealed: false },
 			targets: Buffer::upload_float(gpu, &target_buffer, layout.output_precision)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen_mask)?,
+			timing: Mutex::new(TapeTiming::new(graph, gpu)?),
+			residency,
+			hold,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::zeroed(gpu, gradient_bytes)?,
@@ -23274,11 +25637,12 @@ impl NativeTape {
 			compile_seconds,
 			load_seconds,
 			last_device_seconds: AtomicU64::new(0.0_f64.to_bits()),
-			operations: Mutex::new(Vec::new()),
 			reached: std::sync::atomic::AtomicU32::new(0),
 			window_begin: std::sync::atomic::AtomicU32::new(0),
+			tuner: Mutex::new(None),
 		};
-		if tape.program.artifact.layout.request_control.is_none() { tape.stage_lookups(0, tape.positions, None)?; }
+		tape.stage_lookups(0, tape.positions)?;
+		tape.bind_knobs(graph)?;
 		Ok(tape)
 	}
 	/// Writes every contraction node's forward, gradient, and previous tiles
@@ -23409,33 +25773,7 @@ impl NativeTape {
 		})
 	}
 	fn forward(&self, mode: ForwardMode) -> Result<()> {
-		if self.program.artifact.layout.request_control.is_some() {
-			self.prepare_request(0, self.positions)?;
-			let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-			let request = request.as_ref().ok_or_else(|| RecipeError::new("request input was not prepared"))?;
-			require(request.input.bytes <= self.samples.bytes, "initial input does not cover the request")?;
-			request.input.write_bytes(0, &self.samples.download(request.input.bytes)?)?;
-		}
 		self.forward_window(0, self.positions, mode)
-	}
-	fn prepare_request(&self, begin: u32, end: u32) -> Result<()> {
-		let layout = &self.program.artifact.layout;
-		if layout.request_control.is_none() { return Ok(()) }
-		require(begin <= end && end <= self.positions, "request window is outside the context")?;
-		let mut state = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		if state.is_none() { *state = Some(NativeRequest::new(self.program.gpu)?); }
-		let request = state.as_mut().unwrap();
-		let positions = (end - begin) as usize;
-		let input_bytes = if self.vocabulary > 0.0 { size_of::<i32>() } else { layout.input_precision.bytes() };
-		NativeRequest::grow(&mut request.input, checked_mul(checked_mul(self.input.channels, positions, "request input elements")?, input_bytes, "request input bytes")?)?;
-		let output_positions = if self.output.length == 1 { 1 } else { positions };
-		NativeRequest::grow(&mut request.output, checked_mul(checked_mul(self.output.channels, output_positions, "request output elements")?, layout.output_precision.bytes(), "request output bytes")?)?;
-		if let Some((index, node)) = self.nodes.iter().enumerate().find(|(_, node)| node.retain_output) {
-			NativeRequest::grow(&mut request.hidden, checked_mul(checked_mul(node.output.channels, positions, "request hidden elements")?, layout.precisions[index].bytes(), "request hidden bytes")?)?;
-		}
-		request.begin = begin;
-		request.positions = positions;
-		Ok(())
 	}
 	/// The id one input value names.
 	fn token(&self, value: f64) -> Result<u32> {
@@ -23447,29 +25785,32 @@ impl NativeTape {
 	}
 	/// Gather every lookup's rows for the positions `begin..end` of every row on
 	/// the host and write them into the staging context the device reads.
-	fn stage_lookups(&self, begin: u32, end: u32, mut request: Option<&mut NativeRequest>) -> Result<()> {
+	fn stage_lookups(&self, begin: u32, end: u32) -> Result<()> {
 		let (begin, end) = (begin as usize, end as usize);
+		// A buffer that holds one window keeps its first position at slot zero.
+		let origin = if self.program.artifact.layout.window_positions < self.input.length { begin } else { 0 };
 		let tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
-		for (index, lookup) in self.lookups.iter().enumerate() {
+		for lookup in &self.lookups {
 			let bytes = lookup.precision.bytes();
 			let channels = lookup.hash.heads() * lookup.width;
-			let (buffer, base, length, first) = if let Some(request) = request.as_mut() {
-				if index == request.lookups.len() { request.lookups.push(Buffer::zeroed(self.program.gpu, 1)?); }
-				let buffer = &mut request.lookups[index];
-				NativeRequest::grow(buffer, checked_mul(checked_mul(end - begin, channels, "lookup request elements")?, bytes, "lookup request bytes")?)?;
-				self.contexts.write_bytes(lookup.context, &buffer.pointer.to_ne_bytes())?;
-				(&*buffer, 0, end - begin, 0)
-			} else { (&self.contexts, lookup.context, lookup.length, begin) };
 			for row in 0..self.rows as usize {
 				let ids = tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
+				// The rows of a window are scattered reads of the machine's disk or
+				// memory: they are read at once, each waiting on its own page.
+				let indices = (begin..end).flat_map(|position| lookup.hash.rows_at(&ids, position)).collect::<Vec<_>>();
+				let readers = indices.len().clamp(1, natural("lookup readers", env!("RECIPE_LOOKUP_READERS"))?);
+				let parts = std::thread::scope(|scope| {
+					let handles = indices.chunks(indices.len().div_ceil(readers).max(1)).map(|part| scope.spawn(move || part.iter().map(|index| ngram::table_row(&lookup.table, lookup.width, *index)).collect::<Result<Vec<_>>>())).collect::<Vec<_>>();
+					handles.into_iter().map(|handle| handle.join().map_err(|_| RecipeError::new("a lookup reader panicked"))?).collect::<Result<Vec<_>>>()
+				})?;
 				let mut staged = Vec::with_capacity((end - begin) * channels);
-				for position in begin..end {
-					for index in lookup.hash.rows_at(&ids, position) {
-						staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?);
+				for rows in parts {
+					for row in rows {
+						staged.extend(row);
 					}
 				}
-				let slot = checked_mul(checked_add(checked_mul(row, length, "lookup row")?, first, "lookup slot")?, channels, "lookup staging offset")?;
-				buffer.write_float_bytes(checked_add(base, checked_mul(slot, bytes, "lookup staging bytes")?, "lookup staging")?, &staged, lookup.precision)?;
+				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin - origin, "lookup slot")?, channels, "lookup staging offset")?;
+				self.contexts.write_float_bytes(checked_add(lookup.context, checked_mul(slot, bytes, "lookup staging bytes")?, "lookup staging")?, &staged, lookup.precision)?;
 			}
 		}
 		Ok(())
@@ -23485,27 +25826,28 @@ impl NativeTape {
 		self.forward_window_observed(samples, begin, end, mode, &mut |_, _| {})
 	}
 	fn forward_window_observed(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64)) -> Result<()> {
+		self.forward_window_gated(samples, begin, end, mode, observed, None)
+	}
+	/// A window whose launch waits at `gate` for the other dies of a tensor
+	/// split, so every die starts its step together and none waits at its
+	/// first exchange for another's host work.
+	fn forward_window_gated(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64), gate: Option<&std::sync::Barrier>) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
-		let mut request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		let samples = if let Some(control) = self.program.artifact.layout.request_control {
-			let request = request.as_ref().ok_or_else(|| RecipeError::new("request input was not prepared"))?;
-			require(request.begin == begin && request.positions == (end - begin) as usize, "prepared request does not match the execution window")?;
-			let mut record = [0_u8; 24];
-			record[..4].copy_from_slice(&begin.to_ne_bytes());
-			record[4..8].copy_from_slice(&(end - begin).to_ne_bytes());
-			record[8..16].copy_from_slice(&request.output.pointer.to_ne_bytes());
-			record[16..].copy_from_slice(&request.hidden.pointer.to_ne_bytes());
-			self.contexts.write_bytes(control, &record)?;
-			request.input.pointer
-		} else { samples };
 		let capacity = self.program.artifact.layout.window_positions as u32;
-		self.reached.store(end, Ordering::Relaxed);
-		let retained_begin = if begin < end { begin + (end - begin - 1) / capacity * capacity } else { begin };
-		self.window_begin.store(retained_begin, Ordering::Relaxed);
-		self.stage_lookups(begin, end, request.as_mut())?;
-		if let Some(clocks) = self.program.artifact.layout.clocks {
-			self.contexts.write_bytes(clocks, &vec![0_u8; self.nodes.len() * 24])?;
+		if end - begin > capacity {
+			let (mut cursor, mut seconds) = (begin, 0.0);
+			while cursor < end {
+				let stop = cursor.saturating_add(capacity).min(end);
+				self.forward_window_gated(samples, cursor, stop, mode, observed, gate)?;
+				seconds += f64::from_bits(self.last_device_seconds.load(Ordering::Acquire));
+				cursor = stop;
+			}
+			self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
+			return Ok(());
 		}
+		self.reached.store(end, Ordering::Relaxed);
+		self.window_begin.store(begin, Ordering::Relaxed);
+		self.stage_lookups(begin, end)?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let mut thread_count = threads;
@@ -23514,53 +25856,95 @@ impl NativeTape {
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		#[cfg(nvidia)]
 		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
+		// A decode step runs with the knobs the lane tuner draws for it.
+		let mut tuner = self.tuner.lock().map_err(|_| RecipeError::new("lane tuner lock poisoned"))?;
+		let tuning = single && tuner.is_some();
+		if tuning && let (Some(tuner), Some(offset)) = (tuner.as_mut(), self.program.artifact.layout.knobs) {
+			self.contexts.write_bytes(offset, &tuner.choose())?;
+		}
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
+		if let Some(gate) = gate {
+			gate.wait();
+		}
 		let machine_started = Instant::now();
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.program.gpu.synchronize()?;
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
-		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { self.kernel_seconds()? };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
+		self.capture_mtp_hidden(begin, end)?;
 		observed(end, seconds);
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
 		}
-		if let Some(clocks) = self.program.artifact.layout.clocks {
-			let ticks = self.contexts.download_range::<u64>(clocks / 8, self.nodes.len() * 3)?;
-			let fingerprints = if let Some(offset) = self.program.artifact.layout.fingerprints.filter(|_| begin < end) {
-				let first = if capacity < self.positions { 0 } else { retained_begin as usize };
-				self.contexts.download_range::<u64>(offset / 8 + first * self.nodes.len(), (end - retained_begin) as usize * self.nodes.len())?
-			} else { Vec::new() };
-			let cache_begin = end.saturating_sub(capacity);
-			let cache_fingerprints = if let Some(offset) = self.program.artifact.layout.fingerprints.filter(|_| begin < end) {
-				self.contexts.download_range::<u64>(offset / 8 + capacity as usize * self.nodes.len(), (end - cache_begin) as usize * self.nodes.len())?
-			} else { Vec::new() };
-			let mut operations = self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?;
-			let device = self.device_label()?;
-			for (index, (node, clocks)) in self.nodes.iter().zip(ticks.chunks_exact(3)).enumerate() {
-				if clocks[2] == 0 { continue; }
-				let cache_channel_fingerprints = if let Some(offset) = self.program.artifact.layout.cache_channel_fingerprints[index] {
-					let channels = attention_kv_bytes(node, 1, node.kv_precision)? / node.output.length / node.kv_precision.bytes();
-					self.contexts.download_range::<u64>(offset / 8, channels)?.into_iter().enumerate().map(|(channel, hash)| (channel as u32, hash)).collect()
-				} else { Vec::new() };
-				operations.push(OperationReport {
-					device: device.clone(), model: String::new(), block: node.block_index, node: index,
-					operation: node.primitive_name().to_owned(), begin, end, positions: clocks[2] as usize, ticks: clocks[1],
-					seconds: (self.program.gpu.backend != Backend::Cpu).then_some(clocks[1] as f64 / 1e9),
-					fingerprints: fingerprints.chunks_exact(self.nodes.len()).enumerate().filter_map(|(row, hashes)| {
-						let position = retained_begin + row as u32;
-						(node.output.length == self.input.length || node.output.length == 1 && position + 1 == end).then_some((position, hashes[index]))
-					}).collect(),
-					cache_fingerprints: if node.op == Primitive::Attention {
-						cache_fingerprints.chunks_exact(self.nodes.len()).enumerate().map(|(row, hashes)| (cache_begin + row as u32, hashes[index])).collect()
-					} else { Vec::new() },
-					cache_channel_fingerprints,
-				});
+		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing() || (mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu)) {
+			let count = self.program.artifact.layout.precisions.len();
+			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			if mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu {
+				record_node_timing(&self.timing, (end - begin) as usize, &node_ticks, ticks[0])?;
+			}
+			if tuning && let Some(tuner) = tuner.as_mut() {
+				let stamps = std::iter::once(ticks[0]).chain(node_ticks.iter().copied()).collect::<Vec<_>>();
+				tuner.observe(&stamps);
+			}
+			if tracing() {
+				let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
+				let mut line = format!("clocks window {begin}..{end} {unit}");
+				for index in 0..count {
+					let prior = if index == 0 { ticks[0] } else { node_ticks[index - 1] };
+					line.push_str(&format!(" n{index}:{}", node_ticks[index].wrapping_sub(prior)));
+				}
+				line.push_str(&format!(" device={}", self.device_label()?));
+				trace(&line)?;
 			}
 		}
 		Ok(())
+	}
+	/// Points the program's knob table at this tape's context arena and starts
+	/// the lane tuner, where the program reads knobs.
+	fn bind_knobs(&self, graph: &Graph) -> Result<()> {
+		let Some(offset) = self.program.artifact.layout.knobs else { return Ok(()) };
+		match (&self.program.gpu.driver, &self.program.backend) {
+			#[cfg(nvidia)]
+			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				let (mut address, mut bytes) = (0_u64, 0_usize);
+				if (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, b"recipe_knobs\0".as_ptr()) != 0 {
+					return Ok(());
+				}
+				let table = self.contexts.pointer + offset as u64;
+				driver_status(Backend::Nvidia, (driver.upload)(address, (&table as *const u64).cast(), 8), "knob table write")?;
+			},
+			_ => return Ok(()),
+		}
+		self.contexts.write_bytes(offset, &vec![0; (graph.nodes.len() + 2) * 4])?;
+		*self.tuner.lock().map_err(|_| RecipeError::new("lane tuner lock poisoned"))? = Some(LaneTuner::new(graph)?);
+		Ok(())
+	}
+	/// Points this tape's program at a tensor split's machine RAM and starts
+	/// its exchange count at zero.
+	fn bind_exchange(&self, buffer: &ExchangeBuffer) -> Result<()> {
+		match (&self.program.gpu.driver, &self.program.backend) {
+			#[cfg(nvidia)]
+			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				// The first die's buffer at its unified address, or the address this
+				// device's context maps the machine RAM at.
+				let mut mapped = buffer.device;
+				if mapped == 0 {
+					driver_status(Backend::Nvidia, (driver.host_device_pointer)(&mut mapped, buffer.pointer, 0), "exchange mapping")?;
+				}
+				for (name, value, size) in [(&b"recipe_exchange_host\0"[..], mapped, 8), (&b"recipe_exchange_epoch\0"[..], 0, 4)] {
+					let (mut address, mut bytes) = (0_u64, 0_usize);
+					driver_status(Backend::Nvidia, (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, name.as_ptr()), "exchange symbol")?;
+					driver_status(Backend::Nvidia, (driver.upload)(address, (&value as *const u64).cast(), size), "exchange symbol write")?;
+				}
+				Ok(())
+			},
+			_ => Err(RecipeError::new(format!("{} cannot take part in a tensor split", self.program.gpu.name))),
+		}
 	}
 	/// Evaluate rows after `first` with this trained native program. The input
 	/// buffer is reused in bounded chunks, and `%rows` changes per launch, so a
@@ -23613,22 +25997,25 @@ impl NativeTape {
 	/// Replace a run of the input values from element `first`. A graph that
 	/// starts with a gather holds its input as i32 token ids.
 	fn write_samples(&self, first: usize, values: &[f64]) -> Result<()> {
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		let (buffer, first) = if self.program.artifact.layout.request_control.is_some() {
-			let request = request.as_ref().ok_or_else(|| RecipeError::new("request input was not prepared"))?;
-			let position = first % self.input.length;
-			let packed = first == request.begin as usize && values.len() == checked_mul(self.input.channels, request.positions, "request input count")?;
-			require(packed || request.positions == self.input.length || position >= request.begin as usize && position + values.len() <= request.begin as usize + request.positions, "input write is outside the request window")?;
-			let offset = if packed { 0 } else { (first / self.input.length) * request.positions + position - request.begin as usize };
-			(&request.input, offset)
-		} else { (&self.samples, first) };
 		if self.vocabulary > 0.0 {
 			let ids = values.iter().map(|value| token_id(*value, self.vocabulary).map(i32::to_ne_bytes)).collect::<Result<Vec<_>>>()?;
-			buffer.write_bytes(checked_mul(first, size_of::<i32>(), "token offset")?, ids.as_flattened())
+			self.samples.write_bytes(checked_mul(first, size_of::<i32>(), "token offset")?, ids.as_flattened())
 		} else {
 			let input_precision = self.program.artifact.layout.input_precision;
-			buffer.write_float_bytes(checked_mul(first, input_precision.bytes(), "sample offset")?, values, input_precision)
+			self.samples.write_float_bytes(checked_mul(first - self.input_origin(), input_precision.bytes(), "sample offset")?, values, input_precision)
 		}
+	}
+	/// The first position a windowed stream input holds.
+	fn input_origin(&self) -> usize {
+		if self.program.artifact.layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) as usize } else { 0 }
+	}
+	/// Positions `begin..end` of every input channel, channel by channel.
+	fn write_window(&self, begin: u32, end: u32, values: &[f64]) -> Result<()> {
+		let precision = self.program.artifact.layout.input_precision;
+		let bytes = precision.bytes();
+		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
+		let pitch = checked_mul(self.input.length.min(self.program.artifact.layout.window_positions), bytes, "window pitch")?;
+		self.samples.write_strided_bytes(checked_mul(begin as usize - self.input_origin(), bytes, "window offset")?, pitch, checked_mul((end - begin) as usize, bytes, "window width")?, &encoded)
 	}
 	fn write_tokens(&self, first: usize, values: &[f64]) -> Result<()> {
 		let mut tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
@@ -23662,9 +26049,32 @@ impl NativeTape {
 		}
 		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
 	}
-	/// Restore the token, input, and mutable arenas before a new sequence, while
-	/// retaining packed tables and saved evaluation statistics.
+	fn capture_mtp_hidden(&self, begin: u32, end: u32) -> Result<()> {
+		let Some((index, node)) = self.nodes.iter().enumerate().find(|(_, node)| node.retain_output) else { return Ok(()); };
+		let layout = &self.program.artifact.layout;
+		let length = window_shape(node.output, self.input.length, layout.window_positions).length;
+		let origin = if layout.window_positions < self.input.length { self.window_begin.load(Ordering::Acquire) as usize } else { 0 };
+		let precision = layout.precisions[index];
+		let mut hidden = self.mtp_hidden.lock().map_err(|_| RecipeError::new("MTP hidden state is poisoned"))?;
+		hidden.resize_with(end as usize, Vec::new);
+		for row in &mut hidden[begin as usize..end as usize] { row.resize(node.output.channels, 0.0); }
+		let count = (end - begin) as usize;
+		let bytes = precision.bytes();
+		let first = layout.values[index] + (begin as usize - origin) * bytes;
+		let encoded = self.values.download_strided_bytes(first, length * bytes, count * bytes, node.output.channels)?;
+		for (channel, values) in encoded.chunks_exact(count * bytes).enumerate() {
+			for (row, raw) in hidden[begin as usize..end as usize].iter_mut().zip(values.chunks_exact(bytes)) {
+				let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(raw);
+				row[channel] = precision.unpack(u64::from_le_bytes(bits));
+			}
+		}
+		Ok(())
+	}
+	fn logits_at(&self, predictions: &[f64], position: usize) -> Result<Vec<f64>> {
+		select_last_logits(predictions, self.output, position)
+	}
 	fn reset_sequence(&self) -> Result<()> {
+		self.mtp_hidden.lock().map_err(|_| RecipeError::new("MTP hidden state is poisoned"))?.clear();
 		self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?.fill(0.0);
 		self.samples.clear()?;
 		self.values.clear()?;
@@ -23675,27 +26085,7 @@ impl NativeTape {
 	/// attention keys and values, recurrent state, convolution tail and batch
 	/// normalization statistics.
 	fn resident_bytes(&self) -> usize {
-		let (input, output) = self.request_bytes();
-		self.weights.bytes + self.samples.bytes + self.values.bytes + self.contexts.bytes + input + output
-	}
-	fn request_bytes(&self) -> (usize, usize) {
-		self.request.lock().unwrap().as_ref().map_or((0, 0), |request| (request.input.bytes, request.output.bytes + request.hidden.bytes + request.lookups.iter().map(|buffer| buffer.bytes).sum::<usize>()))
-	}
-	/// The logits of the last reached position in `begin..end`, read from the full output tensor.
-	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
-		let (_, reached) = self.output_window(begin, end)?;
-		require(reached != 0, "decode window reaches no output position")?;
-		select_last_logits(predictions, self.output, reached as usize - 1)
-	}
-	fn logits_at(&self, predictions: &[f64], position: usize) -> Result<Vec<f64>> {
-		if predictions.len() == self.output.elements() { return select_last_logits(predictions, self.output, position); }
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		if let Some(request) = request.as_ref() {
-			let (length, position) = if self.output.length == 1 { (1, 0) } else {
-				(request.positions, position.checked_sub(request.begin as usize).ok_or_else(|| RecipeError::new("logits precede the request window"))?)
-			};
-			select_last_logits(predictions, Shape { channels: self.output.channels, length }, position)
-		} else { select_last_logits(predictions, self.output, position) }
+		self.weights.bytes + self.samples.bytes + self.values.bytes + self.contexts.bytes
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		let expected = self.batch_normalizations.iter().map(|(_, values)| values).sum::<usize>();
@@ -23716,43 +26106,43 @@ impl NativeTape {
 		Ok(stats)
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		if let Some(request) = request.as_ref() {
-			let positions = if self.output.length == 1 { 1 } else { request.positions };
-			return request.output.download_float_bytes(0, self.output.channels * positions, self.program.artifact.layout.output_precision);
-		}
-		drop(request);
 		self.output(0, self.rows as usize * self.output.elements())
 	}
-	fn saved_predictions(&self, predictions: Vec<f64>) -> Result<Vec<f64>> {
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		let Some(request) = request.as_ref().filter(|_| self.output.length > 1) else { return Ok(predictions) };
-		let mut saved = self.saved_output.lock().map_err(|_| RecipeError::new("saved outputs are poisoned"))?;
-		saved.resize(self.output.elements(), 0.0);
-		if request.begin == 0 { saved.fill(0.0); }
-		for channel in 0..self.output.channels {
-			let source = channel * request.positions;
-			let target = channel * self.output.length + request.begin as usize;
-			saved[target..target + request.positions].copy_from_slice(&predictions[source..source + request.positions]);
-		}
-		Ok(saved.clone())
+	/// Positions `begin..end` of every output channel, channel by channel.
+	fn output_window_values(&self, begin: u32, end: u32) -> Result<Vec<f64>> {
+		let layout = &self.program.artifact.layout;
+		let arena = *layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let (precision, bytes) = (layout.output_precision, layout.output_precision.bytes());
+		// A buffer that holds one window keeps its first position at slot zero.
+		let length = window_shape(self.output, self.input.length, layout.window_positions).length;
+		let origin = if layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) } else { 0 };
+		let offset = checked_add(arena, checked_mul((begin - origin) as usize, bytes, "window offset")?, "window offset")?;
+		let encoded = self.values.download_strided_bytes(offset, checked_mul(length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, self.output.channels)?;
+		let values = encoded.chunks_exact(bytes).map(|chunk| { let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(chunk); precision.unpack(u64::from_le_bytes(bits)) }).collect::<Vec<_>>();
+		self.trace_values(&values)?;
+		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+	}
+	/// The output channels at the last position the latest forward reached.
+	fn last_column(&self) -> Result<Vec<f64>> {
+		let layout = &self.program.artifact.layout;
+		let column = layout.last_column.ok_or_else(|| RecipeError::new("this tape keeps no last output column"))?;
+		let values = self.contexts.download_float_bytes(column, self.output.channels, layout.output_precision)?;
+		self.trace_values(&values)?;
+		Ok(values)
+	}
+	/// Select the last output position reached by an input window for
+	/// autoregressive sampling. Predictions stay channel-major (`channel,
+	/// position`) so a decode must sample one value from each channel while
+	/// retaining the full tensor for `Generation::logits`.
+	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		let (_, reached) = self.output_window(begin, end)?;
+		require(reached != 0, "decode window reaches no output position")?;
+		select_last_logits(predictions, self.output, reached as usize - 1)
 	}
 	/// A run of `count` output values from element `first` of the output arena.
-	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
-		let request = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
-		if let Some(request) = request.as_ref() {
-			let (length, begin) = if self.output.length == 1 { (1, 0) } else { (request.positions, request.begin as usize) };
-			let position = first % self.output.length;
-			require(length == self.output.length || position >= begin && position + count <= begin + length, "output read is outside the request window")?;
-			let offset = (first / self.output.length) * length + position - begin;
-			let precision = self.program.artifact.layout.output_precision;
-			return request.output.download_float_bytes(checked_mul(offset, precision.bytes(), "request output offset")?, count, precision);
-		}
-		drop(request);
-		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let output_precision = self.program.artifact.layout.output_precision;
-		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
-		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+	/// Under a trace, the head of every traced node's values, once and again
+	/// whenever the output the host just read went nonfinite.
+	fn trace_values(&self, values: &[f64]) -> Result<()> {
 		// A traced run shows the head of every node's values once, at the first
 		// output, and again if a later output went nonfinite.
 		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -23826,6 +26216,14 @@ impl NativeTape {
 				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
+		Ok(())
+	}
+	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
+		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let output_precision = self.program.artifact.layout.output_precision;
+		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
+		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+		self.trace_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn capture_tensors(&self, begin: u32, end: u32) -> Result<Vec<TensorObservation>> {
@@ -23902,11 +26300,16 @@ impl NativeTape {
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
 		trace(&format!("epoch {} {operation:?} submitted", self.step))?;
 		self.program.gpu.synchronize()?;
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
-		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { self.kernel_seconds()? };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		trace(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
+	}
+	/// The last dispatch on the device's own clock: from the leading worker's
+	/// entry mark to the last worker's exit.
+	fn kernel_seconds(&self) -> Result<f64> {
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		Ok(ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9)
 	}
 	fn epoch_metrics(&self) -> Result<EpochMetrics> {
 		let values = self.metrics.download_float(EpochMetrics::VALUES, self.program.artifact.layout.output_adjoint_precision)?;
@@ -24085,6 +26488,256 @@ struct TransferCost {
 	latency: Duration,
 	bandwidth: f64,
 }
+/// Work and time for one node, summed over every forward window a run executed.
+/// `predicted_seconds` is `None` where no device rates are configured.
+#[derive(Clone, Debug)]
+pub struct NodeTiming {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub op: &'static str,
+	pub operations: f64,
+	pub bytes: f64,
+	pub predicted_seconds: Option<f64>,
+	pub measured_seconds: f64,
+	pub forwards: usize,
+}
+/// What the plan says one node does per position: its primitive, channel
+/// counts, activation width, weight bytes, and the model's context length.
+#[derive(Clone, Copy)]
+struct NodeWork {
+	op: Primitive,
+	input: usize,
+	output: usize,
+	width: f64,
+	weight_bytes: f64,
+	positions: usize,
+}
+struct NodeCost {
+	operations: f64,
+	bytes: f64,
+}
+/// The arithmetic and traffic one node performs over `span` positions. A
+/// contraction costs two operations per weight element and position, attention
+/// costs its score and value products over the context, and every other
+/// primitive costs a fixed count per output element by its class.
+fn node_cost(work: &NodeWork, span: usize) -> NodeCost {
+	let span = span as f64;
+	let (input, output) = (work.input as f64 * span, work.output as f64 * span);
+	let operations = match work.op {
+		Primitive::Contraction => 2.0 * work.input as f64 * work.output as f64 * span,
+		Primitive::Attention => 4.0 * output * work.positions as f64,
+		Primitive::Normalize => 5.0 * output,
+		Primitive::Rope | Primitive::Delta | Primitive::Scan => 6.0 * output,
+		_ => 2.0 * output,
+	};
+	NodeCost { operations, bytes: (input + output) * work.width + work.weight_bytes }
+}
+/// The CPU's peak rates as (FLOP/s over every worker, bytes/s), which node predictions divide by.
+/// `RECIPE_CPU_PEAK_GFLOPS` (per worker thread) and `RECIPE_CPU_PEAK_GBPS` (all workers together)
+/// override a rate. Otherwise the rates are measured on this machine once, in a few hundred
+/// milliseconds on the host before any inference dispatch, and cached in `~/.cache/recipe/cpu-peaks`
+/// under the CPU model and worker count.
+fn cpu_peak_rates(workers: u32) -> Result<(f64, f64)> {
+	static RATES: OnceLock<Result<(f64, f64)>> = OnceLock::new();
+	let rates = RATES.get_or_init(|| {
+		let overridden = |name: &str| -> Result<Option<f64>> {
+			let Ok(text) = std::env::var(name) else { return Ok(None) };
+			let value = text.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("{name} is not a number: {error}")))?;
+			require(value.is_finite() && value > 0.0, format!("{name} must be a positive number"))?;
+			Ok(Some(value))
+		};
+		let (gflops, gbps) = (overridden("RECIPE_CPU_PEAK_GFLOPS")?, overridden("RECIPE_CPU_PEAK_GBPS")?);
+		let (per_worker, bandwidth) = match (gflops, gbps) {
+			(Some(gflops), Some(gbps)) => (gflops, gbps),
+			_ => {
+				let (measured_gflops, measured_gbps) = cached_cpu_peaks(workers as usize);
+				(gflops.unwrap_or(measured_gflops), gbps.unwrap_or(measured_gbps))
+			}
+		};
+		Ok((per_worker * 1e9 * f64::from(workers), bandwidth * 1e9))
+	});
+	match rates {
+		Ok(rates) => Ok(*rates),
+		Err(error) => Err(RecipeError::new(error.to_string())),
+	}
+}
+/// The CPU model the peak cache is keyed by: the processor name where the machine reports one,
+/// else the architecture.
+fn cpu_model() -> String {
+	let named = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| text.lines().find(|line| line.starts_with("model name")).and_then(|line| line.split_once(':')).map(|(_, name)| name.trim().to_owned()));
+	named.or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok()).unwrap_or_else(|| std::env::consts::ARCH.to_owned())
+}
+/// (GFLOP/s per worker, GB/s over all workers) for this CPU model and worker count, from the
+/// cache file or else measured and appended to it.
+fn cached_cpu_peaks(workers: usize) -> (f64, f64) {
+	let model = cpu_model();
+	let path = home_directory().ok().map(|home| home.join(".cache").join("recipe").join("cpu-peaks"));
+	if let Some(text) = path.as_ref().and_then(|path| fs::read_to_string(path).ok()) {
+		for line in text.lines() {
+			let mut fields = line.splitn(4, '\t');
+			if let (Some(count), Some(gflops), Some(gbps), Some(name)) = (fields.next(), fields.next(), fields.next(), fields.next())
+				&& count == workers.to_string()
+				&& name == model
+				&& let (Ok(gflops), Ok(gbps)) = (gflops.parse::<f64>(), gbps.parse::<f64>())
+			{
+				return (gflops, gbps);
+			}
+		}
+	}
+	let (gflops, gbps) = measure_cpu_peaks(workers);
+	if let Some(path) = path {
+		use std::io::Write;
+		if let Some(parent) = path.parent() {
+			let _ = fs::create_dir_all(parent);
+		}
+		if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+			let _ = writeln!(file, "{workers}\t{gflops}\t{gbps}\t{model}");
+		}
+	}
+	(gflops, gbps)
+}
+/// One burst of independent fused multiply-add chains: the value and the FLOPs performed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_burst_avx2(iterations: u64) -> f32 {
+	use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_set1_ps, _mm256_storeu_ps};
+	let mut lanes = [_mm256_set1_ps(0.5); 12];
+	let (a, b) = (_mm256_set1_ps(1.000_000_1), _mm256_set1_ps(1.0e-7));
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			*lane = _mm256_fmadd_ps(*lane, a, b);
+		}
+	}
+	let mut out = [0.0_f32; 8];
+	let mut sum = 0.0_f32;
+	for lane in lanes {
+		_mm256_storeu_ps(out.as_mut_ptr(), lane);
+		sum += out.iter().sum::<f32>();
+	}
+	sum
+}
+fn fma_burst(iterations: u64) -> (f32, f64) {
+	#[cfg(target_arch = "x86_64")]
+	if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+		// 12 accumulators x 8 lanes x 2 operations per FMA.
+		return (unsafe { fma_burst_avx2(iterations) }, iterations as f64 * 12.0 * 8.0 * 2.0);
+	}
+	// Elsewhere: 64 independent lanes the compiler vectorizes to the target's baseline vector unit.
+	let mut lanes = [0.5_f32; 64];
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			#[cfg(target_arch = "aarch64")]
+			{ *lane = lane.mul_add(1.000_000_1, 1.0e-7); }
+			#[cfg(not(target_arch = "aarch64"))]
+			{ *lane = *lane * 1.000_000_1 + 1.0e-7; }
+		}
+	}
+	(lanes.iter().sum(), iterations as f64 * 64.0 * 2.0)
+}
+/// Measures (GFLOP/s per worker, GB/s over all workers): every worker runs a fused multiply-add
+/// burst and a streaming triad (`a = b + 3c` over arrays larger than the cache, each worker
+/// touching its own pages first) in lockstep passes. The best pass counts, since load only slows
+/// a pass down.
+fn measure_cpu_peaks(workers: usize) -> (f64, f64) {
+	const PASSES: usize = 5;
+	const FMA_ITERATIONS: u64 = 2_000_000;
+	const TRIAD_FLOATS: usize = 1 << 24;
+	let workers = workers.max(1);
+	let length = TRIAD_FLOATS / workers;
+	let barrier = std::sync::Barrier::new(workers);
+	let times: Vec<([f64; PASSES], [f64; PASSES], f64)> = std::thread::scope(|scope| {
+		let handles: Vec<_> = (0..workers)
+			.map(|_| {
+				scope.spawn(|| {
+					let (mut fma, mut triad, mut flops) = ([0.0; PASSES], [0.0; PASSES], 0.0);
+					for pass in &mut fma {
+						barrier.wait();
+						let started = Instant::now();
+						let (value, performed) = fma_burst(FMA_ITERATIONS);
+						std::hint::black_box(value);
+						flops = performed;
+						*pass = started.elapsed().as_secs_f64();
+					}
+					let mut a = vec![0.0_f32; length];
+					let b = vec![1.5_f32; length];
+					let c = vec![0.25_f32; length];
+					for round in 0..=PASSES {
+						barrier.wait();
+						let started = Instant::now();
+						for ((out, x), y) in a.iter_mut().zip(&b).zip(&c) {
+							*out = *x + 3.0 * *y;
+						}
+						std::hint::black_box(&a);
+						// Round 0 only faults the pages in.
+						if round > 0 {
+							triad[round - 1] = started.elapsed().as_secs_f64();
+						}
+					}
+					(fma, triad, flops)
+				})
+			})
+			.collect();
+		handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+	});
+	let slowest = |pick: fn(&([f64; PASSES], [f64; PASSES], f64)) -> &[f64; PASSES]| (0..PASSES).map(|pass| times.iter().map(|entry| pick(entry)[pass]).fold(0.0, f64::max)).fold(f64::MAX, f64::min).max(f64::EPSILON);
+	let flops = times.first().map_or(0.0, |entry| entry.2);
+	let fma_seconds = slowest(|entry| &entry.0);
+	let triad_seconds = slowest(|entry| &entry.1);
+	(flops / fma_seconds / 1e9, 12.0 * (length * workers) as f64 / triad_seconds / 1e9)
+}
+/// Per-node work and running totals for one tape. Peak rates come from the
+/// configured CPU rates; other devices have none, so their predictions stay unset.
+struct TapeTiming {
+	work: Vec<NodeWork>,
+	totals: Vec<NodeTiming>,
+	/// Nodes whose clock the kernel writes. Recurrent body nodes run inside their scan.
+	measured: Vec<usize>,
+	peak: Option<(f64, f64)>,
+}
+impl TapeTiming {
+	fn new(graph: &Graph, gpu: &Gpu) -> Result<Self> {
+		let positions = graph_positions(graph);
+		// The peak is per worker times the workers execution uses, so the prediction and the run share one thread count.
+		let peak = if gpu.backend == Backend::Cpu { Some(cpu_peak_rates(cpu_worker_threads()?)?) } else { None };
+		let work = graph.nodes.iter().enumerate().map(|(index, node)| {
+			let width = node.precision.bytes() as f64;
+			let weight_bytes = packed_weight(graph, index, true).map_or(node.parameters as f64 * width, |weight| weight.bytes.len() as f64);
+			NodeWork { op: node.op, input: node.input.channels, output: node.output.channels, width, weight_bytes, positions }
+		}).collect();
+		let totals = graph.nodes.iter().enumerate().map(|(index, node)| NodeTiming {
+			device: gpu.name.clone(), node: index, block: node.block_index, kind: node.block_kind, op: node.op.name(), operations: 0.0, bytes: 0.0, predicted_seconds: peak.map(|_| 0.0), measured_seconds: 0.0, forwards: 0,
+		}).collect();
+		let measured = graph.nodes.iter().enumerate().filter(|(_, node)| node.block_kind != "recur_body").map(|(index, _)| index).collect();
+		Ok(Self { work, totals, measured, peak })
+	}
+}
+/// Adds one forward window to every node's totals. A node's clock is stamped after
+/// its node-ending grid barrier, so a node runs from the previous node's clock (the
+/// forward's entry clock for the first) to its own.
+/// Node clocks count nanoseconds of the CPU kernels' `recipe.clock`.
+fn record_node_timing(timing: &Mutex<TapeTiming>, span: usize, node_ticks: &[i64], start: i64) -> Result<()> {
+	let mut timing = timing.lock().map_err(|_| RecipeError::new("node timing is poisoned"))?;
+	let measured = timing.measured.clone();
+	let peak = timing.peak;
+	let per_tick = 1e-9;
+	let mut prior = start;
+	for &index in &measured {
+		let elapsed = (node_ticks[index] - prior).max(0) as f64 * per_tick;
+		prior = node_ticks[index];
+		let cost = node_cost(&timing.work[index], span);
+		let total = &mut timing.totals[index];
+		total.operations += cost.operations;
+		total.bytes += cost.bytes;
+		total.measured_seconds += elapsed;
+		total.forwards += 1;
+		if let (Some(predicted), Some((flops, bandwidth))) = (total.predicted_seconds.as_mut(), peak) {
+			*predicted += (cost.operations / flops).max(cost.bytes / bandwidth);
+		}
+	}
+	Ok(())
+}
 /// The measured behavior of one device: the two transfer directions between it and the coordinating
 /// machine, the gradient work it retires each second, and the fixed cost of one dispatch on it.
 #[derive(Clone, Copy)]
@@ -24204,7 +26857,8 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width, config.precision, config.precision), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &targets, gpu, config.precision, Some(mse))?;
-	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
+	// Each dispatch's machine time, then the interval its kernel marked on the device's own clock.
+	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<(f64, f64)> {
 		tape.advance()?;
 		let started = Instant::now();
 		if gradient {
@@ -24213,17 +26867,23 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 			tape.optimizer_launch(config.surrogate_rate, config)?;
 		}
 		gpu.synchronize()?;
-		Ok(started.elapsed().as_secs_f64())
+		Ok((started.elapsed().as_secs_f64(), tape.kernel_seconds()?))
 	};
 	// Warm up both paths, then use minimum timings to reduce scheduling noise.
 	timed(&mut tape, true)?;
 	timed(&mut tape, false)?;
-	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
+	let (mut overhead, mut epoch, mut kernel) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
 	for _ in 0..config.surrogate_epochs {
-		overhead = overhead.min(timed(&mut tape, false)?);
-		epoch = epoch.min(timed(&mut tape, true)?);
+		overhead = overhead.min(timed(&mut tape, false)?.0);
+		let (machine, own) = timed(&mut tape, true)?;
+		(epoch, kernel) = (epoch.min(machine), kernel.min(own));
 	}
-	let gradient = epoch - overhead;
+	// A CPU dispatch starts its worker threads and wakes them at every barrier,
+	// and a loaded scheduler defers each wake by up to a tick, longer than the
+	// whole surrogate gradient. The machine times of two such dispatches then
+	// need not differ by the work between them, so the epoch kernel's own clock
+	// times that work inside one dispatch.
+	let gradient = if gpu.backend == Backend::Cpu { kernel } else { epoch - overhead };
 	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
 	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
 }
@@ -24675,9 +27335,8 @@ fn embedding_row(node: &Node) -> Result<(&'static Quantization, usize)> {
 	let format = StorageFormat(node.storage);
 	let layout = format.spec().ok_or_else(|| RecipeError::new("embedding table must be stored in a quantization"))?.codec.quantization();
 	require(!matches!(layout.native, NativeDequant::Nf4), format!("embedding table cannot use {}: its codebook addresses the whole tensor", layout.name))?;
-	let width = integer_argument(node.argument[1], "embedding width")? as usize;
-	require(width % layout.block == 0, format!("embedding width {width} must be a multiple of the {} block of {}", layout.name, layout.block))?;
-	checked_mul(width / layout.block, layout.stride, "embedding row bytes").map(|row| (layout, row))
+	require(node.output.channels % layout.block == 0, format!("embedding width {} must be a multiple of the {} block of {}", node.output.channels, layout.name, layout.block))?;
+	checked_mul(node.output.channels / layout.block, layout.stride, "embedding row bytes").map(|row| (layout, row))
 }
 // A table is decoded one row at a time, from the context arena or on the host,
 // so it is absent from the storage the model-load kernel expands into weights.
@@ -24835,9 +27494,7 @@ fn backward_context_offset(node: &Node, rows: usize) -> Result<usize> {
 		}
 		_ => return Err(RecipeError::new("this op has no separate backward context")),
 	};
-	let state_bytes = NativePrecision::new(node.precision, node.acc)?.state.bytes();
-	let element_bytes = if node.op == Primitive::Delta { state_bytes } else { node.precision.bytes() };
-	align(checked_mul(elements, element_bytes, "forward context bytes")?, state_bytes)
+	align(checked_mul(elements, node.precision.bytes(), "forward context bytes")?, NativePrecision::new(node.precision, node.acc)?.state.bytes())
 }
 fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 	let elements = match node.op {
@@ -24850,7 +27507,7 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 		Primitive::Delta => {
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta adjoint state")?;
-			let vectors = checked_add(checked_mul(2, width, "delta adjoint vectors")?, 1, "delta decay partial")?;
+			let vectors = checked_mul(2, width, "delta adjoint vectors")?;
 			checked_mul(checked_mul(rows, heads, "delta backward pairs")?, checked_add(state, vectors, "delta backward pair")?, "delta backward context")?
 		}
 		_ => return Err(RecipeError::new("this op has no separate backward context")),
@@ -24859,6 +27516,11 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 }
 /// Context sizing and lifetimes are one declaration consumed by allocation.
 /// Regions remain contiguous and in the order the kernel reads them.
+/// The first positions of a decode window whose carried state is kept, so a
+/// rejected draft takes the state back instead of running the window again.
+fn draft_positions() -> Result<usize> {
+	natural("draft positions", env!("RECIPE_DRAFT_POSITIONS"))
+}
 fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool, step: usize) -> Result<Vec<(usize, BufferLifetime)>> {
 	use BufferLifetime::{ReadOnly, Retained, Unused};
 	let local = if inference { BufferLifetime::Until(step) } else { Retained };
@@ -24871,17 +27533,18 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 	}
 	let state = carried(node, rows)?.values;
 	let regions = match node.op {
+		// The inputs before a window that its taps still reach, per channel.
+		Primitive::Dconv if inference => {
+			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
+			let tail = checked_mul(checked_mul(rows, node.output.channels, "depthwise history channels")?, checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?, "depthwise history")?;
+			let tail_bytes = checked_mul(tail.max(1), precision.bytes(), "depthwise history bytes")?;
+			// The history after each of a window's first positions, to take back to.
+			vec![(tail_bytes, Retained), (checked_mul(tail_bytes, draft_positions()?, "depthwise kept histories")?, Retained)]
+		}
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below. Only the reverse pass fills the rows.
 		Primitive::Elementwise if inference => vec![(precision.bytes(), Unused)],
-		Primitive::TopK => {
-			let slots = checked_add(integer_argument(node.argument[0], "selected expert count")? as usize, 1, "selected expert record")?;
-			let records = checked_mul(rows, node.output.length, "selected expert positions")?;
-			let bytes = checked_mul(checked_mul(records, slots, "selected expert indices")?, size_of::<u32>(), "selected expert bytes")?;
-			let last = graph.nodes.iter().enumerate().filter(|(_, consumer)| consumer.second == (step / 2) as i32).map(|(index, _)| index * 2 + 1).max().unwrap_or(step);
-			vec![(bytes, if inference { BufferLifetime::Until(last) } else { Retained })]
-		}
 		Primitive::Elementwise => {
 			let partials = checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?;
 			vec![(checked_mul(partials.max(1), NativePrecision::new(node.precision, node.acc)?.state.bytes(), "scalar gradient partial bytes")?, Retained)]
@@ -24931,18 +27594,16 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			if !inference { return Ok(vec![(checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "delta context")?, Retained)]); }
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta state")?;
-			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "delta pair bytes")?;
-			let slots = checked_add(integer_argument(node.argument[5], "delta checkpoint slots")? as usize, 1, "delta state slots")?;
+			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, precision.bytes(), "delta pair bytes")?;
+			let live = checked_mul(pair_bytes, state, "delta carried state bytes")?;
 			vec![
-				(checked_mul(checked_mul(pair_bytes, state, "delta carried state bytes")?, slots, "delta checkpoint bytes")?, Retained),
-				(checked_mul(pair_bytes, checked_mul(3, node.output.length, "delta window scalars")?, "delta prepared bytes")?, local),
+				(live, Retained),
+				(checked_mul(pair_bytes, checked_mul(2, width, "delta vectors")?, "delta reserved bytes")?, Unused),
+				// The live state after each of a window's first positions, to take back to.
+				(checked_mul(live, draft_positions()?, "delta kept states")?, Retained),
 			]
 		}
 		Primitive::Pool if inference => Vec::new(),
-		Primitive::Dconv if inference && node.input.length < graph.input.length => {
-			let positions = checked_mul(checked_mul(rows, node.input.channels, "depthwise history channels")?, dconv_history(graph, node)?, "depthwise history positions")?;
-			vec![(checked_mul(positions, precision.bytes(), "depthwise history bytes")?, Retained)]
-		}
 		Primitive::Pool => vec![(checked_mul(state, size_of::<u64>(), "pool context bytes")?, Retained)],
 		Primitive::Rope => match rope_sections(node, &graph.programs)? {
 			Some(layout) => vec![(checked_mul(rope_context_words(layout, rows, node.output.length)?, size_of::<i32>(), "rotary context bytes")?, ReadOnly)],
@@ -24951,7 +27612,6 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
 		Primitive::Gather => vec![(checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes")?, ReadOnly)],
-		Primitive::Lookup if inference && node.output.length < graph.input.length => vec![(8, Retained)],
 		Primitive::Lookup => vec![(checked_mul(state.max(1), precision.bytes(), "lookup context bytes")?, Retained)],
 		// One count per expert, then every routed position of every expert in
 		// ascending expert and position order. Only the weight gradients walk
@@ -24987,10 +27647,45 @@ struct Buffer {
 	runtime: &'static Gpu,
 	pointer: u64,
 	bytes: usize,
+	/// A retained weight buffer mapped from a shared file rather than allocated by the runtime.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+	mapped: bool,
+	/// A retained weight buffer a tape reads; writes fail once it is sealed.
+	sealed: bool,
 }
 /// The largest host buffer a zero fill stages at once, so an arena of any size
 /// clears without a host copy of its own size.
 const ZERO_FILL_BYTES: usize = 64 << 20;
+impl Gpu {
+	fn copy_device(&self, destination: u64, source: u64, bytes: usize) -> Result<()> {
+		self.activate()?;
+		unsafe {
+			match &self.driver {
+				Driver::Cpu => { ptr::copy(source as *const u8, destination as *mut u8, bytes); Ok(()) }
+				#[cfg(nvidia)]
+				Driver::Cuda(driver) => {
+					let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 2, src_host: ptr::null(), src_device: source, src_array: ptr::null_mut(), src_pitch: bytes, dst_x: 0, dst_y: 0, dst_memory: 2, dst_host: ptr::null_mut(), dst_device: destination, dst_array: ptr::null_mut(), dst_pitch: bytes, width: bytes, height: 1 };
+					self.status((driver.copy_2d)(&copy), "device copy")
+				}
+				#[cfg(amd)]
+				Driver::Hsa(driver) => self.status((driver.copy)(destination as Ptr, source as *const c_void, bytes), "device copy"),
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_DEVICE_COPY)?; channel.write_u64(destination)?; channel.write_u64(source)?; channel.write_u64(bytes as u64)?; channel.flush()?;
+					channel.read_status("device copy")
+				}
+			}
+		}
+	}
+}
+impl Buffer {
+	fn copy_within(&self, source: usize, destination: usize, bytes: usize) -> Result<()> {
+		require(checked_add(source, bytes, "device copy source")? <= self.bytes && checked_add(destination, bytes, "device copy destination")? <= self.bytes, "device copy exceeds its buffer")?;
+		if bytes == 0 || source == destination { return Ok(()); }
+		require(source + bytes <= destination || destination + bytes <= source, "device copy regions overlap")?;
+		self.runtime.copy_device(self.pointer + destination as u64, self.pointer + source as u64, bytes)
+	}
+}
 impl Buffer {
 	/// Copy bytes after the caller has synchronized the completed pass.
 	fn download_completed_bytes(&self, offset: usize, count: usize) -> Result<Vec<u8>> {
@@ -25003,7 +27698,7 @@ impl Buffer {
 	}
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let bytes = size_of_val(values);
-		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
+		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes, mapped: false, sealed: false })
 	}
 	/// A device buffer of `bytes` zeros, filled one bounded host block at a time.
 	/// A zeroed buffer with `guard` zeroed bytes on both sides of it; the
@@ -25013,13 +27708,13 @@ impl Buffer {
 			return Self::zeroed(runtime, bytes);
 		}
 		let whole = Self::zeroed(runtime, bytes.max(1) + 2 * guard)?;
-		let inner = Self { runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1) };
+		let inner = Self { runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1), mapped: false, sealed: false };
 		std::mem::forget(whole);
 		Ok(inner)
 	}
 	fn zeroed(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes, mapped: false, sealed: false };
 		let zeros = vec![0_u8; bytes.min(ZERO_FILL_BYTES)];
 		for offset in (0..bytes).step_by(zeros.len()) {
 			buffer.write_bytes(offset, &zeros[..zeros.len().min(bytes - offset)])?;
@@ -25031,35 +27726,78 @@ impl Buffer {
 	}
 	/// Writes stored bytes run by run from where they are mapped or held, so a
 	/// weight reaches the device without a host copy of its own size.
+	/// Adjacent runs, such as the per-row views of a die's share, go up
+	/// together through one staging buffer of at most 64 MiB.
 	fn write_runs(&self, offset: usize, stored: &StoredBytes) -> Result<()> {
+		const STAGING: usize = 64 << 20;
+		let (mut staged, mut start) = (Vec::new(), 0);
 		for (at, run) in stored.runs() {
-			self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
+			if !staged.is_empty() && (start + staged.len() != at || staged.len() + run.len() > STAGING) {
+				self.write_bytes(checked_add(offset, start, "GPU run write")?, &staged)?;
+				staged.clear();
+			}
+			if run.len() >= STAGING {
+				self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
+				continue;
+			}
+			if staged.is_empty() {
+				start = at;
+			}
+			staged.extend_from_slice(run);
+		}
+		if !staged.is_empty() {
+			self.write_bytes(checked_add(offset, start, "GPU run write")?, &staged)?;
 		}
 		Ok(())
 	}
 	/// A device buffer of `bytes` left as allocated, for a scratch every write fills before a read.
 	fn reserve(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
-		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes })
+		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes, mapped: false, sealed: false })
 	}
 	/// The weight arena. A packed weight is written from where it is mapped, a
 	/// stored weight the model-load kernel expands is left to that kernel, and
 	/// every other node's parameters are encoded and written in place.
-	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<Self> {
+	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize) -> Result<(Self, (usize, usize, usize))> {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
-		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		// A run decoder reads the last block of a weight as whole aligned words,
+		// up to three bytes past its end.
+		let bytes = bytes + 4;
+		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes, mapped: false, sealed: false };
+		let fill = buffer.fill_weights(graph, &offsets, inference, rows)?;
+		Ok((buffer, fill))
+	}
+	/// Writes every weight node into the weight buffer. Returns the bytes read from the
+	/// stored source, the bytes converted on the CPU, and the bytes uploaded.
+	fn fill_weights(&self, graph: &Graph, offsets: &[usize], inference: bool, rows: usize) -> Result<(usize, usize, usize)> {
+		let (mut read, mut converted, mut uploaded) = (0, 0, 0);
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
-				buffer.write_runs(offsets[index], &weight.bytes)?;
+				match row_interleave(graph, index, inference, rows, self.runtime.lanes()) {
+					Some((lanes, row_bytes, padded_row)) => {
+						let mut bytes = Vec::with_capacity(weight.bytes.len());
+						for (_, run) in weight.bytes.runs() {
+							bytes.extend_from_slice(run);
+						}
+						let stride = weight.format_segments().first().and_then(|(segment, _)| segment.spec()).map_or(row_bytes, |spec| spec.stride);
+						let padded = stride * padded_row / row_bytes;
+						self.write_bytes(offsets[index], &interleave_rows(&bytes, bytes.len() / row_bytes, row_bytes, lanes as usize, stride, padded))?;
+					}
+					None => self.write_runs(offsets[index], &weight.bytes)?,
+				}
+				read += weight.bytes.len();
+				uploaded += weight.bytes.len();
 			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
 				// The load kernel writes this node from its stored bytes.
 				continue;
 			} else {
-				buffer.write_bytes(offsets[index], &encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], node.precision))?;
+				let encoded = encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], node.precision);
+				converted += encoded.len();
+				uploaded += encoded.len();
+				self.write_bytes(offsets[index], &encoded)?;
 			}
 		}
-		Ok(buffer)
+		Ok((read, converted, uploaded))
 	}
 	fn write_float_bytes(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
 		let bytes = precision.bytes();
@@ -25067,8 +27805,22 @@ impl Buffer {
 		self.write_bytes(offset, &encoded)
 	}
 	fn write_bytes(&self, offset: usize, values: &[u8]) -> Result<()> {
+		require(!self.sealed, "retained weights are read-only")?;
 		require(checked_add(offset, values.len(), "GPU byte write")? <= self.bytes, "GPU byte write exceeds buffer")?;
 		self.runtime.upload(self.pointer + offset as u64, values.as_ptr().cast(), values.len()).map(|_| ())
+	}
+	/// Runs of `width` bytes from `offset` on, `pitch` apart, one per value of `values.len() / width`.
+	fn write_strided_bytes(&self, offset: usize, pitch: usize, width: usize, values: &[u8]) -> Result<()> {
+		let rows = values.len() / width.max(1);
+		require(rows == 0 || checked_add(checked_add(offset, checked_mul(rows - 1, pitch, "GPU strided write")?, "GPU strided write")?, width, "GPU strided write")? <= self.bytes, "GPU strided write exceeds buffer")?;
+		self.runtime.upload_strided(self.pointer + offset as u64, values.as_ptr().cast(), pitch, width, rows)
+	}
+	fn download_strided_bytes(&self, offset: usize, pitch: usize, width: usize, rows: usize) -> Result<Vec<u8>> {
+		require(rows == 0 || checked_add(checked_add(offset, checked_mul(rows - 1, pitch, "GPU strided read")?, "GPU strided read")?, width, "GPU strided read")? <= self.bytes, "GPU strided read exceeds buffer")?;
+		let mut values = vec![0_u8; checked_mul(rows, width, "GPU strided read")?];
+		self.runtime.synchronize()?;
+		self.runtime.download_strided(values.as_mut_ptr().cast(), self.pointer + offset as u64, pitch, width, rows)?;
+		Ok(values)
 	}
 	fn clear(&self) -> Result<()> {
 		self.clear_range(0, self.bytes)
@@ -25116,15 +27868,555 @@ impl Buffer {
 }
 impl Drop for Buffer {
 	fn drop(&mut self) {
-		self.runtime.free(self.pointer);
+		#[cfg(target_os = "linux")]
+		if self.mapped {
+			return unmap_retained(self.pointer, self.bytes);
+		}
+		self.runtime.free(self.pointer)
 	}
+}
+
+impl Buffer {
+	/// A weight buffer mapped at a retained address, filled and sealed by its tape.
+	#[cfg(target_os = "linux")]
+	fn retained(runtime: &'static Gpu, pointer: u64, bytes: usize) -> Self {
+		Self { runtime, pointer, bytes, mapped: true, sealed: false }
+	}
+	fn seal(&mut self) {
+		self.sealed = true;
+	}
+}
+/// Weight buffers retained across invocations on the CPU. Each weight buffer is a shared
+/// file mapped at an address recorded in its lease, so a later process maps the
+/// same bytes at the addresses its compiled kernels already name.
+#[cfg(target_os = "linux")]
+const RETAINED_ROOT: &str = "recipe-retained-v1";
+#[cfg(target_os = "linux")]
+const RETAINED_BASE: usize = 0x1000_0000_0000;
+#[cfg(target_os = "linux")]
+const RETAINED_SLOT: usize = 1 << 30;
+#[cfg(target_os = "linux")]
+const RETAINED_SLOTS: u64 = 1 << 16;
+#[cfg(target_os = "linux")]
+const SHA256_ROUNDS: [u32; 64] = [
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+#[cfg(target_os = "linux")]
+struct Sha256 {
+	state: [u32; 8],
+	block: [u8; 64],
+	filled: usize,
+	length: u64,
+}
+#[cfg(target_os = "linux")]
+impl Sha256 {
+	fn new() -> Self {
+		Self { state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], block: [0; 64], filled: 0, length: 0 }
+	}
+	fn compress(&mut self, block: &[u8; 64]) {
+		let mut words = [0_u32; 64];
+		for (index, chunk) in block.chunks_exact(4).enumerate() {
+			words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+		}
+		for index in 16..64 {
+			let early = words[index - 15];
+			let late = words[index - 2];
+			let small_early = early.rotate_right(7) ^ early.rotate_right(18) ^ (early >> 3);
+			let small_late = late.rotate_right(17) ^ late.rotate_right(19) ^ (late >> 10);
+			words[index] = words[index - 16].wrapping_add(small_early).wrapping_add(words[index - 7]).wrapping_add(small_late);
+		}
+		let mut v = self.state;
+		for index in 0..64 {
+			let big_e = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+			let choose = (v[4] & v[5]) ^ (!v[4] & v[6]);
+			let first = v[7].wrapping_add(big_e).wrapping_add(choose).wrapping_add(SHA256_ROUNDS[index]).wrapping_add(words[index]);
+			let big_a = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+			let majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+			let second = big_a.wrapping_add(majority);
+			v = [first.wrapping_add(second), v[0], v[1], v[2], v[3].wrapping_add(first), v[4], v[5], v[6]];
+		}
+		for (state, value) in self.state.iter_mut().zip(v) {
+			*state = state.wrapping_add(value);
+		}
+	}
+	fn update(&mut self, mut data: &[u8]) {
+		self.length = self.length.wrapping_add(data.len() as u64);
+		if self.filled > 0 {
+			let take = (64 - self.filled).min(data.len());
+			self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
+			self.filled += take;
+			data = &data[take..];
+			if self.filled < 64 {
+				return;
+			}
+			let block = self.block;
+			self.compress(&block);
+			self.filled = 0;
+		}
+		let mut chunks = data.chunks_exact(64);
+		for chunk in &mut chunks {
+			self.compress(chunk.try_into().expect("64-byte chunk"));
+		}
+		let rest = chunks.remainder();
+		self.block[..rest.len()].copy_from_slice(rest);
+		self.filled = rest.len();
+	}
+	fn finish(mut self) -> [u8; 32] {
+		let bits = self.length.wrapping_mul(8);
+		self.block[self.filled] = 0x80;
+		self.filled += 1;
+		if self.filled > 56 {
+			self.block[self.filled..].fill(0);
+			let block = self.block;
+			self.compress(&block);
+			self.filled = 0;
+		}
+		self.block[self.filled..56].fill(0);
+		self.block[56..].copy_from_slice(&bits.to_be_bytes());
+		let block = self.block;
+		self.compress(&block);
+		let mut digest = [0_u8; 32];
+		for (chunk, word) in digest.chunks_exact_mut(4).zip(self.state) {
+			chunk.copy_from_slice(&word.to_be_bytes());
+		}
+		digest
+	}
+}
+#[cfg(target_os = "linux")]
+fn sha256(data: &[u8]) -> [u8; 32] {
+	let mut hash = Sha256::new();
+	hash.update(data);
+	hash.finish()
+}
+#[cfg(target_os = "linux")]
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+	use std::io::Read as _;
+	let unreadable = |error: std::io::Error| RecipeError::new(format!("cannot read {}: {error}", path.display()));
+	let mut file = fs::File::open(path).map_err(unreadable)?;
+	let mut hash = Sha256::new();
+	let mut buffer = vec![0_u8; 1 << 20];
+	loop {
+		let read = file.read(&mut buffer).map_err(unreadable)?;
+		if read == 0 {
+			return Ok(hash.finish());
+		}
+		hash.update(&buffer[..read]);
+	}
+}
+#[cfg(target_os = "linux")]
+fn hex(bytes: &[u8]) -> String {
+	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+#[cfg(target_os = "linux")]
+fn unhex(text: &str) -> Option<[u8; 32]> {
+	if text.len() != 64 {
+		return None;
+	}
+	let mut digest = [0_u8; 32];
+	for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+		digest[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+	}
+	Some(digest)
+}
+fn unix_now() -> u64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())
+}
+#[cfg(target_os = "linux")]
+fn private_directory(path: &Path) -> Result<()> {
+	use std::os::unix::fs::DirBuilderExt as _;
+	fs::DirBuilder::new().recursive(true).mode(0o700).create(path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", path.display())))
+}
+#[cfg(target_os = "linux")]
+fn retained_root() -> Result<PathBuf> {
+	let root = home_directory()?.join(".cache").join("recipe").join("retained");
+	private_directory(&root)?;
+	Ok(root)
+}
+/// The content identity of a GGUF source: the SHA-256 of each shard, cached
+/// beside the stat stamp of that shard. A stamp change rehashes the shard.
+#[cfg(target_os = "linux")]
+fn source_digest(paths: &[PathBuf], root: &Path) -> Result<[u8; 32]> {
+	use std::os::unix::fs::MetadataExt as _;
+	let cache = root.join("sources");
+	private_directory(&cache)?;
+	let mut combined = Sha256::new();
+	for path in paths {
+		let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+		let canonical = fs::canonicalize(path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?;
+		let name = canonical.display().to_string();
+		let stamp = format!("{} {} {} {} {} {} {}", metadata.len(), metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec());
+		let entry = cache.join(format!("{}.stamp", hex(&sha256(name.as_bytes()))));
+		let cached = fs::read_to_string(&entry).ok().and_then(|text| {
+			let mut lines = text.lines();
+			if lines.next()? != stamp {
+				return None;
+			}
+			unhex(lines.next()?)
+		});
+		let digest = match cached {
+			Some(digest) => digest,
+			None => {
+				let digest = sha256_file(path)?;
+				fs::write(&entry, format!("{stamp}\n{}\n", hex(&digest))).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", entry.display())))?;
+				digest
+			}
+		};
+		combined.update(name.as_bytes());
+		combined.update(&digest);
+	}
+	Ok(combined.finish())
+}
+/// Lease and loading records, one `name value` pair per line.
+type Fields = std::collections::BTreeMap<String, String>;
+#[cfg(target_os = "linux")]
+fn read_fields(path: &Path, owner: u32) -> Option<Fields> {
+	use std::os::unix::fs::MetadataExt as _;
+	if fs::metadata(path).ok()?.uid() != owner {
+		return None;
+	}
+	let text = fs::read_to_string(path).ok()?;
+	Some(text.lines().filter_map(|line| line.split_once(' ')).map(|(name, value)| (name.to_owned(), value.to_owned())).collect())
+}
+fn write_fields(path: &Path, fields: &Fields) -> Result<()> {
+	let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+	let text: String = fields.iter().map(|(name, value)| format!("{name} {value}\n")).collect();
+	fs::write(&temporary, text).and_then(|()| fs::rename(&temporary, path)).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
+}
+#[cfg(target_os = "linux")]
+fn field_number(fields: &Fields, name: &str) -> Option<u64> {
+	fields.get(name)?.parse().ok()
+}
+#[cfg(target_os = "linux")]
+fn field_address(fields: &Fields, name: &str) -> Option<usize> {
+	usize::from_str_radix(fields.get(name)?.trim_start_matches("0x"), 16).ok()
+}
+/// The start time of a process, used to tell a live holder from a reused pid.
+#[cfg(target_os = "linux")]
+fn process_start(pid: u32) -> Option<u64> {
+	let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+	stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+#[cfg(target_os = "linux")]
+fn holder_alive(holder: Option<&String>) -> bool {
+	let Some(holder) = holder else { return false };
+	let mut parts = holder.split_whitespace().map(|part| part.parse::<u64>().ok());
+	let (Some(Some(pid)), Some(Some(start))) = (parts.next(), parts.next()) else { return false };
+	process_start(pid as u32) == Some(start)
+}
+#[cfg(target_os = "linux")]
+fn remove_retained(lease: &Path) {
+	fs::remove_file(lease).ok();
+	fs::remove_file(lease.with_extension("loading")).ok();
+	fs::remove_file(lease.with_extension("weight buffer")).ok();
+}
+/// Releases expired leases and recovers loads whose holder has exited.
+#[cfg(target_os = "linux")]
+fn sweep_retained(root: &Path, owner: u32, now: u64) -> (usize, usize) {
+	let (mut released, mut recovered) = (0, 0);
+	let Ok(entries) = fs::read_dir(root) else { return (0, 0) };
+	for entry in entries.flatten() {
+		let path = entry.path();
+		let Some(fields) = read_fields(&path, owner) else { continue };
+		match path.extension().and_then(|extension| extension.to_str()) {
+			Some("lease") if field_number(&fields, "expires").is_some_and(|expires| expires <= now) => {
+				remove_retained(&path);
+				released += 1;
+			}
+			Some("loading") if !holder_alive(fields.get("holder")) => {
+				remove_retained(&path);
+				recovered += 1;
+			}
+			_ => {}
+		}
+	}
+	(released, recovered)
+}
+/// Removes retained weight buffers of this source whose content no longer matches.
+#[cfg(target_os = "linux")]
+fn invalidate_sources(root: &Path, owner: u32, source: &str, digest: &str) -> usize {
+	let Ok(entries) = fs::read_dir(root) else { return 0 };
+	let mut removed = 0;
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.extension().and_then(|extension| extension.to_str()) != Some("lease") {
+			continue;
+		}
+		let Some(fields) = read_fields(&path, owner) else { continue };
+		if fields.get("source").map(String::as_str) == Some(source) && fields.get("source_digest").map(String::as_str) != Some(digest) {
+			remove_retained(&path);
+			removed += 1;
+		}
+	}
+	removed
+}
+#[cfg(target_os = "linux")]
+fn renew_retained(lease: &Path, owner: u32, ttl: u64) {
+	let Some(mut fields) = read_fields(lease, owner) else { return };
+	fields.insert("expires".to_owned(), (unix_now() + ttl).to_string());
+	write_fields(lease, &fields).ok();
+}
+#[cfg(target_os = "linux")]
+fn retained_length(bytes: usize) -> usize {
+	bytes.max(1).next_multiple_of(4096)
+}
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+	#[link_name = "mmap"]
+	fn retained_map(address: *mut std::ffi::c_void, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> *mut std::ffi::c_void;
+	#[link_name = "munmap"]
+	fn retained_unmap(address: *mut std::ffi::c_void, length: usize) -> i32;
+}
+/// Maps the weight file at `address` when that range is free.
+#[cfg(target_os = "linux")]
+fn map_retained(file: &fs::File, bytes: usize, address: usize) -> Option<u64> {
+	use std::os::fd::AsRawFd as _;
+	const READ_WRITE: i32 = 0x1 | 0x2;
+	const SHARED_FIXED_NOREPLACE: i32 = 0x01 | 0x10_0000;
+	let length = retained_length(bytes);
+	let pointer = unsafe { retained_map(address as *mut _, length, READ_WRITE, SHARED_FIXED_NOREPLACE, file.as_raw_fd(), 0) };
+	if pointer as isize == -1 {
+		return None;
+	}
+	// Kernels without MAP_FIXED_NOREPLACE treat the address as a hint.
+	if pointer as usize != address {
+		unsafe { retained_unmap(pointer, length) };
+		return None;
+	}
+	Some(address as u64)
+}
+#[cfg(target_os = "linux")]
+fn unmap_retained(pointer: u64, bytes: usize) {
+	unsafe { retained_unmap(pointer as *mut _, retained_length(bytes)) };
+}
+/// The source a placement retains weights for: the GGUF shards, their content
+/// digest, the label used for invalidation, and the lease lifetime in seconds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct RetainedSource {
+	digest: [u8; 32],
+	path: String,
+	ttl: u64,
+}
+fn retained_source(file: &Gguf) -> Result<Option<RetainedSource>> {
+	let Some(minutes) = std::env::var("RECIPE_TTL").ok().map(|value| value.parse::<u64>().map_err(|_| RecipeError::new("--ttl must be a non-negative whole number of minutes"))).transpose()? else {
+		return Ok(None);
+	};
+	let path = file.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(";");
+	let ttl = minutes.checked_mul(60).ok_or_else(|| RecipeError::new("--ttl is too large"))?;
+	#[cfg(target_os = "linux")]
+	let digest = source_digest(&file.paths, &retained_root()?)?;
+	#[cfg(not(target_os = "linux"))]
+	let digest = [0_u8; 32];
+	Ok(Some(RetainedSource { digest, path, ttl }))
+}
+/// Whether a tape's weights came from a retained weight buffer, and what that weight buffer cost.
+#[derive(Clone, Debug, Default)]
+pub struct WeightResidency {
+	pub device: String,
+	/// `private` without a TTL, `created`, `reused`, or `bypassed` with a reason.
+	pub outcome: &'static str,
+	pub reason: String,
+	/// The first 16 hex digits of the retained-allocation identity.
+	pub identity: String,
+	/// The address of the retained weight buffer, or zero when the weight buffer is private.
+	pub address: usize,
+	pub bytes: usize,
+	/// Stored source bytes staged for the weight buffer, read in this invocation.
+	pub read_bytes: usize,
+	/// Parameter bytes encoded on the CPU in this invocation.
+	pub converted_bytes: usize,
+	/// Bytes copied into the weight buffer in this invocation.
+	pub uploaded_bytes: usize,
+	/// Unix seconds when the retained weight buffer expires, or zero when it is private.
+	pub expires: u64,
+	/// Expired or superseded weight buffers removed by this invocation.
+	pub released: usize,
+	/// Interrupted loads recovered by this invocation.
+	pub recovered: usize,
+}
+/// Keeps a retained weight buffer's lease alive for its TTL after the tape is dropped.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct RetainedHold {
+	lease: PathBuf,
+	ttl: u64,
+	owner: u32,
+}
+#[cfg(target_os = "linux")]
+impl Drop for RetainedHold {
+	fn drop(&mut self) {
+		renew_retained(&self.lease, self.owner, self.ttl);
+	}
+}
+/// A retained weight buffer being created. Its lease is written once the weights and
+/// model-load kernel have finished; an earlier exit leaves a loading record
+/// that the next invocation recovers.
+struct RetainedLoad {
+	lease: PathBuf,
+	loading: PathBuf,
+	owner: u32,
+	ttl: u64,
+	fields: Fields,
+}
+impl RetainedLoad {
+	fn commit(mut self, residency: &mut WeightResidency) -> Result<RetainedHold> {
+		let expires = unix_now() + self.ttl;
+		self.fields.insert("state".to_owned(), "ready".to_owned());
+		self.fields.insert("expires".to_owned(), expires.to_string());
+		write_fields(&self.lease, &self.fields)?;
+		fs::remove_file(&self.loading).ok();
+		residency.expires = expires;
+		Ok(RetainedHold { lease: self.lease, ttl: self.ttl, owner: self.owner })
+	}
+}
+/// One tape's weight buffer and the residency decision that produced it.
+struct Acquired {
+	weights: Buffer,
+	residency: WeightResidency,
+	load: Option<RetainedLoad>,
+	hold: Option<RetainedHold>,
+}
+fn private_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize, reason: &str) -> Result<Acquired> {
+	let (weights, (read_bytes, converted_bytes, uploaded_bytes)) = Buffer::upload_weights(gpu, graph, precision, inference, rows)?;
+	let residency = WeightResidency {
+		device: gpu.name.clone(),
+		outcome: if reason.is_empty() { "private" } else { "bypassed" },
+		reason: reason.to_owned(),
+		bytes: weights.bytes,
+		read_bytes,
+		converted_bytes,
+		uploaded_bytes,
+		..Default::default()
+	};
+	Ok(Acquired { weights, residency, load: None, hold: None })
+}
+/// The buffer interface of the weight buffer: offsets, sizes, precisions, and
+/// stored representations of every weighted node. Node operations and indices
+/// are excluded, so a kernel-only change keeps a compatible weight buffer.
+#[cfg(target_os = "linux")]
+fn weight_interface(graph: &Graph, offsets: &[usize], bytes: usize) -> String {
+	let mut text = format!("bytes {bytes}\n");
+	for (index, node) in graph.nodes.iter().enumerate() {
+		let stored = graph.stored.get(index).and_then(Option::as_ref);
+		if node.parameters == 0 && stored.is_none() && !node.packed {
+			continue;
+		}
+		let storage = stored.map_or("none".to_owned(), |weight| format!("{}:{}:{}", quantization(weight.format.0), weight.count, weight.segments.len()));
+		text.push_str(&format!("{} {} {} {} {} {storage}\n", offsets[index], node.parameters, node.precision.label(), node.int_bits, node.packed));
+	}
+	text
+}
+#[cfg(target_os = "linux")]
+fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize, source: Option<&RetainedSource>) -> Result<Acquired> {
+	use std::io::Write as _;
+	use std::os::unix::fs::MetadataExt as _;
+	let Some(source) = source else { return private_weights(gpu, graph, precision, inference, rows, "") };
+	if !inference {
+		return private_weights(gpu, graph, precision, inference, rows, "training weights are mutable");
+	}
+	if !matches!(gpu.driver, Driver::Cpu) {
+		return private_weights(gpu, graph, precision, inference, rows, "device weights are not retained on this device");
+	}
+	let root = retained_root()?;
+	let owner = fs::metadata(&root).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", root.display())))?.uid();
+	let now = unix_now();
+	let (released, recovered) = sweep_retained(&root, owner, now);
+	let (offsets, weight_total) = native_weight_arena(graph, precision, inference)?;
+	// A run decoder reads the last block of a weight as whole aligned words, up to three bytes past its end.
+	let bytes = weight_total + 4;
+	let digest = hex(&source.digest);
+	let interface = weight_interface(graph, &offsets, bytes);
+	let identity = format!(
+		"{RETAINED_ROOT}\nsource {}\nsource_digest {digest}\ninterface {interface}\ndevice {}\ntarget {}\nprecision {}\nrows {rows}\n",
+		source.path,
+		gpu.name,
+		native_target_label(&gpu.native_target),
+		precision.label()
+	);
+	let key = hex(&sha256(identity.as_bytes()));
+	let invalidated = invalidate_sources(&root, owner, &source.path, &digest);
+	let lease = root.join(format!("{key}.lease"));
+	let loading = root.join(format!("{key}.loading"));
+	let weights_path = root.join(format!("{key}.weights"));
+	let mut residency = WeightResidency { device: gpu.name.clone(), outcome: "created", identity: key[..16].to_owned(), bytes, released: released + invalidated, recovered, ..Default::default() };
+	if let Some(fields) = read_fields(&lease, owner) {
+		let current = field_number(&fields, "expires").is_some_and(|expires| expires > now) && field_number(&fields, "bytes") == Some(bytes as u64);
+		if current {
+			let mapped = fs::OpenOptions::new().read(true).write(true).open(&weights_path).ok().zip(field_address(&fields, "address")).and_then(|(file, address)| map_retained(&file, bytes, address));
+			let Some(pointer) = mapped else {
+				return private_weights(gpu, graph, precision, inference, rows, "retained address is unavailable");
+			};
+			let expires = now + source.ttl;
+			let mut renewed = fields;
+			renewed.insert("expires".to_owned(), expires.to_string());
+			write_fields(&lease, &renewed)?;
+			let mut weights = Buffer::retained(gpu, pointer, bytes);
+			weights.seal();
+			residency.outcome = "reused";
+			residency.address = pointer as usize;
+			residency.expires = expires;
+			return Ok(Acquired { weights, residency, load: None, hold: Some(RetainedHold { lease, ttl: source.ttl, owner }) });
+		}
+	}
+	let mut claimed = false;
+	for _ in 0..2 {
+		match fs::OpenOptions::new().write(true).create_new(true).open(&loading) {
+			Ok(mut file) => {
+				let holder = format!("holder {} {}\n", std::process::id(), process_start(std::process::id()).unwrap_or(0));
+				file.write_all(holder.as_bytes()).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", loading.display())))?;
+				claimed = true;
+				break;
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+				let stale = read_fields(&loading, owner).is_some_and(|fields| !holder_alive(fields.get("holder")));
+				if !stale {
+					return private_weights(gpu, graph, precision, inference, rows, "another process is loading these weights");
+				}
+				remove_retained(&lease);
+				residency.recovered += 1;
+			}
+			Err(error) => return Err(RecipeError::new(format!("cannot create {}: {error}", loading.display()))),
+		}
+	}
+	if !claimed {
+		return private_weights(gpu, graph, precision, inference, rows, "another process is loading these weights");
+	}
+	let weight_file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&weights_path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", weights_path.display())))?;
+	weight_file.set_len(retained_length(bytes) as u64).map_err(|error| RecipeError::new(format!("cannot size {}: {error}", weights_path.display())))?;
+	let slot = u64::from_str_radix(&key[..16], 16).unwrap_or(0) % RETAINED_SLOTS;
+	let mapped = (0..64).find_map(|attempt| {
+		let address = RETAINED_BASE + ((slot + attempt) % RETAINED_SLOTS) as usize * RETAINED_SLOT;
+		map_retained(&weight_file, bytes, address)
+	});
+	let Some(pointer) = mapped else {
+		remove_retained(&lease);
+		return private_weights(gpu, graph, precision, inference, rows, "no retained address is free");
+	};
+	let weights = Buffer::retained(gpu, pointer, bytes);
+	let (read_bytes, converted_bytes, uploaded_bytes) = weights.fill_weights(graph, &offsets, inference, rows)?;
+	residency.address = pointer as usize;
+	residency.read_bytes = read_bytes;
+	residency.converted_bytes = converted_bytes;
+	residency.uploaded_bytes = uploaded_bytes;
+	let fields = Fields::from([
+		("address".to_owned(), format!("{pointer:#x}")),
+		("bytes".to_owned(), bytes.to_string()),
+		("source".to_owned(), source.path.clone()),
+		("source_digest".to_owned(), digest),
+	]);
+	Ok(Acquired { weights, residency, load: Some(RetainedLoad { lease, loading, owner, ttl: source.ttl, fields }), hold: None })
+}
+#[cfg(not(target_os = "linux"))]
+fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize, _source: Option<&RetainedSource>) -> Result<Acquired> {
+	let reason = format!("retained weights require Linux, not {}", std::env::consts::OS);
+	private_weights(gpu, graph, precision, inference, rows, &reason)
 }
 #[derive(Clone, Copy)]
 struct Kernel {
 	#[cfg(any(amd, nvidia))]
 	object: u64,
 	shared: u32,
-	nvidia_resources: Option<(u32, u32)>,
 	element: u8,
 	#[cfg(amd)]
 	kernarg: usize,
@@ -25139,7 +28431,7 @@ struct Dispatch {
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32, i32);
-type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
+type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
@@ -25220,7 +28512,6 @@ const HSA_GRID_SYNC_GROUPS_OFFSET: usize = 40;
 
 #[cfg(nvidia)]
 struct NativeCudaProgram {
-	load_seconds: f64,
 	module: usize,
 	step: Option<Dispatch>,
 	unload: unsafe extern "C" fn(Ptr) -> i32,
@@ -25297,7 +28588,6 @@ impl Kernel {
 			#[cfg(any(amd, nvidia))]
 			object: 0,
 			shared,
-			nvidia_resources: None,
 			element,
 			#[cfg(amd)]
 			kernarg: 0,
@@ -25306,6 +28596,27 @@ impl Kernel {
 			layout,
 		}
 	}
+}
+/// `CUDA_MEMCPY2D`: `height` rows of `width` bytes, each side with its own pitch.
+#[cfg(nvidia)]
+#[repr(C)]
+struct CudaCopy2d {
+	src_x: usize,
+	src_y: usize,
+	src_memory: u32,
+	src_host: *const c_void,
+	src_device: u64,
+	src_array: Ptr,
+	src_pitch: usize,
+	dst_x: usize,
+	dst_y: usize,
+	dst_memory: u32,
+	dst_host: Ptr,
+	dst_device: u64,
+	dst_array: Ptr,
+	dst_pitch: usize,
+	width: usize,
+	height: usize,
 }
 #[cfg(nvidia)]
 struct Cuda {
@@ -25316,6 +28627,7 @@ struct Cuda {
 	free: unsafe extern "C" fn(u64) -> i32,
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
+	copy_2d: unsafe extern "C" fn(*const CudaCopy2d) -> i32,
 	clear: unsafe extern "C" fn(u64, u8, usize) -> i32,
 	memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
@@ -25326,6 +28638,11 @@ struct Cuda {
 	function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32,
 	function_attribute_set: Option<unsafe extern "C" fn(usize, i32, i32) -> i32>,
 	occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32,
+	host_alloc: unsafe extern "C" fn(*mut Ptr, usize, u32) -> i32,
+	host_free: unsafe extern "C" fn(Ptr) -> i32,
+	host_device_pointer: unsafe extern "C" fn(*mut u64, Ptr, u32) -> i32,
+	enable_peer: unsafe extern "C" fn(Ptr, u32) -> i32,
+	module_global: unsafe extern "C" fn(*mut u64, *mut usize, Ptr, *const u8) -> i32,
 	cus: u32,
 	wave: u32,
 	workgroup: u32,
@@ -25341,7 +28658,6 @@ impl Kernel {
 		Self {
 			object: object as u64,
 			shared,
-			nvidia_resources: None,
 			element,
 			#[cfg(amd)]
 			kernarg: 0,
@@ -25396,6 +28712,7 @@ const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
 const REMOTE_MEMORY: u8 = 8;
 const REMOTE_CLEAR: u8 = 9;
+const REMOTE_DEVICE_COPY: u8 = 10;
 const REMOTE_NATIVE_EPOCH: u8 = 1;
 const REMOTE_NATIVE_STEP: u8 = 2;
 struct Wire<R: Read, W: Write> {
@@ -25592,6 +28909,17 @@ fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
 }
 impl Gpu {
+	/// The lanes of one wave on this device: a CPU runs one lane at a time.
+	fn lanes(&self) -> u32 {
+		match &self.driver {
+			Driver::Cpu => 1,
+			#[cfg(amd)]
+			Driver::Hsa(hsa) => hsa.wave,
+			#[cfg(nvidia)]
+			Driver::Cuda(cuda) => cuda.wave,
+			Driver::Remote(remote) => remote.wave,
+		}
+	}
 	#[cfg(any(amd, nvidia))]
 	fn status(&self, status: i32, action: &str) -> Result<()> {
 		driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend)))
@@ -25606,12 +28934,30 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<NativeProgram> {
-		let window_positions = inference_window(graph, rows, !epoch);
-		for (index, node) in graph.nodes.iter().enumerate() {
-			let output = window_shape(node.output, graph.input.length, window_positions);
-			let elements = checked_mul(rows, output.elements(), "node batch")?;
-			narrow(elements, &format!("{} output with {} channels and {} positions", node.identity(index), output.channels, output.length))?;
+		let (artifact, schedule, shapes, register_values, waves, element, shared_values) = self.native_compile(graph, rows, precision, loss, epoch)?;
+		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
+		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
+		let required = fixed
+			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
+			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
+		Ok(program)
+	}
+	/// Compiles a graph for this device and runs the driver's own compile of the
+	/// artifact into its cache, without keeping anything loaded.
+	fn native_prepare(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<()> {
+		let (artifact, ..) = self.native_compile(graph, rows, precision, loss, epoch)?;
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe { driver.warm_native(&artifact.artifact) },
+			_ => Ok(()),
 		}
+	}
+	/// The schedule and compiled artifact of a graph on this device, without
+	/// loading it: the artifact lands in the native cache, so ranges compile in
+	/// parallel before each loads on its own device.
+	#[allow(clippy::type_complexity)]
+	fn native_compile(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<(NativeArtifact, NativeSchedule, Vec<Option<NativeContractionShapes>>, u32, u32, Compute, u32)> {
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
@@ -25671,15 +29017,20 @@ impl Gpu {
 		let matrix_waves =
 			narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")?
 				as u32;
-		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
+		// An inference pass over a window runs as wide as the one-position step:
+		// its packed sums spread their rows over every wave the SM holds.
+		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else if loss.is_none() && !cpu { (512 / wave.max(1)).max(1) } else { vector_waves };
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
-		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
+		// A widened inference window keeps the general body's register tile small
+		// enough that its reduction buffer fits beside the packed column.
+		let widened = loss.is_none() && !cpu && !matrix;
+		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m).min(if widened { 2 } else { u32::MAX });
 		let waves = if cpu { 1 } else { waves_per_workgroup };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
-		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
+		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min(if widened { 2 } else { u32::MAX }).min((self.shared_limit
 			/ element.bytes() as u32
 			/ block / register_m
 			.checked_add(1)
@@ -25692,7 +29043,9 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves;
+		// The margin is the configured width's: widening an inference pass to the
+		// step's width keeps the tiles its schedule sized for that width.
+		let shared_budget = shared_values / if matrix || cpu { waves } else { vector_waves };
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
@@ -25736,7 +29089,17 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values);
+		// A packed row stages its whole column at once when the tile holds it: the
+		// column, one padding value per 32, and 96 values of row sums, expert ids
+		// and routing weights per wave of the widest (512-lane) workgroup.
+		let packed_shared_values = if inference && !cpu {
+			let scratch = 96 * (512 / wave.max(1)) + 8;
+			let widest = graph.nodes.iter().filter(|node| node.packed).map(|node| node.input.channels as u32).max().unwrap_or(0);
+			(widest + widest / 32 + 1 + scratch).min(shared_values.saturating_sub(256))
+		} else {
+			0
+		};
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(packed_shared_values);
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
@@ -25777,15 +29140,10 @@ impl Gpu {
 			shared_values,
 			contractions,
 			attention,
+			lanes: self.lanes(),
 		};
-		let artifact = compile_model(&self.native_target, graph, precision, loss, epoch, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
-		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
-		let required = fixed
-			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
-			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
-		Ok(program)
+		let artifact = compile_model(&self.name, &self.native_target, graph, precision, loss, epoch, rows, schedule.clone())?;
+		Ok((artifact, schedule, shapes, register_values, waves, element, shared_values))
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
 		let pointer = self.allocate_bytes(bytes)?;
@@ -25923,6 +29281,35 @@ impl Gpu {
 			}
 		}
 	}
+	/// `bytes` from device address `src` to device address `dst` on this device.
+	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
+	/// `rows` runs of `width` bytes, `pitch` apart on the device, packed together
+	/// in machine RAM: one copy where the driver has one, else one per run.
+	fn download_strided(&self, dst: Ptr, src: u64, pitch: usize, width: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 2, src_host: ptr::null(), src_device: src, src_array: ptr::null_mut(), src_pitch: pitch, dst_x: 0, dst_y: 0, dst_memory: 1, dst_host: dst, dst_device: 0, dst_array: ptr::null_mut(), dst_pitch: width, width, height: rows };
+			let started = Instant::now();
+			let result = self.status(unsafe { (driver.copy_2d)(&copy) }, "strided download");
+			if result.is_ok() { record_transfer(&self.name, false, width * rows, started.elapsed().as_secs_f64()); }
+			return result;
+		}
+		(0..rows).try_for_each(|row| self.download(unsafe { dst.cast::<u8>().add(row * width).cast() }, src + (row * pitch) as u64, width))
+	}
+	/// `rows` runs of `width` bytes packed in machine RAM, written `pitch` apart on the device.
+	fn upload_strided(&self, dst: u64, src: *const c_void, pitch: usize, width: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 1, src_host: src, src_device: 0, src_array: ptr::null_mut(), src_pitch: width, dst_x: 0, dst_y: 0, dst_memory: 2, dst_host: ptr::null_mut(), dst_device: dst, dst_array: ptr::null_mut(), dst_pitch: pitch, width, height: rows };
+			let started = Instant::now();
+			let result = self.status(unsafe { (driver.copy_2d)(&copy) }, "strided upload");
+			if result.is_ok() { record_transfer(&self.name, true, width * rows, started.elapsed().as_secs_f64()); }
+			return result;
+		}
+		(0..rows).try_for_each(|row| self.upload(dst + (row * pitch) as u64, unsafe { src.cast::<u8>().add(row * width).cast() }, width).map(|_| ()))
+	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
 		self.activate()?;
@@ -25963,7 +29350,9 @@ impl Gpu {
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
 					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
-					Ok(free as u64)
+					// Memory above a configured bound is unusable, so it is never free.
+					let unusable = device_usable_bytes(&self.name)?.map_or(0, |usable| (total as u64).saturating_sub(usable));
+					Ok((free as u64).saturating_sub(unusable))
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
@@ -26162,6 +29551,12 @@ static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Dots chain devices under the most recent host prefix. Commas are invalid.
 /// `cpu` names the available CPU pool, not a physical socket.
 /// The first name is the primary device.
+/// The bytes of this machine's device `name` that may hold data, when the
+/// manifest bounds them (`device-usable-bytes`): memory above it is faulty.
+fn device_usable_bytes(name: &str) -> Result<Option<u64>> {
+	let device = format!("{}:{name}", local_host()?);
+	env!("RECIPE_DEVICE_USABLE_BYTES").split(';').filter_map(|entry| entry.split_once('=')).find(|(entry, _)| *entry == device).map(|(_, bytes)| bytes.parse::<u64>().map_err(|error| RecipeError::new(format!("device-usable-bytes for {device} is invalid: {error}")))).transpose()
+}
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
@@ -26423,7 +29818,7 @@ type HsaSymbolInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
 unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, agent: u64, name: &std::ffi::CStr, element: u8, layout: &'static [u8]) -> Result<Kernel> {
 	let mut handle = 0;
 	driver_status(Backend::Amd, unsafe { symbol(executable, name.as_ptr().cast(), &agent, &mut handle) }, "kernel lookup")?;
-	let mut kernel = Kernel { object: 0, shared: 0, nvidia_resources: None, element, kernarg: 0, private: 0, layout };
+	let mut kernel = Kernel { object: 0, shared: 0, element, kernarg: 0, private: 0, layout };
 	for (attribute, output) in [
 		(22, (&mut kernel.object as *mut u64).cast()),
 		(11, (&mut kernel.kernarg as *mut usize).cast()),
@@ -26495,11 +29890,11 @@ impl Cuda {
 			let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 			let mut object = 0;
 			driver_status(Backend::Nvidia, (self.function)(&mut object, module, name.as_ptr().cast()), "native symbol lookup")?;
-			let (mut max_block, mut shared, mut used_registers, mut local) = (0, 0, 0, 0);
-			for (kind, output, action) in [(0, &mut max_block, "native workgroup query"), (1, &mut shared, "native shared-memory query"), (3, &mut local, "native local-memory query"), (4, &mut used_registers, "native register query")] {
+			let (mut max_block, mut shared, mut used_registers) = (0, 0, 0);
+			for (kind, output, action) in [(0, &mut max_block, "native workgroup query"), (1, &mut shared, "native shared-memory query"), (4, &mut used_registers, "native register query")] {
 				driver_status(Backend::Nvidia, (self.function_attribute)(output, kind, object), action)?;
 			}
-			require(max_block > 0 && shared >= 0 && local >= 0 && used_registers > 0, "NVIDIA native symbol resources are invalid")?;
+			require(max_block > 0 && shared >= 0 && used_registers > 0, "NVIDIA native symbol resources are invalid")?;
 			let register_wave = (used_registers as u32).checked_mul(self.wave).ok_or_else(|| RecipeError::new("NVIDIA native register count overflows"))?;
 			require((self.registers / register_wave).min(self.threads / self.wave) != 0, "NVIDIA native symbol has no resident wave")?;
 			let resources = Resources { shared: shared as u32, max_block: max_block as u32 };
@@ -26539,16 +29934,25 @@ impl Cuda {
 		}
 	}
 
+	/// Runs the driver's PTX compile for this device into its compute cache, so
+	/// the later load of the same bytes reads the cached object.
+	unsafe fn warm_native(&self, bytes: &[u8]) -> Result<()> {
+		unsafe {
+			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
+			let mut module = ptr::null_mut();
+			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
+			driver_status(Backend::Nvidia, (self.unload)(module), "native module unload")
+		}
+	}
+
 	unsafe fn load_native(
 		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_step: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
 	) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 			let mut module = ptr::null_mut();
-			let load_started = Instant::now();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
-			let load_seconds = load_started.elapsed().as_secs_f64();
-			let mut program = NativeCudaProgram { module: module as usize, load_seconds, step: None, unload: self.unload };
+			let mut program = NativeCudaProgram { module: module as usize, step: None, unload: self.unload };
 			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves)?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves)).transpose()?;
 			let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
@@ -26578,6 +29982,12 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 
 unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
+}
+/// The CPU kernels' `@recipe.clock`: nanoseconds on the machine's monotonic
+/// clock, so a kernel's own start and end marks time its work in seconds.
+extern "C" fn native_cpu_clock() -> i64 {
+	static ORIGIN: OnceLock<Instant> = OnceLock::new();
+	i64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(i64::MAX)
 }
 
 macro_rules! launch_native_cpu_epoch {
@@ -26652,6 +30062,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 	let barrier = std::sync::Barrier::new(threads as usize);
 	let context = ptr::from_ref(&barrier) as usize;
 	let wait = native_cpu_barrier as *const () as usize;
+	let clock = native_cpu_clock as *const () as usize;
 	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward, cpu.epoch, cpu.model_load);
 	std::thread::scope(|scope| {
 		let workers = (0..threads)
@@ -26661,7 +30072,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 					let thread_id = i32::try_from(thread_id).map_err(|_| RecipeError::new("native CPU worker ID exceeds i32"))?;
 					let arguments = slots.iter().map(|slot| *slot as Ptr).collect::<Vec<_>>();
 					unsafe {
-						thread(thread_id, context as Ptr, wait as Ptr);
+						thread(thread_id, context as Ptr, wait as Ptr, clock as Ptr);
 						launch_native_cpu_entry(forward, epoch, model_load, entry, &arguments)
 					}
 				})
@@ -26803,10 +30214,7 @@ impl NativeProgram {
 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
-		unsafe { launch_backend(gpu, &self.backend, &dispatch, entry, arguments, threads, dynamic, shared) }.map_err(|error| {
-			let resources = dispatch.kernel.nvidia_resources.map_or_else(String::new, |(registers, local)| format!(", registers/thread {registers}, local-bytes/thread {local}"));
-			RecipeError::new(format!("{}: {error}; entry {entry:?}, grid {}, workgroup {}, shared bytes {shared}{resources}, artifact {}", device_label(gpu).unwrap_or_else(|_| gpu.name.clone()), dispatch.geometry.groups, dispatch.geometry.block, self.artifact.path.display()))
-		})
+		unsafe { launch_backend(gpu, &self.backend, &dispatch, entry, arguments, threads, dynamic, shared) }
 	}
 }
 
@@ -27132,6 +30540,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				copy_2d: runtime.function(b"cuMemcpy2D_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
@@ -27142,6 +30551,11 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				function_attribute,
 				function_attribute_set,
 				occupancy,
+				host_alloc: runtime.function(b"cuMemHostAlloc\0")?,
+				host_free: runtime.function(b"cuMemFreeHost\0")?,
+				host_device_pointer: runtime.function(b"cuMemHostGetDevicePointer_v2\0")?,
+				enable_peer: runtime.function(b"cuCtxEnablePeerAccess\0")?,
+				module_global: runtime.function(b"cuModuleGetGlobal_v2\0")?,
 				cus: cus as u32,
 				wave: wave as u32,
 				workgroup: workgroup as u32,
@@ -27250,7 +30664,14 @@ pub fn worker_serve(name: &str) -> Result<()> {
 					wire.write_bytes(&data)?;
 				}
 			}
-			REMOTE_SYNCHRONIZE => wire.status(&gpu.synchronize())?,
+			REMOTE_DEVICE_COPY => {
+				let destination = wire.read_u64()?;
+				let source = wire.read_u64()?;
+				let bytes = wire.read_u64()? as usize;
+				wire.status(&gpu.copy_device(destination, source, bytes))?;
+			}
+
+REMOTE_SYNCHRONIZE => wire.status(&gpu.synchronize())?,
 			REMOTE_MEMORY => {
 				let free = gpu.free_bytes();
 				wire.status(&free.as_ref().map(|_| ()).map_err(Clone::clone))?;
@@ -27352,6 +30773,8 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+	fn madvise(address: Ptr, length: usize, advice: i32) -> i32;
+	fn getpagesize() -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
@@ -28422,7 +31845,6 @@ fn native_attention_shared_values(extent: Tile, whole: bool, inference: bool) ->
 fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32, inference: bool) -> Result<Tile> {
 	require(length != 0 && width != 0 && shared_values != 0 && query_tile != 0, "native attention tile inputs are empty")?;
 	let mut queries = length.min(query_tile);
-	let mut best: Option<Tile> = None;
 	loop {
 		let query_values = queries.checked_mul(width).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let forward_fixed = query_values
@@ -28450,15 +31872,8 @@ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile
 			.and_then(|values| values.checked_add(queries))
 			.ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
 		if keys != 0 && (queries != length || matrix <= shared_values) {
-			let candidate = Tile { m: queries, n: keys.min(length), k: width };
-			if !inference || queries == length { return Ok(candidate); }
-			// Query capacity must leave room for useful key reuse. Taking the
-			// largest query count can leave only one key per shared-memory tile.
-			// Equal areas favor more keys, which also benefits single-token steps.
-			let area = u64::from(candidate.m) * u64::from(candidate.n);
-			if best.is_none_or(|previous| area >= u64::from(previous.m) * u64::from(previous.n)) { best = Some(candidate); }
+			return Ok(Tile { m: queries, n: keys.min(length), k: width });
 		}
-		if queries == 1 { return best.ok_or_else(|| RecipeError::new("native attention tile does not fit the device")); }
 		queries = queries.checked_sub(1).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("native attention tile does not fit the device"))?;
 	}
 }
@@ -28960,15 +32375,6 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 	}
 }
 impl Data {
-	pub fn value(&self, key: &str) -> Option<&GgufValue> {
-		self.file.as_ref()?.value(key)
-	}
-	pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
-		self.file.as_ref()?.tensor(name)
-	}
-	pub fn ngram(&self) -> Ngram<'_> {
-		Ngram::new(self.file.as_ref().expect("n-gram tables require GGUF data")).unwrap_or_else(|error| panic!("{error}"))
-	}
 	fn report_path(&self) -> Result<String> {
 		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
 		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;
@@ -28976,6 +32382,12 @@ impl Data {
 	}
 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
 		self.target = target.into_data_sources();
+		self
+	}
+	/// Use one confirmed dataset schema to validate the source layout and select
+	/// the declared feature types while loading its rows.
+	pub fn schema(mut self, path: impl Into<String>) -> Self {
+		self.schema_file = Some(path.into());
 		self
 	}
 	pub fn include(mut self, names: impl IntoDataSources) -> Self {
@@ -29111,6 +32523,10 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			table.path = path.clone();
 			grouped.push((directory.clone(), table));
 		}
+	}
+	// A confirmed SQLite table selects one table before the tables are aligned.
+	if let Some(name) = confirmed_data_schema(data)?.and_then(|schema| schema.table) {
+		grouped.retain(|(_, table)| table.name == name);
 	}
 	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
 		return Ok((vec![table], paths));
@@ -29394,7 +32810,7 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	if targets.is_empty() {
 		return Ok(None);
 	}
-	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
+	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_audio(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
 		return Ok(None);
@@ -29642,6 +33058,16 @@ fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
 	Ok(str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("sample {} is not UTF-8: {error}", path.display())))?.trim().to_owned())
 }
 fn sample_values(path: &Path, bytes: &[u8]) -> Result<(Option<Shape>, Vec<String>)> {
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_audio) {
+		let (encoding, channels, bits, frames, payload) = data_audio_header(bytes)?;
+		require(encoding == 1 && matches!(bits, 8 | 16), "audio samples must use 8-bit or 16-bit PCM WAV")?;
+		let values = match bits {
+			8 => payload.iter().map(|value| ((f64::from(*value) - 128.0) / 128.0).to_string()).collect::<Vec<_>>(),
+			16 => payload.chunks_exact(2).map(|sample| (f64::from(i16::from_le_bytes(sample.try_into().unwrap())) / 32768.0).to_string()).collect::<Vec<_>>(),
+			_ => unreachable!(),
+		};
+		return Ok((Some(Shape { channels, length: frames }), values));
+	}
 	if !path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
 		return Ok((None, vec![sample_text(path, bytes)?]));
 	}
@@ -29652,6 +33078,9 @@ fn sample_values(path: &Path, bytes: &[u8]) -> Result<(Option<Shape>, Vec<String
 }
 fn is_image(extension: &str) -> bool {
 	matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
+}
+fn is_audio(extension: &str) -> bool {
+	extension.eq_ignore_ascii_case("wav")
 }
 /// Document formats that carry sample text but never decode as tables, so they only
 /// count as samples inside a recognized directory layout.
@@ -30084,10 +33513,45 @@ fn name_headerless(data: &Data, tables: &mut [Table]) -> Result<()> {
 	table.declared = true;
 	Ok(())
 }
+/// Checks one column against its confirmed dtype and returns the feature type it loads as.
+fn confirmed_feature(table: &Table, column: usize, declared: &str, rows: usize) -> Result<FeatureType> {
+	let header = &table.headers[column];
+	let values = table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|entry| !entry.is_empty()).collect::<Vec<_>>();
+	match declared {
+		"integer" => {
+			require(values.iter().all(|entry| entry.parse::<i64>().is_ok()), format!("dataset schema column {header:?} is not integer"))?;
+			Ok(FeatureType::Numeric)
+		}
+		"float" => {
+			require(values.iter().all(|entry| entry.parse::<f64>().is_ok_and(f64::is_finite)), format!("dataset schema column {header:?} is not finite float"))?;
+			Ok(FeatureType::Numeric)
+		}
+		"categorical" => Ok(FeatureType::Categorical(categories(table, column, rows))),
+		"text" => Ok(FeatureType::Text(values.iter().map(|entry| entry.len()).max().unwrap_or(0))),
+		_ => Err(RecipeError::new(format!("dataset schema column {header:?} has a non-tabular type {declared:?}"))),
+	}
+}
+
 fn prepare_data(data: &Data) -> Result<Prepared> {
+	let confirmed = confirmed_data_schema(data)?;
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
 	name_headerless(data, &mut tables)?;
 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
+	if let Some(schema) = &confirmed {
+		require(source_table_rows == schema.samples, format!("dataset schema expected {} samples, loader found {source_table_rows}", schema.samples))?;
+		if schema.parse == "table" || schema.parse == "sqlite_table" {
+			require(tables.len() == 1, format!("confirmed {} schema requires exactly one loaded table", schema.parse))?;
+			let table = &tables[0];
+			require(table.headers.len() == schema.features && table.headers.len() == schema.columns.len(), "dataset schema table width differs from loaded headers")?;
+			// Every declared column, including the target, must match its header and its values.
+			for (column, (header, (name, declared))) in table.headers.iter().zip(&schema.columns).enumerate() {
+				require(header == name, format!("dataset schema column {name:?} differs from loaded header {header:?}"))?;
+				confirmed_feature(table, column, declared, source_table_rows)?;
+			}
+		} else {
+			require(tables.len() == 1 && !data.target.is_empty(), format!("confirmed {} requires one labeled sample table", schema.parse))?;
+		}
+	}
 	if !data.tests.is_empty() {
 		let (mut tests, test_sources) = load_tables(data, &data.tests)?;
 		name_headerless(data, &mut tests)?;
@@ -30133,7 +33597,11 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	for (table, value) in tables.iter().enumerate() {
 		for (column, header) in value.headers.iter().enumerate() {
 			if !selected.contains(&(table, column)) && data.features.selects(value, header, column) {
-				columns.push((table, column, infer_feature(value, column, source_table_rows)));
+				let kind = match confirmed.as_ref().filter(|schema| schema.parse == "table") {
+					Some(schema) => confirmed_feature(value, column, &schema.columns[column].1, source_table_rows)?,
+					None => infer_feature(value, column, source_table_rows),
+				};
+				columns.push((table, column, kind));
 			}
 		}
 	}
@@ -30141,6 +33609,9 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		columns.sort_by_key(|(table, column, _)| names.iter().position(|name| column_match(name, &tables[*table], &tables[*table].headers[*column], *column)).unwrap_or(names.len()));
 	}
 	let features = columns.iter().map(|column| column.2.width()).sum();
+	if let Some(schema) = &confirmed && schema.parse != "table" && schema.parse != "sqlite_table" {
+		require(features == schema.features, format!("dataset schema expected {} sample features, loader found {features}", schema.features))?;
+	}
 	let mut sequence_widths = BTreeMap::new();
 	let repeated = columns.iter().all(|column| {
 		tables[column.0].headers[column.1].rsplit_once('.').and_then(|value| value.1.parse::<usize>().ok().map(|row| *sequence_widths.entry(row).or_insert(0) += column.2.width())).is_some()
@@ -30375,6 +33846,991 @@ fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf,
 	files.push((path.to_owned(), bytes));
 	Ok(())
 }
+fn data_json_string(value: &str) -> String {
+	let mut text = String::from("\"");
+	for character in value.chars() {
+		match character {
+			'"' => text.push_str("\\\""),
+			'\\' => text.push_str("\\\\"),
+			'\n' => text.push_str("\\n"),
+			'\r' => text.push_str("\\r"),
+			'\t' => text.push_str("\\t"),
+			control if control.is_control() => text.push_str(&format!("\\u{:04x}", control as u32)),
+			other => text.push(other),
+		}
+	}
+	text.push('"');
+	text
+}
+
+fn data_name_index(path: &Path) -> Option<usize> {
+	let name = path.file_stem()?.to_str()?;
+	name.split(|character: char| !character.is_ascii_digit()).filter(|part| !part.is_empty()).filter_map(|part| part.parse::<usize>().ok()).max()
+}
+
+fn data_image_header(path: &Path, bytes: &[u8]) -> Result<(usize, usize, usize)> {
+	let kind = path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase();
+	if kind == "png" {
+		require(bytes.get(..8) == Some(&b"\x89PNG\r\n\x1a\n"[..]) && bytes.get(12..16) == Some(&b"IHDR"[..]), "PNG header is absent")?;
+		let header = bytes.get(16..29).ok_or_else(|| RecipeError::new("PNG header is truncated"))?;
+		let width = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+		let height = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+		let channels = match header[9] {
+			0 | 3 => 1,
+			2 => 3,
+			4 => 2,
+			6 => 4,
+			_ => 0,
+		};
+		require(width != 0 && height != 0 && channels != 0, "PNG dimensions or channel type are invalid")?;
+		return Ok((width, height, channels));
+	}
+	require(bytes.get(..2) == Some(&[0xff, 0xd8]), "JPEG header is absent")?;
+	let mut at = 2;
+	while at + 4 <= bytes.len() {
+		if bytes[at] != 0xff {
+			return Err(RecipeError::new("JPEG marker is invalid"));
+		}
+		let marker = bytes[at + 1];
+		if marker == 0xd9 || marker == 0xda {
+			break;
+		}
+		let size = u16::from_be_bytes(bytes[at + 2..at + 4].try_into().unwrap()) as usize;
+		require(size >= 2 && at + 2 + size <= bytes.len(), "JPEG segment is truncated")?;
+		if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+			let body = bytes.get(at + 4..at + 2 + size).ok_or_else(|| RecipeError::new("JPEG frame is truncated"))?;
+			require(body.len() >= 6, "JPEG frame is truncated")?;
+			let height = u16::from_be_bytes(body[1..3].try_into().unwrap()) as usize;
+			let width = u16::from_be_bytes(body[3..5].try_into().unwrap()) as usize;
+			let channels = body[5] as usize;
+			require(width != 0 && height != 0 && channels != 0, "JPEG dimensions or channels are invalid")?;
+			return Ok((width, height, channels));
+		}
+		at += size + 2;
+	}
+	Err(RecipeError::new("JPEG frame header is absent"))
+}
+
+fn data_audio_header(bytes: &[u8]) -> Result<(u16, usize, usize, usize, &[u8])> {
+	require(bytes.get(..4) == Some(&b"RIFF"[..]) && bytes.get(8..12) == Some(&b"WAVE"[..]), "WAV header is absent")?;
+	let (mut at, mut format, mut payload) = (12, None, None);
+	while at + 8 <= bytes.len() {
+		let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+		let start = at + 8;
+		let chunk = bytes.get(start..start + size).ok_or_else(|| RecipeError::new("WAV chunk is truncated"))?;
+		match &bytes[at..at + 4] {
+			b"fmt " if chunk.len() >= 16 => {
+				format = Some((
+					u16::from_le_bytes(chunk[..2].try_into().unwrap()),
+					u16::from_le_bytes(chunk[2..4].try_into().unwrap()) as usize,
+					u16::from_le_bytes(chunk[14..16].try_into().unwrap()) as usize,
+				));
+			}
+			b"data" => payload = Some(chunk),
+			_ => {}
+		}
+		at = start + size + size % 2;
+	}
+	let (encoding, channels, bits) = format.ok_or_else(|| RecipeError::new("WAV format is absent"))?;
+	let payload = payload.ok_or_else(|| RecipeError::new("WAV samples are absent"))?;
+	require(channels != 0 && bits != 0, "WAV format is invalid")?;
+	let frame = checked_mul(channels, bits.div_ceil(8), "WAV frame")?;
+	require(frame != 0 && payload.len() % frame == 0, "WAV samples are incomplete")?;
+	Ok((encoding, channels, bits, payload.len() / frame, payload))
+}
+
+/// Bytes read from the start of a sample image; a JPEG frame header lies within this prefix.
+const PROBE_IMAGE_BYTES: u64 = 1 << 20;
+/// Bytes of each delimited field the probe keeps. Longer fields keep their true length.
+const PROBE_FIELD_BYTES: usize = 4096;
+const PROBE_CHUNK_BYTES: usize = 1 << 16;
+/// Most distinct values a categorical feature may have.
+const PROBE_CATEGORY_LIMIT: usize = 16;
+/// Sample-count choices and anchors offered to the answerer.
+const PROBE_CHOICE_LIMIT: usize = 8;
+/// Entries listed per section of the packet. Section totals are always complete.
+const PROBE_ENTRY_LIMIT: usize = 64;
+/// The fixed categories every feature question offers.
+const PROBE_FEATURE_TYPES: &str = "\"categorical\",\"integer\",\"float\",\"text\",\"image\",\"audio\"";
+const PROBE_DOCUMENT_BYTES: u64 = 16 << 20;
+
+/// One file under the dataset source. The walk records sizes and never opens a file.
+struct ProbeFile {
+	path: PathBuf,
+	bytes: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+	Delimited,
+	Image,
+	Audio,
+	Database,
+	Unprobed,
+}
+
+fn probe_kind(path: &Path) -> ProbeKind {
+	let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+	match extension.as_str() {
+		"csv" | "tsv" | "txt" | "data" | "dat" | "all-data" => ProbeKind::Delimited,
+		"sqlite" | "sqlite3" | "db" => ProbeKind::Database,
+		"wav" => ProbeKind::Audio,
+		"png" | "jpg" | "jpeg" => ProbeKind::Image,
+		_ => ProbeKind::Unprobed,
+	}
+}
+
+/// Lists every file under a path in sorted order. Archives and other formats are listed
+/// as unprobed; the probe does not open their members.
+fn probe_walk(path: &Path, files: &mut Vec<ProbeFile>) -> Result<()> {
+	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+	if !metadata.is_dir() {
+		files.push(ProbeFile { path: path.to_owned(), bytes: metadata.len() });
+		return Ok(());
+	}
+	let mut children = fs::read_dir(path)
+		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		.collect::<std::io::Result<Vec<_>>>()
+		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	children.sort_by_key(fs::DirEntry::path);
+	for child in children {
+		probe_walk(&child.path(), files)?;
+	}
+	Ok(())
+}
+
+#[derive(Default)]
+struct ProbeFolder {
+	files: usize,
+	samples: usize,
+	indexed: usize,
+	low: Option<usize>,
+	high: Option<usize>,
+}
+
+impl ProbeFolder {
+	fn add_sample(&mut self, index: Option<usize>) {
+		self.samples += 1;
+		if let Some(index) = index {
+			self.indexed += 1;
+			self.low = Some(self.low.map_or(index, |low| low.min(index)));
+			self.high = Some(self.high.map_or(index, |high| high.max(index)));
+		}
+	}
+
+	/// The numbered span of the samples, present only when every sample carries a number.
+	fn span(&self) -> Option<usize> {
+		match (self.low, self.high) {
+			(Some(low), Some(high)) if self.indexed == self.samples => Some(high - low + 1),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone)]
+struct ProbeCell {
+	text: String,
+	length: usize,
+}
+
+fn probe_push_byte(field: &mut Vec<u8>, length: &mut usize, byte: u8) {
+	if field.len() < PROBE_FIELD_BYTES {
+		field.push(byte);
+	}
+	*length += 1;
+}
+
+fn probe_take_cell(field: &mut Vec<u8>, length: &mut usize) -> ProbeCell {
+	let cell = ProbeCell { text: String::from_utf8_lossy(field).into_owned(), length: *length };
+	field.clear();
+	*length = 0;
+	cell
+}
+
+/// Streams delimited records with the loader's quoting and blank-record rules. It keeps one
+/// record and at most `PROBE_FIELD_BYTES` of each field in memory.
+fn probe_records(path: &Path, delimiter: u8, mut visit: impl FnMut(&[ProbeCell]) -> Result<()>) -> Result<()> {
+	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let mut chunk = vec![0u8; PROBE_CHUNK_BYTES];
+	let (mut row, mut field, mut length, mut quoted, mut pending) = (Vec::new(), Vec::new(), 0usize, false, false);
+	loop {
+		let read = file.read(&mut chunk).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		if read == 0 {
+			break;
+		}
+		for &byte in &chunk[..read] {
+			if pending {
+				pending = false;
+				if byte == b'"' {
+					probe_push_byte(&mut field, &mut length, byte);
+					continue;
+				}
+				quoted = false;
+			}
+			match byte {
+				b'"' if quoted => pending = true,
+				b'"' => quoted = true,
+				b'\n' if !quoted => {
+					if length == field.len() && field.last() == Some(&b'\r') {
+						field.pop();
+						length -= 1;
+					}
+					row.push(probe_take_cell(&mut field, &mut length));
+					if row.iter().any(|cell| !cell.text.trim().is_empty()) {
+						visit(&row)?;
+					}
+					row.clear();
+				}
+				_ if byte == delimiter && !quoted => row.push(probe_take_cell(&mut field, &mut length)),
+				_ => probe_push_byte(&mut field, &mut length, byte),
+			}
+		}
+	}
+	if pending {
+		quoted = false;
+	}
+	require(!quoted, format!("unterminated quoted feature in {}", path.display()))?;
+	if length > 0 || !row.is_empty() {
+		row.push(probe_take_cell(&mut field, &mut length));
+		if row.iter().any(|cell| !cell.text.trim().is_empty()) {
+			visit(&row)?;
+		}
+	}
+	Ok(())
+}
+
+struct ProbeColumn {
+	name: String,
+	values: usize,
+	integer: bool,
+	float: bool,
+	/// Distinct values, counted up to one past the categorical limit so a larger count is visible.
+	distinct: BTreeSet<String>,
+	longest: usize,
+}
+
+impl ProbeColumn {
+	fn new(name: String) -> Self {
+		Self { name, values: 0, integer: true, float: true, distinct: BTreeSet::new(), longest: 0 }
+	}
+
+	fn observe(&mut self, cell: &ProbeCell) {
+		self.longest = self.longest.max(cell.length);
+		if cell.text.is_empty() {
+			return;
+		}
+		self.values += 1;
+		self.integer &= cell.text.parse::<i64>().is_ok();
+		self.float &= cell.text.parse::<f64>().is_ok_and(f64::is_finite);
+		if self.distinct.len() <= PROBE_CATEGORY_LIMIT {
+			self.distinct.insert(cell.text.clone());
+		}
+	}
+
+	/// The fixed category the probe suggests. The answerer may choose another category the evidence allows.
+	fn suggested(&self) -> &'static str {
+		if self.values == 0 {
+			"text"
+		} else if self.integer {
+			"integer"
+		} else if self.float {
+			"float"
+		} else if self.distinct.len() <= PROBE_CATEGORY_LIMIT && self.distinct.len() * 4 <= self.values {
+			"categorical"
+		} else {
+			"text"
+		}
+	}
+}
+
+struct ProbeTable {
+	path: PathBuf,
+	name: String,
+	rows: usize,
+	ragged: bool,
+	columns: Vec<ProbeColumn>,
+}
+
+/// Probes one delimited file. The delimiter and header rules match `parse_table`, but the
+/// probe streams the file and keeps only column statistics.
+fn probe_delimited(path: &Path) -> Result<ProbeTable> {
+	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	// The widest rectangular parse wins; a tie goes to the later delimiter, as in the loader.
+	let mut choice = (0usize, b',', true);
+	for delimiter in [b'\t', b';', b','] {
+		let (mut width, mut rectangular) = (None, true);
+		probe_records(path, delimiter, |row| {
+			match width {
+				None => width = Some(row.len()),
+				Some(expected) => rectangular &= expected == row.len(),
+			}
+			Ok(())
+		})?;
+		let rectangle = if rectangular { width.unwrap_or(0) } else { 0 };
+		if rectangle >= choice.0 {
+			choice = (rectangle, delimiter, rectangular);
+		}
+	}
+	let (_, delimiter, rectangular) = choice;
+	let mut first: Option<Vec<ProbeCell>> = None;
+	let mut columns = Vec::new();
+	let mut data_rows = 0usize;
+	probe_records(path, delimiter, |row| {
+		if first.is_none() {
+			columns = (0..row.len()).map(|_| ProbeColumn::new(String::new())).collect();
+			first = Some(row.to_vec());
+			return Ok(());
+		}
+		data_rows += 1;
+		for (column, cell) in columns.iter_mut().zip(row) {
+			column.observe(cell);
+		}
+		Ok(())
+	})?;
+	let Some(first) = first else {
+		return Ok(ProbeTable { path: path.to_owned(), name, rows: 0, ragged: !rectangular, columns: Vec::new() });
+	};
+	// A first record of only numbers, or a file with one record, is data with positional names.
+	let headerless = first.iter().all(|cell| cell.text.parse::<f64>().is_ok()) || data_rows == 0;
+	let width = first.len();
+	let names = if headerless {
+		(1..=width).map(|column| if column == width { "target".to_owned() } else { format!("col{column}") }).collect::<Vec<_>>()
+	} else {
+		first.iter().map(|cell| cell.text.clone()).collect()
+	};
+	if headerless {
+		for (column, cell) in columns.iter_mut().zip(&first) {
+			column.observe(cell);
+		}
+	}
+	for (column, name) in columns.iter_mut().zip(names) {
+		column.name = name;
+	}
+	Ok(ProbeTable { path: path.to_owned(), name, rows: data_rows + usize::from(headerless), ragged: !rectangular, columns })
+}
+
+struct ProbeAudio {
+	encoding: u16,
+	channels: usize,
+	sample_rate: u32,
+	bits: usize,
+	frames: usize,
+	loadable: bool,
+	/// Ordinal digits of the mean amplitude over time; present only for loadable PCM samples.
+	envelope: Option<String>,
+}
+
+/// Spans of the sample payload that the envelope compares.
+const PROBE_ENVELOPE_BUCKETS: usize = 16;
+
+/// Ranks the mean amplitude of each span of a PCM payload in one streaming pass. Each span
+/// contributes one hexadecimal digit: 0 for the quietest span and f for the loudest. Ties keep
+/// the earlier span first, so the string is deterministic.
+fn probe_envelope(file: &mut fs::File, body: u64, frames: usize, channels: usize, bits: usize, path: &Path) -> Result<String> {
+	let buckets = frames.min(PROBE_ENVELOPE_BUCKETS);
+	if buckets == 0 {
+		return Ok(String::new());
+	}
+	let bytes = bits / 8;
+	let frame = channels * bytes;
+	let mut sums = vec![0u128; buckets];
+	let mut counts = vec![0u64; buckets];
+	file.seek(SeekFrom::Start(body)).map_err(|error| RecipeError::new(format!("cannot seek {}: {error}", path.display())))?;
+	let read = (PROBE_CHUNK_BYTES / frame).max(1) * frame;
+	let mut chunk = vec![0u8; read];
+	let (mut remaining, mut index) = (frames * frame, 0usize);
+	while remaining > 0 {
+		let take = remaining.min(read);
+		file.read_exact(&mut chunk[..take]).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		for frame_bytes in chunk[..take].chunks_exact(frame) {
+			let bucket = index * buckets / frames;
+			let amplitude = frame_bytes
+				.chunks_exact(bytes)
+				.map(|sample| if bytes == 1 { u128::from((i16::from(sample[0]) - 128).unsigned_abs()) } else { u128::from(i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs()) })
+				.sum::<u128>();
+			sums[bucket] += amplitude;
+			counts[bucket] += channels as u64;
+			index += 1;
+		}
+		remaining -= take;
+	}
+	let mut order = (0..buckets).collect::<Vec<_>>();
+	// Cross-multiplication compares the exact means without division.
+	order.sort_by(|left, right| (sums[*left] * u128::from(counts[*right])).cmp(&(sums[*right] * u128::from(counts[*left]))).then(left.cmp(right)));
+	let mut ranks = vec![0u32; buckets];
+	for (rank, bucket) in order.into_iter().enumerate() {
+		ranks[bucket] = rank as u32;
+	}
+	Ok(ranks.iter().map(|rank| char::from_digit(*rank, 16).unwrap_or('0')).collect())
+}
+
+/// Reads a WAV file's chunk headers and format, and seeks past the sample payload.
+fn probe_wav(path: &Path) -> Result<ProbeAudio> {
+	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let length = file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
+	let mut riff = [0u8; 12];
+	let riff_ok = length >= 12 && file.read_exact(&mut riff).is_ok() && &riff[..4] == b"RIFF" && &riff[8..] == b"WAVE";
+	require(riff_ok, format!("WAV header is absent in {}", path.display()))?;
+	let (mut format, mut data, mut at) = (None::<[u8; 16]>, None::<(u64, u64)>, 12u64);
+	while at + 8 <= length {
+		file.seek(SeekFrom::Start(at)).map_err(|error| RecipeError::new(format!("cannot seek {}: {error}", path.display())))?;
+		let mut head = [0u8; 8];
+		file.read_exact(&mut head).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		let size = u64::from(u32::from_le_bytes(head[4..].try_into().unwrap()));
+		let body = at + 8;
+		match &head[..4] {
+			b"fmt " if size >= 16 => {
+				let mut fields = [0u8; 16];
+				file.read_exact(&mut fields).map_err(|error| RecipeError::new(format!("WAV format is truncated in {}: {error}", path.display())))?;
+				format = Some(fields);
+			}
+			b"data" => data = Some((size, body)),
+			_ => {}
+		}
+		at = body + size + size % 2;
+	}
+	let format = format.ok_or_else(|| RecipeError::new(format!("WAV format is absent in {}", path.display())))?;
+	let (declared, body) = data.ok_or_else(|| RecipeError::new(format!("WAV samples are absent in {}", path.display())))?;
+	let encoding = u16::from_le_bytes([format[0], format[1]]);
+	let channels = u16::from_le_bytes([format[2], format[3]]) as usize;
+	let sample_rate = u32::from_le_bytes(format[4..8].try_into().unwrap());
+	let bits = u16::from_le_bytes([format[14], format[15]]) as usize;
+	let frame = channels * bits.div_ceil(8);
+	let available = length.saturating_sub(body).min(declared);
+	let complete = declared == available && frame != 0 && available % frame as u64 == 0;
+	let frames = if frame == 0 { 0 } else { available as usize / frame };
+	let loadable = complete && channels != 0 && encoding == 1 && matches!(bits, 8 | 16);
+	let envelope = if loadable { Some(probe_envelope(&mut file, body, frames, channels, bits, path)?) } else { None };
+	Ok(ProbeAudio { encoding, channels, sample_rate, bits, frames, loadable, envelope })
+}
+
+/// Reads only the image header prefix that holds the dimensions.
+fn probe_image(path: &Path) -> Result<(usize, usize, usize)> {
+	let mut prefix = Vec::new();
+	fs::File::open(path).and_then(|file| file.take(PROBE_IMAGE_BYTES).read_to_end(&mut prefix)).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	data_image_header(path, &prefix)
+}
+
+/// One SQLite table as the probe saw it: its declared columns and the value statistics of
+/// every column over all of its rows.
+struct ProbeSqliteTable {
+	name: String,
+	rows: usize,
+	declared: Vec<String>,
+	columns: Vec<ProbeColumn>,
+}
+
+struct ProbeDatabase {
+	page_size: usize,
+	pages: usize,
+	tables: Vec<ProbeSqliteTable>,
+}
+
+/// Probes a plaintext SQLite file page by page, with the committed frames of a `-wal` sidecar
+/// laid over the main file. It refuses a file with a pending rollback journal, because those
+/// pages are not the database's current content.
+fn probe_database(path: &Path) -> Result<ProbeDatabase> {
+	let journal = PathBuf::from(format!("{}-journal", path.display()));
+	require(!fs::metadata(&journal).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty -journal file; checkpoint or remove it first", path.display()))?;
+	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
+	let file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let wal = fs::File::open(format!("{}-wal", path.display())).ok().map(|wal| Box::new(wal) as Box<dyn SqliteBytes>);
+	let (mut file, layout) = sqlite_open(Box::new(file), length, wal).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+	let mut tables = Vec::new();
+	for table in sqlite_catalog(&mut file, layout).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))? {
+		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
+		let mut columns = table.columns.iter().map(|column| ProbeColumn::new(column.name.clone())).collect::<Vec<_>>();
+		let mut rows = 0usize;
+		sqlite_scan(&mut file, layout, table.root, &aliases, &mut |row: &[String]| {
+			rows += 1;
+			for (column, value) in columns.iter_mut().zip(row) {
+				column.observe(&probe_cell(value));
+			}
+			Ok(())
+		})
+		.map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+		tables.push(ProbeSqliteTable { name: table.name, rows, declared: table.columns.iter().map(|column| column.declared.clone()).collect(), columns });
+	}
+	Ok(ProbeDatabase { page_size: layout.page_size, pages: layout.pages, tables })
+}
+
+/// Keeps at most `PROBE_FIELD_BYTES` of a stored value, on a character boundary, with its full length.
+fn probe_cell(value: &str) -> ProbeCell {
+	let mut end = value.len().min(PROBE_FIELD_BYTES);
+	while !value.is_char_boundary(end) {
+		end -= 1;
+	}
+	ProbeCell { text: value[..end].to_owned(), length: value.len() }
+}
+
+/// The only value every observation agrees on, or `None` when the values differ or none exist.
+fn probe_uniform(values: &[usize]) -> Option<usize> {
+	let first = *values.first()?;
+	values.iter().all(|value| *value == first).then_some(first)
+}
+
+fn json_optional(value: Option<usize>) -> String {
+	value.map_or("null".to_owned(), |value| value.to_string())
+}
+
+/// One column's evidence in the packet. A declared type is included when the source declares one.
+fn probe_column_json(column: &ProbeColumn, declared: Option<&String>) -> String {
+	let declared = declared.map_or(String::new(), |declared| format!("\"declared\":{},", data_json_string(declared)));
+	format!(
+		"{{\"name\":{},{declared}\"dtype\":{},\"values\":{},\"integer\":{},\"float\":{},\"distinct\":{},\"longest\":{}}}",
+		data_json_string(&column.name),
+		data_json_string(column.suggested()),
+		column.values,
+		column.integer,
+		column.float,
+		column.distinct.len(),
+		column.longest
+	)
+}
+
+/// Builds the bounded metadata packet for one dataset. The packet holds names, counts,
+/// dimensions, and per-column type evidence. It never contains cell values, pixels, or samples.
+/// Output is one JSON object followed by a newline.
+pub fn propose_data_schema(source: impl AsRef<Path>) -> Result<String> {
+	let source = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve dataset: {error}")))?;
+	let mut walked = Vec::new();
+	probe_walk(&source, &mut walked)?;
+	require(!walked.is_empty(), "dataset source contains no files")?;
+	let (mut tables, mut images, mut audio, mut databases) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+	let mut folders = BTreeMap::<PathBuf, ProbeFolder>::new();
+	let mut anchors = BTreeMap::<usize, usize>::new();
+	let mut unprobed = 0usize;
+	for file in &walked {
+		let folder = folders.entry(file.path.parent().unwrap_or(Path::new("")).to_owned()).or_default();
+		folder.files += 1;
+		let index = data_name_index(&file.path);
+		match probe_kind(&file.path) {
+			ProbeKind::Delimited => {
+				let table = probe_delimited(&file.path)?;
+				if table.rows > 0 {
+					*anchors.entry(table.rows).or_default() += 1;
+				}
+				tables.push(table);
+			}
+			ProbeKind::Image => {
+				images.push((file.path.clone(), probe_image(&file.path)?));
+				folder.add_sample(index);
+			}
+			ProbeKind::Audio => {
+				audio.push((file.path.clone(), probe_wav(&file.path)?));
+				folder.add_sample(index);
+			}
+			ProbeKind::Database => {
+				let database = probe_database(&file.path)?;
+				for table in database.tables.iter().filter(|table| table.rows > 0) {
+					*anchors.entry(table.rows).or_default() += 1;
+				}
+				databases.push((file.path.clone(), database));
+			}
+			ProbeKind::Unprobed => unprobed += 1,
+		}
+	}
+	for folder in folders.values().filter(|folder| folder.samples > 0) {
+		*anchors.entry(folder.samples).or_default() += 1;
+		if let Some(span) = folder.span() {
+			*anchors.entry(span).or_default() += 1;
+		}
+	}
+	// A set split into class folders has no single folder holding every sample, so the image
+	// and audio file totals are observations of the sample count too.
+	for total in [images.len(), audio.len()].into_iter().filter(|total| *total > 0) {
+		*anchors.entry(total).or_default() += 1;
+	}
+	// Support counts independent observations of each count; ties prefer the larger count.
+	let mut ranked = anchors.iter().map(|(count, support)| (*count, *support)).collect::<Vec<_>>();
+	ranked.sort_by(|left, right| right.1.cmp(&left.1).then(right.0.cmp(&left.0)));
+	let samples = json_optional(ranked.first().map(|(count, _)| *count));
+	let mut choices = ranked.iter().take(PROBE_CHOICE_LIMIT).map(|(count, _)| data_json_string(&count.to_string())).collect::<Vec<_>>();
+	choices.push(data_json_string("unknown"));
+	let anchor_entries = ranked.iter().take(PROBE_CHOICE_LIMIT).map(|(count, support)| format!("{{\"count\":{count},\"support\":{support}}}")).collect::<Vec<_>>();
+	let mut pixels = Vec::new();
+	for (_, (width, height, channels)) in &images {
+		pixels.push(checked_mul(checked_mul(*width, *height, "image pixels")?, *channels, "image channels")?);
+	}
+	let image_features = probe_uniform(&pixels);
+	let mut sizes = Vec::new();
+	for (_, probe) in &audio {
+		sizes.push(checked_mul(probe.channels, probe.frames, "audio samples")?);
+	}
+	let audio_features = probe_uniform(&sizes);
+	let parse = if !tables.is_empty() {
+		"table"
+	} else if !images.is_empty() {
+		"image_folder"
+	} else if !audio.is_empty() {
+		"audio_folder"
+	} else if databases.iter().any(|(_, database)| !database.tables.is_empty()) {
+		"sqlite_table"
+	} else {
+		"unknown"
+	};
+	let sqlite = match databases.as_slice() {
+		[(_, database)] if database.tables.len() == 1 => Some(&database.tables[0]),
+		_ => None,
+	};
+	let features = match parse {
+		"table" if tables.len() == 1 => tables[0].columns.len(),
+		"sqlite_table" => sqlite.map_or(0, |table| table.columns.len()),
+		"image_folder" => image_features.unwrap_or(0),
+		"audio_folder" => audio_features.unwrap_or(0),
+		_ => 0,
+	};
+	let mut questions = vec![
+		"{\"id\":\"parse\",\"prompt\":\"Which parse path reads one sample per source?\",\"choices\":[\"table\",\"image_folder\",\"audio_folder\",\"sqlite_table\",\"unknown\"]}".to_owned(),
+		format!("{{\"id\":\"samples\",\"prompt\":\"Which count is the sample count?\",\"choices\":[{}]}}", choices.join(",")),
+	];
+	if tables.len() == 1 {
+		for (index, column) in tables[0].columns.iter().enumerate().take(PROBE_ENTRY_LIMIT) {
+			questions.push(format!(
+				"{{\"id\":{},\"prompt\":{},\"choices\":[{PROBE_FEATURE_TYPES}],\"after\":{{\"id\":\"parse\",\"choice\":\"table\"}}}}",
+				data_json_string(&format!("feature.{index}")),
+				data_json_string(&format!("What type is feature {}?", column.name))
+			));
+		}
+	}
+	if !audio.is_empty() {
+		questions.push(format!("{{\"id\":\"feature.sample\",\"prompt\":\"What type is the audio sample?\",\"choices\":[{PROBE_FEATURE_TYPES}],\"after\":{{\"id\":\"parse\",\"choice\":\"audio_folder\"}}}}"));
+	}
+	if let [(_, database)] = databases.as_slice() {
+		if !database.tables.is_empty() {
+			let names = database.tables.iter().take(PROBE_ENTRY_LIMIT).map(|table| data_json_string(&table.name)).collect::<Vec<_>>();
+			questions.push(format!("{{\"id\":\"sqlite_table\",\"prompt\":\"Which table holds one sample per row?\",\"choices\":[{}],\"after\":{{\"id\":\"parse\",\"choice\":\"sqlite_table\"}}}}", names.join(",")));
+			for (index, table) in database.tables.iter().enumerate().take(PROBE_ENTRY_LIMIT) {
+				for (column_index, column) in table.columns.iter().enumerate().take(PROBE_ENTRY_LIMIT) {
+					questions.push(format!(
+						"{{\"id\":{},\"prompt\":{},\"choices\":[{PROBE_FEATURE_TYPES}],\"after\":{{\"id\":\"sqlite_table\",\"choice\":{}}}}}",
+						data_json_string(&format!("table{index}.feature.{column_index}")),
+						data_json_string(&format!("What type is feature {} of table {}?", column.name, table.name)),
+						data_json_string(&table.name)
+					));
+				}
+			}
+		}
+	}
+	let folder_entries = folders
+		.iter()
+		.take(PROBE_ENTRY_LIMIT * 2)
+		.map(|(path, folder)| {
+			format!(
+				"{{\"path\":{},\"files\":{},\"samples\":{},\"low\":{},\"high\":{},\"span\":{}}}",
+				data_json_string(&path.to_string_lossy()),
+				folder.files,
+				folder.samples,
+				json_optional(folder.low),
+				json_optional(folder.high),
+				json_optional(folder.span())
+			)
+		})
+		.collect::<Vec<_>>();
+	let table_entries = tables
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|table| {
+			let columns = table.columns.iter().take(PROBE_ENTRY_LIMIT).map(|column| probe_column_json(column, None)).collect::<Vec<_>>();
+			format!(
+				"{{\"path\":{},\"name\":{},\"rows\":{},\"ragged\":{},\"columns_total\":{},\"columns\":[{}]}}",
+				data_json_string(&table.path.to_string_lossy()),
+				data_json_string(&table.name),
+				table.rows,
+				table.ragged,
+				table.columns.len(),
+				columns.join(",")
+			)
+		})
+		.collect::<Vec<_>>();
+	let image_entries = images
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|(path, (width, height, channels))| format!("{{\"path\":{},\"width\":{width},\"height\":{height},\"channels\":{channels}}}", data_json_string(&path.to_string_lossy())))
+		.collect::<Vec<_>>();
+	let audio_entries = audio
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|(path, probe)| {
+			format!(
+				"{{\"path\":{},\"encoding\":{},\"channels\":{},\"sample_rate\":{},\"bits\":{},\"frames\":{},\"loadable\":{},\"envelope\":{}}}",
+				data_json_string(&path.to_string_lossy()),
+				probe.encoding,
+				probe.channels,
+				probe.sample_rate,
+				probe.bits,
+				probe.frames,
+				probe.loadable,
+				probe.envelope.as_deref().map_or("null".to_owned(), data_json_string)
+			)
+		})
+		.collect::<Vec<_>>();
+	let database_entries = databases
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|(path, database)| {
+			let tables = database
+				.tables
+				.iter()
+				.take(PROBE_ENTRY_LIMIT)
+				.map(|table| {
+					let columns = table.columns.iter().zip(&table.declared).take(PROBE_ENTRY_LIMIT).map(|(column, declared)| probe_column_json(column, Some(declared))).collect::<Vec<_>>();
+					format!("{{\"name\":{},\"rows\":{},\"columns_total\":{},\"columns\":[{}]}}", data_json_string(&table.name), table.rows, table.columns.len(), columns.join(","))
+				})
+				.collect::<Vec<_>>();
+			format!(
+				"{{\"path\":{},\"page_size\":{},\"pages\":{},\"tables\":{{\"total\":{},\"entries\":[{}]}}}}",
+				data_json_string(&path.to_string_lossy()),
+				database.page_size,
+				database.pages,
+				database.tables.len(),
+				tables.join(",")
+			)
+		})
+		.collect::<Vec<_>>();
+	let bytes = walked.iter().map(|file| file.bytes).sum::<u64>();
+	let loadable = audio.iter().filter(|(_, probe)| probe.loadable).count();
+	Ok(format!(
+		"{{\"schema_version\":1,\"source\":{},\"files\":{},\"bytes\":{bytes},\"unprobed\":{unprobed},\"folders\":{{\"total\":{},\"entries\":[{}]}},\"tables\":{{\"total\":{},\"entries\":[{}]}},\"images\":{{\"total\":{},\"features\":{},\"entries\":[{}]}},\"audio\":{{\"total\":{},\"features\":{},\"loadable\":{loadable},\"entries\":[{}]}},\"databases\":{{\"total\":{},\"entries\":[{}]}},\"proposal\":{{\"samples\":{samples},\"features\":{features},\"parse\":{},\"anchors\":[{}]}},\"questions\":[{}]}}\n",
+		data_json_string(&source.to_string_lossy()),
+		walked.len(),
+		folders.len(),
+		folder_entries.join(","),
+		tables.len(),
+		table_entries.join(","),
+		images.len(),
+		json_optional(image_features),
+		image_entries.join(","),
+		audio.len(),
+		json_optional(audio_features),
+		audio_entries.join(","),
+		databases.len(),
+		database_entries.join(","),
+		data_json_string(parse),
+		anchor_entries.join(","),
+		questions.join(",")
+	))
+}
+
+fn data_document(path: &Path) -> Result<JsonValue> {
+	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect schema document {}: {error}", path.display())))?.len();
+	require(length <= PROBE_DOCUMENT_BYTES, format!("schema document {} exceeds {PROBE_DOCUMENT_BYTES} bytes", path.display()))?;
+	let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read schema document {}: {error}", path.display())))?;
+	let (value, rest) = json_value(&text)?;
+	require(rest.trim().is_empty(), format!("schema document {} has trailing content", path.display()))?;
+	Ok(value)
+}
+
+fn data_field<'a>(value: &'a JsonValue, name: &str) -> Result<&'a JsonValue> {
+	let JsonValue::Object(fields) = value else { return Err(RecipeError::new("schema record is not an object")) };
+	fields.iter().find(|(field, _)| field == name).map(|(_, value)| value).ok_or_else(|| RecipeError::new(format!("schema field {name} is absent")))
+}
+
+fn data_text<'a>(value: &'a JsonValue, name: &str) -> Result<&'a str> {
+	let JsonValue::Text(text) = value else { return Err(RecipeError::new(format!("schema field {name} must be text"))) };
+	Ok(text)
+}
+
+fn data_count(value: &JsonValue, name: &str) -> Result<usize> {
+	let JsonValue::Number(text) = value else { return Err(RecipeError::new(format!("schema field {name} must be an integer"))) };
+	text.parse::<usize>().map_err(|_| RecipeError::new(format!("schema field {name} is not a nonnegative integer")))
+}
+
+fn data_bool(value: &JsonValue, name: &str) -> Result<bool> {
+	match data_field(value, name)? {
+		JsonValue::Bool(flag) => Ok(*flag),
+		_ => Err(RecipeError::new(format!("schema field {name} must be true or false"))),
+	}
+}
+
+fn data_items<'a>(value: &'a JsonValue, name: &str) -> Result<&'a [JsonValue]> {
+	let JsonValue::Array(items) = value else { return Err(RecipeError::new(format!("schema field {name} must be a list"))) };
+	Ok(items)
+}
+
+struct ConfirmedDataset {
+	samples: usize,
+	features: usize,
+	parse: String,
+	/// The SQLite table that holds the samples, present only for the `sqlite_table` parse path.
+	table: Option<String>,
+	columns: Vec<(String, String)>,
+}
+
+/// Reads the loader schema named by `Data::schema`, and checks its source and dimensions.
+fn confirmed_data_schema(data: &Data) -> Result<Option<ConfirmedDataset>> {
+	let Some(path) = &data.schema_file else { return Ok(None) };
+	let path = resolve_path(path)?;
+	let document = data_document(&path)?;
+	require(data_count(data_field(&document, "schema_version")?, "schema_version")? == 1, "dataset schema version is unsupported")?;
+	let source = data_text(data_field(&document, "source")?, "source")?;
+	require(data.sources.len() == 1, "a confirmed dataset schema requires exactly one source")?;
+	let actual = fs::canonicalize(resolve_path(&data.sources[0])?).map_err(|error| RecipeError::new(format!("cannot resolve dataset source: {error}")))?;
+	require(actual == Path::new(source), format!("dataset schema source {source:?} differs from {}", actual.display()))?;
+	let samples = data_count(data_field(&document, "samples")?, "samples")?;
+	let features = data_count(data_field(&document, "features")?, "features")?;
+	require(samples != 0 && features != 0, "dataset schema dimensions must be positive")?;
+	let parse = data_text(data_field(&document, "parse")?, "parse")?.to_owned();
+	require(matches!(parse.as_str(), "table" | "sqlite_table" | "image_folder" | "audio_folder"), format!("dataset schema parse path {parse:?} is unsupported"))?;
+	let table = match data_field(&document, "table") {
+		Ok(JsonValue::Text(name)) => Some(name.clone()),
+		_ => None,
+	};
+	require(table.is_some() == (parse == "sqlite_table"), "dataset schema names a SQLite table only for the sqlite_table parse path")?;
+	let columns = data_items(data_field(&document, "columns")?, "columns")?
+		.iter()
+		.map(|column| {
+			let name = data_text(data_field(column, "name")?, "name")?;
+			let kind = data_text(data_field(column, "dtype")?, "dtype")?;
+			require(matches!(kind, "categorical" | "integer" | "float" | "text" | "image" | "audio"), format!("dataset schema feature {name:?} has unsupported type {kind:?}"))?;
+			Ok((name.to_owned(), kind.to_owned()))
+		})
+		.collect::<Result<Vec<_>>>()?;
+	Ok(Some(ConfirmedDataset { samples, features, parse, table, columns }))
+}
+
+/// Checks one feature answer against the evidence in its column packet entry.
+fn probe_feature_check(name: &str, choice: &str, column: &JsonValue) -> Result<()> {
+	let (supported, reason) = match choice {
+		"integer" => (data_bool(column, "integer")?, "a value that is not an integer"),
+		"float" => (data_bool(column, "float")?, "a value that is not a finite float"),
+		"categorical" => (data_count(data_field(column, "distinct")?, "distinct")? <= PROBE_CATEGORY_LIMIT, "more distinct values than a categorical feature allows"),
+		"text" => (true, ""),
+		_ => (false, "no image or audio samples in this column"),
+	};
+	require(supported, format!("feature {name:?} was answered {choice:?}, but the probe found {reason}"))
+}
+
+/// Checks every column answer of one table and returns the loader column objects. `id` names the
+/// question that answers column `index`.
+fn probe_table_answers(table: &JsonValue, samples: usize, decided: &BTreeMap<String, String>, id: impl Fn(usize) -> String) -> Result<Vec<String>> {
+	let rows = data_count(data_field(table, "rows")?, "rows")?;
+	require(rows == samples, format!("sample answer {samples} differs from the {rows} table rows the probe found"))?;
+	let total = data_count(data_field(table, "columns_total")?, "columns_total")?;
+	let entries = data_items(data_field(table, "columns")?, "columns")?;
+	require(total == entries.len(), format!("the table has {total} columns, and the bounded packet lists {}", entries.len()))?;
+	entries
+		.iter()
+		.enumerate()
+		.map(|(index, column)| {
+			let name = data_text(data_field(column, "name")?, "name")?;
+			let key = id(index);
+			let choice = decided.get(&key).ok_or_else(|| RecipeError::new(format!("{key} is absent")))?;
+			probe_feature_check(name, choice, column)?;
+			Ok(format!("{{\"name\":{},\"dtype\":{}}}", data_json_string(name), data_json_string(choice)))
+		})
+		.collect()
+}
+
+/// Checks the answers against the question tree and the probe's evidence, then returns the
+/// loader schema JSON and one `id choice probability` line per answered question.
+/// A wrong answer fails here and names the question that diverged.
+pub fn finalize_data_schema(proposal: impl AsRef<Path>, answers: impl AsRef<Path>) -> Result<(String, String)> {
+	let proposal = data_document(proposal.as_ref())?;
+	let answers = data_document(answers.as_ref())?;
+	require(data_count(data_field(&proposal, "schema_version")?, "schema_version")? == 1, "proposal schema version is unsupported")?;
+	require(data_count(data_field(&answers, "schema_version")?, "schema_version")? == 1, "answer schema version is unsupported")?;
+	let status = data_text(data_field(&answers, "status")?, "status")?;
+	require(status == "ok", format!("the answerer reported status {status:?}, so no loader schema was written"))?;
+	let mut answered = BTreeMap::<String, (String, f64)>::new();
+	for answer in data_items(data_field(&answers, "answers")?, "answers")? {
+		let id = data_text(data_field(answer, "id")?, "id")?;
+		let choice = data_text(data_field(answer, "choice")?, "choice")?;
+		let probability = match data_field(answer, "probability")? {
+			JsonValue::Number(value) => value.parse::<f64>().map_err(|_| RecipeError::new(format!("answer {id} probability is invalid")))?,
+			_ => return Err(RecipeError::new(format!("answer {id} probability must be numeric"))),
+		};
+		require((0.0..=1.0).contains(&probability), format!("answer {id} probability is outside 0 to 1"))?;
+		require(answered.insert(id.to_owned(), (choice.to_owned(), probability)).is_none(), format!("answer {id} is repeated"))?;
+	}
+	// Questions are ordered parents first. A question is active only when its parent answer selects its branch.
+	let mut decided = BTreeMap::<String, String>::new();
+	let mut decisions = Vec::new();
+	for question in data_items(data_field(&proposal, "questions")?, "questions")? {
+		let id = data_text(data_field(question, "id")?, "id")?;
+		let choices = data_items(data_field(question, "choices")?, "choices")?;
+		let active = match data_field(question, "after") {
+			Ok(JsonValue::Null) | Err(_) => true,
+			Ok(parent) => {
+				let parent_id = data_text(data_field(parent, "id")?, "after.id")?;
+				let parent_choice = data_text(data_field(parent, "choice")?, "after.choice")?;
+				decided.get(parent_id).is_some_and(|choice| choice == parent_choice)
+			}
+		};
+		let answer = answered.remove(id);
+		if !active {
+			require(answer.is_none(), format!("answer {id} is outside the active branch and must be absent"))?;
+			continue;
+		}
+		let (choice, probability) = answer.ok_or_else(|| RecipeError::new(format!("answer {id} is absent")))?;
+		require(choices.iter().any(|value| matches!(value, JsonValue::Text(text) if *text == choice)), format!("answer {id} selected {choice:?}, which the question does not offer"))?;
+		decisions.push(format!("{id} {choice} {probability}"));
+		decided.insert(id.to_owned(), choice);
+	}
+	require(answered.is_empty(), format!("answers name questions not in the proposal: {}", answered.keys().cloned().collect::<Vec<_>>().join(", ")))?;
+	let parse = decided.get("parse").ok_or_else(|| RecipeError::new("parse path was not confirmed"))?.clone();
+	let samples_text = decided.get("samples").ok_or_else(|| RecipeError::new("sample count was not confirmed"))?;
+	let samples = samples_text.parse::<usize>().ok().filter(|count| *count != 0).ok_or_else(|| RecipeError::new(format!("sample count {samples_text:?} is not a positive count")))?;
+	let source = data_text(data_field(&proposal, "source")?, "source")?;
+	let (columns, features, table) = match parse.as_str() {
+		"table" => {
+			let tables = data_field(&proposal, "tables")?;
+			require(data_count(data_field(tables, "total")?, "total")? == 1, "the table parse path requires exactly one table in the source")?;
+			let table = data_items(data_field(tables, "entries")?, "entries")?.first().ok_or_else(|| RecipeError::new("table metadata is absent"))?;
+			require(!data_bool(table, "ragged")?, "the table has rows of differing widths")?;
+			let columns = probe_table_answers(table, samples, &decided, |index| format!("feature.{index}"))?;
+			let features = columns.len();
+			(columns, features, None)
+		}
+		"sqlite_table" => {
+			let databases = data_field(&proposal, "databases")?;
+			require(data_count(data_field(databases, "total")?, "total")? == 1, "the sqlite_table parse path requires exactly one database in the source")?;
+			let database = data_items(data_field(databases, "entries")?, "entries")?.first().ok_or_else(|| RecipeError::new("database metadata is absent"))?;
+			let tables = data_field(database, "tables")?;
+			let total = data_count(data_field(tables, "total")?, "total")?;
+			let entries = data_items(data_field(tables, "entries")?, "entries")?;
+			require(total == entries.len(), format!("the database has {total} tables, and the bounded packet lists {}", entries.len()))?;
+			let name = decided.get("sqlite_table").ok_or_else(|| RecipeError::new("table was not confirmed"))?;
+			let index = entries
+				.iter()
+				.position(|table| matches!(data_field(table, "name"), Ok(JsonValue::Text(text)) if text == name))
+				.ok_or_else(|| RecipeError::new(format!("table {name:?} is not in the bounded packet")))?;
+			let columns = probe_table_answers(&entries[index], samples, &decided, |column| format!("table{index}.feature.{column}"))?;
+			let features = columns.len();
+			(columns, features, Some(name.clone()))
+		}
+		"image_folder" | "audio_folder" => {
+			let image = parse == "image_folder";
+			let section = data_field(&proposal, if image { "images" } else { "audio" })?;
+			let total = data_count(data_field(section, "total")?, "total")?;
+			require(total == samples, format!("sample answer {samples} differs from the {total} files the probe found"))?;
+			let features = match data_field(section, "features")? {
+				JsonValue::Null => return Err(RecipeError::new("the sample files do not share one size, so no feature count exists")),
+				value => data_count(value, "features")?,
+			};
+			let dtype = if image {
+				"image".to_owned()
+			} else {
+				let loadable = data_count(data_field(section, "loadable")?, "loadable")?;
+				require(loadable == total, format!("{} of {total} audio files are not 8-bit or 16-bit PCM WAV", total - loadable))?;
+				let kind = decided.get("feature.sample").ok_or_else(|| RecipeError::new("sample type was not confirmed"))?;
+				require(kind == "audio", format!("feature \"sample\" was answered {kind:?}, but the probe found audio samples"))?;
+				kind.clone()
+			};
+			(vec![format!("{{\"name\":\"sample\",\"dtype\":{}}}", data_json_string(&dtype))], features, None)
+		}
+		_ => return Err(RecipeError::new("the unknown parse path has no loader schema")),
+	};
+	let schema = format!(
+		"{{\"schema_version\":1,\"source\":{},\"samples\":{samples},\"features\":{features},\"parse\":{},\"table\":{},\"columns\":[{}]}}\n",
+		data_json_string(source),
+		data_json_string(&parse),
+		table.as_deref().map_or("null".to_owned(), data_json_string),
+		columns.join(",")
+	);
+	Ok((schema, format!("{}\n", decisions.join("\n"))))
+}
+
 fn target_column(table: &Table, name: &str) -> Option<usize> {
 	table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column))
 }
@@ -30522,7 +34978,7 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			}
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
-		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes, fs::read(format!("{}-wal", path.display())).ok().as_deref()).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		Some("xml") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
 			let records = xml_records(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
@@ -30535,69 +34991,384 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
 }
-/// Every user table of a SQLite database, walked from its rowid b-trees.
-fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
-	require(bytes.get(..16) == Some(b"SQLite format 3\0"), "SQLite header is absent")?;
-	let page_size = match u16::from_be_bytes(bytes[16..18].try_into().unwrap()) as usize {
+/// Page geometry of a plaintext SQLite 3 file in rollback-journal or WAL mode.
+#[derive(Clone, Copy)]
+struct SqliteLayout {
+	page_size: usize,
+	/// Bytes of each page that hold b-tree content; the rest is reserved.
+	usable: usize,
+	pages: usize,
+	/// The header declares WAL mode, so committed frames in the `-wal` file supersede main-file pages.
+	wal: bool,
+}
+
+/// Validates the file header and length. Encrypted and truncated files are refused
+/// rather than read as if their pages were plain.
+fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
+	require(head.len() >= 100 && head.starts_with(b"SQLite format 3\0"), "SQLite header is absent; the file is not plaintext SQLite 3 or is encrypted")?;
+	require(head[18] == head[19] && matches!(head[18], 1 | 2), format!("SQLite journal mode bytes {} and {} are neither rollback nor WAL", head[18], head[19]))?;
+	let page_size = match u16::from_be_bytes([head[16], head[17]]) as usize {
 		1 => 65536,
 		size => size,
 	};
+	require(page_size.is_power_of_two() && (512..=65536).contains(&page_size), format!("SQLite page size {page_size} is invalid"))?;
+	let usable = page_size.checked_sub(head[20] as usize).filter(|usable| *usable >= 480).ok_or_else(|| RecipeError::new("SQLite reserved bytes leave no usable page"))?;
+	require(length != 0 && length % page_size as u64 == 0, "SQLite file length is not a whole number of pages; the file is truncated")?;
+	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize, wal: head[18] == 2 })
+}
+
+trait SqliteBytes: Read + Seek {}
+impl<T: Read + Seek> SqliteBytes for T {}
+
+/// The database as a reader sees it: a page the WAL committed comes from its newest committed
+/// frame, and every other page from the main file. Page reads are whole and page-aligned.
+struct SqliteView<'a> {
+	main: Box<dyn SqliteBytes + 'a>,
+	wal: Option<Box<dyn SqliteBytes + 'a>>,
+	/// Page number to the offset of that page's bytes inside the WAL.
+	frames: HashMap<usize, u64>,
+	page_size: usize,
+	position: u64,
+}
+
+impl Read for SqliteView<'_> {
+	fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+		let page_size = self.page_size as u64;
+		let (page, within) = ((self.position / page_size) as usize + 1, self.position % page_size);
+		let count = buffer.len().min((page_size - within) as usize);
+		let read = match (self.frames.get(&page), self.wal.as_mut()) {
+			(Some(offset), Some(wal)) => {
+				wal.seek(SeekFrom::Start(offset + within))?;
+				wal.read(&mut buffer[..count])?
+			}
+			_ => {
+				self.main.seek(SeekFrom::Start(self.position))?;
+				self.main.read(&mut buffer[..count])?
+			}
+		};
+		self.position += read as u64;
+		Ok(read)
+	}
+}
+
+impl Seek for SqliteView<'_> {
+	fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
+		match target {
+			SeekFrom::Start(position) => self.position = position,
+			SeekFrom::Current(delta) => self.position = self.position.checked_add_signed(delta).ok_or_else(|| std::io::Error::other("SQLite seek is before the start"))?,
+			SeekFrom::End(_) => return Err(std::io::Error::other("SQLite pages are addressed from the start")),
+		}
+		Ok(self.position)
+	}
+}
+
+/// The checksum SQLite chains through a WAL: 8-byte units read as two 32-bit words in the
+/// byte order the WAL magic selects.
+fn sqlite_wal_checksum(big_endian: bool, seed: (u32, u32), data: &[u8]) -> (u32, u32) {
+	let word = |bytes: &[u8]| if big_endian { u32::from_be_bytes(bytes.try_into().unwrap()) } else { u32::from_le_bytes(bytes.try_into().unwrap()) };
+	data.chunks_exact(8).fold(seed, |(first, second), unit| {
+		let first = first.wrapping_add(word(&unit[..4])).wrapping_add(second);
+		(first, second.wrapping_add(word(&unit[4..])).wrapping_add(first))
+	})
+}
+
+/// Indexes the committed frames of a WAL. A page maps to the offset of its newest frame at or
+/// before the last commit, and the result carries the database size in pages that commit
+/// declares. A frame that fails its salt or checksum ends the log, as in SQLite's recovery.
+/// An empty WAL, or one with no commit, yields `None`.
+fn sqlite_wal_index(wal: &mut dyn SqliteBytes, page_size: usize) -> Result<Option<(HashMap<usize, u64>, usize)>> {
+	let mut header = [0u8; 32];
+	wal.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite WAL cannot be read: {error}")))?;
+	let mut filled = 0;
+	while filled < header.len() {
+		match wal.read(&mut header[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite WAL cannot be read: {error}"))),
+		}
+	}
+	if filled == 0 {
+		return Ok(None);
+	}
+	require(filled == header.len(), "SQLite WAL header is truncated")?;
+	let be = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().unwrap());
+	let magic = be(&header[..4]);
+	require(matches!(magic, 0x377f0682 | 0x377f0683), "SQLite WAL magic is invalid")?;
+	require(be(&header[4..8]) == 3007000, "SQLite WAL format version is unsupported")?;
+	require(be(&header[8..12]) as usize == page_size, "SQLite WAL page size differs from the database")?;
+	let big_endian = magic & 1 == 1;
+	let mut running = sqlite_wal_checksum(big_endian, (0, 0), &header[..24]);
+	require(running == (be(&header[24..28]), be(&header[28..32])), "SQLite WAL header checksum is wrong")?;
+	let salt = &header[16..24];
+	let (mut pending, mut committed, mut pages) = (HashMap::new(), HashMap::new(), 0usize);
+	let mut frame = vec![0u8; 24 + page_size];
+	for index in 0u64.. {
+		if wal.read_exact(&mut frame).is_err() {
+			break;
+		}
+		let next = sqlite_wal_checksum(big_endian, sqlite_wal_checksum(big_endian, running, &frame[..8]), &frame[24..]);
+		let page = be(&frame[..4]) as usize;
+		if &frame[8..16] != salt || next != (be(&frame[16..20]), be(&frame[20..24])) || page == 0 {
+			break;
+		}
+		running = next;
+		pending.insert(page, 32 + index * (24 + page_size as u64) + 24);
+		let size = be(&frame[4..8]) as usize;
+		if size != 0 {
+			committed.extend(pending.drain());
+			pages = size;
+		}
+	}
+	Ok((pages != 0).then_some((committed, pages)))
+}
+
+/// Opens a database for page reads, with the committed frames of its WAL laid over the main
+/// file when the header declares WAL mode. Returns the view and the layout it presents.
+fn sqlite_open<'a>(mut main: Box<dyn SqliteBytes + 'a>, length: u64, wal: Option<Box<dyn SqliteBytes + 'a>>) -> Result<(SqliteView<'a>, SqliteLayout)> {
+	let mut head = [0u8; 100];
+	let mut filled = 0;
+	main.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite header cannot be read: {error}")))?;
+	while filled < head.len() {
+		match main.read(&mut head[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite header cannot be read: {error}"))),
+		}
+	}
+	let layout = sqlite_layout(&head[..filled], length)?;
+	let mut view = SqliteView { main, wal: None, frames: HashMap::new(), page_size: layout.page_size, position: 0 };
+	let Some(mut wal) = wal.filter(|_| layout.wal) else { return Ok((view, layout)) };
+	let Some((frames, pages)) = sqlite_wal_index(wal.as_mut(), layout.page_size)? else { return Ok((view, layout)) };
+	view.wal = Some(wal);
+	view.frames = frames;
+	let first = sqlite_page(&mut view, SqliteLayout { pages: pages.max(layout.pages), ..layout }, 1)?;
+	let layout = sqlite_layout(&first[..100], pages as u64 * layout.page_size as u64)?;
+	Ok((view, layout))
+}
+
+/// The bytes of a table-leaf payload that stay on its page; the rest continues on overflow pages.
+fn sqlite_local_payload(usable: usize, payload: usize) -> usize {
+	let maximum = usable - 35;
+	if payload <= maximum {
+		return payload;
+	}
+	let minimum = (usable - 12) * 32 / 255 - 23;
+	let local = minimum + (payload - minimum) % (usable - 4);
+	if local <= maximum { local } else { minimum }
+}
+
+/// Reads one page into a buffer of one page. The caller keeps only the buffers it needs.
+fn sqlite_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page: usize) -> Result<Vec<u8>> {
+	require(page >= 1 && page <= layout.pages, format!("SQLite page {page} is outside the file"))?;
+	let mut buffer = vec![0u8; layout.page_size];
+	source.seek(SeekFrom::Start(((page - 1) * layout.page_size) as u64)).and_then(|_| source.read_exact(&mut buffer)).map_err(|error| RecipeError::new(format!("SQLite page {page} cannot be read: {error}")))?;
+	Ok(buffer)
+}
+
+/// A rowid table listed in `sqlite_schema`.
+struct SqliteTable {
+	name: String,
+	root: usize,
+	columns: Vec<SqliteColumn>,
+}
+
+struct SqliteColumn {
+	name: String,
+	/// The declared type words, such as `INTEGER` or `VARCHAR(20)`; empty when the column declares none.
+	declared: String,
+	/// An `INTEGER PRIMARY KEY` stores its value as the rowid, so its record holds NULL.
+	alias: bool,
+}
+
+/// Lists the user tables from `sqlite_schema`, which is the b-tree rooted at page 1.
+fn sqlite_catalog(source: &mut (impl Read + Seek), layout: SqliteLayout) -> Result<Vec<SqliteTable>> {
 	let mut schema = Vec::new();
-	sqlite_rows(bytes, page_size, 1, &mut schema)?;
+	sqlite_scan(source, layout, 1, &[], &mut |row: &[String]| {
+		schema.push(row.to_vec());
+		Ok(())
+	})?;
 	let mut tables = Vec::new();
 	for row in schema {
 		let [kind, name, _, root, sql] = row.as_slice() else { return Err(RecipeError::new("SQLite schema row has the wrong width")) };
 		if kind != "table" || name.starts_with("sqlite_") {
 			continue;
 		}
+		require(!sql.trim_start().to_ascii_uppercase().starts_with("CREATE VIRTUAL"), format!("SQLite table {name:?} is a virtual table, which is unsupported"))?;
 		let root = root.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid SQLite root page: {error}")))?;
-		let columns =
-			sql.split_once('(').map(|(_, rest)| rest.rsplit_once(')').map_or(rest, |(inner, _)| inner)).ok_or_else(|| RecipeError::new(format!("SQLite table {name:?} has no column list")))?;
-		let headers = columns.split(',').map(|column| column.trim().split_whitespace().next().unwrap_or("").trim_matches(['"', '\'', '`', '[', ']']).to_owned()).collect::<Vec<_>>();
-		require(headers.iter().all(|header| !header.is_empty()), format!("SQLite table {name:?} has an unreadable column list"))?;
-		let mut rows = Vec::new();
-		sqlite_rows(bytes, page_size, root, &mut rows)?;
-		for row in &mut rows {
-			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
-			row.resize_with(headers.len(), String::new);
-		}
-		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None, path: PathBuf::new() });
+		require(root != 0, format!("SQLite table {name:?} has no root page"))?;
+		tables.push(SqliteTable { name: name.clone(), root, columns: sqlite_columns(name, sql)? });
 	}
-	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
 }
-/// In-order rowid b-tree walk appending each leaf record's decoded values.
-fn sqlite_rows(bytes: &[u8], page_size: usize, page: usize, rows: &mut Vec<Vec<String>>) -> Result<()> {
-	let start = checked_mul(page - 1, page_size, "SQLite page offset")?;
-	let header = start + if page == 1 { 100 } else { 0 };
-	let contents = bytes.get(start..start + page_size).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
-	let kind = *bytes.get(header).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
-	let cells = u16::from_be_bytes(bytes[header + 3..header + 5].try_into().unwrap()) as usize;
-	let pointers = header + if kind == 5 { 12 } else { 8 };
-	for cell in 0..cells {
-		let pointer = u16::from_be_bytes(bytes[pointers + cell * 2..pointers + cell * 2 + 2].try_into().unwrap()) as usize;
-		let mut offset = start + pointer;
-		match kind {
-			5 => {
-				let child = u32::from_be_bytes(bytes.get(offset..offset + 4).ok_or_else(|| RecipeError::new("SQLite interior cell is truncated"))?.try_into().unwrap()) as usize;
-				sqlite_rows(bytes, page_size, child, rows)?;
+
+/// Splits the column list of a `CREATE TABLE` statement at its top-level commas. Table
+/// constraints are skipped, and each column keeps its declared type words.
+fn sqlite_columns(table: &str, sql: &str) -> Result<Vec<SqliteColumn>> {
+	let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else { return Err(RecipeError::new(format!("SQLite table {table:?} has no column list"))) };
+	require(close > open, format!("SQLite table {table:?} has no column list"))?;
+	let inner = &sql[open + 1..close];
+	let (mut depth, mut quote, mut start, mut segments) = (0usize, None::<char>, 0usize, Vec::new());
+	for (index, ch) in inner.char_indices() {
+		match quote {
+			Some(end) => {
+				if ch == end {
+					quote = None;
+				}
 			}
-			13 => {
-				let (payload, _) = sqlite_varint(bytes, &mut offset)?;
-				let _ = sqlite_varint(bytes, &mut offset)?;
-				let usable = page_size - 35;
-				require((payload as usize) <= usable, format!("SQLite page {page} overflows; overflow pages are unsupported"))?;
-				rows.push(sqlite_record(bytes.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new("SQLite record is truncated"))?)?);
-			}
-			_ => return Err(RecipeError::new(format!("SQLite page type {kind} is unsupported"))),
+			None => match ch {
+				'"' | '\'' | '`' => quote = Some(ch),
+				'[' => quote = Some(']'),
+				'(' => depth += 1,
+				')' => depth = depth.saturating_sub(1),
+				',' if depth == 0 => {
+					segments.push(&inner[start..index]);
+					start = index + 1;
+				}
+				_ => {}
+			},
 		}
 	}
-	if kind == 5 {
-		let right = u32::from_be_bytes(bytes[header + 8..header + 12].try_into().unwrap()) as usize;
-		sqlite_rows(bytes, page_size, right, rows)?;
+	segments.push(&inner[start..]);
+	const TABLE_CONSTRAINTS: [&str; 5] = ["CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"];
+	const COLUMN_CONSTRAINTS: [&str; 11] = ["CONSTRAINT", "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS"];
+	let mut columns = Vec::new();
+	for segment in segments.into_iter().map(str::trim).filter(|segment| !segment.is_empty()) {
+		let (name, rest, quoted) = sqlite_identifier(segment)?;
+		if !quoted && TABLE_CONSTRAINTS.contains(&name.to_ascii_uppercase().as_str()) {
+			continue;
+		}
+		let words = rest.split_whitespace().take_while(|word| !COLUMN_CONSTRAINTS.contains(&word.to_ascii_uppercase().as_str())).collect::<Vec<_>>();
+		let declared = words.join(" ");
+		let alias = declared.eq_ignore_ascii_case("INTEGER") && segment.to_ascii_uppercase().contains("PRIMARY KEY");
+		columns.push(SqliteColumn { name, declared, alias });
 	}
-	let _ = contents;
-	Ok(())
+	require(!columns.is_empty(), format!("SQLite table {table:?} declares no columns"))?;
+	Ok(columns)
+}
+
+/// Reads a column name, with its quoting removed, and returns the text after it.
+fn sqlite_identifier(segment: &str) -> Result<(String, &str, bool)> {
+	let closer = match segment.chars().next() {
+		Some('"') => Some('"'),
+		Some('\'') => Some('\''),
+		Some('`') => Some('`'),
+		Some('[') => Some(']'),
+		_ => None,
+	};
+	match closer {
+		Some(end) => {
+			let body = &segment[1..];
+			let close = body.find(end).ok_or_else(|| RecipeError::new(format!("SQLite column name is unterminated in {segment:?}")))?;
+			Ok((body[..close].to_owned(), &body[close + 1..], true))
+		}
+		None => {
+			let end = segment.find(char::is_whitespace).unwrap_or(segment.len());
+			Ok((segment[..end].to_owned(), &segment[end..], false))
+		}
+	}
+}
+
+/// Visits the rows of one table b-tree in rowid order, reading one page at a time. A column
+/// flagged in `aliases` takes the row's rowid. Returns the number of rows visited.
+fn sqlite_scan(source: &mut (impl Read + Seek), layout: SqliteLayout, root: usize, aliases: &[bool], visit: &mut impl FnMut(&[String]) -> Result<()>) -> Result<usize> {
+	sqlite_scan_page(source, layout, root, aliases, visit, 0)
+}
+
+fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page: usize, aliases: &[bool], visit: &mut impl FnMut(&[String]) -> Result<()>, depth: usize) -> Result<usize> {
+	require(depth <= 32, "SQLite b-tree is deeper than 32 levels or cyclic")?;
+	let buffer = sqlite_page(source, layout, page)?;
+	let header = if page == 1 { 100 } else { 0 };
+	let kind = buffer[header];
+	let cells = u16::from_be_bytes([buffer[header + 3], buffer[header + 4]]) as usize;
+	let pointer = |at: usize| -> Result<usize> {
+		let entry = buffer.get(at..at + 2).ok_or_else(|| RecipeError::new(format!("SQLite page {page} cell pointers are truncated")))?;
+		let offset = u16::from_be_bytes([entry[0], entry[1]]) as usize;
+		require(offset < layout.page_size, format!("SQLite page {page} has a cell outside the page"))?;
+		Ok(offset)
+	};
+	match kind {
+		// Interior table page: each cell names a left child, and the header names the right child.
+		5 => {
+			let mut children = Vec::with_capacity(cells + 1);
+			for cell in 0..cells {
+				let offset = pointer(header + 12 + cell * 2)?;
+				let child = buffer.get(offset..offset + 4).ok_or_else(|| RecipeError::new(format!("SQLite page {page} interior cell is truncated")))?;
+				children.push(u32::from_be_bytes([child[0], child[1], child[2], child[3]]) as usize);
+			}
+			children.push(u32::from_be_bytes([buffer[header + 8], buffer[header + 9], buffer[header + 10], buffer[header + 11]]) as usize);
+			drop(buffer);
+			let mut rows = 0;
+			for child in children {
+				rows += sqlite_scan_page(source, layout, child, aliases, visit, depth + 1)?;
+			}
+			Ok(rows)
+		}
+		// Leaf table page: each cell holds a payload size, a rowid, and the record.
+		13 => {
+			for cell in 0..cells {
+				let mut offset = pointer(header + 8 + cell * 2)?;
+				let (payload, _) = sqlite_varint(&buffer, &mut offset)?;
+				let (rowid, _) = sqlite_varint(&buffer, &mut offset)?;
+				let payload = usize::try_from(payload).ok().filter(|payload| *payload <= layout.pages * layout.usable).ok_or_else(|| RecipeError::new(format!("SQLite page {page} holds a row larger than the file")))?;
+				let local = sqlite_local_payload(layout.usable, payload);
+				let stored = buffer.get(offset..offset + local).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let mut joined = Vec::new();
+				let record = if local == payload {
+					stored
+				} else {
+					// The rest of the record continues on a chain of overflow pages, each led by the number of the next.
+					joined.extend_from_slice(stored);
+					let pointer = buffer.get(offset + local..offset + local + 4).ok_or_else(|| RecipeError::new(format!("SQLite page {page} overflow pointer is truncated")))?;
+					let mut next = u32::from_be_bytes([pointer[0], pointer[1], pointer[2], pointer[3]]) as usize;
+					for _ in 0..layout.pages {
+						if joined.len() == payload {
+							break;
+						}
+						require(next != 0, format!("SQLite page {page} overflow chain ends before its row does"))?;
+						let overflow = sqlite_page(source, layout, next)?;
+						let take = (payload - joined.len()).min(layout.usable - 4);
+						joined.extend_from_slice(&overflow[4..4 + take]);
+						next = u32::from_be_bytes([overflow[0], overflow[1], overflow[2], overflow[3]]) as usize;
+					}
+					require(joined.len() == payload && next == 0, format!("SQLite page {page} overflow chain does not match its row length"))?;
+					&joined[..]
+				};
+				let mut values = sqlite_record(record)?;
+				for (column, _) in aliases.iter().enumerate().filter(|(_, alias)| **alias) {
+					if values.len() <= column {
+						values.resize(column + 1, String::new());
+					}
+					values[column] = rowid.to_string();
+				}
+				visit(&values)?;
+			}
+			Ok(cells)
+		}
+		other => Err(RecipeError::new(format!("SQLite page {page} has type {other}; only rowid table pages are read"))),
+	}
+}
+
+/// Every user table of a SQLite database in memory, for the loader.
+fn sqlite_tables(bytes: &[u8], wal: Option<&[u8]>) -> Result<Vec<Table>> {
+	let wal = wal.map(|wal| Box::new(std::io::Cursor::new(wal)) as Box<dyn SqliteBytes + '_>);
+	let (mut source, layout) = sqlite_open(Box::new(std::io::Cursor::new(bytes)), bytes.len() as u64, wal)?;
+	let catalog = sqlite_catalog(&mut source, layout)?;
+	require(!catalog.is_empty(), "SQLite database has no tables")?;
+	let mut tables = Vec::new();
+	for table in catalog {
+		let headers = table.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
+		let mut rows = Vec::new();
+		sqlite_scan(&mut source, layout, table.root, &aliases, &mut |row: &[String]| {
+			require(row.len() <= headers.len(), format!("SQLite table {:?} row exceeds {} columns", table.name, headers.len()))?;
+			let mut row = row.to_vec();
+			row.resize_with(headers.len(), String::new);
+			rows.push(row);
+			Ok(())
+		})?;
+		tables.push(Table { name: table.name, headers, declared: true, rows, attention: None, path: PathBuf::new() });
+	}
+	Ok(tables)
 }
 fn sqlite_varint(bytes: &[u8], offset: &mut usize) -> Result<(i64, usize)> {
 	let mut value = 0_i64;
@@ -30653,6 +35424,12 @@ fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
 				let text = record.get(body..body + length).ok_or_else(|| RecipeError::new("SQLite text is truncated"))?;
 				body += length;
 				String::from_utf8(text.to_vec()).map_err(|error| RecipeError::new(format!("SQLite text is not UTF-8: {error}")))?
+			}
+			serial if serial >= 12 => {
+				let length = (serial as usize - 12) / 2;
+				let blob = record.get(body..body + length).ok_or_else(|| RecipeError::new("SQLite blob is truncated"))?;
+				body += length;
+				String::from_utf8_lossy(blob).into_owned()
 			}
 			serial => return Err(RecipeError::new(format!("SQLite serial type {serial} is unsupported"))),
 		});
@@ -31415,7 +36192,7 @@ enum JsonValue {
 	Bool(bool),
 	Number(String),
 	Text(String),
-	Array,
+	Array(Vec<JsonValue>),
 	Object(Vec<(String, JsonValue)>),
 }
 impl JsonValue {
@@ -31424,7 +36201,7 @@ impl JsonValue {
 			Self::Null => Some(String::new()),
 			Self::Bool(value) => Some(value.to_string()),
 			Self::Number(value) | Self::Text(value) => Some(value.clone()),
-			Self::Array | Self::Object(_) => None,
+			Self::Array(_) | Self::Object(_) => None,
 		}
 	}
 }
@@ -31442,16 +36219,16 @@ fn json_value(text: &str) -> Result<(JsonValue, &str)> {
 		}
 		Some('[') => {
 			let mut rest = text[1..].trim_start();
-			let mut values = 0;
+			let mut values = Vec::new();
 			loop {
 				if let Some(after) = rest.strip_prefix(']') {
-					return Ok((JsonValue::Array, after));
+					return Ok((JsonValue::Array(values), after));
 				}
-				if values != 0 {
+				if !values.is_empty() {
 					rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON array expects a comma"))?.trim_start();
 				}
-				let (_, remaining) = json_value(rest)?;
-				values += 1;
+				let (value, remaining) = json_value(rest)?;
+				values.push(value);
 				rest = remaining.trim_start();
 			}
 		}
@@ -32483,6 +37260,7 @@ fn prepare_command_data(data: &Data) -> Result<Prepared> {
 		autoregressive: false,
 		target: Vec::new(),
 		features: data.features.clone(),
+		schema_file: data.schema_file.clone(),
 		normalize: data.normalize,
 		split: 1.0,
 		split_supplied: false,
@@ -32608,6 +37386,7 @@ impl Train {
 	}
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
 		self.log_metrics = metrics.into_metrics();
+		assert!(!self.log_metrics.iter().any(|metric| matches!(metric.0, GGUF_METADATA | GGUF_TENSORS | GGUF_NGRAM)), "GGUF file observations require recipe.infer()");
 		arm_trace(&self.log_metrics);
 		self
 	}
@@ -32983,6 +37762,7 @@ impl Train {
 				autoregressive: false,
 				target: Vec::new(),
 				features: FeatureSelection::All,
+				schema_file: None,
 				normalize: false,
 				split: 1.0,
 				split_supplied: false,

@@ -185,7 +185,7 @@ CTA_ROUTE_WAIT:
 .visible .func mtp_scatter_warp(
 	.param .b64 down, .param .b64 router_f32, .param .b64 partials,
 	.param .b64 routing, .param .b32 expert, .param .b32 positions,
-	.param .b32 top_k, .param .b32 rows)
+	.param .b32 top_k, .param .b32 rows, .param .b32 cta_index, .param .b32 cta_count)
 {
 	.reg .pred %p<2>;
 	.reg .b32 %r<20>;
@@ -207,9 +207,9 @@ CTA_ROUTE_WAIT:
 	mul.lo.u32 %r6, %r6, %r3;
 	mov.u32 %r7, %tid.x;
 	mov.u32 %r8, %ntid.x;
-	mov.u32 %r9, %ctaid.x;
+	ld.param.u32 %r9, [cta_index];
 	mad.lo.u32 %r7, %r9, %r8, %r7;
-	mov.u32 %r9, %nctaid.x;
+	ld.param.u32 %r9, [cta_count];
 	mul.lo.u32 %r8, %r8, %r9;
 SCATTER_WARP_LOOP:
 	setp.ge.u32 %p0, %r7, %r6;
@@ -244,7 +244,7 @@ SCATTER_WARP_DONE:
 // Call after the existing grid completion barrier. Output is column-major.
 .visible .func mtp_combine_experts(
 	.param .b64 selected, .param .b64 partials, .param .b64 output,
-	.param .b32 positions, .param .b32 top_k, .param .b32 rows)
+	.param .b32 positions, .param .b32 top_k, .param .b32 rows, .param .b32 cta_index, .param .b32 cta_count)
 {
 	.reg .pred %p<3>;
 	.reg .b32 %r<16>;
@@ -259,8 +259,8 @@ SCATTER_WARP_DONE:
 	mul.lo.u32 %r3, %r0, %r2;
 	mov.u32 %r4, %tid.x;
 	mov.u32 %r5, %ntid.x;
-	mov.u32 %r6, %ctaid.x;
-	mov.u32 %r7, %nctaid.x;
+	ld.param.u32 %r6, [cta_index];
+	ld.param.u32 %r7, [cta_count];
 	mad.lo.u32 %r4, %r6, %r5, %r4;
 	mul.lo.u32 %r5, %r5, %r7;
 COMBINE_LOOP:

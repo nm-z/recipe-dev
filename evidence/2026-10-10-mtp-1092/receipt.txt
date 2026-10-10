@@ -25,7 +25,7 @@ Each source has accepting/rejecting heads, caps 0..4, lookup partial rejection, 
 The target and head stay in one MtpPlaced across each cap/request sweep.
 Reported weight bytes remain unchanged: plain 31108, indexed 60036, MoE 123396.
 Scratch fixture/probe sources stay outside the repository under /home/nate/codex/cx-fl-mtp-edit on archy.
-All public checks use Recipe's normal CLI/API; there are no inline tests or new test-only runtime APIs.
+All public checks use Recipe's normal CLI/API.
 
 GPU primitive checks:
 Compact position/selected-slot routing, absent selections, padding, weighted scatter, and combine pass for 1..5 positions.

@@ -264,41 +264,38 @@ define internal i32 @global_id() #1 { entry:
 const AMD_GRID_BARRIER: &str = r#"declare void @__ockl_grid_sync()
 define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
 // PTX only accepts ordered atomics on sm_70 and newer, so the counting barrier uses
-// device-scoped monotonic atomics with acquire/release fences. A release fence
-// publishes each block's arrival; the last arriver acquires and republishes
-// them before flipping the phase. Each waiter acquires after the flip.
-// The counters and cooperating blocks belong to one GPU. Driver synchronization
-// orders transfers outside the invocation; this barrier needs no system fence.
+// relaxed atomics with explicit fences. A release fence before each arrival publishes the
+// block's writes; the last arriver acquires them, republishes with a release fence, and
+// flips the phase; each waiter acquires after it observes the flip. The fences lower to
+// membar, which every NVIDIA architecture supports, so one barrier serves them all.
 // Every thread reads the phase before the block barrier; then one lane per warp spins
 // on it and the warp reconverges behind that lane (bar.warp.sync), so no bar.sync
 // follows a divergent spin (bar.sync is per warp before sm_70 and would count the
 // leader's warp as arrived on the lanes that skipped the spin) and only one lane in
 // thirty-two loads the phase while the grid drains. The acquire fence is the spinner's
-// alone: before sm_70 a device fence is membar.gl;
+// alone: before sm_70 a system fence is membar.sys, and one per thread cost a millisecond a
+// node; the fences are device scope (membar.gl), as every block of the grid shares the device;
 // the warp's other lanes issue their loads after the spinner's fence by program order.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
+declare void @llvm.nvvm.bar.warp.sync(i32)
 define internal void @grid_barrier(i32 %threads) #1 { entry:
-; Every writer releases its own global-memory operations before the block arrives.
-fence syncscope("device") release
-%phase = load atomic i32, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4
+%phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
 call void @llvm.amdgcn.s.barrier() %tid = call i32 @llvm.amdgcn.workitem.id.x()
-%lane = and i32 %tid, 31 %spinner = icmp eq i32 %lane, 0
 %leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %check arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
 fence syncscope("device") release
-%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 syncscope("device") monotonic %limit = sub i32 %groups, 1
+%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
 %last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
 fence syncscope("device") acquire
-store atomic i32 0, ptr addrspace(1) @grid.count syncscope("device") monotonic, align 4 %next = xor i32 %phase, 1
+store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
 fence syncscope("device") release
-store atomic i32 %next, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4 br label %wait check:
-br i1 %spinner, label %wait, label %waited wait:
-%seen = load atomic i32, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4 %ready = icmp ne i32 %seen, %phase
+store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait check:
+br label %waited wait:
+%seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %acquired, label %wait acquired:
 fence syncscope("device") acquire br label %waited waited:
 call void @llvm.amdgcn.s.barrier()
-fence syncscope("device") acquire
 ret void }"#;
 // A workgroup barrier on AMD is s_barrier between two workgroup-scope
 // fences: s_barrier alone neither waits for in-flight LDS stores nor keeps
@@ -325,8 +322,7 @@ define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyct
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
-declare i64 @llvm.readcyclecounter()
-define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @recipe.cpu.clock() ret i64 %now }
 define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
@@ -1613,20 +1609,16 @@ fn configured(manifest: &str, key: &str, os: &str) -> BuildResult<Option<String>
 	let (name, inside) = reference.split_once('/').unwrap_or((reference, ""));
 	Ok(env::var_os(name).map(PathBuf::from).map(|root| if inside.is_empty() { root } else { root.join(inside) }.to_string_lossy().into_owned()))
 }
-/// The default config and matching precision and storage tables, each encoded
-/// as `name:key=value,...` joined by `;`.
-fn precision_profiles(manifest: &str) -> BuildResult<(String, String, String)> {
+/// `[precision]` and every `[precision.<name>]` table of the manifest: the
+/// default config's name, and each table as `name:key=value,...` joined by `;`.
+fn precision_profiles(manifest: &str) -> BuildResult<(String, String)> {
 	let (mut section, mut default, mut profiles) = (None::<String>, None::<String>, Vec::<(String, Vec<String>)>::new());
-	let mut storage = Vec::<(String, Vec<String>)>::new();
 	for line in manifest.lines() {
 		let line = line.split('#').next().unwrap_or_default().trim();
 		if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
 			let name = name.trim().to_owned();
 			if let Some(profile) = name.strip_prefix("precision.") {
 				profiles.push((profile.to_owned(), Vec::new()));
-			}
-			if let Some(profile) = name.strip_prefix("storage.") {
-				storage.push((profile.to_owned(), Vec::new()));
 			}
 			section = Some(name);
 			continue;
@@ -1636,7 +1628,6 @@ fn precision_profiles(manifest: &str) -> BuildResult<(String, String, String)> {
 		match section.as_deref() {
 			Some("precision") if key == "default-config" => default = Some(value.to_owned()),
 			Some(name) if name.starts_with("precision.") => profiles.last_mut().expect("a precision table is open").1.push(format!("{key}={value}")),
-			Some(name) if name.starts_with("storage.") => storage.last_mut().expect("a storage table is open").1.push(format!("{key}={value}")),
 			_ => {}
 		}
 	}
@@ -1644,18 +1635,7 @@ fn precision_profiles(manifest: &str) -> BuildResult<(String, String, String)> {
 	if !profiles.iter().any(|(name, _)| *name == default) {
 		return Err(io::Error::other(format!("default-config {default} names no [precision.{default}] table")).into());
 	}
-	for (name, _) in &profiles {
-		if !storage.iter().any(|(candidate, _)| candidate == name) {
-			return Err(io::Error::other(format!("[precision.{name}] has no matching [storage.{name}] table")).into());
-		}
-	}
-	for (name, _) in &storage {
-		if !profiles.iter().any(|(candidate, _)| candidate == name) {
-			return Err(io::Error::other(format!("[storage.{name}] has no matching [precision.{name}] table")).into());
-		}
-	}
-	let encode = |tables: &[(String, Vec<String>)]| tables.iter().map(|(name, entries)| format!("{name}:{}", entries.join(","))).collect::<Vec<_>>().join(";");
-	Ok((default, encode(&profiles), encode(&storage)))
+	Ok((default, profiles.iter().map(|(name, entries)| format!("{name}:{}", entries.join(","))).collect::<Vec<_>>().join(";")))
 }
 fn native_configuration(manifest: &str, os: &str) -> u64 {
 	let mut hash = 14695981039346656037_u64;
@@ -1692,13 +1672,13 @@ fn platform(manifest: &str, key: &str, os: &str) -> BuildResult<String> {
 }
 struct NvidiaToolkit {
 	device_library: PathBuf,
-	assembler: PathBuf,
+	assemblers: Vec<PathBuf>,
 	required: bool,
 }
 fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
 	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
 	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
-	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(text(manifest, "nvidia-assembler")?), required: entry.starts_with('$') }))
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assemblers: text(manifest, "nvidia-assembler")?.split(';').map(|path| root.join(path)).collect(), required: entry.starts_with('$') }))
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(
@@ -1721,9 +1701,11 @@ const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
 @recipe.cpu.barrier.context = internal thread_local global ptr null, align 8
 @recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
-define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
+@recipe.cpu.clock.read = internal thread_local global ptr null, align 8
+define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait, ptr %clock) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 store ptr %clock, ptr @recipe.cpu.clock.read, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
-define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
+define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }
+define internal i64 @recipe.cpu.clock() #1 { entry: %read = load ptr, ptr @recipe.cpu.clock.read, align 8 %now = call i64 %read() ret i64 %now }"#;
 /// Contraction shape. Reverse K partitions use `split_span`, capped at
 /// `partitions`, for a fixed summation order across devices.
 #[derive(Clone, Copy)]
@@ -1735,57 +1717,48 @@ struct Schedule {
 	local_chunks: u32,
 }
 /// The key-value cache codec of one template: the cache element type and the
-/// conversions the attention bodies call. `model` is the template's model
+/// four conversions the attention bodies call. `model` is the template's model
 /// type, `arithmetic` its state, `kv` the cache type.
-fn kv_codec(model: &str, arithmetic: &str, kv: &str, fp8: Option<FloatFormat>) -> String {
+fn kv_codec(model: &str, arithmetic: &str, kv: &str, kv_bytes: usize) -> String {
 	let widen = |name: &str, from: &str| if arithmetic == "double" { format!("%{name} = fpext float %{from} to double\n") } else { format!("%{name} = fadd float %{from}, 0.0\n") };
 	let narrow = |name: &str, from: &str| if arithmetic == "double" { format!("%{name} = fptrunc double %{from} to float\n") } else { format!("%{name} = fadd float %{from}, 0.0\n") };
 	let to_float = |name: &str, from: &str| match kv {
-		"i8" => format!("%{name} = call float @recipe.kv.storage.decode(i8 %{from})\n"),
 		"half" => format!("%{name} = fpext half %{from} to float\n"),
 		"i16" => format!("%{name}.wide = zext i16 %{from} to i32\n%{name}.bits = shl i32 %{name}.wide, 16\n%{name} = bitcast i32 %{name}.bits to float\n"),
 		_ => format!("%{name} = fadd float %{from}, 0.0\n"),
 	};
 	let from_float = |name: &str, from: &str| match kv {
-		"i8" => format!("%{name} = call i8 @recipe.kv.storage.encode(float %{from})\n"),
 		"half" => format!("%{name}.below = fcmp olt float %{from}, -65504.0\n%{name}.above = fcmp ogt float %{from}, 65504.0\n%{name}.lowered = select i1 %{name}.below, float -65504.0, float %{from}\n%{name}.clamped = select i1 %{name}.above, float 65504.0, float %{name}.lowered\n%{name} = fptrunc float %{name}.clamped to half\n"),
 		"i16" => format!("%{name}.bits = bitcast float %{from} to i32\n%{name}.low = lshr i32 %{name}.bits, 16\n%{name}.odd = and i32 %{name}.low, 1\n%{name}.bias = add i32 %{name}.odd, 32767\n%{name}.rounded = add i32 %{name}.bits, %{name}.bias\n%{name}.high = lshr i32 %{name}.rounded, 16\n%{name} = trunc i32 %{name}.high to i16\n"),
 		_ => format!("%{name} = fadd float %{from}, 0.0\n"),
 	};
-	let from_state = |name: &str, from: &str| {
-		if fp8.is_some() && arithmetic == "double" {
-			format!("%{name} = call i8 @recipe.kv.storage.fp8.encode(double %{from})\n")
-		} else { narrow("narrowed", from) + &from_float(name, "narrowed") }
-	};
 	// The cache in the model's own type: the bytes pass through untouched.
-	if kv == model && fp8.is_none() {
+	if kv == model {
 		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.decode({model} %value)\nret {arithmetic} %result\n}}\ndefine internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n%result = call {model} @recipe.encode({arithmetic} %value)\nret {kv} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
 	}
-	let mut ir = fp8.map(|format| fp8_codec(format).replace("@recipe.", "@recipe.kv.storage.")).unwrap_or_default();
-	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret {kv} %result\n}}\n", from_state("result", "state")));
+	let mut ir = String::new();
+	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "state"), from_float("result", "narrowed")));
 	ir.push_str(&format!("define internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\n{}{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {model} %result\n}}\n", to_float("wide", "value"), widen("state", "wide")));
 	ir.push_str(&format!("define internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n{}ret float %result\n}}\n", to_float("result", "value")));
 	ir.push_str(&format!("define internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}ret {kv} %result\n}}\n", from_float("result", "wide")));
 	ir.push_str(&format!("define internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n{}{}ret {arithmetic} %result\n}}\n", to_float("wide", "value"), widen("result", "wide")));
-	ir.push_str(&format!("define internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n{}ret {kv} %result\n}}\n", from_state("result", "value")));
+	ir.push_str(&format!("define internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "value"), from_float("result", "narrowed")));
+	let _ = kv_bytes;
 	ir
 }
 /// Every template source: one per model precision with the cache in the model
-/// type, and one more per explicit cache format. FP8 formats remain distinct
-/// from integer formats even though both use an i8 storage element.
+/// type, and one more per cache type a block may name (`-kvf16`, `-kvbf16`,
+/// `-kvf32`) where that type is not the model's own.
 fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<Vec<(String, String)>> {
 	let mut sources = Vec::new();
 	for (suffix, contents, model, arithmetic, bytes) in precision_bases(ir, schedule)? {
-		let cache = |kv: &str, kv_bytes: usize, fp8| contents.replace("RECIPE_KV_ALIGN", &kv_bytes.to_string()).replace("RECIPE_KV", kv) + "\n" + &kv_codec(model, arithmetic, kv, fp8);
-		sources.push((suffix.clone(), cache(model, bytes, None)));
+		let cache = |kv: &str, kv_bytes: usize| contents.replace("RECIPE_KV_ALIGN", &kv_bytes.to_string()).replace("RECIPE_KV", kv) + "\n" + &kv_codec(model, arithmetic, kv, kv_bytes);
+		sources.push((suffix.clone(), cache(model, bytes)));
 		for (name, kv, kv_bytes) in [("f16", "half", 2), ("bf16", "i16", 2), ("f32", "float", 4)] {
 			if kv == model && !(name == "f32" && suffix.starts_with("-tf32")) {
 				continue;
 			}
-			sources.push((format!("{suffix}-kv{name}"), cache(kv, kv_bytes, None)));
-		}
-		for (name, format) in [("f8", FloatFormat::FP8), ("f8e5m2", FloatFormat::FP8_E5M2)] {
-			sources.push((format!("{suffix}-kv{name}"), cache("i8", 1, Some(format))));
+			sources.push((format!("{suffix}-kv{name}"), cache(kv, kv_bytes)));
 		}
 	}
 	Ok(sources)
@@ -1958,7 +1931,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
 	let toolkit = nvidia_toolkit(manifest, os)?.ok_or_else(|| io::Error::other(format!("nvidia-toolkit is not configured for {os}")))?;
 	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", toolkit.device_library.display());
-	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assembler.display());
+	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assemblers.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
 	Ok(())
 }
@@ -2007,14 +1980,10 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
-	let mtp = manifest.split_once("[package.metadata.mtp]").ok_or_else(|| io::Error::other("[package.metadata.mtp] must be configured"))?.1;
+	let mtp = manifest.split_once("[package.metadata.mtp]").ok_or_else(|| io::Error::other("MTP settings are absent"))?.1;
 	let mtp = mtp.split("\n[").next().unwrap_or(mtp);
-	let tokens = setting(mtp, "tokens")?.parse::<u32>().ok().filter(|tokens| *tokens > 0)
-		.ok_or_else(|| io::Error::other("mtp.tokens must be a positive integer"))?;
-	let probs = setting(mtp, "probs")?.parse::<f64>().ok().filter(|probs| probs.is_finite() && (0.0..=1.0).contains(probs))
-		.ok_or_else(|| io::Error::other("mtp.probs must be a finite probability in 0..=1"))?;
-	println!("cargo:rustc-env=RECIPE_MTP_TOKENS={tokens}");
-	println!("cargo:rustc-env=RECIPE_MTP_PROBS={probs}");
+	println!("cargo:rustc-env=RECIPE_MTP_TOKENS={}", setting(mtp, "tokens")?);
+	println!("cargo:rustc-env=RECIPE_MTP_PROBS={}", setting(mtp, "probs")?);
 	let positive = |key: &str| -> BuildResult<u32> {
 		setting(&manifest, key)?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other(format!("{key} must be a positive integer")).into())
 	};
@@ -2085,19 +2054,35 @@ fn main() -> BuildResult<()> {
 		("contraction-matrix-split-span", "RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN"),
 		("contraction-chunk-k", "RECIPE_CONTRACTION_CHUNK_K"),
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
+		("lookup-readers", "RECIPE_LOOKUP_READERS"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("delta-chunk", "RECIPE_DELTA_CHUNK"),
+		("draft-positions", "RECIPE_DRAFT_POSITIONS"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("tensor-split-region-bytes", "RECIPE_TENSOR_SPLIT_REGION_BYTES"),
 		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
+		("nvidia-step-registers", "RECIPE_NVIDIA_STEP_REGISTERS"),
+		("lane-tuning", "RECIPE_LANE_TUNING"),
+		("lane-tuning-window", "RECIPE_LANE_TUNING_WINDOW"),
+		("lane-tuning-temperature", "RECIPE_LANE_TUNING_TEMPERATURE"),
+		("compile-memory-per-ir-byte", "RECIPE_COMPILE_MEMORY_PER_IR_BYTE"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
-	let (default_config, profiles, storage) = precision_profiles(&manifest)?;
+	// Devices whose memory above a bound must not be used: `node:device = bytes`.
+	let usable = setting(&manifest, "device-usable-bytes")?.trim().strip_prefix('{').and_then(|value| value.strip_suffix('}')).ok_or_else(|| io::Error::other("device-usable-bytes must be a table"))?;
+	let usable = usable.split(',').map(str::trim).filter(|entry| !entry.is_empty()).map(|entry| {
+		let (device, bytes) = entry.split_once('=').ok_or_else(|| io::Error::other(format!("device-usable-bytes entry {entry} must be \"node:device\" = bytes")))?;
+		let (device, bytes) = (device.trim().trim_matches('"'), bytes.trim());
+		bytes.parse::<u64>().map_err(|error| io::Error::other(format!("device-usable-bytes for {device} must be a byte count: {error}")))?;
+		Ok(format!("{device}={bytes}"))
+	}).collect::<BuildResult<Vec<_>>>()?.join(";");
+	println!("cargo:rustc-env=RECIPE_DEVICE_USABLE_BYTES={usable}");
+	let (default_config, profiles) = precision_profiles(&manifest)?;
 	println!("cargo:rustc-env=RECIPE_DEFAULT_CONFIG={default_config}");
 	println!("cargo:rustc-env=RECIPE_PRECISION_PROFILES={profiles}");
-	println!("cargo:rustc-env=RECIPE_STORAGE_PROFILES={storage}");
 	let placement = setting(&manifest, "multi-device")?;
 	println!(
 		"cargo:rustc-env=RECIPE_MULTI_DEVICE={}",
@@ -2107,6 +2092,14 @@ fn main() -> BuildResult<()> {
 			value => return Err(io::Error::other(format!("multi-device must be false, true, or \"auto\", not {value}")).into()),
 		}
 	);
+	// How a model placed on several devices divides: by layers, every layer over
+	// every device (a tensor split), or a tensor split whenever every die reaches
+	// the first peer to peer (auto).
+	let split = setting(&manifest, "device-split")?.trim_matches('"');
+	if !matches!(split, "layer" | "tensor" | "auto") {
+		return Err(io::Error::other(format!("device-split must be \"layer\", \"tensor\", or \"auto\", not {split}")).into());
+	}
+	println!("cargo:rustc-env=RECIPE_DEVICE_SPLIT={split}");
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
