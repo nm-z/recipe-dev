@@ -136,6 +136,12 @@ check
 jq -e '.columns[0].dtype == "float"' "$work/schema.json" >/dev/null
 pass 'supported correction'
 printf 'ok' > "$work/mode"
+for rows in 1 2; do
+	head -n "$rows" "$work/headerless.csv" > "$work/short.csv"
+	probe "$work/short.csv"
+	jq -e --argjson rows "$rows" '.tables.entries[0] | .rows == $rows and (.columns | all(.snippets | map(.row) == [range(0; $rows)]))' "$work/proposal.json" >/dev/null
+done
+pass 'unique snippets for one- and two-row tables'
 probe "$root/data/text/single_csv.csv"
 jq -e '.tables.entries[0].columns[0].snippets | length == 3 and all(.text | utf8bytelength <= 64)' "$work/proposal.json" >/dev/null
 check
