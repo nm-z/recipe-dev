@@ -4638,7 +4638,7 @@ impl NativeModelIr {
 					if external_expert(node) {
 						require(backend == Backend::Nvidia && node.precision == Compute::FP32, "expert dispatch requires NVIDIA FP32 expert boundaries")?;
 						let routing = self.emit_expert_selection(backend, index, node, &mut ir)?;
-						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\n%n{index}.split.shared = addrspacecast ptr addrspace(3) @contraction_tile to ptr\n%n{index}.split.shared.bits = ptrtoint ptr %n{index}.split.shared to i64\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 %n{index}.split.shared.bits)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
 						ir.push_str(barrier(backend));
 					} else {
 					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
@@ -8769,6 +8769,11 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			}
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
 			let expert_calls=ptx_source.contains("split_main_forward");
+			if expert_calls {
+				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
+				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
+			}
+
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
 			ptx_source.push_str(expert_split_functions());
