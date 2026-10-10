@@ -14706,9 +14706,19 @@ pub(crate) struct StorageSpec {
 
 /// A weight's block bytes: owned by the graph, or a view of the mapped file they
 /// were read from, which the view keeps mapped.
+struct ResidentLookupBytes {
+	data: Vec<u8>,
+	_source: StoredBytes,
+}
+impl Drop for ResidentLookupBytes {
+	fn drop(&mut self) {
+		#[cfg(unix)] unsafe { munlock(self.data.as_ptr().cast_mut().cast(), self.data.len()); }
+	}
+}
 #[derive(Clone)]
 enum StoredSegment {
 	Owned(Vec<u8>),
+	Resident(Arc<ResidentLookupBytes>),
 	Mapped(Arc<gguf::Mapping>, usize, usize),
 	/// Bytes the load kernel writes on the device: they take their place in the
 	/// run but exist on no host page.
@@ -14718,6 +14728,7 @@ impl StoredSegment {
 	fn length(&self) -> usize {
 		match self {
 			Self::Owned(bytes) => bytes.len(),
+			Self::Resident(bytes) => bytes.data.len(),
 			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
 		}
 	}
@@ -14727,6 +14738,7 @@ impl std::ops::Deref for StoredSegment {
 	fn deref(&self) -> &[u8] {
 		match self {
 			Self::Owned(bytes) => bytes,
+			Self::Resident(bytes) => &bytes.data,
 			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
 			Self::Absent(_) => &[],
 		}
@@ -14739,6 +14751,26 @@ impl std::ops::Deref for StoredSegment {
 #[derive(Clone)]
 pub(crate) struct StoredBytes(Arc<Vec<StoredSegment>>);
 impl StoredBytes {
+	fn resident_lookup(&self) -> Result<Self> {
+		if self.0.iter().all(|segment| matches!(segment, StoredSegment::Resident(_))) { return Ok(self.clone()); }
+		#[cfg(not(unix))] { return Err(RecipeError::new("resident lookup locking requires Unix memory mappings")); }
+		#[cfg(unix)] {
+			static CACHE: OnceLock<Mutex<std::collections::HashMap<Vec<(usize, usize)>, std::sync::Weak<ResidentLookupBytes>>>> = OnceLock::new();
+			let key = self.runs().map(|(_, bytes)| (bytes.as_ptr() as usize, bytes.len())).collect::<Vec<_>>();
+			let mut cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().map_err(|_| RecipeError::new("resident lookup cache is poisoned"))?;
+			if let Some(bytes) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
+				return Ok(Self(Arc::new(vec![StoredSegment::Resident(bytes)])));
+			}
+			let data = self.to_vec()?;
+			require(!data.is_empty(), "resident lookup table is empty")?;
+			require(unsafe { mlock(data.as_ptr().cast_mut().cast(), data.len()) } == 0,
+				format!("cannot lock {} lookup bytes in machine RAM: {}", data.len(), std::io::Error::last_os_error()))?;
+			let bytes = Arc::new(ResidentLookupBytes { data, _source: self.clone() });
+			cache.insert(key, Arc::downgrade(&bytes));
+			Ok(Self(Arc::new(vec![StoredSegment::Resident(bytes)])))
+		}
+	}
+
 	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Mapped(mapping.clone(), at, length)]))
 	}
@@ -21582,6 +21614,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
 		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
 		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
+		StoredSegment::Resident(bytes) => (bytes.data.as_ptr() as usize, 0, bytes.data.len()),
 		StoredSegment::Absent(length) => (0, 0, *length),
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -24598,6 +24631,9 @@ impl NativeTape {
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: Some(RowHash::from_words(words)?), table, width: node.argument[1] as usize, length: node.output.length });
 			}
+		}
+		if inference && graph.expert_execution.is_some() {
+			for lookup in &mut lookups { lookup.table.bytes = lookup.table.bytes.resident_lookup()?; }
 		}
 		let context_resets = layout.context_resets.clone();
 		for (offset, region) in native_context_regions(graph, &layout, &weights, precision.model)? {
@@ -28823,6 +28859,8 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+	fn mlock(address: Ptr, length: usize) -> i32;
+	fn munlock(address: Ptr, length: usize) -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
