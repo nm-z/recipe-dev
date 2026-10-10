@@ -14415,6 +14415,10 @@ pub struct AttentionTensors {
 	pub q_norm: Option<String>,
 	pub k_norm: Option<String>,
 	pub factors: Option<String>,
+	/// With `factors` naming the short rotary factors, the long ones, chosen by context length.
+	pub factors_long: Option<String>,
+	/// `q` holds the query, key and value rows one after another.
+	pub fused: bool,
 	pub out: String,
 	pub indexer: Option<IndexerTensors>,
 }
@@ -14433,6 +14437,8 @@ impl AttentionTensors {
 			q_norm: Some(name("attn_q_norm.weight")),
 			k_norm: Some(name("attn_k_norm.weight")),
 			factors: Some("rope_freqs.weight".to_owned()),
+			factors_long: None,
+			fused: false,
 			out: name("attn_output.weight"),
 			indexer: Some(IndexerTensors::block(layer)),
 		}
@@ -17490,10 +17496,12 @@ fn architecture_normalization(value: &str) -> Result<BlockNormalization> {
 /// The tensor conventions an architecture row declares and a file's tensors can be read for, each
 /// with the values it takes. `-` means the architecture has no such block. A row states them so a
 /// definition builds from the row, not from which tensors a file happens to hold.
-const CONVENTIONS: [(&str, &[&str]); 14] = [
+const CONVENTIONS: [(&str, &[&str]); 16] = [
 	("attention-gate", &["-", "none", "interleaved"]),
+	("attention-projection", &["-", "split", "fused"]),
+	("ffn-projection", &["-", "split", "fused"]),
 	("qk-norm", &["-", "none", "rms"]),
-	("rope-factors", &["-", "none", "tensor", "optional"]),
+	("rope-factors", &["-", "none", "tensor", "short-long", "optional"]),
 	("attention-bias", &["-", "none", "qkv"]),
 	("values-from-keys", &["-", "false", "true"]),
 	("attn-pre-norm", &["-", "false", "true"]),
@@ -17521,14 +17529,17 @@ fn guessed_conventions(file: &Gguf) -> Result<BTreeMap<&'static str, String>> {
 	let flag = |value: bool| if value { "true" } else { "false" }.to_owned();
 	for layer in 0..layers {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		let (attention, delta) = (has(&name("attn_q.weight")), has(&name("ssm_a")));
+		let delta = has(&name("ssm_a"));
+		let fused = !has(&name("attn_q.weight")) && has(&name("attn_qkv.weight")) && !delta;
+		let attention = has(&name("attn_q.weight")) || fused;
 		if attention {
-			let gated = file.tensor(&name("attn_q.weight")).and_then(|query| query.shape.get(1)).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+			let gated = !fused && file.tensor(&name("attn_q.weight")).and_then(|query| query.shape.get(1)).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
 			note("attention-gate", if gated { "interleaved" } else { "none" }.to_owned());
+			note("attention-projection", if fused { "fused" } else { "split" }.to_owned());
 			note("qk-norm", if has(&name("attn_q_norm.weight")) { "rms" } else { "none" }.to_owned());
-			note("rope-factors", if has("rope_freqs.weight") { "tensor" } else { "none" }.to_owned());
-			note("attention-bias", if has(&name("attn_q.bias")) || has(&name("attn_k.bias")) || has(&name("attn_v.bias")) { "qkv" } else { "none" }.to_owned());
-			note("values-from-keys", flag(!has(&name("attn_v.weight"))));
+			note("rope-factors", if has("rope_factors_short.weight") { "short-long" } else if has("rope_freqs.weight") { "tensor" } else { "none" }.to_owned());
+			note("attention-bias", if has(&name("attn_q.bias")) || has(&name("attn_k.bias")) || has(&name("attn_v.bias")) || has(&name("attn_qkv.bias")) { "qkv" } else { "none" }.to_owned());
+			if !fused { note("values-from-keys", flag(!has(&name("attn_v.weight")))); }
 			if has(&name("indexer.q_proj.weight")) {
 				note("indexer-score-norm", if has(&name("indexer.q_norm.weight")) || has(&name("indexer.k_norm.weight")) { "rms" } else { "none" }.to_owned());
 			}
@@ -17540,7 +17551,8 @@ fn guessed_conventions(file: &Gguf) -> Result<BTreeMap<&'static str, String>> {
 			note("attn-pre-norm", flag(has(&name("attn_norm.weight"))));
 			note("attn-post-norm", flag(has(&name("post_attention_norm.weight"))));
 		}
-		if has(&name("ffn_gate.weight")) || has(&name("ffn_gate_inp.weight")) || has(&name("ffn_gate_exps.weight")) {
+		if has(&name("ffn_gate.weight")) || has(&name("ffn_up.weight")) || has(&name("ffn_gate_inp.weight")) || has(&name("ffn_gate_exps.weight")) {
+			if has(&name("ffn_gate.weight")) { note("ffn-projection", "split".to_owned()); } else if has(&name("ffn_up.weight")) && !has(&name("ffn_gate_inp.weight")) { note("ffn-projection", "fused".to_owned()); }
 			note("ffn-pre-norm", if has(&name("ffn_norm.weight")) { "ffn_norm" } else if has(&name("post_attention_norm.weight")) { "post_attention_norm" } else { "none" }.to_owned());
 			note("ffn-post-norm", flag(has(&name("post_ffw_norm.weight"))));
 		}
@@ -17730,6 +17742,8 @@ struct Builder<'a> {
 	expert_scale: Option<f64>,
 	expert_shared: Option<SharedChoice>,
 	expert_shared_gate: Option<Activation>,
+	/// The tensor conventions the architecture row declares.
+	conventions: BTreeMap<String, String>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -17777,7 +17791,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, expert_shared: row.expert_shared, expert_shared_gate: row.expert_shared_gate, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, expert_shared: row.expert_shared, expert_shared_gate: row.expert_shared_gate, conventions: row.conventions.clone(), plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -17835,7 +17849,12 @@ impl<'a> Builder<'a> {
 				model = model.scale(value);
 			}
 		}
-		let output_norm = builder.optional("output_norm.weight").or_else(|| builder.optional("token_embd_norm.weight"));
+		let output_norm_kind = builder.convention("output-norm")?.to_owned();
+		let output_norm = match output_norm_kind.as_str() {
+			"output_norm" => Some(builder.tensor("output_norm.weight", "the output normalization")?),
+			"token_embd_norm" => Some(builder.tensor("token_embd_norm.weight", "the output normalization")?),
+			_ => None,
+		};
 		if let Some(scale) = output_norm {
 			model = model.norm(rms);
 			builder.mapped(vec![scale]);
@@ -17846,10 +17865,15 @@ impl<'a> Builder<'a> {
 			builder.whole("output_hc_up.weight", "the head mixer read gate")?;
 		}
 		model = model.layer(vocabulary);
-		// A file without an output tensor ties the output to the embedding.
-		let output = match builder.optional("output.weight") {
-			Some(output) => output,
-			None => embedding,
+		// A tied output reads the embedding; an optional one is tied when the file holds no output tensor.
+		let output_kind = builder.convention("output")?.to_owned();
+		let output = match output_kind.as_str() {
+			"untied" => builder.tensor("output.weight", "the vocabulary projection")?,
+			"tied" => embedding,
+			_ => match builder.optional("output.weight") {
+				Some(output) => output,
+				None => embedding,
+			},
 		};
 	builder.mapped(vec![output]);
 		if builder.present("final_logit_softcapping") {
@@ -17875,6 +17899,17 @@ impl<'a> Builder<'a> {
 	}
 	fn present(&self, suffix: &str) -> bool {
 		self.file.value(&self.key(suffix)).is_some()
+	}
+	/// The value the architecture row declares for a tensor convention.
+	fn convention(&self, name: &str) -> Result<&str> {
+		self.conventions.get(name).map(String::as_str).ok_or_else(|| RecipeError::new(format!("architecture {:?} declares no {name}; add it to its Cargo.toml row", self.architecture)))
+	}
+	/// An error unless the file holds every tensor the architecture's declaration says a block reads.
+	fn require_tensors(&self, names: &[String], convention: &str, value: &str) -> Result<()> {
+		for name in names {
+			require(self.file.tensor(name).is_some(), format!("tensor {name} is absent; architecture {:?} declares {convention} {value}", self.architecture))?;
+		}
+		Ok(())
 	}
 	fn layer_integers(&self, suffix: &str, default: usize, layers: usize) -> Result<Vec<usize>> {
 		match self.file.value(&self.key(suffix)) {
@@ -18083,30 +18118,73 @@ impl<'a> Builder<'a> {
 		let (width, heads) = (dimensions.width, dimensions.heads);
 		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		let fused = self.file.tensor(&name("attn_q.weight")).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
-		let query = self.file.tensor(&name(if fused { "attn_qkv.weight" } else { "attn_q.weight" })).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
-		let gated = !fused && query.shape.get(1).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+		let projection = self.convention("attention-projection")?.to_owned();
+		let fused = projection == "fused";
+		let query_name = name(if fused { "attn_qkv.weight" } else { "attn_q.weight" });
+		let query = self.file.tensor(&query_name).ok_or_else(|| RecipeError::new(format!("tensor {query_name} is absent; block {layer} attention reads it; architecture {:?} declares attention-projection {projection}", self.architecture)))?;
+		let gate = self.convention("attention-gate")?.to_owned();
+		let gated = gate == "interleaved";
+		require(!(fused && gated), format!("architecture {:?} declares a fused attention projection with an interleaved gate", self.architecture))?;
+		let expected = if fused { (heads + 2 * kv) * head } else if gated { 2 * heads * head } else { heads * head };
+		require(query.shape.get(1).is_some_and(|outputs| *outputs as usize == expected), format!("{query_name} has shape {:?}; architecture {:?} declares attention-projection {projection} and attention-gate {gate}, which take {expected} outputs", query.shape, self.architecture))?;
 		let mut block = if gated { branch.attn_heads(heads) } else { branch.attn(heads) }.kv(kv).head(head);
-		let normalized = self.file.tensor(&name("attn_q_norm.weight")).is_some();
-		if normalized { block = block.qk(rms); }
+		let normalized = self.convention("qk-norm")? == "rms";
+		if normalized {
+			self.require_tensors(&[name("attn_q_norm.weight"), name("attn_k_norm.weight")], "qk-norm", "rms")?;
+			block = block.qk(rms);
+		}
+		let factors_declared = self.convention("rope-factors")?.to_owned();
+		let factors = if factors_declared == "short-long" {
+			self.require_tensors(&["rope_factors_short.weight".to_owned(), "rope_factors_long.weight".to_owned()], "rope-factors", "short-long")?;
+			true
+		} else {
+			!dimensions.swa[layer] && match factors_declared.as_str() {
+				"tensor" => {
+					self.require_tensors(&["rope_freqs.weight".to_owned()], "rope-factors", "tensor")?;
+					true
+				}
+				"none" => false,
+				_ => self.file.tensor("rope_freqs.weight").is_some(),
+			}
+		};
 		block = block.rope(self.rope, rope_dims, rope_base);
-		let (short, attn_factor) = (self.file.tensor("rope_factors_short.weight").is_some(), rope_attn_factor(self.file, self.architecture));
+		let attn_factor = rope_attn_factor(self.file, self.architecture);
 		block = block.edit(|model| {
 			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
 			attention.window = if dimensions.swa[layer] { dimensions.window } else { 0 };
-			attention.factors = short || (!dimensions.swa[layer] && self.file.tensor("rope_freqs.weight").is_some());
+			attention.factors = factors;
 			attention.attn_factor = attn_factor;
 		});
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
 			block = block.index_tokens(index_heads, index_width, block_size, top_k);
-			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
+			if self.convention("indexer-score-norm")? == "rms" {
+				self.require_tensors(&[name("indexer.q_norm.weight"), name("indexer.k_norm.weight")], "indexer-score-norm", "rms")?;
+				block = block.score(rms, rope_dims);
+			}
 		}
+		let biased = self.convention("attention-bias")? == "qkv";
+		let values_from_keys = self.convention("values-from-keys")? == "true";
+		let mut tensors = AttentionTensors::block(layer);
+		if biased {
+			self.require_tensors(&[name("attn_q.bias"), name("attn_k.bias"), name("attn_v.bias")], "attention-bias", "qkv")?;
+		} else {
+			(tensors.q_bias, tensors.k_bias, tensors.v_bias) = (None, None, None);
+		}
+		if fused || values_from_keys { tensors.v = None; } else { self.require_tensors(&[name("attn_v.weight")], "values-from-keys", "false")?; }
+		if !normalized { (tensors.q_norm, tensors.k_norm) = (None, None); }
+		if !factors {
+			tensors.factors = None;
+		} else if factors_declared == "short-long" {
+			(tensors.factors, tensors.factors_long) = (Some("rope_factors_short.weight".to_owned()), Some("rope_factors_long.weight".to_owned()));
+		}
+		if fused { (tensors.fused, tensors.q) = (true, name("attn_qkv.weight")); }
+		if dimensions.indexer.is_none() { tensors.indexer = None; }
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
-		self.attention_planes(layer, attention, normalized, width, None)?;
+		self.attention_planes(layer, attention, normalized, width, Some(&tensors))?;
 		if gated {
-			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
-			self.attention_gate_planes(layer, heads, head, gate_biased, None)?;
+			let gate_biased = biased;
+			self.attention_gate_planes(layer, heads, head, gate_biased, Some(&tensors))?;
 			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
 			self.mapped(vec![output]);
 			block = block.edit(|model| {
@@ -18164,7 +18242,13 @@ impl<'a> Builder<'a> {
 		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
 		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
 		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
-		self.delta_planes(layer, &delta, dimensions.width, None)?;
+		let mut tensors = DeltaTensors::block(layer);
+		if self.convention("decay-bias")? == "true" {
+			self.require_tensors(&[format!("blk.{layer}.ssm_dt.bias")], "decay-bias", "true")?;
+		} else {
+			tensors.decay_bias = None;
+		}
+		self.delta_planes(layer, &delta, dimensions.width, Some(&tensors))?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
 	/// Bind the planes of the declared delta block in lowering order.
@@ -18214,6 +18298,8 @@ impl<'a> Builder<'a> {
 		let hidden = dimensions.feed_forward.ok_or_else(|| RecipeError::new("the architecture names no feed-forward width"))?;
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} feed-forward");
+		let projection = self.convention("ffn-projection")?.to_owned();
+		require(self.file.tensor(&name("ffn_gate.weight")).is_some() == (projection == "split"), format!("block {layer} holds {} ffn_gate.weight; architecture {:?} declares ffn-projection {projection}", if self.file.tensor(&name("ffn_gate.weight")).is_some() { "an" } else { "no" }, self.architecture))?;
 		for tensor in self.gate_and_up(layer, &role, width, hidden)? { self.mapped(vec![tensor]); }
 		let down = self.projection(&name("ffn_down.weight"), &role, hidden, width)?;
 		self.mapped(vec![down]);
@@ -18250,7 +18336,7 @@ impl<'a> Builder<'a> {
 	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
 		let ExpertDims { count, used, hidden, scoring, renormalize, scale, shared } = *experts;
-		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
+		let selection_bias = self.convention("selection-bias")? == "true";
 		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width, None)?;
 		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
 		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
@@ -18351,13 +18437,16 @@ impl<'a> Builder<'a> {
 			}
 			None => {
 				let role = format!("block {layer} {part} pre-normalization");
-				let scale = match part {
-					"attn" => self.tensor(&name("attn_norm.weight"), &role)?,
-					_ => match self.optional(&name("ffn_norm.weight")) {
-						Some(scale) => scale,
-						None => self.tensor(&name("post_attention_norm.weight"), &role)?,
+				let declared = match part {
+					"attn" => if self.convention("attn-pre-norm")? == "true" { Some("attn_norm.weight") } else { None },
+					_ => match self.convention("ffn-pre-norm")? {
+						"ffn_norm" => Some("ffn_norm.weight"),
+						"post_attention_norm" => Some("post_attention_norm.weight"),
+						_ => None,
 					},
 				};
+				let Some(declared) = declared else { return Ok(recipe.model()) };
+				let scale = self.tensor(&name(declared), &role)?;
 				require(scale.elements() == dimensions.width, format!("{} holds {} values; {role} scales {} channels", scale.name, scale.elements(), dimensions.width))?;
 				self.mapped(vec![scale]);
 				Ok(recipe.model().norm(rms))
@@ -18370,7 +18459,8 @@ impl<'a> Builder<'a> {
 	fn post(&mut self, layer: usize, part: &str, branch: Model, dimensions: &Dimensions) -> Result<Model> {
 		let suffix = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
 		let name = format!("blk.{layer}.{suffix}");
-		let Some(scale) = self.optional(&name) else { return Ok(branch) };
+		if self.convention(if part == "attn" { "attn-post-norm" } else { "ffn-post-norm" })? != "true" { return Ok(branch); }
+		let scale = self.tensor(&name, &format!("block {layer} {part} post-normalization"))?;
 		require(scale.elements() == dimensions.width, format!("{} holds {} values; block {layer} {part} post-normalization scales {} channels", scale.name, scale.elements(), dimensions.width))?;
 		self.mapped(vec![scale]);
 		Ok(branch.norm(rms))
@@ -19045,8 +19135,9 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
-	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, plan: Binding::default() };
+	let row = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?;
+	let rope = row.rope;
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, conventions: row.conventions.clone(), plan: Binding::default() };
 	builder.plan_model(model)?;
 	builder.plan.mark_unread(file);
 	Ok(builder.plan)
@@ -19315,8 +19406,9 @@ impl Builder<'_> {
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let fused = spelled.is_none() && self.file.tensor(&named.q).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
-		let query = self.tensor(&if fused { name("attn_qkv.weight") } else { named.q.clone() }, &role)?;
+		let guessed_fused = spelled.is_none() && self.file.tensor(&named.q).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
+		let fused = named.fused || guessed_fused;
+		let query = self.tensor(&if guessed_fused { name("attn_qkv.weight") } else { named.q.clone() }, &role)?;
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
 		// A fused tensor stores the query, key and value heads as consecutive rows.
 		let (gated, key_base) = if fused {
@@ -19375,10 +19467,11 @@ impl Builder<'_> {
 		}
 		if attention.factors {
 			let factors_name = named.factors.as_deref().unwrap_or("rope_freqs.weight");
-			if self.file.tensor(factors_name).is_none() && self.file.tensor("rope_factors_short.weight").is_some() {
+			if named.factors_long.is_some() || (spelled.is_none() && self.file.tensor(factors_name).is_none() && self.file.tensor("rope_factors_short.weight").is_some()) {
 				let original = self.integer_or("rope.scaling.original_context_length", self.integer_or("context_length", 0)?)?;
 				require(original != 0, format!("{role} selects short or long rotary factors by context, but the file names no context length"))?;
-				let (short, long) = (self.tensor("rope_factors_short.weight", &role)?, self.tensor("rope_factors_long.weight", &role)?);
+				let (short_name, long_name) = (named.factors.clone().unwrap_or_else(|| "rope_factors_short.weight".to_owned()), named.factors_long.clone().unwrap_or_else(|| "rope_factors_long.weight".to_owned()));
+				let (short, long) = (self.tensor(&short_name, &role)?, self.tensor(&long_name, &role)?);
 				let fits = |tensor: &GgufTensor| attention.rope.is_some() && tensor.elements() == rope_dims / 2;
 				require(fits(&short) && fits(&long), format!("{} holds {} values; {role} rotates {} channel pairs", short.name, short.elements(), rope_dims / 2))?;
 				let group = self.plan.nodes.len();
