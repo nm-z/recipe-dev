@@ -8398,7 +8398,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes()]); }
-	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
+	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-no-opt-constants-v2");}
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
@@ -8786,7 +8786,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				let mut command = Command::new(assembler);
 				let separate=expert_calls;
 				let object=output.with_extension("device.cubin");
-				if separate {command.arg("-c");}
+				if separate {command.args(["-c","--disable-optimizer-constants"]);}
 				command.arg(format!("-arch={architecture}")).args([if separate {"-O1"} else {"-O3"}, "-o"]).arg(if separate {&object} else {output}).arg(&ptx);
 				let assembled = native_command(command, "NVIDIA PTX assembler", key);
 				assembled?;
@@ -19332,7 +19332,7 @@ impl ExpertExecution {
 			fs::write(&ptx, source).map_err(|error| RecipeError::new(format!("expert PTX write: {error}")))?;
 			let assembler = native_nvidia_assembler("sm_52").ok_or_else(|| RecipeError::new("expert worker requires the NVIDIA PTX assembler"))?;
 			let object=directory.join("expert-worker-device.cubin");
-			let mut command = Command::new(&assembler); command.args(["-c","-arch=sm_52","-O1","-v","-o"]).arg(&object).arg(&ptx);
+			let mut command = Command::new(&assembler); command.args(["-c","-arch=sm_52","-O1","--disable-optimizer-constants","-v","-o"]).arg(&object).arg(&ptx);
 			let diagnostic = native_command(command,"expert worker PTX assembler",&key)?;
 			let mut command=Command::new(Path::new(&assembler).with_file_name("nvlink")); command.args(["-arch=sm_52","--kernels-used","expert_split_worker","-o"]).arg(&cubin).arg(&object);
 			native_command(command,"expert worker device linker",&key)?;
