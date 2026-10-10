@@ -71,3 +71,15 @@ After the group's product writes finish, the caller supplies its completion barr
 The composed full-active 1/2-column probe passes on real gate/up/down weights, with product error at most 3.38e-7 and checked down error at most 9.24e-8. Current selected-source masked, zero-active, and invalid-mask GPU checks wait for the resident model's lock; those cases are not declared GPU-validated. Whole-model rate and final logits remain integration gates.
 
 The composed timing path uses IQ4_NL down with `kind=2`, `row_lanes=8`, capacity 1/2, and 256/512 threads. `fused-down.tsv` lists these measured configurations. Their decode loads the 16 IQ4 values into warp registers and selects them with SHFL; it does not read the large signed dictionary per weight. These configurations use the existing fourteen-input matvec dispatcher or ten-input typed `packed_g_20_*` functions. Other tuple selections retain their own measured implementation and rate.
+
+The generic fused dispatcher has this exact PTX interface:
+
+```text
+packed_gate_up(type:u32, capacity:u32, active_columns:u32, row_lanes:u32,
+	position_mask:u32, gate:u64, up:u64, packed_x:u64, scales:u64,
+	product_f32:u64, k:u32, m:u32, cta_index:u32, cta_count:u32) -> u32
+```
+
+It accepts type 17/18, k=2560, m=640, and capacity 1/2. At 256 threads, row_lanes must be 16; at 512 threads, row_lanes can be 8/16. Unsupported tuples return 0. It delegates to the measured typed bodies; current generic-wrapper GPU revalidation waits for the resident owner.
+
+The persistent expert caller must call this dispatcher to use fusion. Two matvec calls followed by a separate SiLU product do not execute the fused implementation. Write the fused result into the group's compact product plane, retain the existing completion protocol, and zero any padded columns before a preparation pass that covers those columns. Higher capacities and other formats keep their existing execution path. Select the fast IQ4 down tuple from `fused-down.tsv`.
