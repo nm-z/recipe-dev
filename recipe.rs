@@ -4638,7 +4638,7 @@ impl NativeModelIr {
 					if external_expert(node) {
 						require(backend == Backend::Nvidia && node.precision == Compute::FP32, "expert dispatch requires NVIDIA FP32 expert boundaries")?;
 						let routing = self.emit_expert_selection(backend, index, node, &mut ir)?;
-						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\n%n{index}.split.shared = addrspacecast ptr addrspace(3) @contraction_tile to ptr\n%n{index}.split.shared.bits = ptrtoint ptr %n{index}.split.shared to i64\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 %n{index}.split.shared.bits)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
 						ir.push_str(barrier(backend));
 					} else {
 					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
@@ -8769,6 +8769,11 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			}
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
 			let expert_calls=ptx_source.contains("split_main_forward");
+			if expert_calls {
+				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
+				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
+			}
+
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
 			ptx_source.push_str(expert_split_functions());
@@ -8787,7 +8792,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				assembled?;
 				if separate {
 					let linker=Path::new(&native_nvidia_assembler(architecture).unwrap()).with_file_name("nvlink");
-					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used","recipe_model,expert_split_worker"]).arg("-o").arg(output).arg(&object);
+					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used","recipe_model_forward,recipe_model_load,expert_split_worker"]).arg("-o").arg(output).arg(&object);
 					native_command(command,"NVIDIA device linker",key)?;
 				}
 				return Ok(Vec::new());
@@ -9056,7 +9061,7 @@ mod gguf {
 		pub kind: u32,
 		pub offset: usize,
 		pub bytes: usize,
-		shard: usize,
+		pub(super) shard: usize,
 	}
 
 	impl GgufTensor {
@@ -19186,7 +19191,7 @@ fn expert_main_reserve(target:&Graph,head:Option<&Graph>,target_file:&Gguf,head_
 	let native=part_bytes(target,precision)?+head.map(|graph|part_bytes(graph,precision)).transpose()?.unwrap_or(0);
 	let requests=expert_request_bytes(target,precision)?+head.map(|graph|expert_request_bytes(graph,precision)).transpose()?.unwrap_or(0);
 	let raw=target_file.tensors().iter().chain(head_file.into_iter().flat_map(Gguf::tensors)).filter(|tensor|!tensor.name.ends_with("_exps.weight") && !matches!(tensor.name.as_str(),"token_embd.weight"|"per_layer_token_embd.weight")).map(|tensor|tensor.bytes).sum::<usize>();
-	Ok((native.saturating_sub(raw)+requests+(32<<20)+placement_reserve_bytes()?,native,requests))
+	Ok((native.saturating_sub(raw)+requests+(128<<20)+placement_reserve_bytes()?,native,requests))
 }
 
 fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, checkpoints: usize, observations: u8) -> Result<(Placed, Option<MtpRuntime>)> {
@@ -19199,7 +19204,7 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	if let Some(graph)=&head_graph {drop(main.native_program(graph,1,precision,None,false)?);}
 	let head_file=head.as_ref().map(|head|&head.bound.file);
 	let (reserve,native_bytes,requests)=expert_main_reserve(&target_graph,head_graph.as_ref(),&bound.file,head_file,precision)?;
-	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:32<<20};8];
+	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:128<<20};8];
 	for gpu in selected_gpus()? {
 		let die=gpu.name.strip_prefix("nv").and_then(|value|value.parse::<usize>().ok()).ok_or_else(||RecipeError::new("expert startup requires physical local NVIDIA names"))?;
 		require(die<8 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
@@ -19231,6 +19236,7 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 			Some(MtpRuntime {head,lookup,lookup_enabled,placed,samples:Vec::new(),hidden:Vec::new(),hidden_released:0,ids:Vec::new(),logits:Vec::new(),sequence:positions,head_valid:0,poisoned:false})
 		}, _=>None,
 	};
+	execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.weights.upload(&bound.file,runtime.as_ref().map(|runtime|&runtime.head.bound.file))?;
 	Ok((target,runtime))
 }
 
@@ -19332,7 +19338,7 @@ impl ExpertExecution {
 			fs::write(directory.join("assembly.txt"),diagnostic).map_err(|error| RecipeError::new(format!("expert assembly receipt: {error}")))?;
 		}
 		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
-		let weights = ExpertSplitWeights::load(plan, target, head, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
+		let weights = ExpertSplitWeights::prepare(plan, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
 		let control = Buffer::zeroed(main, 128)?;
 		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
 		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
@@ -19620,7 +19626,8 @@ pub struct ExpertSplitWeights {
 impl ExpertSplitWeights {
 	/// Names use physical Archy ordinal order. Dies 2 and 6 have no context or buffer.
 	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
-	pub fn load(mut plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str; 8]) -> Result<Self> {
+	pub fn load(plan:ExpertSplitPlan,target:&Gguf,head:Option<&Gguf>,names:[&str;8])->Result<Self> {let value=Self::prepare(plan,names)?;value.upload(target,head)?;Ok(value)}
+	fn prepare(mut plan: ExpertSplitPlan, names: [&str; 8]) -> Result<Self> {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
 		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
 		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
@@ -19645,16 +19652,6 @@ impl ExpertSplitWeights {
 		}
 		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
 		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
-		for item in plan.placements.iter().filter(|item| item.expert.is_some()) {
-			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
-			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
-			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else { original.clone() };
-			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
-			if item.spilled {
-				let spill=spill.as_ref().expect("spill allocation is present");
-				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
-			} else {buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
-		}
 		let response_table = Buffer::reserve(main, 6 * 16)?;
 		let mut bindings=std::collections::HashMap::new();
 		for item in plan.placements.iter().filter(|item|item.expert.is_some()) {
@@ -19690,6 +19687,25 @@ impl ExpertSplitWeights {
 		let table: Vec<u8> = value.responses.iter().flat_map(|packet| [packet.address(), packet.sequence_address()].into_iter().flat_map(u64::to_ne_bytes)).collect();
 		value.response_table.write_bytes(0, &table)?;
 		Ok(value)
+	}
+	fn upload(&self,target:&Gguf,head:Option<&Gguf>)->Result<()> {
+		let mut uploads=self.plan.placements.iter().filter(|item|item.expert.is_some()).collect::<Vec<_>>();
+		uploads.sort_by_key(|item|(item.mtp,item.tensor.shard,item.tensor.offset,item.die));
+		let started=Instant::now();let mut reported=started;let mut bytes=0usize;
+		for item in uploads {
+			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
+			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
+			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else { original.clone() };
+			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
+			if item.spilled {
+				let spill=self.spill.as_ref().expect("spill allocation is present");
+				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
+			} else {self.buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
+			bytes=checked_add(bytes,tensor.bytes,"uploaded packed bytes")?;let now=Instant::now();
+			if now.duration_since(reported).as_secs_f64()>=1.0 {println!("resident weights {bytes} bytes  rate {:.4} GB/s",bytes as f64/now.duration_since(started).as_secs_f64()/1e9);reported=now;}
+		}
+		println!("resident weights {bytes} bytes  average rate {:.4} GB/s",bytes as f64/started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
+		Ok(())
 	}
 	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
 	pub fn weight_address(&self, mtp: bool, name: &str, expert: Option<u32>) -> Option<(usize, u64, usize, u32)> {
