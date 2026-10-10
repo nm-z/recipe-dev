@@ -1,57 +1,51 @@
-# M60 P2P flag barrier
+# M60 P2P runtime barrier
 
-This standalone #1092 evidence runs only on Archy's dies 1 and 2. It provides an owned PTX artifact, one Makefile, a Rust CUDA harness, and a two-layer Q4_K handoff demo. Recipe's weight holder and forward pass remain owned by cx-flash.
+Part of #1092. Recipe owns `barrier.ptx` at the repository root and the `PeerPacket` allocation API in `recipe.rs`. The root Makefile assembles this hand-owned PTX with ptxas 11.4 for sm_52 and builds the Rust measurement harness. CUDA C++ sources and generation rules have been removed. The original PTX came from nvcc 12.9; subsequent changes are authored directly in PTX, with `.version 7.4` for driver 470.
 
 ## Build and run
 
-Use nvcc 12.9 to emit sm_52 PTX, set `.version 7.4`, and assemble with `/opt/cuda-11.4/bin/ptxas` for driver 470. The Rust harness links the CUDA driver and an existing CUDA 11 runtime for the `cudaMemcpyPeer` comparison. Override `CUDART` in Make if that runtime is elsewhere.
+Run on archy from the repository root:
 
 ```sh
 make all
 flock /home/nate/codex/flash-1092-die1.lock make run
 ```
 
-Before running, read the latest #1092 comments and coordinate the measurement window. cx-flash applies power caps. `make run` selects the two full UUIDs; the harness checks each UUID before creating that device's context. GPU 6 is fenced. This program never selects it or changes caps, clocks, or other processes.
+Read the latest #1092 comments before each GPU job. cx-flash owns caps and clocks. The harness selects and verifies the full UUIDs of dies 1/2 before creating CUDA contexts. It does not stop services or select die 6.
 
-## Transport contract
+## Runtime contract
 
-Each receiving die owns its packet allocation. Both CUDA contexts enable peer access. A packet contains 4,096 32-bit payload words, a 32-bit sequence, 15 padding words, and a completion word. Its size is 16,452 bytes; sequence and completion offsets are 16,384 and 16,448 bytes.
+`recipe::PeerPacket::new(name)` allocates a resident receiving packet and one zeroed 128-byte completion slot per SM. Enable both directions with `packet.enable_sender(&peer)`. Retain these allocations alongside the weight holder across tokens. The payload is 16 KB; the sequence is at byte 16384. `reserve_sequences(hops)` returns a base, and hop h uses base+h. Both participants reserve the same range. Zero is empty; overflow returns an error. Complete the previous token on both dies before reusing or destroying its packet.
 
-One 256-thread CTA runs per die per token. For each hop, the sender writes 16 KB through the peer mapping. Every payload-writing thread executes `__threadfence_system()`, then the CTA synchronizes, then thread 0 writes the receiver's sequence. The receiver spins on its own local sequence with `ld.volatile.global.u32`. Payload reads and peer writes also use volatile PTX instructions. There are no peer atomics. Sequence values are unique across tokens; callers must recreate or reset the buffers before the 32-bit sequence range wraps.
+`recipe::p2p_functions()` returns owned PTX function definitions. Append them after the forward kernel's PTX header. They introduce no additional kernel launch:
 
-The relay alternates directions. The consumer checks all 4,096 words at every hop and increments the vector for the following hop, so stale or early publication produces errors. Odd hop counts finish with a completion acknowledgement from the last consumer. Both kernels have a device deadline. The negative case deliberately omits the first flag and requires both dies to time out.
+```text
+p2p_wait(address: u64, want: u32, deadline_ns: u64) -> u32
+p2p_publish(slots: u64, remote_sequence: u64, sequence: u32, deadline_ns: u64) -> u32
+```
 
-The `layer` entry packs FP32 activations to the Q8_1-equivalent int16 register layout and calls the #1091 Q4_K XMAD helper inside the persistent CTA. Die A publishes its packed-layer result as a 16 KB FP32 vector. Die B waits, computes its layer, and acknowledges completion. Both layer launches occur before either final machine synchronization. The demo allocates and uploads two weight matrices once and reuses them for all measured tokens.
+`p2p_wait` polls a local volatile flag and returns 1 on receipt or 0 on deadline. A receiving CTA's thread 0 calls it, then shares the result through CTA shared memory and a CTA barrier. Treat timeout as a failed token; never consume the payload after timeout.
 
-The demo uses synthetic, valid packed Q4_K 4096x4096 matrices, 9,437,184 bytes per die. An independent scalar Rust calculation checks the same Q4_K/Q8_1 algebra. This exercises the handoff and arithmetic contract. A single persistent CTA does not establish full-die matvec bandwidth, Flash-Next inference, final logits, or a whole-model decode rate.
+All payload-writing threads call `p2p_publish` after their peer stores. Every thread executes `membar.sys`, then the CTA synchronizes. Thread 0 writes its own local completion slot. CTA 0's first warp polls all slots in parallel. Its thread 0 writes the peer flag only after every slot equals the current sequence. There are no peer atomics. Each CTA returns its completion result through shared memory. Other CTAs can reach their next local wait while CTA 0 finishes the publication. A publication timeout on CTA 0 and a receipt timeout on its peer fail the token.
 
-## Measurement
+The receiving acquire orders reads of the local packet with `membar.gl`; every payload writer retains its system fence. The coordinator polls local slots with volatile loads and performs its system fence before the peer flag store.
 
-`results.txt` records aggregate machine intervals from before both launches through both final synchronizations. Report copies and preparation occur outside that interval. For 200 measured tokens, the harness reports mean per-token and per-hop time, token p50/p99, and die A's `%globaltimer` interval. Twenty warmup tokens precede each series. All payload checks are included in the device execution.
+All CTAs must remain resident. Recipe rejects devices with more than 32 SMs for this coordinator. Use a one-dimensional grid and block. The grid uses one CTA per SM, 256 threads each; the caller must also verify occupancy permits at least one such CTA per SM. Do not launch an oversubscribed grid or another persistent grid concurrently. Each CTA must finish its own output and peer stores before posting its slot. Publication covers every CTA, including CTAs that produce no part of a particular packet. Sequences distinguish hops and tokens without clearing slots between them.
 
-The required gate is mean machine end-to-end time below 10 us per hop for both 7 and 100 hops. Device timing is a local interval on die A; no timestamps from separate GPUs are subtracted. The same-pair `cudaMemcpyPeer` baseline copies 4 KB and 16 KB and synchronizes the destination context after each hop. The previously reported 6.2 us / 4 KB is historical comparison data, not this run's result.
+`PeerPacket::activate()` selects Recipe's context for resident allocations. `context_address()` borrows that context for existing CUDA driver integration; the caller must not destroy it. cx-flash owns wiring these functions into the PR #942 forward pass. This PR supplies and exercises the runtime primitive directly through the public Recipe packet API.
 
-The packed demo has two warmup tokens and eight measured tokens. Its timing includes the device arithmetic checks and final acknowledgement. Build diagnostics, selected-device state, exit statuses, and artifact hashes accompany the raw measurements.
+## Multi-CTA packed layer measurement
 
-## Integration
+`p2p_layers` runs one persistent CTA on each of all 16 SMs per die. Each token queues both die launches once and performs 100 alternating layer computations and peer handoffs without a machine action between layers. The two dense synthetic Q4_K matrices use FP16 block scales of 2^-16 to keep the repeated chain bounded and remain packed and resident across all iterations. Each layer has 4096 input columns and either 2560 or 10240 output rows; every row is computed and checked against independent scalar Q4_K/Q8_1 algebra at every hop. Each CTA copies only rows it computed, fences, and posts its own sequence slot. The handoff carries the first 4096 rows, padding the 2560-row result with zeros. This is a transport and packed-layer demonstration, not a complete model definition.
 
-`publish`, `wait_word`, `Packet`, and the `layer` entry show the reusable flag contract. Keep the receiver's flag local, preserve every writer's system fence, and publish only after all writers have completed. Production multi-CTA layers need an on-die completion scheme before one CTA publishes a sequence. This one-CTA demo does not provide that completion scheme or change Recipe's runtime scheduling.
+The harness records actual `%smid` and CTA IDs, verifies participation of all 16 SMs, queries occupancy, and checks all local completion slots after each token. Reference preparation, initial activation upload, and result downloads are outside the timed interval; all device arithmetic checks are inside. The machine interval includes both launches and both final synchronizations. Each packed series uses five warmups and 20 measured tokens. Weights upload exactly once per die for each shape.
 
-The owned `packed.cuh` helper comes from `8118be62cb9ac7189439b0e7b38663d764914a10`, the #1091 evidence branch. It preserves packed weights and uses signed 16-bit XMAD with integer accumulation, then applies floating-point block scales. cx-flash can integrate this contract alongside the full packed-kernel track, expert split, and MTP from PR #942.
+`p2p_grid_relay` isolates the same all-SM completion and 16 KB transport over 100 hops, with 200 measured tokens after five warmups. A separate 5 us delay on CTA 7 checks that publication waits for that CTA. Omitting CTA 7's first slot must reach a device deadline on both dies without publishing the first peer sequence.
 
-## Measured result
+The original one-CTA vector relay, same-pair cudaMemcpyPeer plus destination synchronization, and two-layer packed demo remain regression measurements. The original <10 us end-to-end gate applies to the requested 7/100-hop transport series. Packed-layer time includes weight reads and arithmetic and is reported separately from transport.
 
-The final run on October 10, 2026, from 10:59:13 to 10:59:16 UTC exits 0 and passes both requested gates. The assigned dies have 113 W caps applied by cx-flash. Full raw measurements are in `results.txt`; `initial/` retains the first run that failed the gate. The initial source and PTX are preserved in commit `bd50443f`.
+## Evidence
 
-| 16 KB path | Hops per token | Machine us per token | Machine us per hop | Die A device us per hop |
-|---|---:|---:|---:|---:|
-| Flag relay | 7 | 64.359 | 9.194 | 7.501 |
-| Flag relay | 100 | 693.454 | 6.935 | 6.806 |
-| cudaMemcpyPeer and destination sync | 7 | 82.153 | 11.736 | |
-| cudaMemcpyPeer and destination sync | 100 | 1152.409 | 11.524 | |
+`multi/` contains the review revision's build diagnostics, selected-device state, aggregate machine and device measurements, exit status, and source/artifact hashes. `results.txt` retains the preceding one-CTA measurement. `initial/` retains the first failing measurement; commit bd50443f preserves its source. Historical hashes refer to those historical artifacts. Current hashes are in `multi/artifact-sha256.txt`.
 
-The flag relay's p99 token times are 66.010 us for seven hops and 702.378 us for 100 hops. One hop, including two launches and final completion, costs 24.122 us. The gate applies to the requested seven-hop and 100-hop cases. The four-KB copy comparison measures 9.773 and 9.713 us per hop, respectively; it does not reproduce the historical 6.2 us under this synchronization boundary.
-
-The vector relay uses 128-bit volatile loads and peer stores and retains each received vector in registers for its next publication. Disassembly contains `LDG.E.CV.128`, `STG.E.WT.128`, and system fences, with no atomics. It uses 46 registers and 1,048 shared bytes without spills. Delayed publication passes; missing publication reaches both device deadlines.
-
-The repeated packed two-layer demo averages 3,074.133 us per token. All eight measured tokens pass the independent algebra check. Maximum absolute errors are 9.5e-7 on die A and 1.2e-7 on die B. Weight allocations remain resident across all ten demo tokens, including warmups. The demo establishes no Flash-Next token rate or final-logit result.
+No whole-model token rate or final-logit agreement is established by these probes. Those measurements belong to cx-flash's resident forward-pass integration.
