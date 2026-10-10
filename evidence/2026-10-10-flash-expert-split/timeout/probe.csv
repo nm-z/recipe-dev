@@ -1,0 +1,2 @@
+fixture only: two dies, owned callable transport, 16 CTAs/die, 256 threads/CTA, 48 routed layers/token; no expert matvec or real router capture
+rows,positions,layers,measured_tokens,machine_us_per_token,machine_us_per_layer,device_us_per_token,machine_p99_us,errors
