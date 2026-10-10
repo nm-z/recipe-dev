@@ -4611,6 +4611,7 @@ impl NativeModelIr {
 					trace(&format!("barrier kept before node {index}: {hazard}"))?;
 				}
 				if access.is_some() && hazard.is_none() && block == Some(plan.node.block_index) {
+					trace(&format!("barrier elided before node {index}: no conflicting value accesses"))?;
 					elided += 1;
 					if !converts {
 						ir.push_str(workgroup_barrier(backend));
@@ -6117,9 +6118,9 @@ impl NativeModelIr {
 					}
 				}
 			}
-			// Each forward primitive has completed its node-ending grid barrier.
-			// Stamp that boundary, so neighboring clock slots enclose one node's
-			// work rather than the next node's entry or the prior node's tail.
+			// Stamp thread zero's completion of this node. An elided or deferred
+			// grid barrier lets other workgroups continue outstanding independent
+			// work, so this timestamp is not their synchronized completion.
 			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
 				ir.push_str(&clock_stamp(backend, &format!("clk.n{index}"), clocks + index * 8));
 			}
