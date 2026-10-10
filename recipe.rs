@@ -6,6 +6,17 @@
 #[path = "build.rs"]
 mod native_build;
 use native_build::{encoding, fp8};
+/// Packed GGUF matvec functions for Maxwell, callable inside the native step.
+pub struct PackedMatvec;
+impl PackedMatvec {
+	/// Bytes of 16-byte-aligned CTA shared storage required by `packed_matvec`.
+	pub const SHARED_BYTES: usize = 40960;
+	/// Append this function/table text to the persistent NVIDIA PTX module.
+	pub fn ptx() -> &'static str {
+		include_str!("packed.ptx").split_once("// BEGIN PACKED HELPERS\n").expect("packed PTX function boundary").1
+	}
+}
+
 mod reference;
 mod program_ir {
 	//! Compile-time lowering for the scalar, predictor, route, and normalization

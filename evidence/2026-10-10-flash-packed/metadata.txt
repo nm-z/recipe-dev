@@ -1,0 +1,8 @@
+metadata qwen4exp.block_count=48
+metadata qwen4exp.expert_count=512
+metadata qwen4exp.expert_used_count=10
+metadata qwen4exp.expert_feed_forward_length=640
+metadata qwen4exp.expert_shared_feed_forward_length=640
+shard 1: 0 tensors, tensor table ends at 10946618, data starts at 10946624
+shard 2: 503 tensors, tensor table ends at 31840, data starts at 31840
+shard 3: 721 tensors, tensor table ends at 46061, data starts at 46080
