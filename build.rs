@@ -2015,6 +2015,16 @@ fn main() -> BuildResult<()> {
 		Ok(format!("{device}={bytes}"))
 	}).collect::<BuildResult<Vec<_>>>()?.join(";");
 	println!("cargo:rustc-env=RECIPE_DEVICE_USABLE_BYTES={usable}");
+	let fenced = setting(&manifest, "device-fenced-uuids")?.trim().strip_prefix('[').and_then(|value| value.strip_suffix(']')).ok_or_else(|| io::Error::other("device-fenced-uuids must be a list"))?;
+	let fenced = fenced.split(',').map(str::trim).filter(|entry| !entry.is_empty()).map(|entry| -> io::Result<String> {
+		let uuid = entry.trim_matches('"').strip_prefix("GPU-").ok_or_else(|| io::Error::other("a fenced UUID must start with GPU-"))?;
+		let parts = uuid.split('-').collect::<Vec<_>>();
+		if parts.len() != 5 || parts.iter().zip([8, 4, 4, 4, 12]).any(|(part, length)| part.len() != length || !part.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+			return Err(io::Error::other(format!("invalid fenced GPU UUID {uuid}")));
+		}
+		Ok(uuid.replace('-', "").to_ascii_lowercase())
+	}).collect::<io::Result<Vec<_>>>()?.join(";");
+	println!("cargo:rustc-env=RECIPE_DEVICE_FENCED_UUIDS={fenced}");
 	let mtp = manifest.split_once("[package.metadata.mtp]").ok_or_else(|| io::Error::other("[package.metadata.mtp] must be configured"))?.1;
 	let mtp = mtp.split("\n[").next().unwrap_or(mtp);
 	let tokens = setting(mtp, "tokens")?.parse::<u32>().ok().filter(|tokens| *tokens > 0)

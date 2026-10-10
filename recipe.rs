@@ -19127,7 +19127,7 @@ impl ExpertSplitPlan {
 	/// `head` contains unique MTP tensors; the holder decides whether its output
 	/// projection and token lookup share the target's quantized representation.
 	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; 8]) -> Result<Self> {
-		require((2..6).contains(&main_die), "expert split main die must be physical Archy die 2, 3, 4, or 5")?;
+		require([3, 4, 5, 7].contains(&main_die), "expert split main die must be physical Archy die 3, 4, 5, or 7")?;
 		let mut plan = Self { main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
 		let mut layers: std::collections::BTreeMap<(bool, usize), Vec<&GgufTensor>> = std::collections::BTreeMap::new();
 		let mut names = std::collections::HashSet::new();
@@ -19155,7 +19155,7 @@ impl ExpertSplitPlan {
 				format!("block {layer} expert shapes or packed byte strides disagree"))?;
 			for expert in 0..count as usize {
 				let slices = tensors.iter().map(|tensor| tensor.expert(expert)).collect::<Result<Vec<_>>>()?;
-				let die = (0..8).filter(|die| *die != main_die && *die != 6).filter_map(|die| {
+				let die = (0..8).filter(|die| *die != main_die && *die != 2 && *die != 6).filter_map(|die| {
 					let mut end = plan.weights[die];
 					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
 					let available = budgets[die].free_bytes.saturating_sub(budgets[die].reserve_bytes);
@@ -19188,7 +19188,7 @@ impl ExpertSplitPlan {
 	pub fn table(&self) -> String {
 		let mut text = String::from("| Physical die | Role | Free bytes | KV/scratch reserve | Assigned weight bytes | Expert bundles | Remaining bytes |\n|---:|---|---:|---:|---:|---:|---:|\n");
 		for die in 0..8 {
-			if die == 6 { continue; }
+			if die == 2 || die == 6 { continue; }
 			let budget = self.budgets[die];
 			let remaining = budget.free_bytes as i128 - budget.reserve_bytes as i128 - self.weights[die] as i128;
 			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
@@ -19227,14 +19227,14 @@ pub struct ExpertSplitWeights {
 	response_table: Buffer,
 }
 impl ExpertSplitWeights {
-	/// Names use physical Archy ordinal order. Die 6 has no context or buffer.
+	/// Names use physical Archy ordinal order. Dies 2 and 6 have no context or buffer.
 	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
 	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str; 8]) -> Result<Self> {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
 		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
 		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
-		require(plan.budgets.iter().enumerate().all(|(die, budget)| die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
-		let devices = names.iter().enumerate().map(|(die, name)| if die == 6 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
+		require(plan.budgets.iter().enumerate().all(|(die, budget)| die == 2 || die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
+		let devices = names.iter().enumerate().map(|(die, name)| if die == 2 || die == 6 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
 		for (die, gpu) in devices.iter().enumerate().filter_map(|(die, gpu)| gpu.map(|gpu| (die, gpu))) {
 			#[cfg(nvidia)]
 			require(matches!(gpu.driver, Driver::Cuda(_)), "expert split requires local NVIDIA dies")?;
@@ -19246,7 +19246,7 @@ impl ExpertSplitWeights {
 		}
 		let main = devices[plan.main_die].expect("main die is permitted");
 		for die in 0..8 {
-			if die == 6 { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
+			if die == 2 || die == 6 { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
 		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, plan.weights[die])).transpose()).collect::<Result<Vec<_>>>()?;
 		for item in &plan.placements {
 			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
@@ -19255,7 +19255,7 @@ impl ExpertSplitWeights {
 			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
 			buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;
 		}
-		let response_table = Buffer::reserve(main, 6 * 16)?;
+		let response_table = Buffer::reserve(main, 5 * 16)?;
 		let mut value = Self { plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
 		let mut layers = std::collections::BTreeMap::new();
 		for item in &value.plan.placements {
@@ -19272,7 +19272,7 @@ impl ExpertSplitWeights {
 			value.owners.push((layer, Buffer::upload(main, &owners)?));
 		}
 		for die in 0..8 {
-			if die == 6 { continue; }
+			if die == 2 || die == 6 { continue; }
 			if die == value.plan.main_die { continue; }
 			let request = PeerPacket::with_payload(names[die], 5 * 10240 * 4)?;
 			let response = PeerPacket::with_payload(names[value.plan.main_die], 5 * 10240 * 4)?;
@@ -25856,6 +25856,7 @@ impl Kernel {
 #[cfg(nvidia)]
 struct Cuda {
 	_runtime: std::sync::Arc<Library>,
+	usable_bytes: Option<u64>,
 	context: Ptr,
 	set: unsafe extern "C" fn(Ptr) -> i32,
 	allocate: unsafe extern "C" fn(*mut u64, usize) -> i32,
@@ -26526,7 +26527,7 @@ impl Gpu {
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
 					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
-					let unusable = device_usable_bytes(&self.name)?.map_or(0, |usable| (total as u64).saturating_sub(usable));
+					let unusable = driver.usable_bytes.map_or(0, |usable| (total as u64).saturating_sub(usable));
 					Ok((free as u64).saturating_sub(unusable))
 				}
 				#[cfg(amd)]
@@ -27644,6 +27645,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
+		let get_uuid: unsafe extern "C" fn(*mut [u8; 16], i32) -> i32 = runtime.function(b"cuDeviceGetUuid\0")?;
 		let attribute: NvQuery = runtime.function(b"cuDeviceGetAttribute\0")?;
 		let total: unsafe extern "C" fn(*mut usize, i32) -> i32 = runtime.function(b"cuDeviceTotalMem_v2\0")?;
 		let create: unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32 = runtime.function(b"cuCtxCreate_v2\0")?;
@@ -27661,7 +27663,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let mut count = 0;
 		check(init(0), "initialization")?;
 		check(count_devices(&mut count), "device enumeration")?;
-		let load_device = |device, index| -> Result<Gpu> {
+		let load_device = |device, index, usable_bytes| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
 			let mut context = ptr::null_mut();
 			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -27695,6 +27697,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda {
 				_runtime: runtime.clone(),
+				usable_bytes,
 				context,
 				set: runtime.function(b"cuCtxSetCurrent\0")?,
 				allocate: runtime.function(b"cuMemAlloc_v2\0")?,
@@ -27738,7 +27741,20 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			devices.push(gpu);
 		}
 		require(!devices.is_empty(), "Nvidia has no GPU")?;
-		devices.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
+		let mut loaded = Vec::new();
+		for (index, device) in devices.into_iter().enumerate() {
+			let name = format!("nv{index}");
+			if _selection.is_some_and(|names| !names.contains(&name)) { continue; }
+			let mut uuid = [0_u8; 16];
+			check(get_uuid(&mut uuid, device), "device UUID")?;
+			let uuid = uuid.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+			if env!("RECIPE_DEVICE_FENCED_UUIDS").split(';').any(|fenced| fenced == uuid) { continue; }
+			let identity = format!("GPU-{}-{}-{}-{}-{}", &uuid[..8], &uuid[8..12], &uuid[12..16], &uuid[16..20], &uuid[20..]);
+			let usable_bytes = device_usable_bytes(&identity)?.or(if std::env::var_os("CUDA_VISIBLE_DEVICES").is_none() { device_usable_bytes(&name)? } else { None });
+			if usable_bytes == Some(0) { continue; }
+			loaded.push(load_device(device, index, usable_bytes)?);
+		}
+		Ok(loaded)
 	}
 }
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
