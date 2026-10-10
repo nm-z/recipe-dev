@@ -5055,7 +5055,9 @@ impl NativeModelIr {
 					let heads = integer_argument(node.argument[0], "attention heads")?;
 					let online_order = self.inference && self.graph.profile.online_softmax;
 					require(!online_order || node.output.channels <= 256 * heads.max(1) as usize, "online attention head width exceeds 256")?;
-					let attention = if !compact && !online_order && matrix && node.kv_precision == node.precision && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					let sliding = if node.argument[3] < 0.0 { integer_argument(-node.argument[3], "attention window")? } else { 0 };
+					require(sliding == 0 || !online_order, "sliding attention has no online softmax order")?;
+					let attention = if sliding == 0 && !compact && !online_order && matrix && node.kv_precision == node.precision && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (from, channels) = (node.output.elements(), node.output.channels);
@@ -5105,6 +5107,7 @@ impl NativeModelIr {
 						&& self.schedule.shared_values >= extent.k.saturating_mul(2)
 						&& attention == "attention_forward_body"
 						&& blocks == 0
+						&& sliding == 0
 						&& node.argument[2] == 0.0
 						&& pointers.attention_kv.is_some() && attention_value_heads(node) == node.argument[1] as usize;
 					let (tile_m, tile_n) = if self.inference && attention == "attention_forward_body" {
@@ -5121,7 +5124,7 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}, i32 {sliding}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
@@ -5596,6 +5599,8 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = "attention_reverse_body";
+					let reach = if node.argument[3] < 0.0 { integer_argument(-node.argument[3], "attention window")? as usize } else { 0 };
+					require(reach == 0 || node.output.length <= reach, format!("attention sliding window is {reach}, but this graph has {} positions; the reverse pass has no sliding mask", node.output.length))?;
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
@@ -14238,6 +14243,10 @@ impl Block {
 	pub fn width(self, width: usize) -> Self {
 		self.attention("width", |attention| attention.width = width)
 	}
+	/// A sliding window on this `attn` block: each query sees only the last `positions` keys, itself included.
+	pub fn window(self, positions: usize) -> Self {
+		self.attention("window", |attention| attention.window = positions)
+	}
 	/// Equal key and value heads of this `attn` block. Each head serves
 	/// `heads / kv` query heads.
 	pub fn kv(self, heads: usize) -> Self {
@@ -14805,6 +14814,10 @@ impl Model {
 	/// Compatibility spelling for the public attention head-width selector.
 	pub fn width(&self, width: usize) -> Self {
 		self.head(width)
+	}
+	/// A sliding window on the preceding `attn` block: each query sees only the last `positions` keys, itself included.
+	pub fn window(&self, positions: usize) -> Self {
+		self.attention("window", |block| block.window(positions))
 	}
 	/// Key and query heads of the preceding `delta` block, at `width` each. Every
 	/// key head serves `heads / count` value heads.
@@ -18452,6 +18465,8 @@ pub struct AttentionKeys {
 	pub key_length: usize,
 	pub value_length: usize,
 	pub layer_norm_rms_epsilon: f64,
+	/// Positions a sliding layer attends over, or zero where the file names none.
+	pub sliding_window: usize,
 }
 pub struct IndexerKeys {
 	pub head_count: usize,
@@ -18471,6 +18486,8 @@ pub struct SsmKeys {
 }
 pub struct RopeKeys {
 	pub freq_base: f64,
+	/// The base of the sliding layers, the file's `rope.freq_base_swa` or else `freq_base`.
+	pub freq_base_swa: f64,
 	pub dimension_count: usize,
 	pub scaling: RopeScalingKeys,
 }
@@ -18541,9 +18558,11 @@ impl ArchitectureKeys {
 				key_length,
 				value_length: or(count("attention.value_length"), key_length),
 				layer_norm_rms_epsilon: real("attention.layer_norm_rms_epsilon", 0.0),
+				sliding_window: count("attention.sliding_window"),
 			},
 			rope: RopeKeys {
 				freq_base: real("rope.freq_base", 10000.0),
+				freq_base_swa: real("rope.freq_base_swa", real("rope.freq_base", 10000.0)),
 				dimension_count: or(count("rope.dimension_count"), key_length),
 				scaling: RopeScalingKeys {
 					factor: real("rope.scaling.factor", 1.0),
@@ -23041,7 +23060,6 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
 	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, project, window, factors, unscaled, attn_factor } = attention;
 	let ordinary_precision = graph.block_precision;
-	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
 	require(!unscaled || index.is_none(), "unscaled attention and sparse indexing cannot share one block")?;
 	require(heads != 0, "attention head partition is invalid")?;
