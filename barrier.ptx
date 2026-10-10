@@ -1680,18 +1680,20 @@ wait_return:
 	ret;
 }
 
-.visible .func (.param .b32 result) p2p_publish(
+// Local completion tags are independent of the published peer protocol sequence.
+.visible .func (.param .b32 result) p2p_publish_tagged(
 	.param .b64 slots, .param .b64 remote_sequence,
-	.param .b32 sequence, .param .b64 deadline
+	.param .b32 sequence, .param .b32 peer_sequence, .param .b64 deadline
 )
 {
 	.reg .pred p, lane_ready, all_ready, lane_expired, any_expired;
-	.reg .b32 tid, cta, count, value, ok, seq;
+	.reg .b32 tid, cta, count, value, ok, seq, peer_seq;
 	.reg .b64 local, remote, offset, pointer, limit, now;
 	.shared .align 4 .u32 publish_ok;
 	ld.param.u64 local, [slots];
 	ld.param.u64 remote, [remote_sequence];
 	ld.param.u32 seq, [sequence];
+	ld.param.u32 peer_seq, [peer_sequence];
 	ld.param.u64 limit, [deadline];
 	mov.u32 tid, %tid.x;
 	mov.u32 cta, %ctaid.x;
@@ -1733,7 +1735,7 @@ publish_success:
 	setp.ne.u32 p, tid, 0;
 	@p bra publish_join;
 	membar.sys;
-	st.volatile.global.u32 [remote], seq;
+	st.volatile.global.u32 [remote], peer_seq;
 	// Receipt gates the next use; the sequence store needs no trailing fence.
 publish_result:
 	setp.ne.u32 p, tid, 0;
@@ -1744,6 +1746,19 @@ publish_join:
 	ld.shared.u32 ok, [publish_ok];
 	st.param.b32 [result], ok;
 	ret;
+}
+
+.visible .func (.param .b32 result) p2p_publish(
+	.param .b64 slots, .param .b64 remote_sequence,
+	.param .b32 sequence, .param .b64 deadline
+)
+{
+	.reg .b64 s,f,d; .reg .b32 q,r;
+	ld.param.u64 s,[slots]; ld.param.u64 f,[remote_sequence]; ld.param.u32 q,[sequence]; ld.param.u64 d,[deadline];
+	{ .param .u64 a,b,c; .param .u32 x,y,z;
+	st.param.u64 [a],s; st.param.u64 [b],f; st.param.u64 [c],d; st.param.u32 [x],q; st.param.u32 [y],q;
+	call.uni (z),p2p_publish_tagged,(a,b,x,y,c); ld.param.u32 r,[z]; }
+	st.param.u32 [result],r; ret;
 }
 
 // Persistent all-SM packed layer chain. One CTA per SM, 256 threads per CTA.
@@ -2757,7 +2772,9 @@ grid_finish:
 	or.pred p1, p1, p2;
 	setp.gt.u32 p2, r18, 5;
 	or.pred p1, p1, p2;
-	setp.gt.u32 p2, r1, 5;
+	setp.gt.u32 p2, r1, 7;
+	or.pred p1, p1, p2;
+	setp.eq.u32 p2, r1, 6;
 	or.pred p1, p1, p2;
 	@p1 bra send_invalid;
 	mov.u32 r20, 0;
@@ -2965,12 +2982,14 @@ return_loop:
 return_publish:
 	{
 		.param .u64 s, peer, limit;
-		.param .u32 seq, ok;
+		.param .u32 seq, tag, ok;
 		st.param.u64 [s], a2;
 		st.param.u64 [peer], a3;
 		st.param.u64 [limit], a4;
 		st.param.u32 [seq], r0;
-		call.uni (ok), p2p_publish, (s, peer, seq, limit);
+		mad.lo.u32 r8,r0,64,63;
+		st.param.u32 [tag],r8;
+		call.uni (ok), p2p_publish_tagged, (s, peer, tag, seq, limit);
 		ld.param.u32 r8, [ok];
 	}
 	st.param.u32 [result], r8;
