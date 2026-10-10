@@ -1,0 +1,29 @@
+IQ3_XXS production-worker follow-up, 2026-10-10
+Repair source: 3927904e7decb92c12c2bc1410c145b25f248f2d
+Machine: archy. Physical die 1, GPU-ccb8b3a3-f45d-8962-215b-c2b140e4bb28.
+Production expert_split_worker, 16 CTAs x 256 threads, 40960 dynamic shared bytes.
+Real layer-2 IQ3_XXS gate/up (2560 -> 640) and IQ4_NL down (640 -> 2560).
+Three experts, three source columns, 6528000 packed weight bytes.
+
+Per-column selected counts are 3, 2, 3. Expert groups 0/1 use three active columns
+and capacity 4, so they execute separate gate/up. Group 2 has mask 5 and two active
+columns at capacity 2, so it executes fused gate/up with a mask spanning beyond
+its compact capacity. Down therefore covers capacities 4 and 2.
+The production scratch dimensions, padded product planes, and group offsets are unchanged.
+
+Run 12:31:35-12:31:36 PDT. Wrapper exit 0.
+Compute Sanitizer 2021.2.1: ERROR SUMMARY: 0 errors.
+All 16 CTA statuses equal 1; response sequence equals 1.
+All 12288 returned packet words are finite, including padded rows.
+No new NVRM/Xid appears in this interval.
+Context and allocations are released; die 1 returns to 0 MiB used.
+No cap, clock, reset, reboot, or other-die operation occurs.
+
+This closes additional memory-coverage risk for the distinct IQ3 codebook,
+unequal logical CTA counts, mixed fused/separate execution, and sparse mask 5.
+It does not establish stock arithmetic agreement, full-model logits, or throughput.
+No more optional memory checks are queued from this track.
+
+Source and logs remain at archy:/home/nate/codex/cx-fl-kern-build/
+worker-layer-memcheck.c, fixed-worker-source.ptx, fixed-worker-lineinfo.cubin,
+worker-memcheck-iq3.log, worker-memcheck-iq3-output.log, worker-memcheck.state.
