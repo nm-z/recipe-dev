@@ -27,7 +27,71 @@ impl PackedMatvec {
 			}
 			offset += line.len() + 1;
 		}
+		declarations.push_str(".func packed_prepare_tape(.param .b64 x,.param .b64 pk,.param .b64 sc,.param .b32 k,.param .b32 c,.param .b32 a,.param .b32 r,.param .b32 n,.param .b32 stride);\n.func (.param .b32 result) packed_matvec_tape(.param .b32 t,.param .b32 c,.param .b32 a,.param .b32 d,.param .b32 l,.param .b32 z,.param .b64 w,.param .b64 x,.param .b64 s,.param .b64 o,.param .b32 k,.param .b32 m,.param .b32 r,.param .b32 n,.param .b32 stride,.param .b32 relu);\n");
 		declarations
+	}
+	/// Derive single-position tape access from the shipped packed arithmetic.
+	/// Only addresses and the existing optional ReLU change; weight decoding and
+	/// reduction instructions remain the public helper's instructions.
+	fn tape_ptx() -> Result<String> {
+		let source = Self::ptx();
+		let mut result = String::from("\n.shared .align 4 .b8 packed_tape_layout[8];\n");
+		let mut dispatch = String::new();
+		for (name, prepare) in std::iter::once(("packed_prepare".to_owned(), true)).chain([8,12,13,14,17,18,20].into_iter().flat_map(|kind| [256,512].into_iter().map(move |block| {
+			let word = packed_contraction_word(kind,block).expect("packed tape tuple coverage");
+			let (method,lanes) = (word & 255,(word >> 8) & 255);
+			let name = if matches!(kind,12|13) && method == 0 {format!("packed_h_{kind}_1_{}_{lanes}",block/32)} else {format!("packed_g_{kind}_1_{}_{method}_{lanes}",block/32)};
+			(name,false)
+		}))) {
+			let start = source.find(&format!(".func {name}(\n")).ok_or_else(||RecipeError::new(format!("packed tape helper {name} is absent")))?;
+			let body = start + source[start..].find("\n{\n").ok_or_else(||RecipeError::new("packed tape helper has no body"))?;
+			let end = body + source[body..].find("\n}\n").ok_or_else(||RecipeError::new("packed tape helper has no end"))? + 3;
+			let tape = if prepare {"packed_prepare_tape".to_owned()} else {name.replacen("packed_","packed_tape_",1)};
+			let function = source[start..end].replace(&name,&tape);
+			let mut changed = String::new();
+			let mut stores = 0;
+			for line in function.lines() {
+				if prepare && line.trim() == format!(".param .b32 {tape}_param_7") {
+					changed.push_str(&format!("{line},\n\t.param .b32 {tape}_param_8\n")); continue;
+				}
+				changed.push_str(line); changed.push('\n');
+				if line == "{" {
+					changed.push_str("\t.reg .b64 tape_base,tape_offset,tape_address,tape_stride64;\n\t.reg .b32 tape_stride,tape_relu;\n\t.reg .pred tape_clamp;\n\t.reg .f32 tape_value;\n");
+				}
+				if line.trim_start().starts_with("ld.param.u64") && line.contains(&format!("{tape}_param_{}",if prepare {0} else {3})) {
+					changed.push_str(&format!("\tld.param.u64 tape_base,[{tape}_param_{}];\n\tcvta.to.global.u64 tape_base,tape_base;\n",if prepare {0} else {3}));
+					if prepare {changed.push_str(&format!("\tld.param.u32 tape_stride,[{tape}_param_8];\n"));}
+					else {changed.push_str("\tld.shared.u32 tape_stride,[packed_tape_layout];\n\tld.shared.u32 tape_relu,[packed_tape_layout+4];\n\tsetp.ne.u32 tape_clamp,tape_relu,0;\n");}
+					changed.push_str("\tcvt.u64.u32 tape_stride64,tape_stride;\n");
+				}
+				let access = if prepare {"ld.global.f32"} else {"st.global.f32"};
+				if line.trim_start().starts_with(access) {
+					let begin = line.find('[').ok_or_else(||RecipeError::new("packed tape address is absent"))?;
+					let finish = line.find(']').ok_or_else(||RecipeError::new("packed tape address is unterminated"))?;
+					let address = &line[begin+1..finish];
+					let cut = changed.len()-line.len()-1; changed.truncate(cut);
+					changed.push_str(&format!("\tsub.u64 tape_offset,{address},tape_base;\n\tmul.lo.u64 tape_offset,tape_offset,tape_stride64;\n\tadd.u64 tape_address,tape_base,tape_offset;\n"));
+					if prepare {changed.push_str(&line.replace(&format!("[{address}]"),"[tape_address]"));changed.push('\n');}
+					else {
+						let value = line[finish+1..].trim().trim_start_matches(',').trim().trim_end_matches(';');
+						changed.push_str(&format!("\tmov.f32 tape_value,{value};\n\t@tape_clamp max.f32 tape_value,tape_value,0f00000000;\n\tst.global.f32 [tape_address],tape_value;\n"));
+					}
+					stores += 1;
+				}
+			}
+			require(stores==1,format!("packed tape {name} must have exactly one {}",if prepare {"activation read"} else {"output store"}))?;
+			result.push_str(&changed);
+			if !prepare {
+				let fields = name.split('_').collect::<Vec<_>>();
+				let (kind,warps) = (fields[2],fields[4]);
+				let (method,lanes) = if fields[1]=="h" {("0",fields[5])} else {(fields[5],fields[6])};
+				dispatch.push_str(&format!("\tsetp.eq.u32 p,t,{kind};setp.eq.u32 q,block,{};and.pred p,p,q;setp.eq.u32 q,method,{method};and.pred p,p,q;setp.eq.u32 q,lanes,{lanes};and.pred p,p,q;@!p bra tape_next_{};\n\t{{ .param .b64 cw,cx,cs,co; .param .b32 ck,cm,ca,cz,cr,cn; st.param.b64 [cw],w;st.param.b64 [cx],x;st.param.b64 [cs],s;st.param.b64 [co],o;st.param.b32 [ck],k;st.param.b32 [cm],m;st.param.b32 [ca],active;st.param.b32 [cz],mask;st.param.b32 [cr],rank;st.param.b32 [cn],count;call.uni {tape},(cw,cx,cs,co,ck,cm,ca,cz,cr,cn); }}\n\tst.param.b32 [result],1;ret;\ntape_next_{}:\n",warps.parse::<u32>().unwrap()*32,tape,tape));
+			}
+		}
+		result.push_str(".func (.param .b32 result) packed_matvec_tape(.param .b32 at,.param .b32 ac,.param .b32 aa,.param .b32 ad,.param .b32 al,.param .b32 az,.param .b64 aw,.param .b64 ax,.param .b64 as,.param .b64 ao,.param .b32 ak,.param .b32 am,.param .b32 ar,.param .b32 an,.param .b32 astride,.param .b32 arelu)\n{\n\t.reg .b32 t,capacity,active,method,lanes,mask,k,m,rank,count,block,tid,stride,relu;\n\t.reg .b64 w,x,s,o;\n\t.reg .pred p,q;\n\tld.param.u32 t,[at];ld.param.u32 capacity,[ac];ld.param.u32 active,[aa];ld.param.u32 method,[ad];ld.param.u32 lanes,[al];ld.param.u32 mask,[az];ld.param.u64 w,[aw];ld.param.u64 x,[ax];ld.param.u64 s,[as];ld.param.u64 o,[ao];ld.param.u32 k,[ak];ld.param.u32 m,[am];ld.param.u32 rank,[ar];ld.param.u32 count,[an];ld.param.u32 stride,[astride];ld.param.u32 relu,[arelu];mov.u32 block,%ntid.x;mov.u32 tid,%tid.x;\n\tsetp.ne.u32 p,capacity,1;setp.gt.u32 q,active,1;or.pred p,p,q;@p bra tape_rejected;setp.ne.u32 p,mask,0;setp.eq.u32 q,count,0;or.pred p,p,q;setp.ge.u32 q,rank,count;or.pred p,p,q;setp.eq.u32 q,stride,0;or.pred p,p,q;@p bra tape_rejected;setp.eq.u32 p,active,0;@p bra tape_empty;\n\tsetp.eq.u32 p,tid,0;@p st.shared.u32 [packed_tape_layout],stride;@p st.shared.u32 [packed_tape_layout+4],relu;bar.sync 0;\n");
+		result.push_str(&dispatch);
+		result.push_str("tape_rejected:\n\tst.param.b32 [result],0;ret;\ntape_empty:\n\tst.param.b32 [result],1;ret;\n}\n");
+		Ok(result)
 	}
 }
 
@@ -1726,6 +1790,8 @@ pub(crate) struct NativeLayout {
 	/// Only the current invocation occupies device memory; reports live in RAM.
 	pub clocks: Option<usize>,
 	pub packed_scratch: Option<usize>,
+	/// Single-position packed inputs, shared by contractions with the same source.
+	pub packed_inputs: Vec<Option<(usize, usize)>>,
 	pub packed_routes: Option<usize>,
 	/// Output and retained-KV fingerprint planes for reference runs. Each plane
 	/// holds one bounded window; collected observations live in RAM.
@@ -2438,8 +2504,35 @@ impl NativeLayout {
 		let clocks = if inference || tracing() {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 24, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
-		let packed_size = if inference && rows == 1 { graph.nodes.iter().enumerate().filter(|(index, node)| packed_contraction_parts(node, graph.stored.get(*index).and_then(Option::as_ref), packed_weight(graph, *index, true).is_some()).is_some()).map(|(_, node)| packed_contraction_bytes(node,window_shape(node.output,graph.input.length,window_positions).length.min(8).max(1).next_power_of_two())).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0) } else { 0 };
-		let packed_scratch = if packed_size != 0 { Some(context_plan.allocate(&[(packed_size, BufferLifetime::Retained)], 16, 0, false)?) } else { None };
+		let mut packed_workspace = BufferPlan::default();
+		if inference && rows==1 {
+			for (index,node) in graph.nodes.iter().enumerate().filter(|(index,node)|packed_contraction_parts(node,graph.stored.get(*index).and_then(Option::as_ref),packed_weight(graph,*index,true).is_some()).is_some()) {
+				let bytes=packed_contraction_bytes(node,window_shape(node.output,graph.input.length,window_positions).length.min(8).max(1).next_power_of_two())?;
+				packed_workspace.bytes=packed_workspace.bytes.max(bytes);
+				// Reserve each operation's general-path writes even during decode.
+				// A retained prepared input can use only bytes idle for its whole lifetime.
+				packed_workspace.spans.push(BufferSpan {begin:0,end:bytes,first:index,last:Some(index),read_only:false});
+			}
+		}
+		let mut packed_inputs = vec![None; graph.nodes.len()];
+		if packed_workspace.bytes!=0 {
+			let mut consumers = std::collections::BTreeMap::<(i32,usize),Vec<usize>>::new();
+			for (index,node) in graph.nodes.iter().enumerate() {
+				if node.precision != Compute::FP32 || casts[index][0].is_some() || node.source < 0 || node.block_kind=="split_dense"
+					|| packed_contraction_parts(node,graph.stored.get(index).and_then(Option::as_ref),packed_weight(graph,index,true).is_some()).is_none() {continue;}
+				let source = &graph.nodes[node.source as usize];
+				if source.output != node.input {continue;}
+				consumers.entry((node.source,node.input.channels)).or_default().push(index);
+			}
+			for ((_,channels),indices) in consumers.into_iter().filter(|(_,indices)|indices.len()>1) {
+				let first = indices[0]; let last = *indices.last().unwrap();
+				let bytes = checked_add(checked_mul(channels,2,"shared packed pairs")?,channels/4,"shared packed scales")?;
+				let slot = packed_workspace.allocate(&[(bytes,BufferLifetime::Until(last))],16,first,true)?;
+				for index in indices {packed_inputs[index]=Some((slot,first));}
+			}
+		}
+		let packed_scratch = if packed_workspace.bytes!=0 {Some(context_plan.allocate(&[(packed_workspace.bytes,BufferLifetime::Retained)],16,0,false)?)} else {None};
+		if let Some(scratch)=packed_scratch {for (slot,_) in packed_inputs.iter_mut().flatten() {*slot=checked_add(scratch,*slot,"shared packed input offset")?;}}
 		let packed_routes = if inference && rows == 1 { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len(), 20, "packed route records")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let fingerprints = if inference && rows == 1 && ["RECIPE_REFERENCE", "RECIPE_REFERENCE_WRITE"].iter().any(|name| std::env::var_os(name).is_some()) {
 			let bytes = checked_mul(checked_mul(window_positions, graph.nodes.len(), "operation fingerprint count")?, 16, "output and KV fingerprint bytes")?;
@@ -2452,7 +2545,7 @@ impl NativeLayout {
 			context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false).map(Some)
 		}).collect::<Result<Vec<_>>>()?;
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_routes, fingerprints, cache_channel_fingerprints })
+		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_inputs, packed_routes, fingerprints, cache_channel_fingerprints })
 	}
 }
 
@@ -7008,6 +7101,37 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		ir.push_str(&format!("%{name}.counter = getelementptr i8, {pointer} %contexts, i64 {}\ncall void asm sideeffect \"{{ .reg .pred p,q; .reg .b32 old; setp.eq.u32 p,$1,0; setp.ne.u32 q,$2,0; and.pred p,p,q; @p atom.global.add.u32 old,[$0],1; }}\", \"l,r,r,~{{memory}}\"({pointer} %{name}.counter,i32 %tid,i32 {span})\n", offset + index * 20 + field * 4));
 	}
+	fn emit_packed_decode(&self,index: usize,plan: &NodePlan,pointers: &ModelPointers,window: &NodeWindow,scratch: usize,parts: &[PackedContractionPart],words: &[(u64,u64)],ir: &mut String) -> Result<()> {
+		let node = &plan.node;
+		let p = format!("n{index}.packed.decode");
+		let k = node.input.channels;
+		let capacity = node.output.length.min(8).max(1).next_power_of_two();
+		let (pairs,scales,prepare) = if let Some((slot,first))=self.layout.packed_inputs[index] {(slot,slot+k*2,first==index)}
+		else {(scratch+k*capacity*4,scratch+k*capacity*6,true)};
+		ir.push_str(&format!("%{p}.grid = call {{i32,i32,i32}} asm \"mov.u32 $0,%ctaid.x;mov.u32 $1,%nctaid.x;mov.u32 $2,%ntid.x;\",\"=r,=r,=r\"()\n%{p}.rank = extractvalue {{i32,i32,i32}} %{p}.grid,0\n%{p}.count = extractvalue {{i32,i32,i32}} %{p}.grid,1\n%{p}.block = extractvalue {{i32,i32,i32}} %{p}.grid,2\n%{p}.b256 = icmp eq i32 %{p}.block,256\n%{p}.b512 = icmp eq i32 %{p}.block,512\n%{p}.geometry = or i1 %{p}.b256,%{p}.b512\n%{p}.single = icmp eq i32 {span},1\n%{p}.run = and i1 %{p}.single,%{p}.geometry\nbr i1 %{p}.run,label %{p}.entry,label %n{index}.packed.entry\n{p}.entry:\n%{p}.input = getelementptr float,ptr addrspace(1) {source},i32 {begin}\n%{p}.pairs = getelementptr i8,ptr addrspace(1) %contexts,i64 {pairs}\n%{p}.scales = getelementptr i8,ptr addrspace(1) %contexts,i64 {scales}\n",span=window.span,begin=window.begin,source=pointers.source));
+		if prepare {
+			let (function,extra,arguments,constraints) = if node.input.length==1 {("packed_prepare","",String::new(),"l,l,l,r,r,r,r,r,~{memory}")}
+			else {("packed_prepare_tape", ",stride",",i32 ".to_owned()+&node.input.length.to_string(),"l,l,l,r,r,r,r,r,r,~{memory}")};
+			let stride = if node.input.length==1 {String::new()} else {".param .b32 stride;st.param.b32 [stride],$8;".to_owned()};
+			ir.push_str(&format!("call void asm sideeffect \"{{ .param .b64 x,pk,sc; .param .b32 k,c,a,r,n; {stride}st.param.b64 [x],$0;st.param.b64 [pk],$1;st.param.b64 [sc],$2;st.param.b32 [k],$3;st.param.b32 [c],$4;st.param.b32 [a],$5;st.param.b32 [r],$6;st.param.b32 [n],$7;call.uni {function},(x,pk,sc,k,c,a,r,n{extra}); }}\",\"{constraints}\"(ptr addrspace(1) %{p}.input,ptr addrspace(1) %{p}.pairs,ptr addrspace(1) %{p}.scales,i32 {k},i32 1,i32 1,i32 %{p}.rank,i32 %{p}.count{arguments})\n"));
+			ir.push_str(barrier(Backend::Nvidia));
+		}
+		for (part,(desc,(word256,word512))) in parts.iter().zip(words).enumerate() {
+			let q = format!("{p}.part{part}");
+			let (function,extra,arguments,constraints) = if node.output.length==1 && node.argument[1]==0.0 {("packed_matvec","",String::new(),"=r,r,r,r,r,r,r,l,l,l,l,r,r,r,r,~{memory}")}
+			else {("packed_matvec_tape",",stride,relu",format!(",i32 {},i32 {}",node.output.length,usize::from(node.argument[1]==1.0)),"=r,r,r,r,r,r,r,l,l,l,l,r,r,r,r,r,r,~{memory}")};
+			let layout = if extra.is_empty() {""} else {".param .b32 stride,relu;st.param.b32 [stride],$15;st.param.b32 [relu],$16;"};
+			ir.push_str(&format!("%{q}.weights = getelementptr i8,ptr addrspace(1) {weights},i64 {bytes}\n%{q}.position = add i32 {begin},{row}\n%{q}.output = getelementptr float,ptr addrspace(1) {output},i32 %{q}.position\n%{q}.word = select i1 %{p}.b512,i64 {word512},i64 {word256}\n%{q}.tuple = trunc i64 %{q}.word to i32\n%{q}.kind = and i32 %{q}.tuple,255\n%{q}.lanes0 = lshr i32 %{q}.tuple,8\n%{q}.lanes = and i32 %{q}.lanes0,255\n%{q}.ok = call i32 asm sideeffect \"{{ .param .b32 t,c,a,d,l,z,k,m,r,n,ret; .param .b64 w,x,s,o; {layout}st.param.b32 [t],$1;st.param.b32 [c],$2;st.param.b32 [a],$3;st.param.b32 [d],$4;st.param.b32 [l],$5;st.param.b32 [z],$6;st.param.b64 [w],$7;st.param.b64 [x],$8;st.param.b64 [s],$9;st.param.b64 [o],$10;st.param.b32 [k],$11;st.param.b32 [m],$12;st.param.b32 [r],$13;st.param.b32 [n],$14;call.uni (ret),{function},(t,c,a,d,l,z,w,x,s,o,k,m,r,n{extra});ld.param.b32 $0,[ret]; }}\",\"{constraints}\"(i32 {kind},i32 1,i32 1,i32 %{q}.kind,i32 %{q}.lanes,i32 0,ptr addrspace(1) %{q}.weights,ptr addrspace(1) %{p}.pairs,ptr addrspace(1) %{p}.scales,ptr addrspace(1) %{q}.output,i32 {k},i32 {rows},i32 %{p}.rank,i32 %{p}.count{arguments})\n%{q}.accepted = icmp eq i32 %{q}.ok,1\nbr i1 %{q}.accepted,label %{q}.accepted.body,label %{p}.rejected\n{q}.accepted.body:\n",weights=pointers.weights,bytes=desc.bytes,begin=window.begin,row=desc.row*node.output.length,output=pointers.value,kind=desc.kind,rows=desc.rows));
+			self.packed_count(Backend::Nvidia,index,0,&format!("{q}.executed"),"1",ir);
+		}
+		// All row planes write disjoint tape ranges. Completion is required once,
+		// when the next operation can consume them, not between independent planes.
+		ir.push_str(barrier(Backend::Nvidia));
+		ir.push_str(&format!("br label %n{index}.packed.done\n{p}.rejected:\n"));
+		self.packed_count(Backend::Nvidia,index,4,&format!("{p}.failure"),"1",ir);
+		ir.push_str("call void asm sideeffect \"trap;\",\"~{memory}\"()\nunreachable\n");
+		Ok(())
+	}
 	fn emit_packed_contraction(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, direct: &str, ir: &mut String) -> Result<bool> {
 		if backend != Backend::Nvidia || !self.inference || self.rows != 1 { return Ok(false); }
 		let node = &plan.node;
@@ -7027,7 +7151,10 @@ impl NativeModelIr {
 		let scales = checked_mul(slots,6,"packed activation pairs")?;
 		let output = checked_add(scales,slots/4,"packed activation scales")?.next_multiple_of(16);
 		let words = parts.iter().map(|part| Ok((packed_contraction_word(part.kind,256).ok_or_else(||RecipeError::new("packed 256-thread tuple coverage is absent"))?,packed_contraction_word(part.kind,512).ok_or_else(||RecipeError::new("packed 512-thread tuple coverage is absent"))?))).collect::<Result<Vec<_>>>()?;
-		ir.push_str(&format!("br label %{p}.entry\n{p}.entry:\n%{p}.grid = call {{i32,i32,i32}} asm \"mov.u32 $0,%ctaid.x;mov.u32 $1,%nctaid.x;mov.u32 $2,%ntid.x;\",\"=r,=r,=r\"()\n%{p}.rank = extractvalue {{i32,i32,i32}} %{p}.grid,0\n%{p}.count = extractvalue {{i32,i32,i32}} %{p}.grid,1\n%{p}.block = extractvalue {{i32,i32,i32}} %{p}.grid,2\n%{p}.b256 = icmp eq i32 %{p}.block,256\n%{p}.b512 = icmp eq i32 %{p}.block,512\n%{p}.geometry = or i1 %{p}.b256,%{p}.b512\n%{p}.input = getelementptr i8,{pointer} %contexts,i64 {scratch}\n%{p}.pairs = getelementptr i8,{pointer} %{p}.input,i64 {pairs}\n%{p}.scales = getelementptr i8,{pointer} %{p}.input,i64 {scales}\n%{p}.output = getelementptr i8,{pointer} %{p}.input,i64 {output}\nbr i1 %{p}.geometry,label %{p}.loop,label %{p}.direct\n{p}.loop:\n%{p}.off = phi i32 [0,%{p}.entry],[%{p}.next,%{p}.advance]\n%{p}.more = icmp ult i32 %{p}.off,{span}\nbr i1 %{p}.more,label %{p}.chunk,label %{p}.done\n{p}.chunk:\n%{p}.remaining = sub i32 {span},%{p}.off\n%{p}.over8 = icmp ugt i32 %{p}.remaining,8\n%{p}.cols = select i1 %{p}.over8,i32 8,i32 %{p}.remaining\n%{p}.over1 = icmp ugt i32 %{p}.cols,1\n%{p}.over2 = icmp ugt i32 %{p}.cols,2\n%{p}.over4 = icmp ugt i32 %{p}.cols,4\n%{p}.cap2 = select i1 %{p}.over1,i32 2,i32 1\n%{p}.cap4 = select i1 %{p}.over2,i32 4,i32 %{p}.cap2\n%{p}.cap = select i1 %{p}.over4,i32 8,i32 %{p}.cap4\n%{p}.shift2 = select i1 %{p}.over1,i64 16,i64 0\n%{p}.shift4 = select i1 %{p}.over2,i64 32,i64 %{p}.shift2\n%{p}.shift = select i1 %{p}.over4,i64 48,i64 %{p}.shift4\n%{p}.items = mul i32 %{p}.cols,{k}\nbr label %{p}.gather\n{p}.gather:\n%{p}.at = phi i32 [%tid,%{p}.chunk],[%{p}.at.next,%{p}.gather.body]\n%{p}.at.more = icmp ult i32 %{p}.at,%{p}.items\nbr i1 %{p}.at.more,label %{p}.gather.body,label %{p}.gather.done\n{p}.gather.body:\n%{p}.column = udiv i32 %{p}.at,{k}\n%{p}.channel = urem i32 %{p}.at,{k}\n%{p}.position0 = add i32 {begin},%{p}.off\n%{p}.position = add i32 %{p}.position0,%{p}.column\n%{p}.channel.base = mul i32 %{p}.channel,{in_length}\n%{p}.source.index = add i32 %{p}.channel.base,%{p}.position\n%{p}.source.ptr = getelementptr {ty},{pointer} {source},i32 %{p}.source.index\n%{p}.raw = load {ty},{pointer} %{p}.source.ptr,align {align}\n%{p}.f32 = call float @recipe.to.f32{v}({ty} %{p}.raw)\n%{p}.input.ptr = getelementptr float,{pointer} %{p}.input,i32 %{p}.at\nstore float %{p}.f32,{pointer} %{p}.input.ptr,align 4\n%{p}.at.next = add i32 %{p}.at,%threads\nbr label %{p}.gather\n{p}.gather.done:\n",span=window.span,begin=window.begin,in_length=node.input.length,source=pointers.source,align=alignment(ty)));
+		let decode = ty=="float";
+		if decode {self.emit_packed_decode(index,plan,pointers,window,scratch,&parts,&words,ir)?;}
+		let entry = if decode {String::new()} else {format!("br label %{p}.entry\n")};
+		ir.push_str(&format!("{entry}{p}.entry:\n%{p}.grid = call {{i32,i32,i32}} asm \"mov.u32 $0,%ctaid.x;mov.u32 $1,%nctaid.x;mov.u32 $2,%ntid.x;\",\"=r,=r,=r\"()\n%{p}.rank = extractvalue {{i32,i32,i32}} %{p}.grid,0\n%{p}.count = extractvalue {{i32,i32,i32}} %{p}.grid,1\n%{p}.block = extractvalue {{i32,i32,i32}} %{p}.grid,2\n%{p}.b256 = icmp eq i32 %{p}.block,256\n%{p}.b512 = icmp eq i32 %{p}.block,512\n%{p}.geometry = or i1 %{p}.b256,%{p}.b512\n%{p}.input = getelementptr i8,{pointer} %contexts,i64 {scratch}\n%{p}.pairs = getelementptr i8,{pointer} %{p}.input,i64 {pairs}\n%{p}.scales = getelementptr i8,{pointer} %{p}.input,i64 {scales}\n%{p}.output = getelementptr i8,{pointer} %{p}.input,i64 {output}\nbr i1 %{p}.geometry,label %{p}.loop,label %{p}.direct\n{p}.loop:\n%{p}.off = phi i32 [0,%{p}.entry],[%{p}.next,%{p}.advance]\n%{p}.more = icmp ult i32 %{p}.off,{span}\nbr i1 %{p}.more,label %{p}.chunk,label %{p}.done\n{p}.chunk:\n%{p}.remaining = sub i32 {span},%{p}.off\n%{p}.over8 = icmp ugt i32 %{p}.remaining,8\n%{p}.cols = select i1 %{p}.over8,i32 8,i32 %{p}.remaining\n%{p}.over1 = icmp ugt i32 %{p}.cols,1\n%{p}.over2 = icmp ugt i32 %{p}.cols,2\n%{p}.over4 = icmp ugt i32 %{p}.cols,4\n%{p}.cap2 = select i1 %{p}.over1,i32 2,i32 1\n%{p}.cap4 = select i1 %{p}.over2,i32 4,i32 %{p}.cap2\n%{p}.cap = select i1 %{p}.over4,i32 8,i32 %{p}.cap4\n%{p}.shift2 = select i1 %{p}.over1,i64 16,i64 0\n%{p}.shift4 = select i1 %{p}.over2,i64 32,i64 %{p}.shift2\n%{p}.shift = select i1 %{p}.over4,i64 48,i64 %{p}.shift4\n%{p}.items = mul i32 %{p}.cols,{k}\nbr label %{p}.gather\n{p}.gather:\n%{p}.at = phi i32 [%tid,%{p}.chunk],[%{p}.at.next,%{p}.gather.body]\n%{p}.at.more = icmp ult i32 %{p}.at,%{p}.items\nbr i1 %{p}.at.more,label %{p}.gather.body,label %{p}.gather.done\n{p}.gather.body:\n%{p}.column = udiv i32 %{p}.at,{k}\n%{p}.channel = urem i32 %{p}.at,{k}\n%{p}.position0 = add i32 {begin},%{p}.off\n%{p}.position = add i32 %{p}.position0,%{p}.column\n%{p}.channel.base = mul i32 %{p}.channel,{in_length}\n%{p}.source.index = add i32 %{p}.channel.base,%{p}.position\n%{p}.source.ptr = getelementptr {ty},{pointer} {source},i32 %{p}.source.index\n%{p}.raw = load {ty},{pointer} %{p}.source.ptr,align {align}\n%{p}.f32 = call float @recipe.to.f32{v}({ty} %{p}.raw)\n%{p}.input.ptr = getelementptr float,{pointer} %{p}.input,i32 %{p}.at\nstore float %{p}.f32,{pointer} %{p}.input.ptr,align 4\n%{p}.at.next = add i32 %{p}.at,%threads\nbr label %{p}.gather\n{p}.gather.done:\n",span=window.span,begin=window.begin,in_length=node.input.length,source=pointers.source,align=alignment(ty)));
 		ir.push_str(barrier(backend));
 		ir.push_str(&format!("call void asm sideeffect \"{{ .param .b64 x,pk,sc; .param .b32 k,c,a,r,n; st.param.b64 [x],$0;st.param.b64 [pk],$1;st.param.b64 [sc],$2;st.param.b32 [k],$3;st.param.b32 [c],$4;st.param.b32 [a],$5;st.param.b32 [r],$6;st.param.b32 [n],$7;call.uni packed_prepare,(x,pk,sc,k,c,a,r,n); }}\",\"l,l,l,r,r,r,r,r,~{{memory}}\"({pointer} %{p}.input,{pointer} %{p}.pairs,{pointer} %{p}.scales,i32 {k},i32 %{p}.cap,i32 %{p}.cols,i32 %{p}.rank,i32 %{p}.count)\n"));
 		ir.push_str(barrier(backend));
@@ -8512,6 +8639,8 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	let local_p2p = local_p2p_functions();
+	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
+	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
 	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]); }
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	for part in parts {
@@ -8899,6 +9028,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(&local_p2p_functions());
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
+			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
 			let entries = ptx_source.lines().filter_map(|line| {
 				let words = line.split_whitespace().collect::<Vec<_>>();
