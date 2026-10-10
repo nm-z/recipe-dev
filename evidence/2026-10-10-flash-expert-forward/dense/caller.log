@@ -1,0 +1,68 @@
+[1m[33mwarning[0m: Cargo.toml: unused manifest key: encoding
+[1m[33mwarning[0m: Cargo.toml: unused manifest key: precision
+[1m[33mwarning[0m: Cargo.toml: unused manifest key: storage
+[1m[33mwarning[0m: `recipe` (manifest) generated 3 warnings
+[1m[92m   Compiling[0m recipe v0.1.0 (/home/nate/work/cx-fl-dense)
+[1m[33mwarning[0m[1m: method `name` is never used[0m
+     [1m[94m--> [0mrecipe.rs:13109:5
+      [1m[94m|[0m
+[1m[94m13104[0m [1m[94m|[0m impl ActivationStep {
+      [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m13109[0m [1m[94m|[0m     fn name(self) -> &'static str {
+      [1m[94m|[0m        [1m[33m^^^^[0m
+      [1m[94m|[0m
+      [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: method `name` is never used[0m
+     [1m[94m--> [0mrecipe.rs:15279:11
+      [1m[94m|[0m
+[1m[94m15278[0m [1m[94m|[0m impl BlockNormalization {
+      [1m[94m|[0m [1m[94m-----------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m15279[0m [1m[94m|[0m     const fn name(self) -> &'static str {
+      [1m[94m|[0m              [1m[33m^^^^[0m
+
+[1m[33mwarning[0m[1m: fields `blocks` and `tensors` are never read[0m
+     [1m[94m--> [0mrecipe.rs:16079:2
+      [1m[94m|[0m
+[1m[94m16075[0m [1m[94m|[0m pub struct Bound {
+      [1m[94m|[0m            [1m[94m-----[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m16079[0m [1m[94m|[0m     blocks: usize,
+      [1m[94m|[0m     [1m[33m^^^^^^[0m
+[1m[94m16080[0m [1m[94m|[0m     tensors: usize,
+      [1m[94m|[0m     [1m[33m^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `sequence` is never read[0m
+     [1m[94m--> [0mrecipe.rs:19391:2
+      [1m[94m|[0m
+[1m[94m19379[0m [1m[94m|[0m struct ExpertExecution {
+      [1m[94m|[0m        [1m[94m---------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m19391[0m [1m[94m|[0m     sequence: usize,
+      [1m[94m|[0m     [1m[33m^^^^^^^^[0m
+
+[1m[33mwarning[0m[1m: field `spill` is never read[0m
+     [1m[94m--> [0mrecipe.rs:19750:2
+      [1m[94m|[0m
+[1m[94m19747[0m [1m[94m|[0m pub struct ExpertSplitWeights {
+      [1m[94m|[0m            [1m[94m------------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m19750[0m [1m[94m|[0m     spill: Option<ExpertPinned>,
+      [1m[94m|[0m     [1m[33m^^^^^[0m
+
+[1m[33mwarning[0m[1m: function `contains_moe` is never used[0m
+     [1m[94m--> [0mrecipe.rs:22247:4
+      [1m[94m|[0m
+[1m[94m22247[0m [1m[94m|[0m fn contains_moe(block: &Block) -> bool {
+      [1m[94m|[0m    [1m[33m^^^^^^^^^^^^[0m
+
+[1m[33mwarning[0m: `recipe` (lib test) generated 6 warnings
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 8.47s
+[1m[92m     Running[0m unittests recipe.rs (target/debug/deps/recipe-110acabb436be8f4)
+
+running 1 test
+dense native caller artifact: /home/nate/.cache/recipe/native/recipe-native-e7ccea25da8f65f2/artifact.cubin
+test split_forward_checks::dense_dispatch_uses_external_weights_and_compiles_native_caller ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 6.70s

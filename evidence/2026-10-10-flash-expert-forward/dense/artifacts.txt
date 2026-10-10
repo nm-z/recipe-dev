@@ -1,0 +1,27 @@
+   193: 0000000000000000  4480 FUNC    LOCAL  DEFAULT  260 split_dense_layer
+   194: 0000000000000000     0 SECTION LOCAL  DEFAULT  260 .text.split_dense_layer
+   203: 0000000000000000     0 SECTION LOCAL  DEFAULT  269 .text.expert_split_worker
+   204: 0000000000000000     0 SECTION LOCAL  DEFAULT  271 .nv.shared.expert_split_worker
+   215: 0000000000000000     0 SECTION LOCAL  DEFAULT  162 .nv.constant0.expert_split_worker
+   216: 0000000000000000     0 SECTION LOCAL  DEFAULT  163 .nv.constant2.expert_split_worker
+   226: 0000000000000000   640 FUNC    GLOBAL DEFAULT [<other>: 10]   269 expert_split_worker
+   197: 0000000000000000  5504 FUNC    LOCAL  DEFAULT  276 split_main_forward
+   198: 0000000000000000     0 SECTION LOCAL  DEFAULT  276 .text.split_main_forward
+   211: 0000000000000000     0 SECTION LOCAL  DEFAULT  288 .text.expert_split_worker
+   212: 0000000000000000     0 SECTION LOCAL  DEFAULT  291 .nv.shared.expert_split_worker
+   213: 0000000000000000     0 SECTION LOCAL  DEFAULT  289 .text.recipe_model_forward
+   214: 0000000000000000     0 SECTION LOCAL  DEFAULT  292 .nv.shared.recipe_model_forward
+   228: 0000000000000000     0 SECTION LOCAL  DEFAULT  174 .nv.constant0.expert_split_worker
+   229: 0000000000000000     0 SECTION LOCAL  DEFAULT  175 .nv.constant0.recipe_model_forward
+   230: 0000000000000000     0 SECTION LOCAL  DEFAULT  176 .nv.constant2.recipe_model_forward
+   231: 0000000000000000     0 SECTION LOCAL  DEFAULT  177 .nv.constant2.expert_split_worker
+   243: 0000000000000000   640 FUNC    GLOBAL DEFAULT [<other>: 10]   288 expert_split_worker
+   244: 0000000000000000   448 FUNC    GLOBAL DEFAULT [<other>: 10]   289 recipe_model_forward
+e9bc3e394aca371f470a023a72e865e4d3154c26324c82a0907066bf71cb7182  /home/nate/work/cx-fl-dense/recipe.rs
+271cee2af2fbb590aa02f5bd1795f313fe78c709408ac8063d68dfd10da2c8a0  /home/nate/work/cx-fl-dense/packed.ptx
+ba05e064ffb107079e7b04704fd2a095ebd0d8e53e6fd41bd624efc1c79f4ab6  /home/nate/work/cx-fl-dense/barrier.ptx
+381951469f9f34fa0c49a265a01028f03a83b4dfb911e749e846f7ca7370d5b4  /home/nate/work/cx-fl-dense/target/release/librecipe.rlib
+8c938f57c0cf9abaaa24471b93a3f5fea8b64c98bf9ad70ab25a51feb06b27c3  /home/nate/work/cx-fl-dense/target/release/recipe
+f8341ce7e8be933bb3e262337ed7c9f5b488d772b769f08cf129e7e78dd9cd13  /home/nate/codex/cx-fl-dense-build/worker.ptx
+72138ca142619e450082091e9c9ddbf781195d04167f119a7f01fd6fdb8cdffb  /home/nate/codex/cx-fl-dense-build/worker.cubin
+3571368e92a0712c4c359806fabe528f26264670d0de2f34314ebc32e21b8162  /home/nate/.cache/recipe/native/recipe-native-e7ccea25da8f65f2/artifact.cubin
