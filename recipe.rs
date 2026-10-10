@@ -17714,6 +17714,7 @@ impl Infer {
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history: Vec<Arc<InferenceRequest>> = Vec::new();
+		let mut reply_limit = self.tokens;
 		loop {
 			let start_progress = |started| {
 				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
@@ -17743,23 +17744,41 @@ impl Infer {
 				}
 				if line.trim() == "/report" || line.trim().starts_with("/report ") {
 					use std::fmt::Write as _;
-					let mut text = String::from("request\tinput\toutput\tcached\tprefill_seconds\tgeneration_seconds\ttok_per_second\tmtp_drafted\tmtp_accepted\tmtp_verify_seconds\tmtp_step_seconds\n");
+					let mut text = String::from("request\tinput\toutput\tcached\tprefill_seconds\tgeneration_seconds\ttok_per_second\tmtp_drafted\tmtp_accepted\tmtp_verify_seconds\tmtp_step_seconds\tmtp_draft_seconds\n");
 					for (index, request) in request_history.iter().enumerate() {
 						let rate = if request.tg_seconds > 0.0 { request.out as f64 / request.tg_seconds } else { 0.0 };
-						writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{rate}\t{}\t{}\t{}\t{}", request.input, request.out, request.cached, request.pp_seconds,
-							request.tg_seconds, request.mtp.drafted, request.mtp.accepted, request.mtp.verify_seconds, request.mtp.step_seconds)?;
+						writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{rate}\t{}\t{}\t{}\t{}\t{}", request.input, request.out, request.cached, request.pp_seconds,
+							request.tg_seconds, request.mtp.drafted, request.mtp.accepted, request.mtp.verify_seconds, request.mtp.step_seconds, request.mtp.draft_seconds)?;
 					}
-					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\n");
+					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\tselected_experts\tweight_bytes\n");
 					for (index, request) in request_history.iter().enumerate() {
 						for operation in &request.operations {
-							writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block,
+							writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block,
 								operation.node, operation.operation, operation.begin, operation.end, operation.positions, operation.ticks,
-								operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()))?;
+								operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()), operation.selected_experts, operation.weight_bytes)?;
 						}
 					}
 					if let Some(path) = line.trim().strip_prefix("/report ") {
 						if let Err(error) = fs::write(path, text) { eprintln!("cannot write inference report {path}: {error}"); }
 					} else { eprint!("{text}"); }
+					continue;
+				}
+				if let Some(value) = line.trim().strip_prefix("/reply ") {
+					match value.parse::<usize>() {
+						Ok(limit) => reply_limit = Some(limit),
+						Err(_) => eprintln!("reply limit must be a nonnegative integer"),
+					}
+					continue;
+				}
+				if let Some(path) = line.trim().strip_prefix("/dump_ids ") {
+					if let Some(request) = request_history.last() {
+						use std::fmt::Write as _;
+						let mut text = String::from("kind\tposition\ttoken_id\n");
+						for (kind, ids) in [("input", &request.input_ids), ("output", &request.output_ids)] {
+							for (position, id) in ids.iter().enumerate() { writeln!(text, "{kind}\t{position}\t{id}")?; }
+						}
+						if let Err(error) = fs::write(path, text) { eprintln!("cannot write token IDs {path}: {error}"); }
+					} else { eprintln!("no completed inference request"); }
 					continue;
 				}
 				if let Some(path) = line.trim().strip_prefix("/dump_logits ") {
@@ -17813,7 +17832,7 @@ impl Infer {
 			}
 			require(prompt.len() < sequence, format!("{} prompt tokens leave no reply positions in {sequence} context positions", prompt.len()))?;
 			let available = sequence - prompt.len();
-			let budget = self.tokens.map_or(available, |limit| limit.min(available));
+			let budget = reply_limit.map_or(available, |limit| limit.min(available));
 			let show_reply = self.chat.is_some() || self.log.iter().any(|metric| metric.0 == chat.0);
 			let streaming = show_reply;
 			let framed = progress.as_ref().is_some_and(InferenceLive::renders_reply);
@@ -19174,6 +19193,10 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	let main = device(Some("nv4"))?;
 	let (target_graph,head_graph)=expert_graphs(bound,head.as_ref(),positions,checkpoints,observations,main)?;
 	let precision=Config::load()?.precision;
+	// Validate and compile both native forwards before uploading resident weights.
+	// The later tapes reuse these artifacts with the same graph layout.
+	drop(main.native_program(&target_graph,1,precision,None,false)?);
+	if let Some(graph)=&head_graph {drop(main.native_program(graph,1,precision,None,false)?);}
 	let head_file=head.as_ref().map(|head|&head.bound.file);
 	let (reserve,native_bytes,requests)=expert_main_reserve(&target_graph,head_graph.as_ref(),&bound.file,head_file,precision)?;
 	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:32<<20};8];
@@ -19292,11 +19315,7 @@ impl ExpertExecution {
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|layer.gate.shape[..2]==[2560,640] && layer.up.shape[..2]==[2560,640] && layer.down.shape[..2]==[640,2560]),"expert worker dimensions differ from the real Flash-Next 2560/640 matrices")?;
-		let weights = ExpertSplitWeights::load(plan, target, head, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
 		let main = device(Some("nv4"))?;
-		let control = Buffer::zeroed(main, 128)?;
-		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
-		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
 		let source = Self::worker_source();
 		let key = native_artifact_key(&main.native_target, &source)?;
 		let directory = native_artifact_directory(&key)?;
@@ -19313,6 +19332,10 @@ impl ExpertExecution {
 			fs::write(directory.join("assembly.txt"),diagnostic).map_err(|error| RecipeError::new(format!("expert assembly receipt: {error}")))?;
 		}
 		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
+		let weights = ExpertSplitWeights::load(plan, target, head, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
+		let control = Buffer::zeroed(main, 128)?;
+		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
+		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
 		let main_sync=PeerPacket::new("nv4")?;
 		control.write_bytes(32,&native_words(&[main_sync.completion_address(),main_sync.sequence_address()+4]))?;
 		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_LOG").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
