@@ -19710,9 +19710,26 @@ impl ExpertExecution {
 	fn finish(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<Vec<OperationReport>> {
 		let phases=(end-begin).div_ceil(capacity) as usize*layers;
 		let mut observations=Vec::new();
+		let status=self.control.download_range::<u32>(6,2)?;
+		let mut receipts=Vec::new();
 		for worker in &self.workers {
 			worker.gpu.synchronize()?;
 			let reports=worker.reports.download_range::<u32>(0,phases*32)?;
+			receipts.push((worker,reports));
+		}
+		if status[0]!=0 || receipts.iter().any(|(_,reports)|reports.chunks_exact(32).any(|report|report[16..32].iter().any(|status|*status!=1))) {
+			let control=self.control.download::<u8>(self.control.bytes)?;
+			let path=self.pick_path.with_extension("failure-control.bin");
+			if let Err(error)=fs::write(&path,&control) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
+			for (worker,reports) in &receipts {
+				let path=self.pick_path.with_extension(format!("failure-die{}.bin",worker.die));
+				let bytes=reports.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+				if let Err(error)=fs::write(&path,&bytes) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
+			}
+			if let Err(error)=self.export_picks() {eprintln!("cannot export expert picks after failure: {error}");}
+		}
+		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}; worker receipts use {}",status[0],status[1],self.pick_path.display()))?;
+		for (worker,reports) in receipts {
 			for (phase,report) in reports.chunks_exact(32).enumerate() {
 				for (cta,status) in report[16..32].iter().enumerate() {
 					require(*status==1,format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16]))?;
@@ -19727,9 +19744,6 @@ impl ExpertExecution {
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 			}
 		}
-		let status=self.control.download_range::<u32>(24,2)?;
-		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}",status[0],status[1]))?;
-
 		Ok(observations)
 	}
 	fn export_picks(&self)->Result<()> {
