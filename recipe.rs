@@ -8511,7 +8511,8 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
-	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes()]); }
+	let local_p2p = local_p2p_functions();
+	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]); }
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
@@ -8895,6 +8896,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
+			ptx_source.push_str(&local_p2p_functions());
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
@@ -19215,6 +19217,12 @@ pub fn p2p_functions() -> &'static str {
 	let end = source[start..].find("// Persistent all-SM packed layer chain.").expect("owned P2P function boundary") + start;
 	&source[start..end]
 }
+// Internal completion addresses belong to the executing die. Peer publication
+// retains the system fences in the original owned functions.
+fn local_p2p_functions() -> String {
+	p2p_functions().lines().filter(|line| !line.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+		.replace("p2p_wait", "split_local_wait").replace("p2p_publish", "split_local_publish").replace("membar.sys", "membar.gl")
+}
 /// A receiving die's resident peer packet and local CTA completion slots.
 /// Allocate alongside the weight holder and retain across tokens. Before reuse
 /// or destruction, finish both dies' previous token. Sequence zero means empty.
@@ -19581,7 +19589,7 @@ impl ExpertExecution {
 		Ok(())
 	}
 	fn worker_source() -> String {
-		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}", p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
+		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
@@ -35004,11 +35012,11 @@ fn expert_forward_functions() -> &'static str { r#"
 	ld.param.u64 s,[s0]; ld.param.u64 f,[f0]; ld.param.u32 q,[q0]; ld.param.u64 d,[d0];
 	{ .param .u64 a,b,c; .param .u32 x,y;
 	st.param.u64 [a],s; st.param.u64 [b],f; st.param.u64 [c],d; st.param.u32 [x],q;
-	call.uni (y),p2p_publish,(a,b,x,c); ld.param.u32 r,[y]; }
+	call.uni (y),split_local_publish,(a,b,x,c); ld.param.u32 r,[y]; }
 	setp.eq.u32 failed,r,0; @failed bra grid_done;
 	{ .param .u64 address,deadline; .param .u32 sequence,receipt;
 	st.param.u64 [address],f; st.param.u64 [deadline],d; st.param.u32 [sequence],q;
-	call.uni (receipt),p2p_wait,(address,sequence,deadline); ld.param.u32 r,[receipt]; }
+	call.uni (receipt),split_local_wait,(address,sequence,deadline); ld.param.u32 r,[receipt]; }
 grid_done:
 	st.param.u32 [result],r; ret;
 }
