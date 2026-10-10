@@ -1,0 +1,50 @@
+Packed forward wiring compilation receipt, 2026-10-10
+Assigned base: a35d0b93
+Compatibility base: 381b10ee666db7b8ff843e42a19da177610f4c32
+Machine: archy
+Checkout: /home/nate/codex/cx-fl-kern-wiring
+No GPU context, model upload, dispatch, or resident-process mutation occurs in this verification.
+
+CARGO_BUILD_JOBS=3 cargo check --lib: exit 0 (5 existing warnings)
+CARGO_BUILD_JOBS=3 cargo build --release --lib: exit 0.
+Final source Cargo check --lib: exit 0.
+Final source release build: exit 0 in 1m 41s.
+
+Worker emission uses the existing public recipe::expert_worker_ptx() export through
+/home/nate/codex/flash-1092-evidence/emit-worker.rs and the release library.
+The final two guards change ordinary-path Rust eligibility, not emitted worker PTX.
+
+/opt/cuda-11.4/bin/ptxas -c -arch=sm_52 -O1 -v: exit 0
+/opt/cuda-11.4/bin/nvlink -arch=sm_52 --kernels-used expert_split_worker -v: exit 0
+PTX version: 7.4
+Linked expert_split_worker resources: 252 registers, 504 stack bytes,
+16 static shared bytes, 420 cmem[2] bytes, 0 local bytes.
+Dynamic shared requirement: 40960 bytes.
+Module globals: 1087632 bytes.
+split_route_count: 0 stack bytes, 0 spill stores, 0 spill loads.
+split_expert_layer: 312 stack bytes, 284 spill stores, 284 spill loads at -O1.
+split_dense_layer: 184 stack bytes, 156 spill stores, 156 spill loads at -O1.
+These caller spills remain an open performance defect; the linked 0 local bytes
+field does not establish a spill-free caller.
+
+Worker call counters occupy existing report bytes 32 through 51 in each 128-byte record.
+They reset in the executing kernel before the existing completion barrier.
+Only tid.x=0 in logical row-group rank 0 increments a helper receipt.
+Successful packed matvec or fused gate/up contributes one packed_calls receipt.
+Preparation is not counted as a matvec call. BF16/F32 dense calls increment direct_format.
+Rejected packed receipts increment packed_rejected. Existing status checks remain authoritative.
+
+SHA256 recipe.rs: 488a1580eedfcde46d7e1d1001ec6ed9fe937e67ae33b1bb00b6a67d22e807f9
+SHA256 packed.ptx: 3d2fee071b70b2adde89b557cb64d11243a0702b93387c02b40df707e038b527
+SHA256 worker PTX: 13c810dfa5c28aa29ef109380cb1eb273f5b2fbe10858291207d53d26d0a1624
+
+Open acceptance:
+The new ordinary Contraction LLVM string emission is not yet exercised by a native model compilation.
+No new GPU arithmetic, forward-call count, model tok/s, or final-logit acceptance is claimed.
+Resident owner 3302363 still uses source 381b10ee. New ordinary-path context offsets and
+Rust report fields require the updated executable and its startup layout.
+IQ performance gates and PR #1097 draft status remain unchanged.
+
+Full logs and artifacts: archy:/home/nate/codex/cx-fl-kern-build/
+check-wiring-final.log, build-wiring-final.log, wiring-worker.ptx,
+wiring-worker-assembly.log, wiring-worker-link.log, wiring-worker.cubin.
