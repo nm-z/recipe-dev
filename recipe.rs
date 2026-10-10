@@ -19220,7 +19220,7 @@ fn split_working_reserve(target:&Graph,head:Option<&Graph>)->usize {
 	let positions=target.input.length.max(head.map_or(0,|graph|graph.input.length));
 	let reports=positions*jobs.len()*128;
 	// Include modules, peer packets, main descriptors, counters, and synchronization storage.
-	(32<<20).max(scratch+tables+reports+jobs.len()*(192+112+6*48+512*4)+(8<<20))
+	(128<<20).max(scratch+tables+reports+jobs.len()*(192+112+6*48+512*4)+(8<<20))
 }
 fn expert_main_reserve(target:&Graph,head:Option<&Graph>,target_file:&Gguf,head_file:Option<&Gguf>,precision:Compute)->Result<(usize,usize,usize)> {
 	let native=part_bytes(target,precision)?+head.map(|graph|part_bytes(graph,precision)).transpose()?.unwrap_or(0);
@@ -19278,6 +19278,8 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 			Some(MtpRuntime {head,lookup,lookup_enabled,placed,samples:Vec::new(),hidden:Vec::new(),hidden_released:0,ids:Vec::new(),logits:Vec::new(),sequence:positions,head_valid:0,poisoned:false})
 		}, _=>None,
 	};
+	// Every workspace, descriptor, module, and target/head tape exists before the bulk upload.
+	execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.weights.upload(&bound.file,runtime.as_ref().map(|runtime|&runtime.head.bound.file))?;
 	Ok((target,runtime))
 }
 
@@ -19484,7 +19486,7 @@ impl ExpertExecution {
 			fs::write(directory.join("assembly.txt"),diagnostic).map_err(|error| RecipeError::new(format!("expert assembly receipt: {error}")))?;
 		}
 		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
-		let weights = ExpertSplitWeights::load(plan, target, head, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
+		let weights = ExpertSplitWeights::prepare(plan, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
 		let control = Buffer::zeroed(main, 128)?;
 		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
 		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
@@ -19823,7 +19825,12 @@ pub struct ExpertSplitWeights {
 impl ExpertSplitWeights {
 	/// Names use physical Archy ordinal order. Dies 2 and 6 have no context or buffer.
 	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
-	pub fn load(mut plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str; 8]) -> Result<Self> {
+	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str;8]) -> Result<Self> {
+		let value=Self::prepare(plan,names)?;
+		value.upload(target,head)?;
+		Ok(value)
+	}
+	fn prepare(mut plan: ExpertSplitPlan, names: [&str; 8]) -> Result<Self> {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
 		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
 		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
@@ -19848,27 +19855,6 @@ impl ExpertSplitWeights {
 		}
 		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
 		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
-		// Read each shard in file order while preserving every assigned destination.
-		let mut uploads=plan.placements.iter().filter(|item|item.expert.is_some() || item.row_start.is_some()).collect::<Vec<_>>();
-		uploads.sort_by_key(|item|(item.mtp,item.tensor.shard,item.tensor.offset,item.die));
-		let upload_started=Instant::now(); let mut upload_reported=upload_started; let mut uploaded=0usize;
-		for item in uploads {
-			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
-			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
-			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
-			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
-			if item.spilled {
-				let spill=spill.as_ref().expect("spill allocation is present");
-				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
-			} else {buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
-			uploaded=checked_add(uploaded,tensor.bytes,"uploaded packed weight bytes")?;
-			let now=Instant::now();
-			if now.duration_since(upload_reported).as_secs_f64()>=1.0 {
-				println!("resident weights {} bytes  rate {:.4} GB/s",uploaded,uploaded as f64/now.duration_since(upload_started).as_secs_f64()/1e9);
-				upload_reported=now;
-			}
-		}
-		println!("resident weights {} bytes  average rate {:.4} GB/s",uploaded,uploaded as f64/upload_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
 		let response_table = Buffer::reserve(main, 6 * 16)?;
 		let mut bindings=std::collections::HashMap::new();
 		for item in plan.placements.iter().filter(|item|item.expert.is_some()) {
@@ -19908,6 +19894,30 @@ impl ExpertSplitWeights {
 		let table: Vec<u8> = value.responses.iter().flat_map(|packet| [packet.address(), packet.sequence_address()].into_iter().flat_map(u64::to_ne_bytes)).collect();
 		value.response_table.write_bytes(0, &table)?;
 		Ok(value)
+	}
+	fn upload(&self,target:&Gguf,head:Option<&Gguf>)->Result<()> {
+		// Read each shard in file order while preserving every assigned destination.
+		let mut uploads=self.plan.placements.iter().filter(|item|item.expert.is_some() || item.row_start.is_some()).collect::<Vec<_>>();
+		uploads.sort_by_key(|item|(item.mtp,item.tensor.shard,item.tensor.offset,item.die));
+		let upload_started=Instant::now(); let mut upload_reported=upload_started; let mut uploaded=0usize;
+		for item in uploads {
+			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
+			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
+			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
+			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
+			if item.spilled {
+				let spill=self.spill.as_ref().expect("spill allocation is present");
+				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
+			} else {self.buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
+			uploaded=checked_add(uploaded,tensor.bytes,"uploaded packed weight bytes")?;
+			let now=Instant::now();
+			if now.duration_since(upload_reported).as_secs_f64()>=1.0 {
+				println!("resident weights {} bytes  rate {:.4} GB/s",uploaded,uploaded as f64/now.duration_since(upload_started).as_secs_f64()/1e9);
+				upload_reported=now;
+			}
+		}
+		println!("resident weights {} bytes  average rate {:.4} GB/s",uploaded,uploaded as f64/upload_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
+		Ok(())
 	}
 	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
 	pub fn weight_address(&self, mtp: bool, name: &str, expert: Option<u32>) -> Option<(usize, u64, usize, u32)> {
