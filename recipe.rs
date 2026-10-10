@@ -19518,7 +19518,7 @@ impl ExpertExecution {
 			}
 			let channels=Buffer::upload(main,&channels)?;
 			let local=value.workers.iter().find(|worker|worker.die==4).unwrap();
-			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.mtp,layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
+			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
 			let fields=[value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
 			let mut record=native_words(&fields);
 			for dimension in [layer.global as u32,value.workers.len() as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
@@ -19783,7 +19783,7 @@ pub struct ExpertSplitWeights {
 	requests: Vec<PeerPacket>,
 	responses: Vec<PeerPacket>,
 	routes: Vec<Buffer>,
-	owners: Vec<((bool,usize), Buffer)>,
+	owners: Vec<(usize, Buffer)>,
 	response_table: Buffer,
 }
 impl ExpertSplitWeights {
@@ -19842,7 +19842,7 @@ impl ExpertSplitWeights {
 			if item.tensor.name.ends_with("ffn_up_exps.weight") {
 				let layer = item.tensor.name.split('.').nth(1).and_then(|number| number.parse::<usize>().ok()).expect("validated expert block index");
 				let expert = item.expert.expect("validated expert slice") as usize;
-				let entries = layers.entry((item.mtp,layer)).or_insert_with(Vec::new);
+				let entries = layers.entry(layer).or_insert_with(Vec::new);
 				if entries.len() <= expert { entries.resize(expert + 1, u32::MAX); }
 				entries[expert] = item.die as u32;
 			}
@@ -19874,8 +19874,8 @@ impl ExpertSplitWeights {
 	pub fn channel(&self, index: usize) -> Option<(&PeerPacket, &PeerPacket, u64)> {
 		Some((self.requests.get(index)?, self.responses.get(index)?, self.routes.get(index)?.pointer))
 	}
-	pub fn owner_address(&self, mtp:bool, layer: usize) -> Option<(u64, usize)> {
-		self.owners.iter().find(|(index, _)| *index == (mtp,layer)).map(|(_, buffer)| (buffer.pointer, buffer.bytes / 4))
+	pub fn owner_address(&self, layer: usize) -> Option<(u64, usize)> {
+		self.owners.iter().find(|(index, _)| *index == layer).map(|(_, buffer)| (buffer.pointer, buffer.bytes / 4))
 	}
 	/// Main-die resident `{payload, sequence_address}` records for split_combine.
 	pub fn response_table_address(&self) -> u64 { self.response_table.pointer }
