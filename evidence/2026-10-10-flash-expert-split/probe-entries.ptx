@@ -1,0 +1,259 @@
+
+.visible .entry split_probe_main(
+	.param .u64 hidden, .param .u64 selected, .param .u64 coefficients,
+	.param .u64 owners, .param .u64 request, .param .u64 route,
+	.param .u64 slots, .param .u64 request_sequence, .param .u64 response_table,
+	.param .u64 output, .param .u64 report, .param .u32 base,
+	.param .u32 layers, .param .u32 in_rows, .param .u32 positions,
+	.param .u32 packet_rows
+) {
+	.reg .pred p<8>;
+	.reg .b32 r<32>;
+	.reg .b64 a<32>;
+	.reg .f32 f<8>;
+	ld.param.u64 a0, [hidden];
+	ld.param.u64 a1, [selected];
+	ld.param.u64 a2, [coefficients];
+	ld.param.u64 a3, [owners];
+	ld.param.u64 a4, [request];
+	ld.param.u64 a5, [route];
+	add.u64 a6, a5, 512;
+	ld.param.u64 a7, [slots];
+	ld.param.u64 a8, [request_sequence];
+	ld.param.u64 a9, [response_table];
+	ld.param.u64 a10, [output];
+	ld.param.u64 a11, [report];
+	ld.param.u32 r0, [base];
+	ld.param.u32 r1, [layers];
+	ld.param.u32 r2, [in_rows];
+	ld.param.u32 r3, [positions];
+	ld.param.u32 r4, [packet_rows];
+	mov.u32 r5, %tid.x;
+	mov.u32 r6, %ctaid.x;
+	mov.u32 r7, %ntid.x;
+	mov.u32 r8, %nctaid.x;
+	or.b32 r9, r5, r6;
+	setp.eq.u32 p0, r9, 0;
+	mov.u64 a12, %globaltimer;
+	@p0 st.global.u64 [a11], a12;
+	mov.u32 r10, 0;
+	mov.u32 r11, 0;
+main_layer:
+	add.u32 r12, r0, r10;
+	add.u32 r12, r12, 1;
+	mov.u64 a13, %globaltimer;
+	add.u64 a13, a13, 1000000000;
+	{
+		.param .u64 x, sel, coef, own, req, rec, routing, slot, flag, limit;
+		.param .u32 seq, die, experts, top, rows, pos, stride, ok;
+		st.param.u64 [x], a0;
+		st.param.u64 [sel], a1;
+		st.param.u64 [coef], a2;
+		st.param.u64 [own], a3;
+		st.param.u64 [req], a4;
+		st.param.u64 [rec], a5;
+		st.param.u64 [routing], a6;
+		st.param.u64 [slot], a7;
+		st.param.u64 [flag], a8;
+		st.param.u64 [limit], a13;
+		st.param.u32 [seq], r12;
+		mov.u32 r13, 1;
+		st.param.u32 [die], r13;
+		mov.u32 r13, 512;
+		st.param.u32 [experts], r13;
+		mov.u32 r13, 10;
+		st.param.u32 [top], r13;
+		st.param.u32 [rows], r2;
+		st.param.u32 [pos], r3;
+		st.param.u32 [stride], r4;
+		call.uni (ok), split_send, (x, sel, coef, own, req, rec, routing, slot, flag, seq, limit, die, experts, top, rows, pos, stride);
+		ld.param.u32 r13, [ok];
+	}
+	setp.eq.u32 p1, r13, 0;
+	@p1 bra main_failed;
+	{
+		.param .u64 table, out, limit;
+		.param .u32 seq, rows, workers, pos, stride, ok;
+		st.param.u64 [table], a9;
+		st.param.u64 [out], a10;
+		st.param.u64 [limit], a13;
+		st.param.u32 [seq], r12;
+		st.param.u32 [rows], r2;
+		mov.u32 r13, 1;
+		st.param.u32 [workers], r13;
+		st.param.u32 [pos], r3;
+		st.param.u32 [stride], r4;
+		call.uni (ok), split_combine, (table, out, seq, limit, rows, workers, pos, stride);
+		ld.param.u32 r13, [ok];
+	}
+	setp.eq.u32 p1, r13, 0;
+	@p1 bra main_failed;
+	// Check every output row at every layer, independently of the worker helper.
+	mad.lo.u32 r14, r6, r7, r5;
+	mul.lo.u32 r15, r7, r8;
+	mul.lo.u32 r16, r2, r3;
+main_check:
+	setp.ge.u32 p1, r14, r16;
+	@p1 bra main_checked;
+	div.u32 r17, r14, r2;
+	mul.wide.u32 a14, r17, 44;
+	add.u64 a15, a1, a14;
+	ld.global.cg.u32 r18, [a15];
+	mov.f32 f0, 0f00000000;
+	mov.u32 r19, 0;
+main_coefficient:
+	setp.ge.u32 p1, r19, r18;
+	@p1 bra main_expected;
+	mad.lo.u32 r20, r17, 10, r19;
+	mul.wide.u32 a16, r20, 4;
+	add.u64 a17, a2, a16;
+	ld.global.cg.f32 f1, [a17];
+	add.rn.f32 f0, f0, f1;
+	add.u32 r19, r19, 1;
+	bra main_coefficient;
+main_expected:
+	mul.wide.u32 a18, r14, 4;
+	add.u64 a19, a0, a18;
+	add.u64 a20, a10, a18;
+	ld.global.cg.f32 f2, [a19];
+	ld.global.cg.f32 f3, [a20];
+	mul.rn.f32 f4, f0, f2;
+	sub.rn.f32 f5, f3, f4;
+	abs.f32 f5, f5;
+	setp.gt.f32 p1, f5, 0f38d1b717;
+	setp.nan.f32 p2, f3, f3;
+	or.pred p1, p1, p2;
+	@p1 mov.u32 r11, 1;
+	add.u32 r14, r14, r15;
+	bra main_check;
+main_checked:
+	add.u32 r10, r10, 1;
+	setp.lt.u32 p1, r10, r1;
+	@p1 bra main_layer;
+	bra main_done;
+main_failed:
+	mov.u32 r11, 2;
+main_done:
+	mov.u64 a12, %globaltimer;
+	@p0 st.global.u64 [a11+8], a12;
+	mad.lo.u32 r14, r6, r7, r5;
+	mul.wide.u32 a21, r14, 4;
+	add.u64 a22, a11, a21;
+	st.global.u32 [a22+16], r11;
+	ret;
+}
+
+.visible .entry split_probe_worker(
+	.param .u64 request, .param .u64 request_sequence, .param .u64 route,
+	.param .u64 partial, .param .u64 response, .param .u64 response_sequence,
+	.param .u64 in_slots, .param .u32 base, .param .u32 layers,
+	.param .u32 in_rows, .param .u32 positions, .param .u32 packet_rows
+) {
+	.reg .pred p<8>;
+	.reg .b32 r<24>;
+	.reg .b64 a<24>;
+	ld.param.u64 a0, [request];
+	ld.param.u64 a1, [request_sequence];
+	ld.param.u64 a2, [route];
+	ld.param.u64 a3, [partial];
+	ld.param.u64 a4, [response];
+	ld.param.u64 a5, [response_sequence];
+	ld.param.u64 a6, [in_slots];
+	ld.param.u32 r0, [base];
+	ld.param.u32 r1, [layers];
+	ld.param.u32 r2, [in_rows];
+	ld.param.u32 r3, [positions];
+	ld.param.u32 r4, [packet_rows];
+	add.u64 a7, a1, 4;
+	mov.u32 r5, 0;
+worker_layer:
+	add.u32 r6, r0, r5;
+	add.u32 r6, r6, 1;
+	mov.u64 a8, %globaltimer;
+	add.u64 a8, a8, 1000000000;
+	{
+		.param .u64 flag, limit;
+		.param .u32 seq, ok;
+		st.param.u64 [flag], a1;
+		st.param.u64 [limit], a8;
+		st.param.u32 [seq], r6;
+		call.uni (ok), p2p_wait, (flag, seq, limit);
+		ld.param.u32 r7, [ok];
+	}
+	setp.eq.u32 p0, r7, 0;
+	@p0 ret;
+	mov.u32 r8, 0;
+worker_position:
+	mul.lo.u32 r9, r8, r2;
+	mul.wide.u32 a9, r9, 4;
+	add.u64 a10, a3, a9;
+	mul.lo.u32 r9, r8, r4;
+	mul.wide.u32 a11, r9, 4;
+	add.u64 a12, a0, a11;
+	mul.wide.u32 a13, r8, 40;
+	add.u64 a14, a2, a13;
+	add.u64 a14, a14, 512;
+	mul.wide.u32 a15, r8, 44;
+	add.u64 a16, a2, a15;
+	ld.volatile.global.u32 r10, [a16];
+	mov.u32 r11, 0;
+	mov.u32 r12, 0;
+worker_accumulate:
+	{
+		.param .u64 down, coef, out;
+		.param .u32 slot, rows, mode;
+		st.param.u64 [down], a12;
+		st.param.u64 [coef], a14;
+		st.param.u64 [out], a10;
+		st.param.u32 [slot], r11;
+		st.param.u32 [rows], r2;
+		st.param.u32 [mode], r12;
+		call.uni split_accumulate, (down, coef, out, slot, rows, mode);
+	}
+	setp.eq.u32 p0, r12, 0;
+	@p0 bra worker_cleared;
+	add.u32 r11, r11, 1;
+worker_cleared:
+	mov.u32 r12, 1;
+	setp.lt.u32 p0, r11, r10;
+	@p0 bra worker_accumulate;
+	add.u32 r8, r8, 1;
+	setp.lt.u32 p0, r8, r3;
+	@p0 bra worker_position;
+	// Local completion before a differently-strided response copy reads partials.
+	mul.lo.u32 r13, r6, 2;
+	{
+		.param .u64 slots, flag, limit;
+		.param .u32 seq, ok;
+		st.param.u64 [slots], a6;
+		st.param.u64 [flag], a7;
+		st.param.u64 [limit], a8;
+		st.param.u32 [seq], r13;
+		call.uni (ok), p2p_publish, (slots, flag, seq, limit);
+		call.uni (ok), p2p_wait, (flag, seq, limit);
+		ld.param.u32 r7, [ok];
+	}
+	setp.eq.u32 p0, r7, 0;
+	@p0 ret;
+	{
+		.param .u64 in, out, slots, flag, limit;
+		.param .u32 seq, rows, pos, stride, ok;
+		st.param.u64 [in], a3;
+		st.param.u64 [out], a4;
+		st.param.u64 [slots], a6;
+		st.param.u64 [flag], a5;
+		st.param.u64 [limit], a8;
+		st.param.u32 [seq], r6;
+		st.param.u32 [rows], r2;
+		st.param.u32 [pos], r3;
+		st.param.u32 [stride], r4;
+		call.uni (ok), split_return, (in, out, slots, flag, seq, limit, rows, pos, stride);
+		ld.param.u32 r7, [ok];
+	}
+	setp.eq.u32 p0, r7, 0;
+	@p0 ret;
+	add.u32 r5, r5, 1;
+	setp.lt.u32 p0, r5, r1;
+	@p0 bra worker_layer;
+	ret;
+}

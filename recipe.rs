@@ -20528,6 +20528,7 @@ pub struct ExpertSplitWeights {
 	responses: Vec<PeerPacket>,
 	routes: Vec<Buffer>,
 	owners: Vec<(usize, Buffer)>,
+	response_table: Buffer,
 }
 impl ExpertSplitWeights {
 	/// Names are local CUDA ordinal names for physical dies 0..5 in this order.
@@ -20562,7 +20563,8 @@ impl ExpertSplitWeights {
 			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
 			buffers[item.die].write_bytes(item.offset, model.data(&tensor))?;
 		}
-		let mut value = Self { plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new() };
+		let response_table = Buffer::reserve(main, 5 * 16)?;
+		let mut value = Self { plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
 		let mut layers = std::collections::BTreeMap::new();
 		for item in &value.plan.placements {
 			if !item.mtp && item.tensor.name.ends_with("ffn_up_exps.weight") {
@@ -20587,6 +20589,8 @@ impl ExpertSplitWeights {
 			value.responses.push(response);
 			value.routes.push(Buffer::zeroed(devices[die], 1024)?);
 		}
+		let table: Vec<u8> = value.responses.iter().flat_map(|packet| [packet.address(), packet.sequence_address()].into_iter().flat_map(u64::to_ne_bytes)).collect();
+		value.response_table.write_bytes(0, &table)?;
 		Ok(value)
 	}
 	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
@@ -20603,6 +20607,8 @@ impl ExpertSplitWeights {
 	pub fn owner_address(&self, layer: usize) -> Option<(u64, usize)> {
 		self.owners.iter().find(|(index, _)| *index == layer).map(|(_, buffer)| (buffer.pointer, buffer.bytes / 4))
 	}
+	/// Main-die resident `{payload, sequence_address}` records for split_combine.
+	pub fn response_table_address(&self) -> u64 { self.response_table.pointer }
 	/// Reserve the same checked sequence range on both ends before queuing a token.
 	pub fn reserve_sequences(&mut self, layers: u32) -> Result<u32> {
 		require(layers != 0 && self.requests.iter().chain(&self.responses).all(|packet| packet.sequence.checked_add(layers).is_some()), "expert split sequence exhausted")?;

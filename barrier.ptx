@@ -2850,48 +2850,74 @@ send_invalid:
 	ret;
 }
 
-// mode 0 clears the worker sum without reading down or coefficients.
-// mode 1 adds one expert's down vector, using its compact routed slot coefficient.
-// The caller completes its grid barrier before each call that consumes down.
-.visible .func split_accumulate(
-	.param .u64 down, .param .u64 coefficients, .param .u64 partial,
-	.param .u32 slot, .param .u32 rows, .param .u32 mode
+// Expert CTAs write distinct [position, compact_selected_slot, row] planes.
+// After the caller's grid barrier, reduce those planes once on the worker die.
+// This supports one CTA per expert and one packed read for its active positions.
+.visible .func (.param .u32 result) split_local_combine(
+	.param .u64 records, .param .u64 coefficients, .param .u64 expert_outputs,
+	.param .u64 partial, .param .u32 top_k, .param .u32 rows,
+	.param .u32 positions
 ) {
 	.reg .pred p<4>;
-	.reg .b32 r<10>;
-	.reg .b64 a<10>;
+	.reg .b32 r<24>;
+	.reg .b64 a<16>;
 	.reg .f32 f<5>;
-	ld.param.u64 a0, [down];
+	ld.param.u64 a0, [records];
 	ld.param.u64 a1, [coefficients];
-	ld.param.u64 a2, [partial];
-	ld.param.u32 r0, [slot];
+	ld.param.u64 a2, [expert_outputs];
+	ld.param.u64 a3, [partial];
+	ld.param.u32 r0, [top_k];
 	ld.param.u32 r1, [rows];
-	ld.param.u32 r2, [mode];
+	ld.param.u32 r2, [positions];
 	mov.u32 r3, %tid.x;
 	mov.u32 r4, %ctaid.x;
 	mov.u32 r5, %ntid.x;
 	mov.u32 r6, %nctaid.x;
 	mad.lo.u32 r7, r4, r5, r3;
 	mul.lo.u32 r8, r5, r6;
-	setp.ne.u32 p0, r2, 0;
-	mul.wide.u32 a3, r0, 4;
-	add.u64 a4, a1, a3;
-	@p0 ld.volatile.global.f32 f0, [a4];
-accumulate_loop:
-	setp.ge.u32 p1, r7, r1;
-	@p1 ret;
-	mul.wide.u32 a5, r7, 4;
-	add.u64 a6, a2, a5;
-	mov.f32 f1, 0f00000000;
-	@!p0 bra accumulate_store;
-	add.u64 a7, a0, a5;
-	ld.global.cg.f32 f2, [a7];
-	ld.global.cg.f32 f3, [a6];
-	fma.rn.f32 f1, f2, f0, f3;
-accumulate_store:
-	st.global.f32 [a6], f1;
+	mul.lo.u32 r9, r1, r2;
+local_row:
+	setp.ge.u32 p0, r7, r9;
+	@p0 bra local_done;
+	div.u32 r10, r7, r1;
+	rem.u32 r11, r7, r1;
+	add.u32 r12, r0, 1;
+	mul.lo.u32 r12, r12, r10;
+	mul.wide.u32 a4, r12, 4;
+	add.u64 a5, a0, a4;
+	ld.volatile.global.u32 r13, [a5];
+	setp.gt.u32 p0, r13, r0;
+	@p0 bra local_invalid;
+	mov.f32 f0, 0f00000000;
+	mov.u32 r14, 0;
+local_slot:
+	setp.ge.u32 p0, r14, r13;
+	@p0 bra local_store;
+	mad.lo.u32 r15, r10, r0, r14;
+	mul.wide.u32 a6, r15, 4;
+	add.u64 a7, a1, a6;
+	ld.volatile.global.f32 f1, [a7];
+	mad.lo.u32 r16, r15, r1, r11;
+	mul.wide.u32 a8, r16, 4;
+	add.u64 a9, a2, a8;
+	ld.global.cg.f32 f2, [a9];
+	fma.rn.f32 f0, f1, f2, f0;
+	add.u32 r14, r14, 1;
+	bra local_slot;
+local_store:
+	mul.wide.u32 a10, r7, 4;
+	add.u64 a11, a3, a10;
+	st.global.f32 [a11], f0;
 	add.u32 r7, r7, r8;
-	bra accumulate_loop;
+	bra local_row;
+local_done:
+	mov.u32 r17, 1;
+	st.param.u32 [result], r17;
+	ret;
+local_invalid:
+	mov.u32 r17, 0;
+	st.param.u32 [result], r17;
+	ret;
 }
 
 .visible .func (.param .u32 result) split_return(
