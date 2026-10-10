@@ -215,7 +215,79 @@ template<int T,int N,int NW,int LW,bool MAGIC,bool DICT>static __device__ __forc
 		if(l==0&&row<m&&c<active)out[c*m+row]=acc[c];
 	}
 }
-#define G(T,N,W,L,K) extern "C" __device__ __noinline__ void packed_g_##T##_##N##_##W##_##K##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32<T,N,W,L,(K==1),(K==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+template<int T,int N,bool DICT>static __device__ __forceinline__ void decode32_fast(const uint8_t *row,int b,u32 (&w)[16],float &d,float &s0,float &s1,float &mn,const int *,const u32 *,int warp_lut){
+	const uint8_t *p=row+size_t(b)*18;d=half_at(p);s0=s1=1;mn=0;
+	#pragma unroll
+	for(int j=0;j<8;j++){u32 q=__ldg((const uint16_t*)(p+2+2*j));int a=__shfl_sync(0xffffffff,warp_lut,q&15),b=__shfl_sync(0xffffffff,warp_lut,(q>>8)&15),c=__shfl_sync(0xffffffff,warp_lut,(q>>4)&15),e=__shfl_sync(0xffffffff,warp_lut,q>>12);w[j]=__byte_perm(a,b,0x5410);w[j+8]=__byte_perm(c,e,0x5410);}
+}
+template<int T,int N,int NW,int LW,bool MAGIC,bool DICT>static __device__ __forceinline__ void group32_fast(const uint8_t *W,const u32 *x,const float2 *ds,float *out,int k,int m,int row_base,int active,u32 position_mask,u32 cta_count,u32 *scratch,int warp_lut){
+	constexpr int NT=NW*32,TU=LW,YS=20,NY=(TU*4+NT-1)/NT;
+	u32 (*ys)[2][TU*YS]=(u32 (*)[2][TU*YS])scratch;
+	float2 (*dss)[2][TU]=(float2 (*)[2][TU])(scratch+N*2*TU*YS);
+	int *table=(int*)((float2*)dss+N*2*TU);
+	int tid=threadIdx.x,l=tid&(LW-1),row=row_base+(tid/LW)*cta_count,nb=k/32,nt=(nb+TU-1)/TU;
+	int source[N];
+	#pragma unroll
+	for(int c=0;c<N;c++){u32 mask=position_mask;for(int j=0;j<c;j++)mask&=mask-1;source[c]=c>=active?-1:position_mask?__ffs(mask)-1:c;}
+	if constexpr(T==20&&!DICT){if(tid<16)table[tid]=kvalues_iq4nl[tid];__syncthreads();}
+	const uint8_t *rp=W+(size_t)(row<m?row:0)*(k/Format<T>::block)*Format<T>::bytes;
+	uint4 yr[N][NY];float2 dr[N];
+	#pragma unroll
+	for(int c=0;c<N;c++){
+		#pragma unroll
+		for(int i=0;i<NY;i++){int ii=tid+i*NT;yr[c][i]=make_uint4(0,0,0,0);if(source[c]>=0&&ii<TU*4&&ii<nb*4)yr[c][i]=__ldg((const uint4*)x+source[c]*nb*4+ii);if(ii<TU*4)store_shared4(&ys[c][0][(ii/4)*YS+(ii%4)*4],yr[c][i]);}
+		dr[c]=make_float2(0,0);if(source[c]>=0&&tid<TU&&tid<nb)dr[c]=__ldg(ds+source[c]*nb+tid);if(tid<TU)store_shared2(&dss[c][0][tid],dr[c]);
+	}
+	__syncthreads();float acc[N]={};
+	for(int tile=0;tile<nt;tile++){
+		int buf=tile&1;
+		if(tile+1<nt){
+			#pragma unroll
+			for(int c=0;c<N;c++){
+				#pragma unroll
+				for(int i=0;i<NY;i++){int ii=tid+i*NT;yr[c][i]=make_uint4(0,0,0,0);if(source[c]>=0&&ii<TU*4&&(tile+1)*TU*4+ii<nb*4)yr[c][i]=__ldg((const uint4*)x+source[c]*nb*4+(tile+1)*TU*4+ii);}
+				dr[c]=make_float2(0,0);if(source[c]>=0&&tid<TU&&(tile+1)*TU+tid<nb)dr[c]=__ldg(ds+source[c]*nb+(tile+1)*TU+tid);
+			}
+		}
+		u32 w[16];float d,s0,s1,mn;int b=tile*TU+l;
+		if(row<m||(T==20&&DICT))decode32_fast<T,N,DICT>(rp,b<nb?b:0,w,d,s0,s1,mn,table,scratch,warp_lut);
+		#pragma unroll
+		for(int c=0;c<N;c++){
+			if(c>=active||row>=m)continue;
+			const u32 *xp=&ys[c][buf][l*YS];float z0,z1;
+			if constexpr(!MAGIC){int a0=0,a1=0;
+				#pragma unroll
+				for(int h=0;h<2;h++){uint4 a=load_shared4(xp+4*h),b=load_shared4(xp+8+4*h);u32 x0[4]={a.x,a.y,a.z,a.w},x1[4]={b.x,b.y,b.z,b.w};
+					#pragma unroll
+					for(int j=0;j<4;j++){a0=mad2(w[h*4+j],x0[j],a0);a1=mad2(w[h*4+j+8],x1[j],a1);}}
+				z0=a0;z1=a1;
+			}else{float a0=0,a1=0,b0=0,b1=0;
+				#pragma unroll
+				for(int h=0;h<2;h++){uint4 a=load_shared4(xp+4*h),b=load_shared4(xp+8+4*h);u32 x0[4]={a.x,a.y,a.z,a.w},x1[4]={b.x,b.y,b.z,b.w};
+					#pragma unroll
+					for(int j=0;j<4;j++){int v=h*4+j;a0=fmaf(magic((int16_t)w[v]),float((int16_t)x0[j]),a0);b0=fmaf(magic((int16_t)(w[v]>>16)),float((int16_t)(x0[j]>>16)),b0);a1=fmaf(magic((int16_t)w[v+8]),float((int16_t)x1[j]),a1);b1=fmaf(magic((int16_t)(w[v+8]>>16)),float((int16_t)(x1[j]>>16)),b1);}}
+				z0=a0+b0;z1=a1+b1;
+			}
+			float2 scale=load_shared2(&dss[c][buf][l]);acc[c]+=fmaf(d*scale.x,fmaf(s0,z0,s1*z1),-mn*scale.y);
+		}
+		if(tile+1<nt){
+			#pragma unroll
+			for(int c=0;c<N;c++){
+				#pragma unroll
+				for(int i=0;i<NY;i++){int ii=tid+i*NT;if(ii<TU*4)store_shared4(&ys[c][buf^1][(ii/4)*YS+(ii%4)*4],yr[c][i]);}
+				if(tid<TU)store_shared2(&dss[c][buf^1][tid],dr[c]);
+			}
+		}
+		__syncthreads();
+	}
+	#pragma unroll
+	for(int c=0;c<N;c++){
+		#pragma unroll
+		for(int j=LW/2;j;j>>=1)acc[c]+=__shfl_xor_sync(0xffffffff,acc[c],j);
+		if(l==0&&row<m&&c<active)out[c*m+row]=acc[c];
+	}
+}
+#define G(T,N,W,L,K) extern "C" __device__ __noinline__ void packed_g_##T##_##N##_##W##_##K##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(T==20&&K==2&&N<=2&&L==8&&(W==8||W==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32_fast<T,N,W,L,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32<T,N,W,L,(K==1),(K==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
 #define GK(T,N,W,L) G(T,N,W,L,0) G(T,N,W,L,1)
 #define GW(T,N,L) GK(T,N,2,L) GK(T,N,4,L) GK(T,N,8,L) GK(T,N,16,L)
 #define GN(T,N) GW(T,N,8) GW(T,N,16)
@@ -423,6 +495,26 @@ template<int T,int N,int NW,int LW>static __device__ __forceinline__ void fused_
 #define FUSED(T,N,W,L) extern "C" __device__ __noinline__ u32 packed_gate_up_##T##_##N##_##W##_##L(const uint8_t *g,const uint8_t *u,const u32 *x,const float2 *ds,float *out,int active,u32 mask,u32 index,u32 count){extern __shared__ __align__(16) u32 scratch[];if(active<0||active>N||!count||index>=count||(mask&&__popc(mask)!=active))return 0;if(active==0)return 1;fused_pair<T,N,W,L>(g,u,x,ds,out,2560,640,active,mask,index,count,scratch);return 1;}
 #define FUSEDN(T,N) FUSED(T,N,8,8) FUSED(T,N,8,16) FUSED(T,N,16,8) FUSED(T,N,16,16)
 FUSEDN(17,1) FUSEDN(17,2) FUSEDN(18,1) FUSEDN(18,2)
+extern "C" __device__ __noinline__ u32 packed_gate_up(int type,int capacity,int active,int lanes,u32 mask,const uint8_t *gate,const uint8_t *up,const u32 *x,const float2 *ds,float *product,int k,int m,u32 rank,u32 count){
+	if(k!=2560||m!=640)return 0;
+	if(blockDim.x==256&&lanes==16){
+		if(type==17&&capacity==1)return packed_gate_up_17_1_8_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==2)return packed_gate_up_17_2_8_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==1)return packed_gate_up_18_1_8_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==2)return packed_gate_up_18_2_8_16(gate,up,x,ds,product,active,mask,rank,count);
+	}
+	if(blockDim.x==512){
+		if(type==17&&capacity==1&&lanes==8)return packed_gate_up_17_1_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==1&&lanes==16)return packed_gate_up_17_1_16_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==2&&lanes==8)return packed_gate_up_17_2_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==17&&capacity==2&&lanes==16)return packed_gate_up_17_2_16_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==1&&lanes==8)return packed_gate_up_18_1_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==1&&lanes==16)return packed_gate_up_18_1_16_16(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==2&&lanes==8)return packed_gate_up_18_2_16_8(gate,up,x,ds,product,active,mask,rank,count);
+		if(type==18&&capacity==2&&lanes==16)return packed_gate_up_18_2_16_16(gate,up,x,ds,product,active,mask,rank,count);
+	}
+	return 0;
+}
 extern "C" __device__ __noinline__ u32 packed_matvec_wide(int type,int capacity,int active,int kind,int lanes,u32 position_mask,const uint8_t *W,const u32 *x,const float2 *ds,float *out,int k,int m,u32 cta_index,u32 cta_count,u32 *scratch){
 	if(!valid_packed(type,capacity,active,kind,lanes,position_mask,k,m,cta_index,cta_count,scratch))return 0;
 	if(blockDim.x!=1024||capacity>2)return 0;
@@ -1429,3 +1521,4 @@ PAIR_PROBE(17,1,8,8) PAIR_PROBE(17,1,8,16) PAIR_PROBE(17,1,16,8) PAIR_PROBE(17,1
 PAIR_PROBE(17,2,8,8) PAIR_PROBE(17,2,8,16) PAIR_PROBE(17,2,16,8) PAIR_PROBE(17,2,16,16)
 PAIR_PROBE(18,1,8,8) PAIR_PROBE(18,1,8,16) PAIR_PROBE(18,1,16,8) PAIR_PROBE(18,1,16,16)
 PAIR_PROBE(18,2,8,8) PAIR_PROBE(18,2,8,16) PAIR_PROBE(18,2,16,8) PAIR_PROBE(18,2,16,16)
+extern "C" __global__ void __launch_bounds__(512,1) packed_gate_up_probe(const uint8_t *gate,const uint8_t *up,const u32 *x,const float2 *ds,float *product,int type,int capacity,int active,int lanes,u32 mask,int k,int m,u32 *status){u32 ok=packed_gate_up(type,capacity,active,lanes,mask,gate,up,x,ds,product,k,m,blockIdx.x,gridDim.x);if(threadIdx.x==0)status[blockIdx.x]=ok;}
