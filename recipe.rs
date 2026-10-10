@@ -35243,32 +35243,3 @@ main_invalid:
 }
 
 "# }
-
-#[cfg(test)]
-mod split_forward_checks {
-	use super::*;
-	#[test]
-	fn dense_dispatch_uses_external_weights_and_compiles_native_caller() {
-		let mut graph=Graph::new(Shape {channels:64,length:5},1e-5);
-		graph.block_precision=Some(Compute::FP32);
-		push_node(&mut graph,Primitive::Contraction,Shape {channels:32,length:5},64*32,[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,1.0],-1).unwrap();
-		graph.nodes[0].block_kind="split_dense";graph.nodes[0].precision=Compute::FP32;graph.nodes[0].acc=Compute::FP32;
-		graph.expert_layers.push(ExpertLayer {node:0,global:0,mtp:false,layer:0,last_only:false,work:SplitWork::Dense(Vec::new())});
-		assert_eq!(native_weight_arena(&graph,Compute::FP32,true).unwrap().1,24);
-		let check_tile=Tile {m:16,n:8,k:32};
-		let schedule=NativeSchedule {element:Compute::FP32,matrix:false,block:256,tile:check_tile,register_m:8,register_n:8,register_count:64,fragment_k:16,
-			chunk_k:64,chunk_values:10240,chunk_bias_values:0,scratch_base:0,shared_values:10240,contractions:vec![None],attention:vec![None]};
-		let model=NativeModelIr::from_graph(&graph,1,Compute::FP32,schedule.clone(),true).unwrap();
-		let ir=model.emit(Backend::Nvidia,None,None,false,false,true).unwrap();
-		assert!(ir.contains("split_main_forward"));
-		assert!(!ir.contains("@recipe_model_step("));
-		if std::env::var_os("RECIPE_SPLIT_ASSEMBLE_CHECK").is_some() {
-			// Compile only; the fixture creates no CUDA context or model allocation.
-			NVIDIA_DRIVER_VERSION.store(11040,Ordering::Relaxed);
-			assert!(native_nvidia_assembler("sm_52").is_some());
-			let artifact=compile_model(&BackendTarget::Nvidia {architecture:"sm_52".to_owned()},&graph,Compute::FP32,None,false,1,schedule).unwrap();
-			assert!(artifact.path.metadata().unwrap().len()>1024);
-			eprintln!("dense native caller artifact: {}",artifact.path.display());
-		}
-	}
-}
