@@ -34991,11 +34991,16 @@ pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source() }
 fn expert_forward_functions() -> &'static str { r#"
 // Real forward glue. Every local completion stage has a distinct sequence.
 .func (.param .u32 result) split_grid(.param .u64 s0,.param .u64 f0,.param .u32 q0,.param .u64 d0) {
-	.reg .b64 s,f,d; .reg .b32 q,r;
+	.reg .b64 s,f,d; .reg .b32 q,r; .reg .pred failed;
 	ld.param.u64 s,[s0]; ld.param.u64 f,[f0]; ld.param.u32 q,[q0]; ld.param.u64 d,[d0];
 	{ .param .u64 a,b,c; .param .u32 x,y;
 	st.param.u64 [a],s; st.param.u64 [b],f; st.param.u64 [c],d; st.param.u32 [x],q;
-	call.uni (y),p2p_publish,(a,b,x,c); call.uni (y),p2p_wait,(b,x,c); ld.param.u32 r,[y]; }
+	call.uni (y),p2p_publish,(a,b,x,c); ld.param.u32 r,[y]; }
+	setp.eq.u32 failed,r,0; @failed bra grid_done;
+	{ .param .u64 address,deadline; .param .u32 sequence,receipt;
+	st.param.u64 [address],f; st.param.u64 [deadline],d; st.param.u32 [sequence],q;
+	call.uni (receipt),p2p_wait,(address,sequence,deadline); ld.param.u32 r,[receipt]; }
+grid_done:
 	st.param.u32 [result],r; ret;
 }
 .func (.param .u32 result) split_mv(.param .u64 w0,.param .u32 t0,.param .u64 x0,.param .u64 s0,.param .u64 o0,
