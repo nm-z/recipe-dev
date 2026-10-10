@@ -33,9 +33,18 @@ $(BUILD)/selected.ptx: $(BUILD)/selected.cu $(BUILD)/codebooks.inc
 	mkdir -p $(BUILD)/tmp
 	TMPDIR=$(BUILD)/tmp $(NVCC) -Wno-deprecated-gpu-targets -arch=sm_52 -I$(LLAMA)/ggml/src -I$(BUILD) -ptx $< -o $@
 	sed -i 's/^\.version .*/.version 7.4/' $@
-packed.ptx: $(BUILD)/selected.ptx $(PACKED_EVIDENCE)/extract-helpers.awk $(PACKED_EVIDENCE)/prune-globals.awk
-	awk -f $(PACKED_EVIDENCE)/prune-globals.awk $< $< > $(BUILD)/selected-pruned.ptx
-	awk -f $(PACKED_EVIDENCE)/extract-helpers.awk $(BUILD)/selected-pruned.ptx > $@
+$(BUILD)/worker-columns.ptx: $(BUILD)/selected.cu $(BUILD)/codebooks.inc
+	mkdir -p $(BUILD)/tmp
+	TMPDIR=$(BUILD)/tmp $(NVCC) -Wno-deprecated-gpu-targets -arch=sm_52 -DPACKED_WORKER -I$(LLAMA)/ggml/src -I$(BUILD) -ptx $< -o $@
+	sed -i 's/^\.version .*/.version 7.4/' $@
+$(BUILD)/worker-columns-helpers.ptx: $(BUILD)/worker-columns.ptx $(PACKED_EVIDENCE)/implicit-shared.awk $(PACKED_EVIDENCE)/worker-helpers.awk
+	awk -f $(PACKED_EVIDENCE)/implicit-shared.awk $< > $(BUILD)/worker-columns-implicit.ptx
+	awk -f $(PACKED_EVIDENCE)/worker-helpers.awk $(BUILD)/worker-columns-implicit.ptx > $@
+packed.ptx: $(BUILD)/worker-columns-helpers.ptx
+	awk '/^\/\/ BEGIN PRIVATE WORKER HELPERS/{exit}{print}' $@ > $(BUILD)/packed-public.ptx
+	cp $(BUILD)/packed-public.ptx $@
+	printf '// BEGIN PRIVATE WORKER HELPERS\n' >> $@
+	cat $(BUILD)/worker-columns-helpers.ptx >> $@
 $(BUILD)/packed.cubin: $(BUILD)/probes.ptx
 	$(PTXAS) -arch=sm_52 -v $< -o $@
 $(BUILD)/selected-probes.cubin: $(BUILD)/selected.ptx
