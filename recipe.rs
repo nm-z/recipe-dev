@@ -19510,7 +19510,11 @@ fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Grap
 	Ok(())
 }
 fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
-	if std::env::var("RECIPE_DENSE_SPLIT").as_deref()!=Ok("1") { return Ok(()); }
+	match std::env::var("RECIPE_DENSE_SPLIT").as_deref().unwrap_or("1") {
+		"0"=>return Ok(()),
+		"1"=>{},
+		_=>return Err(RecipeError::new("dense split must be 0 or 1")),
+	}
 	let minimum=std::env::var("RECIPE_DENSE_SPLIT_MIN_BYTES").ok().map(|value|value.parse::<usize>().map_err(|_|RecipeError::new("dense split minimum bytes must be a nonnegative integer"))).transpose()?.unwrap_or(8_000_000);
 	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
 	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;

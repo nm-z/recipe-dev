@@ -2,7 +2,7 @@
 
 This checkpoint follows the CEO's size-policy correction in issue 1092, comment 6102648385, and its CPU proposal in comment 6102767239. The earlier deeper batching prototype is not shipped.
 
-Dense-on-main stays the default baseline. Set `RECIPE_DENSE_SPLIT=1` to enable large-matrix row splitting. `RECIPE_DENSE_SPLIT_MIN_BYTES` defaults to 8000000; only mapped biasless Contraction jobs with combined packed/raw matrix bytes strictly above this threshold become external jobs. QKV's already-ready mapped planes share one source and one transport point. Set the minimum to zero only when explicitly reproducing the former all-matrix split policy.
+Large-matrix row splitting is the default after the CEO approval. Set `RECIPE_DENSE_SPLIT=0` for the dense-on-main baseline, or `RECIPE_DENSE_SPLIT=1` to explicitly select the default split policy. `RECIPE_DENSE_SPLIT_MIN_BYTES` defaults to 8000000; only mapped biasless Contraction jobs with combined packed/raw matrix bytes strictly above this threshold become external jobs. QKV's already-ready mapped planes share one source and one transport point. Set the minimum to zero only when explicitly reproducing the former all-matrix split policy.
 
 The actual target goes from 629 external dense points to 134, leaving 495 dense jobs inline on main. Its 48 expert points remain, for 182 external target points per decoded token. The MTP graph has seven large split calls, including four uses of the same EH projection; state-only refresh omits its terminal vocabulary job. Shared expert gate/up/down tensors are below 8 MB in this file, so the literal threshold leaves them on main. Hyper down/up matrices are 3481600 bytes each.
 
