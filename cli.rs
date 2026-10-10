@@ -1,10 +1,30 @@
-use std::{fs, path::Path, path::PathBuf, process::Command};
+use std::{fs, io::Write, path::Path, path::PathBuf, process::{Command, Stdio}};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [--ttl <minutes>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe schema probe <dataset>\n\trecipe schema finalize <proposal.json> <answers.json> <schema.json>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [--ttl <minutes>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe schema probe <dataset>\n\trecipe schema check <proposal.json> <answers.json> <schema.json> --jev <http://127.0.0.1:port/path> [--model <name>]\n\trecipe schema finalize <proposal.json> <answers.json> <schema.json>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
 	std::process::exit(2)
+}
+
+fn jev_endpoint(endpoint: &str) -> bool {
+	let Some(address) = endpoint.strip_prefix("http://").map(|rest| rest.split('/').next().unwrap_or(rest)) else { return false };
+	let Some((node, port)) = address.rsplit_once(':') else { return false };
+	matches!(node, "127.0.0.1" | "localhost" | "[::1]") && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
+fn jev_request(endpoint: &str, request: &str) -> std::io::Result<String> {
+	let mut child = Command::new("curl").args(["--disable", "--silent", "--show-error", "--fail", "--noproxy", "*", "--proto", "=http",
+		"--connect-timeout", "5", "--max-time", "30", "--max-filesize", "16777216", "--header", "Content-Type: application/json", "--data-binary", "@-", endpoint])
+		.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+		.map_err(|error| std::io::Error::other(format!("cannot start curl for Jev: {error}")))?;
+	let sent = child.stdin.take().unwrap().write_all(request.as_bytes());
+	let output = child.wait_with_output().map_err(|error| std::io::Error::other(format!("cannot read Jev response: {error}")))?;
+	sent.map_err(|error| std::io::Error::other(format!("cannot send Jev metadata: {error}")))?;
+	if !output.status.success() {
+		return Err(std::io::Error::other(format!("Jev request failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+	}
+	String::from_utf8(output.stdout).map_err(|error| std::io::Error::other(format!("Jev response is not UTF-8: {error}")))
 }
 
 fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> {
@@ -200,6 +220,24 @@ fn main() {
 						invalid(USAGE);
 					}
 					let (schema, decisions) = recipe::finalize_data_schema(&path, &answers).unwrap_or_else(|error| invalid(&error.to_string()));
+					fs::write(&output, schema).unwrap_or_else(|error| invalid(&format!("cannot write {output}: {error}")));
+					print!("{decisions}");
+				}
+				"check" => {
+					let answers = arguments.next().unwrap_or_else(|| invalid(USAGE));
+					let output = arguments.next().unwrap_or_else(|| invalid(USAGE));
+					if arguments.next().as_deref() != Some("--jev") { invalid(USAGE); }
+					let endpoint = arguments.next().unwrap_or_else(|| invalid(USAGE));
+					if !jev_endpoint(&endpoint) { invalid("Jev endpoint must be an HTTP loopback address with an explicit port"); }
+					let model = match arguments.next().as_deref() {
+						None => "jev-1.13".to_owned(),
+						Some("--model") => arguments.next().unwrap_or_else(|| invalid(USAGE)),
+						_ => invalid(USAGE),
+					};
+					if arguments.next().is_some() || answers == output || answers == path || output == path { invalid(USAGE); }
+					let (document, schema, decisions) = recipe::check_data_schema(&path, &model, |request| jev_request(&endpoint, request))
+						.unwrap_or_else(|error| invalid(&error.to_string()));
+					fs::write(&answers, document).unwrap_or_else(|error| invalid(&format!("cannot write {answers}: {error}")));
 					fs::write(&output, schema).unwrap_or_else(|error| invalid(&format!("cannot write {output}: {error}")));
 					print!("{decisions}");
 				}
