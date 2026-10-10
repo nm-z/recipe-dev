@@ -17604,7 +17604,7 @@ impl Infer {
 		let head_file=head.as_ref().map(|head|&head.bound.file);
 		budgets[4].reserve_bytes=expert_main_reserve(&target,other.as_ref(),file,head_file,Config::load()?.precision)?.0;
 		budgets[0].free_bytes=budgets[0].free_bytes.min(6_186_598_400);
-		budgets[2].free_bytes=budgets[2].free_bytes.min(5_798_205_440);
+		budgets[2].free_bytes=0; budgets[6].free_bytes=0;
 		ExpertSplitPlan::new(file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets)
 	}
 	/// Select an MTP checkpoint on the machine executing inference.
@@ -19244,7 +19244,7 @@ macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 fn expert_pick_seed()->Result<std::collections::BTreeMap<(bool,usize,u32),u64>> {
 	let mut counts=std::collections::BTreeMap::new();
 	let Some(path)=std::env::var_os("RECIPE_EXPERT_PICK_COUNTS") else {return Ok(counts)};
-	if !Path::new(&path).is_file() {return Ok(counts)}
+	require(Path::new(&path).is_file(), "configured expert frequency file is absent")?;
 	let text=fs::read_to_string(path).map_err(|error|RecipeError::new(format!("expert frequency read: {error}")))?;
 	for line in text.lines().filter(|line|!line.is_empty() && !line.starts_with("model,") && !line.starts_with("layer\t")) {
 		let reference=line.contains('\t');
@@ -19256,6 +19256,7 @@ fn expert_pick_seed()->Result<std::collections::BTreeMap<(bool,usize,u32),u64>> 
 		let picks=fields[offset+2].parse().map_err(|_|RecipeError::new("expert frequency count is invalid"))?;
 		require(expert<512,"expert frequency ID exceeds Flash-Next expert count")?; counts.insert((mtp,layer,expert),picks);
 	}
+	require(!counts.is_empty(), "configured expert frequency file has no records")?;
 	Ok(counts)
 }
 
@@ -19519,8 +19520,14 @@ impl ExpertSplitPlan {
 				bundles.push((mtp,layer,expert,slices));
 			}
 		}
-		bundles.sort_by_key(|(mtp,layer,expert,_)|(std::cmp::Reverse(frequencies.get(&(*mtp,*layer,*expert as u32)).copied().unwrap_or(0)),*mtp,*layer,*expert));
-		for (mtp,_layer,expert,slices) in bundles {
+		let calibrated = !frequencies.is_empty();
+		// Missing observations are not zero picks. Keep unmeasured bundles in
+		// VRAM, then measured hot bundles, before assigning measured zero picks.
+		bundles.sort_by_key(|(mtp,layer,expert,_)| {
+			let picks = frequencies.get(&(*mtp,*layer,*expert as u32)).copied();
+			(!(calibrated && picks.is_none()), std::cmp::Reverse(picks.unwrap_or(0)), *mtp, *layer, *expert)
+		});
+		for (mtp,layer,expert,slices) in bundles {
 				let die = (0..8).filter(|die| *die != main_die && *die != 2 && *die != 6).filter_map(|die| {
 					let mut end = plan.weights[die];
 					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
@@ -19535,6 +19542,11 @@ impl ExpertSplitPlan {
 					for slice in slices { plan.append(slice, Some(expert as u32), die, mtp)?; }
 					plan.experts[die] += 1;
 				} else {
+					if calibrated && frequencies.get(&(mtp, layer, expert as u32)) != Some(&0) {
+						plan.unplaced_experts += 1;
+						for tensor in slices { plan.unplaced_bytes = checked_add(plan.unplaced_bytes, tensor.bytes, "unplaced noncold expert bytes")?; }
+						continue;
+					}
 					let die=[3,4,5].into_iter().min_by_key(|die|plan.experts[*die]).unwrap();
 					for tensor in slices {
 						let (offset,end)=Self::end(plan.spill_bytes,tensor.bytes)?; plan.spill_bytes=end;
