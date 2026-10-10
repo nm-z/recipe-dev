@@ -33,7 +33,8 @@ delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 536870912
 # Archy allocations remain below die 0's bad VRAM band; die 6 is fenced.
-device-usable-bytes = { "archy:nv0" = 6186598400, "archy:nv6" = 0 }
+device-usable-bytes = { "archy:nv0" = 6186598400, "archy:GPU-1783441e-9a1a-684e-82bb-14d24e6e0c8f" = 6186598400, "archy:nv2" = 0, "archy:nv6" = 0 }
+device-fenced-uuids = ["GPU-c767d250-4454-d181-d648-8706b5f2fb64", "GPU-431371bd-b482-96b2-4b70-04f83c6d075b"]
 cpu-worker-threads = 0
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
@@ -149,6 +150,25 @@ exact-cpu = false
 tolerance = 0.05
 step = 32
 
+[precision.flash]
+sum = "fp32"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+atvn = "fp32"
+norm = "fp16"
+res = "fp16"
+acc = "fp32"
+train = "fp32"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.05
+step = 32
+
 [precision.llamacpp]
 fp8 = "e4m3"
 train = "fp32"
@@ -170,6 +190,10 @@ math = "libm"
 step = 256
 
 [storage.recipe]
+kv = "fp8"
+fp8 = "e4m3"
+
+[storage.flash]
 kv = "fp8"
 fp8 = "e4m3"
 

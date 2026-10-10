@@ -2007,10 +2007,12 @@ fn encode_floats(values: &[f64], precision: Compute) -> Vec<u8> {
 /// The stored representation a packed node keeps, or `None` when the node decodes at
 /// load. A gather's table is its context rather than a weight span, so it never packs.
 fn runtime_stored_weight(graph: &Graph, index: usize, inference: bool) -> Option<&StoredWeight> {
+	if inference && external_expert(&graph.nodes[index]) { return None; }
 	if !inference && graph.nodes[index].int_bits != 0 { return None; }
 	graph.stored.get(index)?.as_ref()
 }
 fn packed_weight(graph: &Graph, index: usize, inference: bool) -> Option<&StoredWeight> {
+	if inference && external_expert(&graph.nodes[index]) { return None; }
 	if !inference || !graph.nodes[index].packed {
 		return None;
 	}
@@ -2037,17 +2039,30 @@ fn native_gradient_arena(graph: &Graph) -> Result<(Vec<usize>, usize)> {
 fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Result<(Vec<usize>, usize)> {
 	let mut offsets = Vec::with_capacity(graph.nodes.len());
 	let mut bytes = 0;
+	let mut mapped = std::collections::BTreeMap::new();
 	let _ = precision;
 	for index in 0..graph.nodes.len() {
 		let element = graph.nodes[index].precision.bytes();
+		let weight = packed_weight(graph, index, inference);
+		let key = weight.filter(|weight| weight.codebook.is_empty() && weight.arithmetic.is_empty()).map(|weight| {
+			(weight.format.0, weight.count, weight.format_segments().into_iter().map(|(format, count)| (format.0, count)).collect::<Vec<_>>(),
+				weight.bytes.runs().into_iter().map(|(offset, bytes)| (offset, bytes.as_ptr() as usize, bytes.len())).collect::<Vec<_>>())
+		});
+		if let Some(offset) = key.as_ref().and_then(|key| mapped.get(key)) {
+			offsets.push(*offset);
+			continue;
+		}
 		// Sixteen-byte alignment: a packed node's 144-byte Q4_K blocks are then
 		// read sixteen bytes at a time by the block dots.
 		let offset = align(bytes, element.max(16))?;
-		let span = match packed_weight(graph, index, inference) {
+		let span = if inference && external_expert(&graph.nodes[index]) {
+			if graph.nodes[index].argument[8] > 0.0 { 8 } else { 0 }
+		} else { match weight {
 			Some(weight) => weight.bytes.len(),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
-		};
+		} };
 		offsets.push(offset);
+		if let Some(key) = key { mapped.insert(key, offset); }
 		bytes = checked_add(offset, span, "native weight arena")?;
 	}
 	// Sixteen bytes of slack: the block dots read a two-aligned slice as the
@@ -2141,8 +2156,9 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 
 /// Causal token graphs retain K/V, recurrent state, and convolution history
 /// independently of their temporary position window.
-fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
-	const POSITIONS: usize = 128;
+fn inference_window(graph: &Graph, rows: usize, inference: bool) -> Result<usize> {
+	let positions = std::env::var("RECIPE_INFERENCE_WINDOW_POSITIONS").ok().map(|value| count("inference window positions", &value)).transpose()?.unwrap_or(128);
+	require(positions != 0 && positions <= 128, "inference window positions must be in 1..=128")?;
 	let length = graph.input.length;
 	let tokens = graph.nodes.first().is_some_and(Node::token_input);
 	let bounded = inference && rows == 1 && (!tokens || graph.input.channels == 1)
@@ -2158,7 +2174,7 @@ fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
 					_ => false,
 				}
 		});
-	if bounded { length.min(POSITIONS) } else { length }
+	Ok(if bounded { length.min(if graph.expert_layers.is_empty() { positions } else { positions.min(5) }) } else { length })
 }
 
 fn window_shape(shape: Shape, sequence: usize, positions: usize) -> Shape {
@@ -2295,7 +2311,7 @@ impl NativeLayout {
 	/// use the same lifetime-based allocator. Retained regions stay private;
 	/// transient regions share storage after their last reader's barrier.
 	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
-		let window_positions = inference_window(graph, rows, inference);
+		let window_positions = inference_window(graph, rows, inference)?;
 		let element = precision.bytes();
 		let unit = 8;
 		let mut values = Vec::with_capacity(graph.nodes.len());
@@ -2429,7 +2445,8 @@ impl NativeLayout {
 #[derive(Clone)]
 struct PackedContractionPart { kind: u32, row: usize, rows: usize, bytes: usize }
 fn packed_contraction_parts(node: &Node, stored: Option<&StoredWeight>, packed: bool) -> Option<Vec<PackedContractionPart>> {
-	if !packed || node.op != Primitive::Contraction || node.argument[0] > 1.0 || node.argument[2] == 0.0 || node.input.length != node.output.length || node.input.channels == 0 { return None; }
+	if !packed || node.op != Primitive::Contraction || node.argument[0] > 1.0 || node.argument[2] == 0.0 || node.input.length != node.output.length || node.input.channels == 0
+		|| node.acc != Compute::FP32 || node.precision.bytes() > 4 { return None; }
 	let stored = stored?;
 	let k = node.input.channels;
 	let (mut row, mut bytes, mut parts) = (0, 0, Vec::new());
@@ -2451,7 +2468,7 @@ fn packed_contraction_word(kind: u32, block: u32) -> Option<u64> {
 	for line in PackedMatvec::ptx().lines().filter(|line| line.starts_with(".func packed_")) {
 		let name = line.split_whitespace().nth(1)?.trim_end_matches('(');
 		let pieces = name.split('_').collect::<Vec<_>>();
-		if pieces.len() < 6 || !matches!(pieces[1], "g" | "h") { continue; }
+		if pieces.len() < 6 || !matches!(pieces[1], "g" | "h") || pieces[1] == "g" && pieces.len() < 7 { continue; }
 		let t = pieces[2].parse::<u32>().ok()?; let capacity = pieces[3].parse::<u32>().ok()?; let warps = pieces[4].parse::<u32>().ok()?;
 		if t != kind || warps * 32 != block || !matches!(capacity, 1 | 2 | 4 | 8) { continue; }
 		let (method, lanes) = if pieces[1] == "h" { (0, pieces[5].parse::<u32>().ok()?) } else { (pieces[5].parse::<u32>().ok()?, pieces[6].parse::<u32>().ok()?) };
@@ -3462,6 +3479,7 @@ mod quantized {
 		fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int;
 		fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int;
 		fn half(&mut self, offset: Self::Int) -> Self::Value;
+		fn bfloat(&mut self, offset: Self::Int) -> Self::Value;
 		fn float(&mut self, offset: Self::Int) -> Self::Value;
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value;
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int;
@@ -4063,6 +4081,10 @@ mod quantized {
 		fn half(&mut self, offset: Self::Int) -> Self::Value {
 			f64::from(half(&self.bytes[offset as usize..]))
 		}
+		fn bfloat(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = u16::from_le_bytes(self.bytes[offset as usize..offset as usize + 2].try_into().unwrap());
+			f64::from(f32::from_bits(u32::from(bits) << 16))
+		}
 		fn float(&mut self, offset: Self::Int) -> Self::Value {
 			f64::from(f32::from_le_bytes(self.bytes[offset as usize..offset as usize + 4].try_into().unwrap()))
 		}
@@ -4183,6 +4205,16 @@ mod quantized {
 			let loaded = self.instruction(format!("load float, {pointer} {address}, align 4"));
 			self.instruction(format!("call {state} @recipe.state.from.f32{}(float {loaded})", self.suffix))
 		}
+		fn bfloat(&mut self, offset: Self::Int) -> Self::Value {
+			let pointer = pointer_type(self.backend);
+			let state = self.precision.state_type;
+			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
+			let loaded = self.instruction(format!("load i16, {pointer} {address}, align 2"));
+			let extended = self.instruction(format!("zext i16 {loaded} to i32"));
+			let shifted = self.instruction(format!("shl i32 {extended}, 16"));
+			let value = self.instruction(format!("bitcast i32 {shifted} to float"));
+			self.instruction(format!("call {state} @recipe.state.from.f32{}(float {value})", self.suffix))
+		}
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
 			let state = self.precision.state_type;
 			let bits = self.instruction(format!("trunc i64 {bits} to i16"));
@@ -4284,9 +4316,13 @@ impl NativeModelIr {
 			if plan.node.block_kind == "recur_body" {
 				continue;
 			}
+			let state_projection = !reverse && !training && index + 1 == self.plans.len()
+				&& plan.node.op == Primitive::Contraction && self.graph.nodes.iter().any(|node| node.retain_output);
+			if state_projection { ir.push_str("br i1 %state.only, label %state.projection.done, label %state.projection.run\nstate.projection.run:\n"); }
 			// Keep position propagation in the caller. Operation-local values do
 			// not need to remain live across later operations in the same kernel.
 			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: plan.node.output.length.to_string() } } else { self.emit_node_window(index, &plan.node, &mut ir)? };
+			if !reverse && external_expert(&plan.node) && plan.node.argument[8] < 0.0 { continue; }
 			let body_start = ir.len();
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
@@ -4309,6 +4345,11 @@ impl NativeModelIr {
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
+					if node.block_kind=="split_dense" {
+						require(backend==Backend::Nvidia && node.precision==Compute::FP32,"dense row dispatch requires NVIDIA FP32 boundary values")?;
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1;  .reg .b64 z; mov.u64 z, 0; st.param.u64 [c], z; st.param.u64 [s], z; st.param.u64 [o], $2; st.param.u64 [h], $7; st.param.u32 [l], $3; st.param.u32 [b], $4; st.param.u32 [p], $5; st.param.u32 [t], $6; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n",weights=pointers.weights,source=pointers.source,out=pointers.value,length=node.output.length));
+						ir.push_str(barrier(backend));
+					} else {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					// Dense exact CPU inference uses one reduction order for prefill,
@@ -4336,6 +4377,7 @@ impl NativeModelIr {
 						tile_k = tiles[2]
 					);
 					if !self.emit_packed_contraction(backend,index,plan,&pointers,&window,&call,&mut ir)? { ir.push_str(&call); ir.push_str(barrier(backend)); }
+					}
 				}
 				(false, Primitive::Gather) => {
 					if self.inference {
@@ -4641,6 +4683,12 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertOut) => {
+					if external_expert(node) {
+						require(backend == Backend::Nvidia && node.precision == Compute::FP32, "expert dispatch requires NVIDIA FP32 expert boundaries")?;
+						let routing = self.emit_expert_selection(backend, index, node, &mut ir)?;
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
+						ir.push_str(barrier(backend));
+					} else {
 					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
 					let body = self.expert_specialization(backend, index).map_or_else(|| format!("expert_out_forward_body{v}"), |(_, name)| name);
 					emit_expert_window_loop(&mut ir, index, "expert.out", node.output, &window, self.inference && backend != Backend::Cpu, |ir, wide, lane, width| {
@@ -4660,6 +4708,7 @@ impl NativeModelIr {
 						));
 					})?;
 					ir.push_str(barrier(backend));
+					}
 				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
@@ -5548,6 +5597,7 @@ impl NativeModelIr {
 				functions.push_str(&format!("define internal void @recipe_operation_n{index}({arguments}) #3 {{\nentry:\n{operation}ret void\n}}\n"));
 				ir.push_str(&format!("call void @recipe_operation_n{index}({arguments})\n"));
 			}
+			if state_projection { ir.push_str("br label %state.projection.done\nstate.projection.done:\n"); }
 		}
 		Ok(ir)
 	}
@@ -6918,6 +6968,7 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		for (index, plan) in self.plans.iter().enumerate().filter(|(index, plan)| *index + 1 == self.plans.len() || plan.node.retain_output) {
 			let name = if index + 1 == self.plans.len() { "output" } else { "hidden" };
+			if name == "output" { ir.push_str("br i1 %state.only, label %request.output.skipped, label %request.output.run\nrequest.output.run:\n"); }
 			let prefix = format!("request.{name}.export");
 			let ty = self.node_precision(&plan.node).model_type;
 			let shape = plan.node.output;
@@ -6931,6 +6982,7 @@ impl NativeModelIr {
 				}
 				ir.push_str(&format!("%{prefix}.from = getelementptr {ty}, {pointer} %{prefix}.source, i64 {wide}\n%{prefix}.value = load {ty}, {pointer} %{prefix}.from, align {align}\n%{prefix}.to = getelementptr {ty}, {pointer} %request.{name}, i64 %{prefix}.index\nstore {ty} %{prefix}.value, {pointer} %{prefix}.to, align {align}\n", align = alignment(ty)));
 			})?;
+			if name == "output" { ir.push_str("br label %request.output.skipped\nrequest.output.skipped:\n"); }
 		}
 		ir.push_str(barrier(backend));
 		Ok(())
@@ -6945,7 +6997,8 @@ impl NativeModelIr {
 		let node = &plan.node;
 		let p = format!("n{index}.packed");
 		let Some(parts) = packed_contraction_parts(node, plan.stored.as_ref(), plan.packed) else {
-			self.packed_count(backend,index,if node.argument[0]>1.0 || node.argument[2]==0.0 || node.input.length!=node.output.length {2} else {1},&format!("{p}.direct"),&window.span,ir);
+			self.packed_count(backend,index,if node.argument[0]>1.0 || node.argument[2]==0.0 || node.input.length!=node.output.length || node.acc!=Compute::FP32
+				|| node.precision.bytes()>4 {2} else {1},&format!("{p}.direct"),&window.span,ir);
 			return Ok(false);
 		};
 		let Some(scratch) = self.layout.packed_scratch else { return Ok(false) };
@@ -7607,17 +7660,17 @@ impl NativeModelIr {
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
 		let bounded = self.layout.window_positions < self.graph.input.length;
 		if bounded {
-			body.push_str(&format!("define internal void @recipe_model_inference_chunk({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&format!("define internal void @recipe_model_inference_chunk({forward_args}, i1 %state.only) #1 {{\nentry:\n%tid = {thread}\n"));
 			self.emit_request_begin(backend, &mut body)?;
 			body.push_str(&inference_forward);
 			self.emit_request_end(backend, &mut body)?;
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}, i1 %state.only) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
 		if bounded {
 			let chunk_args = forward_args.replace("i32 %begin", "i32 %window.begin").replace("i32 %end", "i32 %window.end");
-			body.push_str(&format!("br label %window.loop\nwindow.loop:\n%window.begin = phi i32 [ %begin, %timing.inference.start.done ], [ %window.end, %window.next ]\n%window.more = icmp ult i32 %window.begin, %end\nbr i1 %window.more, label %window.run, label %window.done\nwindow.run:\n%window.remaining = sub i32 %end, %window.begin\n%window.full = icmp ugt i32 %window.remaining, {capacity}\n%window.span = select i1 %window.full, i32 {capacity}, i32 %window.remaining\n%window.end = add i32 %window.begin, %window.span\ncall void @recipe_model_inference_chunk({chunk_args})\n", capacity = self.layout.window_positions));
+			body.push_str(&format!("br label %window.loop\nwindow.loop:\n%window.begin = phi i32 [ %begin, %timing.inference.start.done ], [ %window.end, %window.next ]\n%window.more = icmp ult i32 %window.begin, %end\nbr i1 %window.more, label %window.run, label %window.done\nwindow.run:\n%window.remaining = sub i32 %end, %window.begin\n%window.full = icmp ugt i32 %window.remaining, {capacity}\n%window.span = select i1 %window.full, i32 {capacity}, i32 %window.remaining\n%window.end = add i32 %window.begin, %window.span\ncall void @recipe_model_inference_chunk({chunk_args}, i1 %state.only)\n", capacity = self.layout.window_positions));
 			body.push_str(barrier(backend));
 			body.push_str("br label %window.next\nwindow.next:\nbr label %window.loop\nwindow.done:\n");
 		} else {
@@ -7634,17 +7687,17 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
-		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
+		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) && !(backend==Backend::Nvidia && !self.graph.expert_layers.is_empty()) {
 			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
 			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
-			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
+			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%state.only = icmp eq i32 %training, 2\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args}, i1 %state.only)\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
 		}
 		if loss.is_some() {
-			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%state.only = icmp eq i32 %training, 2\n%forward.training = icmp eq i32 %training, 1\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args}, i1 %state.only)\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
 			body.push_str(&format!(
-				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%state.only = icmp eq i32 %training, 2\ncall void @recipe_model_inference_forward_body({forward_args}, i1 %state.only)\nret void\n}}\n"
 			));
 		}
 		if let Some(loss) = loss.filter(|_| epoch) {
@@ -7662,7 +7715,7 @@ impl NativeModelIr {
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
 			body.push_str(&format!(
-				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.forward.entry:\ncall void @recipe_model_inference_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.entry:\n",
+				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.forward.entry:\ncall void @recipe_model_inference_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions}, i1 false)\nbr label %metrics.entry\nmetrics.entry:\n",
 				positions = graph_positions(&self.graph)
 			));
 			let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
@@ -8442,7 +8495,8 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
-	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes()]); }
+	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes()]); }
+	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
@@ -8812,18 +8866,33 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
 			}
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
+			let expert_calls=ptx_source.contains("split_main_forward");
+			if expert_calls {
+				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
+				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
+			}
+
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(p2p_functions());
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
+			if expert_calls {ptx_source.push_str(expert_forward_functions());}
 			fs::write(output, ptx_source).map_err(|error| RecipeError::new(format!("cannot append MTP PTX: {error}")))?;
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
 				let mut command = Command::new(assembler);
-				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
+				let separate=expert_calls;
+				let object=output.with_extension("device.cubin");
+				if separate {command.arg("-c");}
+				command.arg(format!("-arch={architecture}")).args([if separate {"-O1"} else {"-O3"}, "-o"]).arg(if separate {&object} else {output}).arg(&ptx);
 				let assembled = native_command(command, "NVIDIA PTX assembler", key);
 				assembled?;
+				if separate {
+					let linker=Path::new(&native_nvidia_assembler(architecture).unwrap()).with_file_name("nvlink");
+					let mut command=Command::new(linker); command.arg(format!("-arch={architecture}")).args(["--kernels-used","recipe_model_forward,recipe_model_load,expert_split_worker"]).arg("-o").arg(output).arg(&object);
+					native_command(command,"NVIDIA device linker",key)?;
+				}
 				return Ok(Vec::new());
 			}
 			fs::read(output)
@@ -9090,7 +9159,7 @@ mod gguf {
 		pub kind: u32,
 		pub offset: usize,
 		pub bytes: usize,
-		shard: usize,
+		pub(super) shard: usize,
 	}
 
 	impl GgufTensor {
@@ -9139,7 +9208,7 @@ mod gguf {
 			26 => return Ok(("I32", 1, 4, None)),
 			27 => return Ok(("I64", 1, 8, None)),
 			28 => return Ok(("F64", 1, 8, None)),
-			30 => return Ok(("BF16", 1, 2, None)),
+			30 => "bf16",
 			2 => "q4_0",
 			3 => "q4_1",
 			6 => "q5_0",
@@ -14426,6 +14495,7 @@ pub(crate) struct StorageFormat(pub(crate) u16);
 #[derive(Clone, Copy)]
 enum NativeDequant {
 	F16,
+	BF16,
 	F32,
 	Nf4,
 	Scalar(ScalarLayout),
@@ -14451,6 +14521,11 @@ impl NativeDequant {
 				let index = operations.index();
 				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(4));
 				operations.float(offset)
+			}
+			Self::BF16 => {
+				let index = operations.index();
+				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(2));
+				operations.bfloat(offset)
 			}
 			Self::Nf4 => unreachable!("NF4 dequantization requires its model codebook"),
 			Self::Scalar(layout) => quantized::dequant_scalar(operations, layout),
@@ -14544,6 +14619,7 @@ macro_rules! quantizations {
 
 quantizations! {
 	F16 { code: (2, 16, [0]), block: 1, stride: 2, name: "f16", quant: Quantizer::Raw, native: Some(NativeDequant::F16) }
+	BF16 { code: (2, 16, [1]), block: 1, stride: 2, name: "bf16", quant: Quantizer::Raw, native: Some(NativeDequant::BF16) }
 	F32 { code: (2, 32, [0]), block: 1, stride: 4, name: "f32", quant: Quantizer::Raw, native: Some(NativeDequant::F32) }
 	Q4_0 { code: (0, 4, [0]), block: 32, stride: 18, name: "q4_0", quant: Quantizer::Scalar { bits: 4, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 0 })) }
 	Q4_1 { code: (0, 4, [1]), block: 32, stride: 20, name: "q4_1", quant: Quantizer::Scalar { bits: 4, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 1 })) }
@@ -16558,7 +16634,7 @@ impl MtpRuntime {
 		let positions = end - begin;
 		self.samples.resize(checked_mul(self.head.width * self.head.lanes + 1, positions, "MTP request input")?, 0.0);
 		for position in begin..end { self.input(position - begin, positions, ids[position + 1], &self.hidden[position].clone())?; }
-		self.placed.run_window(&self.samples, begin as u32, end as u32)?;
+		self.placed.run_state_window(&self.samples, begin as u32, end as u32)?;
 		self.head_valid = end;
 		self.release_hidden(end)?;
 		Ok(())
@@ -17591,6 +17667,47 @@ impl Recipe {
 	}
 }
 impl Infer {
+	/// Plan complete target and head working buffers without allocating device weights.
+	/// The target includes five speculative delta slots when an MTP head is selected.
+	pub fn memory(&self, model: &Model, data: &Data, positions: usize) -> Result<Vec<DeviceMemory>> {
+		require(positions != 0, "inference memory plan has no context positions")?;
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("inference memory planning requires GGUF data"))?;
+		let gpu = selected_gpus()?[0];
+		let head = self.mtp.as_ref().map(|path| MtpHead::open(path, file, model)).transpose()?;
+		let bound = explicit_bound(file, model, head.is_none())?;
+		let mut graph = bound_graph_on(file, &bound.model, &bound.plan, &vec![0.0; positions], 1, gpu)?;
+		if head.is_some() {
+			retain_mtp_hidden(&mut graph)?;
+			for node in &mut graph.nodes { if node.op == Primitive::Delta { node.argument[5] = 5.0; } }
+		}
+		let precision = Config::load()?.precision;
+		let mut target = part_memory(&graph, precision)?;
+		target.device = device_label(gpu)?;
+		let mut memory = vec![target];
+		if let Some(head) = head {
+			let mut graph = head.graph(positions, gpu)?;
+			retain_mtp_hidden(&mut graph)?;
+			let mut planned = part_memory(&graph, precision)?;
+			planned.device = device_label(gpu)?;
+			memory.push(planned);
+		}
+		Ok(memory)
+	}
+	/// Plan the exact lowered target/head working buffers without GPU allocation.
+	pub fn expert_plan(&self,model:&Model,data:&Data,positions:usize,mut budgets:[ExpertDieBudget;8])->Result<ExpertSplitPlan> {
+		let file=data.file.as_ref().ok_or_else(||RecipeError::new("expert planning requires GGUF data"))?;
+		let head=self.mtp.as_ref().map(|path|MtpHead::open(path,file,model)).transpose()?;
+		let bound=explicit_bound(file,model,head.is_none())?;
+		let (target,other)=expert_graphs(&bound,head.as_ref(),positions,if head.is_some(){5}else{0},0,shared_cpu_device()?)?;
+		let head_file=head.as_ref().map(|head|&head.bound.file);
+		let working=split_working_reserve(&target,other.as_ref());for budget in &mut budgets {budget.reserve_bytes=budget.reserve_bytes.max(working);}
+		budgets[4].reserve_bytes=expert_main_reserve(&target,other.as_ref(),file,head_file,Config::load()?.precision)?.0;
+		budgets[0].free_bytes=budgets[0].free_bytes.min(6_186_598_400);
+		budgets[2].free_bytes=0;budgets[6].free_bytes=0;
+		let mut plan=ExpertSplitPlan::with_dense(file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets,&dense_names(&target,other.as_ref()))?;
+		validate_dense_plan(&mut plan,&target,other.as_ref(),file,head_file)?;
+		Ok(plan)
+	}
 	/// Select an MTP checkpoint on the machine executing inference.
 	pub fn mtp(mut self, path: impl AsRef<Path>) -> Self {
 		self.mtp = Some(path.as_ref().to_path_buf());
@@ -17604,6 +17721,10 @@ impl Infer {
 		let head = MtpHead::open(path, file, model)?;
 		let bound = explicit_bound(file, model, false)?;
 		let devices = selected_gpus()?;
+		if expert_enabled(file,devices) {
+			let (main,runtime)=place_expert_pair(&bound,Some(head),positions,5,tensor_observation_mask(&self.log))?;
+			return Ok(MtpPlaced { main, runtime:runtime.ok_or_else(||RecipeError::new("expert MTP placement has no head"))? });
+		}
 		let runtime = MtpRuntime::place(head, positions, devices)?;
 		let main = place_bound_observed(&bound, positions, split, devices, 5, tensor_observation_mask(&self.log))?;
 		Ok(MtpPlaced { main, runtime })
@@ -17669,8 +17790,12 @@ impl Infer {
 			None => ceiling,
 		};
 		let checkpoints = head.as_ref().map_or(0, |_| 5);
-		let mut mtp = head.map(|head| MtpRuntime::place(head, sequence, devices)).transpose()?;
-		let mut placed = place_bound_observed(&bound, sequence, &[], devices, checkpoints, tensor_observation_mask(&self.log))?;
+		let (mut placed,mut mtp)=if expert_enabled(&file,devices) {
+			place_expert_pair(&bound,head,sequence,checkpoints,tensor_observation_mask(&self.log))?
+		} else {
+			let mtp=head.map(|head|MtpRuntime::place(head,sequence,devices)).transpose()?;
+			(place_bound_observed(&bound,sequence,&[],devices,checkpoints,tensor_observation_mask(&self.log))?,mtp)
+		};
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
 		let input = ChatInput::new(interactive)?;
@@ -17695,6 +17820,7 @@ impl Infer {
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history: Vec<Arc<InferenceRequest>> = Vec::new();
+		let mut reply_limit = self.tokens;
 		loop {
 			let start_progress = |started| {
 				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
@@ -17723,19 +17849,21 @@ impl Infer {
 					continue;
 				}
 				if line.trim() == "/report" || line.trim().starts_with("/report ") {
+					if let Err(error)=placed.export_router_picks() {eprintln!("cannot export router picks: {error}");}
 					use std::fmt::Write as _;
-					let mut text = String::from("request\tinput\toutput\tcached\tprefill_seconds\tgeneration_seconds\ttok_per_second\tmtp_drafted\tmtp_accepted\tmtp_verify_seconds\tmtp_step_seconds\n");
+					let mut text = String::from("request\tinput\toutput\tcached\tprefill_seconds\tgeneration_seconds\ttok_per_second\tmtp_drafted\tmtp_accepted\tmtp_verify_seconds\tmtp_step_seconds\tmtp_draft_seconds\n");
 					for (index, request) in request_history.iter().enumerate() {
 						let rate = if request.tg_seconds > 0.0 { request.out as f64 / request.tg_seconds } else { 0.0 };
-						writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{rate}\t{}\t{}\t{}\t{}", request.input, request.out, request.cached, request.pp_seconds,
-							request.tg_seconds, request.mtp.drafted, request.mtp.accepted, request.mtp.verify_seconds, request.mtp.step_seconds)?;
+						writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{rate}\t{}\t{}\t{}\t{}\t{}", request.input, request.out, request.cached, request.pp_seconds,
+							request.tg_seconds, request.mtp.drafted, request.mtp.accepted, request.mtp.verify_seconds, request.mtp.step_seconds, request.mtp.draft_seconds)?;
 					}
-					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\tpacked_calls\tdirect_format\tdirect_shape\tdirect_schedule\tpacked_rejected\n");
+					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\tselected_experts\tweight_bytes\tpacked_calls\tdirect_format\tdirect_shape\tdirect_schedule\tpacked_rejected\n");
 					for (index, request) in request_history.iter().enumerate() {
 						for operation in &request.operations {
-							writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block,
+							writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block,
 								operation.node, operation.operation, operation.begin, operation.end, operation.positions, operation.ticks,
-								format!("{}\t{}\t{}\t{}\t{}\t{}",operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()),operation.packed_calls,operation.packed_fallbacks[0],operation.packed_fallbacks[1],operation.packed_fallbacks[2],operation.packed_fallbacks[3]))?;
+								operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()), operation.selected_experts,
+								format!("{}\t{}\t{}\t{}\t{}\t{}",operation.weight_bytes,operation.packed_calls,operation.packed_fallbacks[0],operation.packed_fallbacks[1],operation.packed_fallbacks[2],operation.packed_fallbacks[3]))?;
 						}
 					}
 					if let Some(path) = line.trim().strip_prefix("/report ") {
@@ -17743,11 +17871,35 @@ impl Infer {
 					} else { eprint!("{text}"); }
 					continue;
 				}
+				if let Some(value) = line.trim().strip_prefix("/reply ") {
+					match value.parse::<usize>() {
+						Ok(limit) => reply_limit = Some(limit),
+						Err(_) => eprintln!("reply limit must be a nonnegative integer"),
+					}
+					continue;
+				}
+				if let Some(path) = line.trim().strip_prefix("/dump_ids ") {
+					if let Some(request) = request_history.last() {
+						use std::fmt::Write as _;
+						let mut text = String::from("kind\tposition\ttoken_id\n");
+						for (kind, ids) in [("input", &request.input_ids), ("output", &request.output_ids)] {
+							for (position, id) in ids.iter().enumerate() { writeln!(text, "{kind}\t{position}\t{id}")?; }
+						}
+						if let Err(error) = fs::write(path, text) { eprintln!("cannot write token IDs {path}: {error}"); }
+					} else { eprintln!("no completed inference request"); }
+					continue;
+				}
 				if let Some(path) = line.trim().strip_prefix("/dump_logits ") {
 					if let Some(request) = request_history.last() {
 						let bytes = request.logits.iter().flat_map(|value| (*value as f32).to_le_bytes()).collect::<Vec<_>>();
 						if let Err(error) = fs::write(path, bytes) { eprintln!("cannot write final logits {path}: {error}"); }
 					} else { eprintln!("no completed inference request"); }
+					continue;
+				}
+				if line.trim()=="/reload_workers" || line.trim().starts_with("/reload_workers ") {
+					let path=if let Some(path)=line.trim().strip_prefix("/reload_workers ") {Ok(PathBuf::from(path))}
+						else {placed.expert_artifacts().and_then(|paths|paths.into_iter().next().ok_or_else(||RecipeError::new("no resident expert workers")))};
+					if let Err(error)=path.and_then(|path|placed.reload_expert_workers(path)) {eprintln!("{error}");}
 					continue;
 				}
 				if line.trim() == "/reload_mtp" {
@@ -17759,6 +17911,7 @@ impl Infer {
 				}
 				if line.trim() == "/artifacts" {
 					for path in placed.native_artifacts() { eprintln!("artifact {}", path.display()); }
+					for path in placed.expert_artifacts()? {eprintln!("worker artifact {}",path.display());}
 					if let Some(mtp) = &mtp { for path in mtp.placed.native_artifacts() { eprintln!("MTP artifact {}", path.display()); } }
 					continue;
 				}
@@ -17794,7 +17947,7 @@ impl Infer {
 			}
 			require(prompt.len() < sequence, format!("{} prompt tokens leave no reply positions in {sequence} context positions", prompt.len()))?;
 			let available = sequence - prompt.len();
-			let budget = self.tokens.map_or(available, |limit| limit.min(available));
+			let budget = reply_limit.map_or(available, |limit| limit.min(available));
 			let show_reply = self.chat.is_some() || self.log.iter().any(|metric| metric.0 == chat.0);
 			let streaming = show_reply;
 			let framed = progress.as_ref().is_some_and(InferenceLive::renders_reply);
@@ -17826,6 +17979,7 @@ impl Infer {
 			memory = resident_memory(&placed, mtp.as_ref());
 			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
 			drop(progress);
+			if let Err(error)=placed.export_router_picks() {eprintln!("cannot export router picks: {error}");}
 			let reply = coder.decode(&ids);
 			let mut operations = placed.take_operations("main");
 			if let Some(mtp) = &mtp { operations.extend(mtp.placed.take_operations("mtp")); }
@@ -18437,6 +18591,8 @@ impl std::ops::Deref for InferenceReport {
 /// Observations from one request. The flat report fields refer to its last request.
 #[derive(Clone, Debug)]
 pub struct OperationReport {
+	pub selected_experts: usize,
+	pub weight_bytes: usize,
 	pub device: String,
 	pub model: String,
 	pub block: usize,
@@ -19122,6 +19278,435 @@ impl Drop for PeerPacket {
 	fn drop(&mut self) { self.gpu.free(self.slots); self.gpu.free(self.packet); }
 }
 
+fn expert_graphs(bound:&Bound,head:Option<&MtpHead>,positions:usize,checkpoints:usize,observations:u8,gpu:&'static Gpu)->Result<(Graph,Option<Graph>)> {
+	let mut target=bound_graph_on(&bound.file,&bound.model,&bound.plan,&vec![0.0;positions],1,gpu)?;
+	target.observations=observations;
+	if checkpoints>0 {retain_mtp_hidden(&mut target)?;for node in &mut target.nodes {if node.op==Primitive::Delta {node.argument[5]=checkpoints as f64;}}}
+	wire_expert_graph(&mut target,&bound.plan,false,0)?;
+	wire_dense_graph(&mut target,&bound.plan,false,0)?;
+	let mut other=head.map(|head|head.graph(positions,gpu)).transpose()?;
+	if let (Some(head),Some(graph))=(head,&mut other) {retain_mtp_hidden(graph)?;wire_expert_graph(graph,&head.bound.plan,true,target.expert_layers.len())?;wire_dense_graph(graph,&head.bound.plan,true,target.expert_layers.len())?;}
+	Ok((target,other))
+}
+fn expert_request_bytes(graph:&Graph,precision:Compute)->Result<usize> {
+	let layout=NativeLayout::for_graph(graph,1,precision,true)?;
+	let positions=layout.window_positions;
+	let mut bytes=graph.input.channels*positions*layout.input_precision.bytes();
+	bytes+=graph.output.channels*if graph.output.length==1 {1} else {positions}*layout.output_precision.bytes();
+	for (index,node) in graph.nodes.iter().enumerate() {
+		if node.retain_output {bytes+=node.output.channels*positions*layout.precisions[index].bytes();}
+		if matches!(node.op,Primitive::Gather|Primitive::Lookup) {
+			let channels=if node.op==Primitive::Gather {node.argument[1] as usize} else {node.output.channels};
+			bytes+=channels*positions*node.precision.bytes();
+		}
+	}
+	Ok(bytes)
+}
+fn split_working_reserve(target:&Graph,head:Option<&Graph>)->usize {
+	let jobs=target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).collect::<Vec<_>>();
+	let rows=jobs.iter().filter(|job|job.dense()).flat_map(|job|job.tensors()).map(|tensor|(tensor.shape[1] as usize).div_ceil(6)).max().unwrap_or(0).max(10240);
+	let scratch=[5*10240*4,8*10240*2,8*10240/32*8,5*16*10240*4,5*rows*4,16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
+	let tables=jobs.iter().map(|job|if job.dense(){job.tensors().len()*32}else{512*40}).sum::<usize>();
+	let positions=target.input.length.max(head.map_or(0,|graph|graph.input.length));
+	let reports=positions*jobs.len()*128;
+	// Include modules, peer packets, main descriptors, counters, and synchronization storage.
+	(128<<20).max(scratch+tables+reports+jobs.len()*(192+112+6*48+512*4)+(8<<20))
+}
+fn expert_main_reserve(target:&Graph,head:Option<&Graph>,target_file:&Gguf,head_file:Option<&Gguf>,precision:Compute)->Result<(usize,usize,usize)> {
+	let native=part_bytes(target,precision)?+head.map(|graph|part_bytes(graph,precision)).transpose()?.unwrap_or(0);
+	let requests=expert_request_bytes(target,precision)?+head.map(|graph|expert_request_bytes(graph,precision)).transpose()?.unwrap_or(0);
+	let dense=dense_names(target,head);
+	let raw=[(false,target_file),(true,head_file.unwrap_or(target_file))].into_iter().filter(|(mtp,_)|!*mtp || head_file.is_some()).flat_map(|(mtp,file)|file.tensors().iter().map(move|tensor|(mtp,tensor)))
+		.filter(|(mtp,tensor)|!dense.contains(&(*mtp,tensor.name.clone())) && !tensor.name.ends_with("_exps.weight") && !matches!(tensor.name.as_str(),"token_embd.weight"|"per_layer_token_embd.weight")).map(|(_,tensor)|tensor.bytes).sum::<usize>();
+	Ok((native.saturating_sub(raw)+requests+split_working_reserve(target,head)+placement_reserve_bytes()?,native,requests))
+}
+fn dense_names(target:&Graph,head:Option<&Graph>)->std::collections::HashSet<(bool,String)> {
+	target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).filter(|layer|layer.dense())
+		.flat_map(|layer|layer.tensors().iter().map(move|tensor|(layer.mtp,tensor.name.clone()))).collect()
+}
+
+fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, checkpoints: usize, observations: u8) -> Result<(Placed, Option<MtpRuntime>)> {
+	let main = device(Some("nv4"))?;
+	let (target_graph,head_graph)=expert_graphs(bound,head.as_ref(),positions,checkpoints,observations,main)?;
+	let precision=Config::load()?.precision;
+	// Validate and compile both native forwards before uploading resident weights.
+	// The later tapes reuse these artifacts with the same graph layout.
+	drop(main.native_program(&target_graph,1,precision,None,false)?);
+	if let Some(graph)=&head_graph {drop(main.native_program(graph,1,precision,None,false)?);}
+	let head_file=head.as_ref().map(|head|&head.bound.file);
+	let (reserve,native_bytes,requests)=expert_main_reserve(&target_graph,head_graph.as_ref(),&bound.file,head_file,precision)?;
+	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:split_working_reserve(&target_graph,head_graph.as_ref())};8];
+	for gpu in selected_gpus()? {
+		let die=gpu.name.strip_prefix("nv").and_then(|value|value.parse::<usize>().ok()).ok_or_else(||RecipeError::new("expert startup requires physical local NVIDIA names"))?;
+		require(die<8 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
+		#[cfg(nvidia)] if die==2 && let Driver::Cuda(driver)=&gpu.driver {
+			gpu.activate()?; let (mut free,mut total)=(0,0); unsafe {gpu.status((driver.memory_info)(&mut free,&mut total),"capped expert memory")?;}
+			budgets[die].free_bytes=budgets[die].free_bytes.min(free.saturating_sub(total.saturating_sub(5_798_205_440)));
+		}
+	}
+	budgets[4].reserve_bytes=reserve;
+	let mut plan=ExpertSplitPlan::with_dense(bound.file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets,&dense_names(&target_graph,head_graph.as_ref()))?;
+	validate_dense_plan(&mut plan,&target_graph,head_graph.as_ref(),&bound.file,head_file)?;
+	println!("{}",plan.table());
+	require(plan.fits(),format!("expert forward resident placement failed; canonical target/head buffers {native_bytes} bytes, five-slot request reserve {requests} bytes\n{}",plan.table()))?;
+	let mut layers=target_graph.expert_layers.clone(); if let Some(graph)=&head_graph {layers.extend(graph.expert_layers.clone());}
+	let execution=Arc::new(Mutex::new(ExpertExecution::new(plan,&bound.file,head_file,layers,positions)?));
+	let place_graph=|mut graph:Graph| -> Result<Placed> {
+		graph.expert_execution=Some(execution.clone());
+		let tokens=vec![0.0;positions];
+		let tape=NativeTape::new(&graph,TapeInput::Zeroed(graph.input.elements()),&tokens,&[],main,precision,None)?;
+		let bytes=tape.resident_bytes();
+		let blocks=graph.nodes.last().map_or(0,|node|node.block_index+1);
+		Ok(Placed {source:PlacedSource::Bound(graph.input,Vec::new()),decode:Mutex::new(DecodeState::default()),devices:vec![main],split:vec![blocks],tapes:vec![vec![tape]],resident:vec![bytes],movement:vec![0],moved:0})
+	};
+	let target=place_graph(target_graph)?;
+	let runtime=match (head,head_graph) {
+		(Some(head),Some(graph))=> {
+			let placed=place_graph(graph)?;
+			let lookup=MtpLookup {hash:head.lookup_hash.clone(),..MtpLookup::default()};
+			let lookup_enabled=std::env::var("RECIPE_MTP_LOOKUP").as_deref()!=Ok("0");
+			Some(MtpRuntime {head,lookup,lookup_enabled,placed,samples:Vec::new(),hidden:Vec::new(),hidden_released:0,ids:Vec::new(),logits:Vec::new(),sequence:positions,head_valid:0,poisoned:false})
+		}, _=>None,
+	};
+	// Every workspace, descriptor, module, and target/head tape exists before the bulk upload.
+	execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.weights.upload(&bound.file,runtime.as_ref().map(|runtime|&runtime.head.bound.file))?;
+	Ok((target,runtime))
+}
+
+macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
+fn expert_pick_seed()->Result<std::collections::BTreeMap<(bool,usize,u32),u64>> {
+	let mut counts=std::collections::BTreeMap::new();
+	let Some(path)=std::env::var_os("RECIPE_EXPERT_PICK_COUNTS") else {return Ok(counts)};
+	require(Path::new(&path).is_file(), "configured expert frequency file is absent")?;
+	let text=fs::read_to_string(path).map_err(|error|RecipeError::new(format!("expert frequency read: {error}")))?;
+	for line in text.lines().filter(|line|!line.is_empty() && !line.starts_with("model,") && !line.starts_with("layer\t")) {
+		let reference=line.contains('\t');
+		let fields=line.split(if reference {'\t'} else {','}).collect::<Vec<_>>(); require(fields.len()==4,"expert frequency record needs four fields")?;
+		let mtp=if reference {false} else {match fields[0] {"target"=>false,"mtp"=>true,_=>return Err(RecipeError::new("expert frequency model is invalid"))}};
+		let offset=usize::from(!reference);
+		let layer=fields[offset].parse().map_err(|_|RecipeError::new("expert frequency layer is invalid"))?;
+		let expert=fields[offset+1].parse::<u32>().map_err(|_|RecipeError::new("expert frequency ID is invalid"))?;
+		let picks=fields[offset+2].parse().map_err(|_|RecipeError::new("expert frequency count is invalid"))?;
+		require(expert<512,"expert frequency ID exceeds Flash-Next expert count")?; counts.insert((mtp,layer,expert),picks);
+	}
+	require(!counts.is_empty(), "configured expert frequency file has no records")?;
+	Ok(counts)
+}
+
+fn external_expert(node: &Node) -> bool { matches!(node.block_kind,"split_expert"|"split_dense") }
+#[derive(Clone)]
+enum SplitWork { Expert([GgufTensor;3]), Dense(Vec<GgufTensor>) }
+#[derive(Clone)]
+struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, last_only: bool, work: SplitWork }
+impl ExpertLayer {
+	fn tensors(&self)->&[GgufTensor] {match &self.work {SplitWork::Expert(tensors)=>tensors,SplitWork::Dense(tensors)=>tensors}}
+	fn dense(&self)->bool {matches!(self.work,SplitWork::Dense(_))}
+	fn input_width(&self)->usize {self.tensors()[0].shape[0] as usize}
+	fn output_width(&self)->usize {match &self.work {SplitWork::Expert(tensors)=>tensors[2].shape[1] as usize,SplitWork::Dense(tensors)=>tensors.iter().map(|tensor|tensor.shape[1] as usize).sum()}}
+	fn hidden(&self)->usize {if self.dense(){0}else{self.tensors()[0].shape[1] as usize}}
+	fn expert_count(&self)->usize {if self.dense(){0}else{self.tensors()[0].shape[2] as usize}}
+	fn expert_bytes(&self)->usize {if self.dense(){0}else{self.tensors().iter().map(|tensor|tensor.bytes).sum::<usize>()/self.expert_count()}}
+}
+fn wire_expert_graph(graph: &mut Graph, binding: &Binding, mtp: bool, first: usize) -> Result<()> {
+	let tensors: Vec<GgufTensor> = binding.nodes.iter().filter_map(|planes| {
+		(planes.len() == 1).then(|| planes[0].mapped()).flatten().filter(|tensor| tensor.name.ends_with("_exps.weight")).cloned()
+	}).collect();
+	let nodes: Vec<usize> = graph.nodes.iter().enumerate().filter_map(|(index,node)| matches!(node.op, Primitive::ExpertIn | Primitive::ExpertOut).then_some(index)).collect();
+	require(tensors.len() == nodes.len() && nodes.len() % 3 == 0, "expert forward bindings do not match the lowered gate/up/down nodes")?;
+	for (group, (indices, tensors)) in nodes.chunks_exact(3).zip(tensors.chunks_exact(3)).enumerate() {
+		let (gate, up, out) = (indices[0], indices[1], indices[2]);
+		require(graph.nodes[gate].op == Primitive::ExpertIn && graph.nodes[up].op == Primitive::ExpertIn && graph.nodes[out].op == Primitive::ExpertOut,
+			"expert forward needs gate/up/down in binding order")?;
+		require(graph.nodes[gate].source == graph.nodes[up].source && graph.nodes[gate].second == graph.nodes[out].second && graph.nodes[up].second == graph.nodes[out].second,
+			"expert forward projections disagree on source or routing")?;
+		require(tensors[0].name.ends_with("ffn_gate_exps.weight") && tensors[1].name.ends_with("ffn_up_exps.weight") && tensors[2].name.ends_with("ffn_down_exps.weight"), "expert forward tensor names disagree with projection order")?;
+		let layer = tensors[0].name.split('.').nth(1).and_then(|value| value.parse().ok()).ok_or_else(|| RecipeError::new("expert forward tensor has no layer number"))?;
+		let input = graph.nodes[gate].input;
+		let source = graph.nodes[gate].source;
+		for node in &mut graph.nodes[gate..out] { node.block_kind = "split_expert"; node.argument[8] = -1.0; node.observation=None; }
+		graph.nodes[out].source = source;
+		graph.nodes[out].input = input;
+		graph.nodes[out].block_kind = "split_expert";
+		graph.nodes[out].argument[8] = (group + 1) as f64;
+		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, last_only:false, work:SplitWork::Expert([tensors[0].clone(),tensors[1].clone(),tensors[2].clone()]) });
+	}
+	Ok(())
+}
+// Measured 256-thread lane tuples. Row slicing retains the source shape's tuple.
+fn dense_lane_word(tensor:&GgufTensor)->u32 {
+	let (kind,k,m)=(tensor.kind,tensor.shape[0],tensor.shape[1]);
+	[1,2,4,8].into_iter().enumerate().fold(0,|word,(index,capacity)| {
+		let lanes=match kind {
+			8=>if k==2560 || k==10240 || (k==320 && capacity==2) {16}else{8},
+			13=>if (k==6144 && capacity==1) || (m==640 && capacity!=2) {16}else{8},
+			14=>if k==6144 || m==640 || (m==512 && capacity<=4) || capacity<=2 {16}else{8},
+			17|18=>16,
+			_=>8,
+		};word | (lanes << (index*8))
+	})
+}
+fn dense_row_map(tensors:&[GgufTensor],original:&GgufTensor,first:usize,rows:usize)->Result<Vec<u32>> {
+	let stride=original.bytes/original.shape[1] as usize;let mut map=vec![u32::MAX;rows];let mut output=0;
+	for plane in tensors {
+		if plane.name==original.name {
+			let skipped=plane.offset.checked_sub(original.offset).ok_or_else(||RecipeError::new("dense view precedes its source tensor"))?;
+			require(skipped%stride==0,"dense mapped plane cuts a packed row")?;let before=skipped/stride;
+			let start=first.max(before);let end=(first+rows).min(before+plane.shape[1] as usize);
+			for row in start..end {let destination=(output+row-before) as u32;let entry=&mut map[row-first];require(*entry==u32::MAX || *entry==destination,"dense matrix row is reused at distinct output channels")?;*entry=destination;}
+		}
+		output+=plane.shape[1] as usize;
+	}
+	Ok(map)
+}
+fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Graph>,target_file:&Gguf,head_file:Option<&Gguf>)->Result<()> {
+	for job in target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).filter(|job|job.dense()) {
+		let model=if job.mtp {head_file.ok_or_else(||RecipeError::new("dense head plan has no checkpoint"))?} else {target_file};
+		let mut covered=vec![false;job.output_width()];let mut names=std::collections::HashSet::new();
+		for tensor in job.tensors() {
+			if !names.insert(&tensor.name) {continue;}
+			let original=model.tensor(&tensor.name).ok_or_else(||RecipeError::new("dense plan source header is absent"))?;
+			for item in plan.placements.iter().filter(|item|item.mtp==job.mtp && item.tensor.name==tensor.name && item.row_start.is_some()) {
+				let map=dense_row_map(job.tensors(),original,item.row_start.unwrap(),item.tensor.shape[1] as usize)?;
+				if map.iter().any(|row|*row!=u32::MAX) {plan.dense_read_bytes[usize::from(job.mtp)][item.die]+=item.tensor.bytes;}
+				for row in map.into_iter().filter(|row|*row!=u32::MAX) {let entry=covered.get_mut(row as usize).ok_or_else(||RecipeError::new("dense output row exceeds its graph shape"))?;require(!*entry,"dense output row has overlapping die ownership")?;*entry=true;}
+			}
+		}
+		require(covered.iter().all(|row|*row),format!("dense node {} has uncovered output rows",job.node))?;
+	}
+	Ok(())
+}
+fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
+	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
+	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;
+	for (index,planes) in nodes.into_iter().zip(&binding.nodes) {
+		let node=&graph.nodes[index];
+		if node.op!=Primitive::Contraction || node.argument[0]>1.0 || node.argument[1]!=0.0 || node.argument[2]==0.0 {continue;}
+		let Some(tensors)=planes.iter().map(|plane|plane.mapped().cloned()).collect::<Option<Vec<_>>>() else {continue};
+		if tensors.is_empty() || !tensors.iter().all(|tensor|tensor.shape.len()==2 && tensor.shape[0] as usize==node.input.channels) {continue;}
+		if tensors.iter().map(GgufTensor::elements).sum::<usize>()!=node.weights() {continue;}
+		if tensors.iter().map(|tensor|tensor.shape[1] as usize).sum::<usize>()!=node.output.channels {continue;}
+		require(tensors.iter().map(|tensor|&tensor.name).collect::<std::collections::HashSet<_>>().len()<=16 && tensors.iter().all(|tensor|matches!(tensor.kind,0|8|12|13|14|17|18|20|30) && tensor.shape[0]<=10240 && (matches!(tensor.kind,0|30) || tensor.shape[0]%32==0)),format!("dense row split needs supported types, aligned quantized widths, and at most sixteen source matrices: {tensors:?}"))?;
+		let layer=node.block_index;let last_only=node.output.length==1;
+		graph.nodes[index].block_kind="split_dense";graph.nodes[index].precision=Compute::FP32;graph.nodes[index].acc=Compute::FP32;graph.nodes[index].argument[8]=1.0;
+		graph.expert_layers.push(ExpertLayer {node:index,global:0,mtp,layer,last_only,work:SplitWork::Dense(tensors)});
+	}
+	graph.expert_layers.sort_by_key(|layer|layer.node);
+	for (local,layer) in graph.expert_layers.iter_mut().enumerate() {layer.global=first+local;graph.nodes[layer.node].argument[8]=(local+1) as f64;}
+	Ok(())
+}
+fn expert_enabled(file: &Gguf, devices: &[&Gpu]) -> bool {
+	file.value("general.architecture").and_then(GgufValue::text) == Some("qwen4exp")
+		&& file.value("qwen4exp.expert_count").and_then(GgufValue::integer) == Some(512)
+		&& ["nv0","nv1","nv3","nv4","nv5","nv7"].iter().all(|name|devices.iter().any(|gpu|gpu.name==*name))
+		&& devices.iter().all(|gpu|matches!(gpu.name.as_str(),"nv0"|"nv1"|"nv2"|"nv3"|"nv4"|"nv5"|"nv7"))
+}
+struct ExpertModule { gpu: &'static Gpu, handle: usize, function: usize }
+impl ExpertModule {
+	fn load(gpu: &'static Gpu, bytes: &[u8]) -> Result<Self> {
+		#[cfg(nvidia)] {
+			let Driver::Cuda(driver)=&gpu.driver else {return Err(RecipeError::new("expert worker requires CUDA"));};
+			gpu.activate()?; let (mut handle,mut function,mut active)=(ptr::null_mut(),0,0);
+			unsafe {
+				gpu.status((driver.load)(&mut handle,bytes.as_ptr().cast()),"expert module load")?;
+				let mut module=Self {gpu,handle:handle as usize,function:0};
+				gpu.status((driver.function)(&mut function,handle,c"expert_split_worker".as_ptr().cast()),"expert worker symbol")?;
+				gpu.status((driver.occupancy)(&mut active,function,256,40960),"expert worker occupancy")?;
+				require(active>=1 && driver.cus==16,"expert worker requires all 16 M60 SMs to be resident")?;
+				module.function=function; Ok(module)
+			}
+		}
+		#[cfg(not(nvidia))] {let _=(gpu,bytes);Err(RecipeError::new("expert worker requires NVIDIA support"))}
+	}
+}
+impl Drop for ExpertModule {
+	fn drop(&mut self) {
+		#[cfg(nvidia)] if let Driver::Cuda(driver) = &self.gpu.driver { let _ = self.gpu.activate(); unsafe { (driver.unload)(self.handle as Ptr); } }
+	}
+}
+struct ExpertWorker { read_bytes:Vec<usize>, die: usize, gpu: &'static Gpu, jobs: Buffer, reports: Buffer, scratch: Vec<Buffer>, module: Option<ExpertModule> }
+struct ExpertExecution {
+	pick_counts: Buffer,
+	pick_path: PathBuf,
+	worker_path: PathBuf,
+	failed: bool,
+	main_sync: PeerPacket,
+	weights: ExpertSplitWeights,
+	control: Buffer,
+	main_scratch: Vec<Buffer>,
+	main_descriptors: Vec<Buffer>,
+	channel_tables: Vec<Buffer>,
+	workers: Vec<ExpertWorker>,
+	layers: Vec<ExpertLayer>,
+	sequence: usize,
+}
+fn native_words(words: &[u64]) -> Vec<u8> { words.iter().flat_map(|word| word.to_ne_bytes()).collect() }
+impl ExpertExecution {
+	fn reload_workers(&mut self, path: &Path) -> Result<()> {
+		require(!self.failed,"expert execution is invalid after an unsuccessful request")?;
+		let bytes=fs::read(path).map_err(|error|RecipeError::new(format!("cannot read worker {}: {error}",path.display())))?;
+		require(bytes.starts_with(b"\x7fELF"),"worker replacement is not a cubin")?;
+		let mut replacements=Vec::new();
+		for (index,worker) in self.workers.iter().enumerate().filter(|(_,worker)|worker.module.is_some()) {
+			worker.gpu.synchronize()?;
+			replacements.push((index,ExpertModule::load(worker.gpu,&bytes)?));
+		}
+		for (index,module) in replacements {self.workers[index].module=Some(module);}
+		self.worker_path=path.to_path_buf();
+		Ok(())
+	}
+	fn worker_source() -> String {
+		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}", p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
+	}
+	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
+		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
+		let main = device(Some("nv4"))?;
+		let source = Self::worker_source();
+		let key = native_artifact_key(&main.native_target, &source)?;
+		let directory = native_artifact_directory(&key)?;
+		fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("expert artifact directory: {error}")))?;
+		let ptx = directory.join("expert-worker.ptx"); let cubin = directory.join("expert-worker.cubin");
+		if !cubin.is_file() {
+			fs::write(&ptx, source).map_err(|error| RecipeError::new(format!("expert PTX write: {error}")))?;
+			let assembler = native_nvidia_assembler("sm_52").ok_or_else(|| RecipeError::new("expert worker requires the NVIDIA PTX assembler"))?;
+			let object=directory.join("expert-worker-device.cubin");
+			let mut command = Command::new(&assembler); command.args(["-c","-arch=sm_52","-O1","-v","-o"]).arg(&object).arg(&ptx);
+			let diagnostic = native_command(command,"expert worker PTX assembler",&key)?;
+			let mut command=Command::new(Path::new(&assembler).with_file_name("nvlink")); command.args(["-arch=sm_52","--kernels-used","expert_split_worker","-o"]).arg(&cubin).arg(&object);
+			native_command(command,"expert worker device linker",&key)?;
+			fs::write(directory.join("assembly.txt"),diagnostic).map_err(|error| RecipeError::new(format!("expert assembly receipt: {error}")))?;
+		}
+		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
+		let weights = ExpertSplitWeights::prepare(plan, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
+		let control = Buffer::zeroed(main, 128)?;
+		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
+		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
+		let main_sync=PeerPacket::new("nv4")?;
+		control.write_bytes(32,&native_words(&[main_sync.completion_address(),main_sync.sequence_address()+4]))?;
+		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_LOG").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
+		let mut value = Self { pick_counts,pick_path,worker_path:cubin.clone(),failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
+		for die in [0,1,2,3,4,5,7].into_iter().filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
+			let gpu = device(Some(&format!("nv{die}")))?;
+			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
+			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
+			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
+			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
+			let mut module = None;
+			#[cfg(nvidia)] if die != 4 {module=Some(ExpertModule::load(gpu,&bytes)?);}
+
+			value.workers.push(ExpertWorker { read_bytes:Vec::new(), die, gpu, jobs, reports, scratch, module });
+		}
+		for layer in &value.layers {
+			let mut channels=Vec::new();
+			for (channel,worker) in value.workers.iter_mut().enumerate() {
+				let (request,response,route)=value.weights.channel(channel).ok_or_else(||RecipeError::new("split channel is absent"))?;
+				channels.extend([request.address(),route,route+512,response.completion_address(),request.sequence_address(),worker.die as u64]);
+				let mut matrices=Vec::new();let mut read_bytes=0;let mut slices=0;
+				match &layer.work {
+					SplitWork::Expert(tensors)=> {
+						for expert in 0..layer.expert_count() as u32 {
+							let mut entry=[0u64;5];
+							for (slot,tensor) in tensors.iter().enumerate() {
+								if let Some((owner,address,_,kind))=value.weights.weight_address(layer.mtp,&tensor.name,Some(expert)) {
+									if owner==worker.die {entry[slot]=address;entry[3+slot/2]|=(kind as u64)<<(32*(slot%2));}
+								}
+							}
+							matrices.extend(entry);
+						}
+						read_bytes=layer.expert_bytes();
+					},
+					SplitWork::Dense(tensors)=> {
+						let model=if layer.mtp {head.ok_or_else(||RecipeError::new("dense MTP rows require a checkpoint"))?} else {target};
+						let mut names=std::collections::HashSet::new();
+						for tensor in tensors {
+							if !names.insert(tensor.name.clone()) {continue;}
+							let original=model.tensor(&tensor.name).ok_or_else(||RecipeError::new("dense source header is absent"))?;
+							let Some((address,bytes,kind,first))=value.weights.dense_bindings.get(&(layer.mtp,tensor.name.clone(),worker.die)).copied() else {continue};
+							let stride=original.bytes/original.shape[1] as usize;let rows=bytes/stride;
+							let row_map=dense_row_map(tensors,original,first,rows)?;
+							if row_map.iter().all(|row|*row==u32::MAX) {continue;}
+							let map=Buffer::upload(worker.gpu,&row_map)?;
+							matrices.extend([address,(kind as u64)|((original.shape[0])<<32),rows as u64,dense_lane_word(original) as u64,map.pointer]);
+							value.channel_tables.push(map);read_bytes+=bytes;slices+=1;
+						}
+					},
+				}
+				if matrices.is_empty() {matrices.push(0);}
+				let table=Buffer::upload(worker.gpu,&matrices)?;
+				worker.read_bytes.push(read_bytes);
+				let fields=[request.address(),request.sequence_address(),route,route+512,worker.scratch[0].pointer,worker.scratch[1].pointer,worker.scratch[2].pointer,table.pointer,
+					worker.scratch[3].pointer,worker.scratch[4].pointer,worker.scratch[5].pointer,request.completion_address(),request.sequence_address()+4,response.address(),response.sequence_address(),worker.reports.pointer];
+				let mut record=native_words(&fields);
+				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
+				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
+				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),layer.input_width().max(4096) as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
+				value.channel_tables.push(table);
+			}
+			let channels=Buffer::upload(main,&channels)?;
+			let local=value.workers.iter().find(|worker|worker.die==4).unwrap();
+			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
+			let fields=[value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
+			let mut record=native_words(&fields);
+			for dimension in [layer.global as u32,value.workers.len() as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
+			record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
+			record.extend(u32::from(layer.dense()).to_ne_bytes());
+			value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
+		}
+		Ok(value)
+	}
+	fn start(&mut self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<()> {
+		require(!self.failed,"expert execution failed previously; retain its trace and replace the failed execution before another request")?;
+		require(capacity>0 && capacity<=5 && end>=begin,"expert request has an unsupported position capacity")?;
+		let phases = (end-begin).div_ceil(capacity) as usize * layers;
+		let base = self.weights.reserve_sequences(u32::try_from(phases).map_err(|_| RecipeError::new("expert phase count overflows"))?)?;
+		require(base.checked_add(phases as u32).and_then(|sequence|sequence.checked_mul(64)).is_some(),"expert completion sequence exhausted")?;
+		let mut control=Vec::new(); for word in [base,begin,capacity,layers as u32,first as u32,end-begin,0,0] {control.extend(word.to_ne_bytes());}
+		self.control.write_bytes(0,&control)?;
+		for worker in &self.workers {
+			#[cfg(nvidia)] if let Some(module)=&worker.module {
+				let Driver::Cuda(driver)=&worker.gpu.driver else {unreachable!()}; worker.gpu.activate()?;
+				let (first,layers,tokens)=(first as u32,layers as u32,end-begin);
+				let mut call=ptrs![worker.jobs.pointer,first,layers,base,tokens,capacity];
+				unsafe {worker.gpu.status((driver.launch)(module.function,driver.cus,1,1,256,1,1,40960,ptr::null_mut(),call.as_mut_ptr().cast(),ptr::null_mut()),"expert worker launch")?;}
+			}
+		}
+		Ok(())
+	}
+	fn finish(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<Vec<OperationReport>> {
+		let phases=(end-begin).div_ceil(capacity) as usize*layers;
+		let mut observations=Vec::new();
+		for worker in &self.workers {
+			worker.gpu.synchronize()?;
+			let reports=worker.reports.download_range::<u32>(0,phases*32)?;
+			for (phase,report) in reports.chunks_exact(32).enumerate() {
+				for (cta,status) in report[16..32].iter().enumerate() {
+					require(*status==1,format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16]))?;
+				}
+				let clock=|index|u64::from(report[index]) | u64::from(report[index+1])<<32;
+				let ticks=clock(6).saturating_sub(clock(2));
+				let layer=&self.layers[first+phase%layers]; let experts=report[14] as usize;
+				let start=begin+(phase/layers) as u32*capacity; let stop=(start+capacity).min(end);
+				observations.push(OperationReport { selected_experts:if layer.dense(){0}else{experts},weight_bytes:if layer.dense(){worker.read_bytes[layer.global]}else{experts*worker.read_bytes[layer.global]},
+					packed_calls:report[8] as usize,packed_fallbacks:[report[9] as usize,report[10] as usize,report[11] as usize,report[12] as usize],
+					device:device_label(worker.gpu)?,model:String::new(),block:layer.layer,node:layer.node,operation:if layer.dense(){"DenseRowSplit"}else{"ExpertSplit"}.to_owned(),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
+					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
+			}
+		}
+		let status=self.control.download_range::<u32>(24,2)?;
+		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}",status[0],status[1]))?;
+
+		Ok(observations)
+	}
+	fn export_picks(&self)->Result<()> {
+		let counts=self.pick_counts.download_range::<u32>(0,self.layers.len()*512)?;
+		let mut text=String::from("model,layer,expert,picks\n");
+		for layer in self.layers.iter().filter(|layer|!layer.dense()) {for expert in 0..512 {text.push_str(&format!("{},{},{expert},{}\n",if layer.mtp {"mtp"} else {"target"},layer.layer,counts[layer.global*512+expert]));}}
+		fs::write(&self.pick_path,text).map_err(|error|RecipeError::new(format!("expert frequency write: {error}")))?;
+		Ok(())
+	}
+	fn abort(&mut self) {self.failed=true; for worker in &self.workers {let _=worker.gpu.synchronize();}}
+}
+
 /// Physical Archy die capacity measured before placement. Reserve includes KV,
 /// CUDA working storage, and the persistent peer packets, separately from weights.
 #[derive(Clone, Copy, Debug)]
@@ -19131,6 +19716,8 @@ pub struct ExpertDieBudget {
 }
 #[derive(Clone, Debug)]
 pub struct ExpertWeightPlacement {
+	pub row_start: Option<usize>,
+	pub spilled: bool,
 	pub tensor: GgufTensor,
 	pub expert: Option<u32>,
 	pub die: usize,
@@ -19142,6 +19729,8 @@ pub struct ExpertWeightPlacement {
 /// their type and byte layout. Lookup tables remain in the caller's RAM mapping.
 #[derive(Clone, Debug)]
 pub struct ExpertSplitPlan {
+	pub dense_read_bytes:[[usize;8];2],
+	pub spill_bytes: usize,
 	pub main_die: usize,
 	pub budgets: [ExpertDieBudget; 8],
 	pub weights: [usize; 8],
@@ -19154,15 +19743,32 @@ impl ExpertSplitPlan {
 	/// `head` contains unique MTP tensors; the holder decides whether its output
 	/// projection and token lookup share the target's quantized representation.
 	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; 8]) -> Result<Self> {
-		require((2..6).contains(&main_die), "expert split main die must be physical Archy die 2, 3, 4, or 5")?;
-		let mut plan = Self { main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
+		Self::with_dense(target,head,main_die,budgets,&std::collections::HashSet::new())
+	}
+	fn with_dense(target:&[GgufTensor],head:&[GgufTensor],main_die:usize,budgets:[ExpertDieBudget;8],dense:&std::collections::HashSet<(bool,String)>)->Result<Self> {
+		require(matches!(main_die,3|4), "expert split main die must be physical Archy die 3 or 4")?;
+		let mut budgets=budgets;budgets[2].free_bytes=0;budgets[6].free_bytes=0;for budget in &mut budgets {if budget.free_bytes==0 {budget.reserve_bytes=0;}}
+		let mut plan = Self { dense_read_bytes:[[0;8];2],spill_bytes:0, main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
 		let mut layers: std::collections::BTreeMap<(bool, usize), Vec<&GgufTensor>> = std::collections::BTreeMap::new();
 		let mut names = std::collections::HashSet::new();
+		let frequencies=expert_pick_seed()?;
+		let mut bundles=Vec::new();
 		for (mtp, tensors) in [(false, target), (true, head)] {
 			for tensor in tensors {
 				require(tensor.bytes != 0, "expert split cannot place an empty tensor")?;
 				require(names.insert((mtp, tensor.name.clone())), format!("duplicate split tensor {}", tensor.name))?;
 				if matches!(tensor.name.as_str(), "token_embd.weight" | "per_layer_token_embd.weight") { continue; }
+				if dense.contains(&(mtp,tensor.name.clone())) {
+					require(tensor.shape.len()==2,"dense row placement needs a matrix")?;
+					let dies=(0..8).filter(|die|budgets[*die].free_bytes!=0).collect::<Vec<_>>();
+					let rows=tensor.shape[1] as usize;
+					for (rank,die) in dies.iter().copied().enumerate() {
+						let first=rows*rank/dies.len();let end=rows*(rank+1)/dies.len();if end==first {continue;}
+						let slice=tensor.rows(first,end-first)?;
+						plan.append(slice,None,die,mtp)?;plan.placements.last_mut().unwrap().row_start=Some(first);
+					}
+					continue;
+				}
 				if tensor.name.ends_with("_exps.weight") {
 					let layer = tensor.name.strip_prefix("blk.").and_then(|name| name.split('.').next()).and_then(|number| number.parse::<usize>().ok())
 						.ok_or_else(|| RecipeError::new(format!("expert tensor {} has no block index", tensor.name)))?;
@@ -19182,20 +19788,33 @@ impl ExpertSplitPlan {
 				format!("block {layer} expert shapes or packed byte strides disagree"))?;
 			for expert in 0..count as usize {
 				let slices = tensors.iter().map(|tensor| tensor.expert(expert)).collect::<Result<Vec<_>>>()?;
-				let die = (0..8).filter(|die| *die != main_die && *die != 6).filter_map(|die| {
+				bundles.push((mtp,layer,expert,slices));
+			}
+		}
+		bundles.sort_by_key(|(mtp,layer,expert,_)| {let picks=frequencies.get(&(*mtp,*layer,*expert as u32)).copied();let cold=!*mtp && *layer!=47 && picks==Some(0);(cold,std::cmp::Reverse(picks.unwrap_or(0)),*layer,*expert)});
+		for (mtp,layer,expert,slices) in bundles {
+				let die = (0..8).filter(|die| *die != main_die && *die != 2 && *die != 6).filter_map(|die| {
 					let mut end = plan.weights[die];
 					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
 					let available = budgets[die].free_bytes.saturating_sub(budgets[die].reserve_bytes);
 					(end <= available).then(|| (die, available - end))
-				}).max_by_key(|(die, remaining)| (*remaining, std::cmp::Reverse(*die))).map(|(die, _)| die);
+				}).max_by_key(|(die, remaining)| (*remaining, std::cmp::Reverse(*die))).map(|(die, _)| die).or_else(|| {
+					let mut end = plan.weights[main_die];
+					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
+					(end <= budgets[main_die].free_bytes.saturating_sub(budgets[main_die].reserve_bytes)).then_some(main_die)
+				});
 				if let Some(die) = die {
 					for slice in slices { plan.append(slice, Some(expert as u32), die, mtp)?; }
 					plan.experts[die] += 1;
 				} else {
-					plan.unplaced_experts += 1;
-					for slice in slices { plan.unplaced_bytes = checked_add(plan.unplaced_bytes, slice.bytes, "unplaced expert bytes")?; }
+					require(!mtp && layer!=47 && frequencies.get(&(mtp,layer,expert as u32)).copied()==Some(0),"resident capacity cannot keep a selected or MTP expert; cold spill requires a zero-pick target expert")?;
+					let die=[3,4,5].into_iter().min_by_key(|die|plan.experts[*die]).unwrap();
+					for tensor in slices {
+						let (offset,end)=Self::end(plan.spill_bytes,tensor.bytes)?; plan.spill_bytes=end;
+						plan.placements.push(ExpertWeightPlacement {row_start:None,spilled:true,tensor,expert:Some(expert as u32),die,offset,mtp});
+					}
+					plan.experts[die]+=1;
 				}
-			}
 		}
 		Ok(plan)
 	}
@@ -19206,7 +19825,7 @@ impl ExpertSplitPlan {
 	fn append(&mut self, tensor: GgufTensor, expert: Option<u32>, die: usize, mtp: bool) -> Result<()> {
 		let (offset, end) = Self::end(self.weights[die], tensor.bytes)?;
 		self.weights[die] = end;
-		self.placements.push(ExpertWeightPlacement { tensor, expert, die, offset, mtp });
+		self.placements.push(ExpertWeightPlacement { row_start:None,spilled:false,tensor, expert, die, offset, mtp });
 		Ok(())
 	}
 	pub fn fits(&self) -> bool {
@@ -19215,12 +19834,28 @@ impl ExpertSplitPlan {
 	pub fn table(&self) -> String {
 		let mut text = String::from("| Physical die | Role | Free bytes | KV/scratch reserve | Assigned weight bytes | Expert bundles | Remaining bytes |\n|---:|---|---:|---:|---:|---:|---:|\n");
 		for die in 0..8 {
-			if die == 6 { continue; }
+			if die == 2 || die == 6 { continue; }
 			let budget = self.budgets[die];
 			let remaining = budget.free_bytes as i128 - budget.reserve_bytes as i128 - self.weights[die] as i128;
-			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
+			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if budget.free_bytes==0 {"excluded"} else if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
 		}
-		text.push_str(&format!("\nUnplaced expert bundles: {}; unplaced packed bytes: {}; complete resident fit: {}.\n", self.unplaced_experts, self.unplaced_bytes, self.fits()));
+		text.push_str("\n| Physical die | Target dense read bytes/position | MTP dense read bytes/position | Resident expert bytes | RAM expert bytes | RAM bundles | Reference selected expert bytes, all recorded picks |\n|---:|---:|---:|---:|---:|---:|---:|\n");
+		let frequencies=expert_pick_seed().unwrap_or_default();
+		for die in 0..8 {
+			if self.budgets[die].free_bytes==0 {continue;}
+			let dense=[self.dense_read_bytes[0][die],self.dense_read_bytes[1][die]];let mut resident=0;let mut spill=0;let mut cold=std::collections::HashSet::new();let mut reads=0u128;
+			for item in self.placements.iter().filter(|item|item.die==die) {
+
+				if let Some(expert)=item.expert {
+					if item.spilled {spill+=item.tensor.bytes;cold.insert((item.mtp,item.tensor.name.split('.').nth(1).unwrap_or(""),expert));} else {resident+=item.tensor.bytes;}
+					let layer=item.tensor.name.split('.').nth(1).and_then(|value|value.parse::<usize>().ok()).unwrap_or(usize::MAX);
+					reads+=item.tensor.bytes as u128*frequencies.get(&(item.mtp,layer,expert)).copied().unwrap_or(0) as u128;
+				}
+			}
+			text.push_str(&format!("| {die} | {} | {} | {resident} | {spill} | {} | {reads} |\n",dense[0],dense[1],cold.len()));
+		}
+
+		text.push_str(&format!("\nUnplaced expert bundles: {}; unplaced packed bytes: {}; pinned RAM expert bytes: {}; complete placement fit: {}.\n", self.unplaced_experts, self.unplaced_bytes,self.spill_bytes,self.fits()));
 		text
 	}
 	/// Native selected records are `[count, expert IDs...]`; the route coefficients
@@ -19244,7 +19879,32 @@ impl ExpertSplitPlan {
 /// Retain this object in cx-flash's holder. Creation is transactional: capacity
 /// failure returns before weight allocation; upload failure drops new buffers.
 /// Module replacement leaves these allocations and peer sequences unchanged.
+struct ExpertPinned { gpu: &'static Gpu, pointer: usize, mapped: [u64;8] }
+impl ExpertPinned {
+	fn new(gpu: &'static Gpu, bytes: usize, devices: &[Option<&'static Gpu>]) -> Result<Self> {
+		#[cfg(nvidia)] {
+			let Driver::Cuda(driver)=&gpu.driver else {return Err(RecipeError::new("expert spill requires CUDA mapped RAM"));};
+			gpu.activate()?; let mut pointer=ptr::null_mut();
+			unsafe {gpu.status((driver.host_alloc)(&mut pointer,bytes,3),"expert pinned RAM allocation")?;}
+			let mut value=Self {gpu,pointer:pointer as usize,mapped:[0;8]};
+			for (die,device) in devices.iter().enumerate().filter_map(|(die,gpu)|gpu.map(|gpu|(die,gpu))) {
+				let Driver::Cuda(driver)=&device.driver else {return Err(RecipeError::new("expert spill compute die is not CUDA"));};
+				device.activate()?;
+				unsafe {device.status((driver.host_device_pointer)(&mut value.mapped[die],pointer,0),"expert mapped RAM address")?;}
+			}
+			Ok(value)
+		}
+		#[cfg(not(nvidia))] {let _=(gpu,bytes,devices);Err(RecipeError::new("expert spill requires CUDA"))}
+	}
+}
+impl Drop for ExpertPinned {
+	fn drop(&mut self) { #[cfg(nvidia)] if let Driver::Cuda(driver)=&self.gpu.driver {let _=self.gpu.activate(); unsafe {(driver.host_free)(self.pointer as Ptr);}} }
+}
+
 pub struct ExpertSplitWeights {
+	dense_bindings:std::collections::HashMap<(bool,String,usize),(u64,usize,u32,usize)>,
+	bindings: std::collections::HashMap<(bool,String),Vec<Option<(usize,u64,usize,u32)>>>,
+	spill: Option<ExpertPinned>,
 	plan: ExpertSplitPlan,
 	buffers: Vec<Option<Buffer>>,
 	requests: Vec<PeerPacket>,
@@ -19254,14 +19914,19 @@ pub struct ExpertSplitWeights {
 	response_table: Buffer,
 }
 impl ExpertSplitWeights {
-	/// Names use physical Archy ordinal order. Die 6 has no context or buffer.
+	/// Names use physical Archy ordinal order. Dies 2 and 6 have no context or buffer.
 	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
-	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str; 8]) -> Result<Self> {
+	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str;8]) -> Result<Self> {
+		let value=Self::prepare(plan,names)?;
+		value.upload(target,head)?;
+		Ok(value)
+	}
+	fn prepare(mut plan: ExpertSplitPlan, names: [&str; 8]) -> Result<Self> {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
 		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
 		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
-		require(plan.budgets.iter().enumerate().all(|(die, budget)| die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
-		let devices = names.iter().enumerate().map(|(die, name)| if die == 6 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
+		require(plan.budgets.iter().enumerate().all(|(die, budget)| budget.free_bytes == 0 || die == 2 || die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
+		let devices = names.iter().enumerate().map(|(die, name)| if die == 2 || die == 6 || plan.budgets[die].free_bytes==0 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
 		for (die, gpu) in devices.iter().enumerate().filter_map(|(die, gpu)| gpu.map(|gpu| (die, gpu))) {
 			#[cfg(nvidia)]
 			require(matches!(gpu.driver, Driver::Cuda(_)), "expert split requires local NVIDIA dies")?;
@@ -19273,17 +19938,27 @@ impl ExpertSplitWeights {
 		}
 		let main = devices[plan.main_die].expect("main die is permitted");
 		for die in 0..8 {
-			if die == 6 { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
-		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, plan.weights[die])).transpose()).collect::<Result<Vec<_>>>()?;
-		for item in &plan.placements {
-			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
-			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
-			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else { original.clone() };
-			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
-			buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;
+			if devices[die].is_none() { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
+		// Ordinary tapes own norms and unmapped operations. This pool holds row slices and experts.
+		let mut expert_bytes = [0;8];
+		for item in plan.placements.iter_mut().filter(|item| (item.expert.is_some() || item.row_start.is_some()) && !item.spilled) {
+			let (offset,end)=ExpertSplitPlan::end(expert_bytes[item.die],item.tensor.bytes)?; item.offset=offset; expert_bytes[item.die]=end;
 		}
+		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
+		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
 		let response_table = Buffer::reserve(main, 6 * 16)?;
-		let mut value = Self { plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
+		let mut bindings=std::collections::HashMap::new();
+		for item in plan.placements.iter().filter(|item|item.expert.is_some()) {
+			let entries=bindings.entry((item.mtp,item.tensor.name.clone())).or_insert_with(Vec::new);
+			let expert=item.expert.unwrap() as usize; if entries.len()<=expert {entries.resize(expert+1,None);}
+			let pointer=if item.spilled {spill.as_ref().expect("spill allocation is present").mapped[item.die]} else {buffers[item.die].as_ref().unwrap().pointer};
+			entries[expert]=Some((item.die,pointer+item.offset as u64,item.tensor.bytes,item.tensor.kind));
+		}
+		let mut dense_bindings=std::collections::HashMap::new();
+		for item in plan.placements.iter().filter(|item|item.row_start.is_some()) {
+			dense_bindings.insert((item.mtp,item.tensor.name.clone(),item.die),(buffers[item.die].as_ref().unwrap().pointer+item.offset as u64,item.tensor.bytes,item.tensor.kind,item.row_start.unwrap()));
+		}
+		let mut value = Self { dense_bindings,bindings,spill,plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
 		let mut layers = std::collections::BTreeMap::new();
 		for item in &value.plan.placements {
 			if item.tensor.name.ends_with("ffn_up_exps.weight") {
@@ -19299,24 +19974,45 @@ impl ExpertSplitWeights {
 			value.owners.push((layer, Buffer::upload(main, &owners)?));
 		}
 		for die in 0..8 {
-			if die == 6 { continue; }
-			if die == value.plan.main_die { continue; }
+			if devices[die].is_none() { continue; }
 			let request = PeerPacket::with_payload(names[die], 5 * 10240 * 4)?;
 			let response = PeerPacket::with_payload(names[value.plan.main_die], 5 * 10240 * 4)?;
-			request.enable_sender(&response)?;
-			response.enable_sender(&request)?;
+			if die != value.plan.main_die { request.enable_sender(&response)?; response.enable_sender(&request)?; }
 			value.requests.push(request);
 			value.responses.push(response);
-			value.routes.push(Buffer::zeroed(devices[die].expect("worker die is permitted"), 1024)?);
+			value.routes.push(Buffer::zeroed(devices[die].expect("worker die is permitted"), 2048)?);
 		}
 		let table: Vec<u8> = value.responses.iter().flat_map(|packet| [packet.address(), packet.sequence_address()].into_iter().flat_map(u64::to_ne_bytes)).collect();
 		value.response_table.write_bytes(0, &table)?;
 		Ok(value)
 	}
+	fn upload(&self,target:&Gguf,head:Option<&Gguf>)->Result<()> {
+		// Read each shard in file order while preserving every assigned destination.
+		let mut uploads=self.plan.placements.iter().filter(|item|item.expert.is_some() || item.row_start.is_some()).collect::<Vec<_>>();
+		uploads.sort_by_key(|item|(item.mtp,item.tensor.shard,item.tensor.offset,item.die));
+		let upload_started=Instant::now(); let mut upload_reported=upload_started; let mut uploaded=0usize;
+		for item in uploads {
+			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
+			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
+			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
+			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
+			if item.spilled {
+				let spill=self.spill.as_ref().expect("spill allocation is present");
+				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
+			} else {self.buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
+			uploaded=checked_add(uploaded,tensor.bytes,"uploaded packed weight bytes")?;
+			let now=Instant::now();
+			if now.duration_since(upload_reported).as_secs_f64()>=1.0 {
+				println!("resident weights {} bytes  rate {:.4} GB/s",uploaded,uploaded as f64/now.duration_since(upload_started).as_secs_f64()/1e9);
+				upload_reported=now;
+			}
+		}
+		println!("resident weights {} bytes  average rate {:.4} GB/s",uploaded,uploaded as f64/upload_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
+		Ok(())
+	}
 	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
 	pub fn weight_address(&self, mtp: bool, name: &str, expert: Option<u32>) -> Option<(usize, u64, usize, u32)> {
-		self.plan.placements.iter().find(|item| item.mtp == mtp && item.tensor.name == name && item.expert == expert)
-			.map(|item| (item.die, self.buffers[item.die].as_ref().expect("assigned die is permitted").pointer + item.offset as u64, item.tensor.bytes, item.tensor.kind))
+		self.bindings.get(&(mtp,name.to_owned()))?.get(expert? as usize).copied().flatten()
 	}
 	/// Channels are ordered by increasing physical expert die, excluding main.
 	/// Route storage: up to five native count/ID records at +0, FP32 coefficients
@@ -19548,6 +20244,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 	// span. The next node's offset is the actual end of this part's span.
 	let parameters = graph.nodes.get(end).map_or(graph.parameters.len(), |node| node.offset);
 	Ok(Graph {
+		expert_layers:Vec::new(), expert_execution:None,
 		observations: graph.observations,
 		nodes,
 		parameters: graph.parameters[base..parameters].to_vec(),
@@ -19658,6 +20355,7 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	place_bound_observed(model, positions, split, devices, 0, 0)
 }
 fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], checkpoints: usize, observations: u8) -> Result<Placed> {
+	if expert_enabled(&model.file,devices) { return place_expert_pair(model,None,positions,checkpoints,observations).map(|(placed,_)|placed); }
 	require(positions != 0, "a placed bound model has no positions")?;
 	let samples = vec![0.0; positions];
 	let mut graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
@@ -19678,9 +20376,32 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	/// Export actual cumulative router counters after a request or on demand.
+	/// Dense jobs do not produce router records. Shared target/head pools export once.
+	pub fn export_router_picks(&self)->Result<()> {
+		let mut pools=std::collections::HashSet::new();
+		for tape in self.tapes.iter().flatten() {
+			if let Some(execution)=&tape.expert_execution && pools.insert(Arc::as_ptr(execution) as usize) {
+				execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.export_picks()?;
+			}
+		}
+		Ok(())
+	}
 	/// Paths of the loaded native modules, in graph and device order.
 	pub fn native_artifacts(&self) -> Vec<PathBuf> {
 		self.tapes.iter().flatten().map(|tape| tape.program.artifact.path.clone()).collect()
+	}
+	/// The resident worker module shared by the target and MTP execution.
+	pub fn expert_artifacts(&self) -> Result<Vec<PathBuf>> {
+		let Some(execution)=self.tapes.iter().flatten().find_map(|tape|tape.expert_execution.as_ref()) else {return Ok(Vec::new());};
+		let execution=execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?;
+		Ok(vec![execution.worker_path.clone()])
+	}
+	/// Replace all worker modules transactionally, retaining weights, packets, and sequences.
+	/// The replacement must retain the worker entrypoint and descriptor layout.
+	pub fn reload_expert_workers(&self, path: impl AsRef<Path>) -> Result<()> {
+		let execution=self.tapes.iter().flatten().find_map(|tape|tape.expert_execution.as_ref()).ok_or_else(||RecipeError::new("no resident expert workers"))?;
+		execution.lock().map_err(|_|RecipeError::new("expert execution is poisoned"))?.reload_workers(path.as_ref())
 	}
 	/// Replace NVIDIA modules without loading weights or resetting carried state.
 	/// Each cubin must retain the current graph's buffer layout and entrypoint ABI.
@@ -19725,42 +20446,73 @@ impl Placed {
 	}
 	/// Commit an evaluated speculative prefix without replaying model arithmetic.
 	fn commit_mtp_prefix(&self, end: u32) -> Result<()> {
-		let mut images = Vec::new();
+		let mut copies = Vec::new();
+		let mut clears = Vec::new();
+		let mut writes = Vec::new();
 		for tape in self.tapes.iter().flatten() {
-			let mut contexts = tape.contexts.download::<u8>(tape.contexts.bytes)?;
-			let mut values = tape.values.download::<u8>(tape.values.bytes)?;
-			tape.commit_index_prefix(&mut contexts, &mut values, end)?;
+			require(end <= tape.reached.load(Ordering::Acquire), "MTP prefix exceeds evaluated positions")?;
+			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
+				let layout = attention_index_layout(node, tape.rows as usize)?;
+				let buffer = if tape.program.artifact.layout.contexts_in_values[index] { &tape.values } else { &tape.contexts };
+				let base = tape.program.artifact.layout.contexts[index];
+				require(base + layout.bytes <= buffer.bytes, "MTP indexer context exceeds its buffer")?;
+				let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
+				let row_bytes = checked_mul(width, node.precision.bytes(), "MTP indexer row bytes")?;
+				let count_at = base + layout.counts;
+				let mut counts = buffer.download_range::<u64>(count_at / 8, tape.rows as usize * blocks)?;
+				let mut changed = false;
+				for row in 0..tape.rows as usize {
+					for b in 0..blocks {
+						let start = b * block;
+						let count = (end as usize).saturating_sub(start).min(block);
+						let slot = row * blocks + b;
+						require(counts[slot] <= block.min(node.output.length - start) as u64 && counts[slot] >= count as u64, "MTP indexer count was not evaluated")?;
+						if counts[slot] == count as u64 { continue; }
+						changed = true;
+						let destination = base + layout.sums + slot * row_bytes;
+						if count == 0 { clears.push((buffer, destination, row_bytes)); }
+						else {
+							let position = row * node.output.length + start + count - 1;
+							copies.push((buffer, base + layout.prefix_sums + position * row_bytes, destination, row_bytes));
+						}
+						counts[slot] = count as u64;
+					}
+				}
+				if changed { writes.push((buffer, count_at, counts.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>())); }
+			}
 			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Delta) {
 				let slots = integer_argument(node.argument[5], "delta checkpoint slots")? as usize;
 				require(slots != 0, "MTP delta prefix has no checkpoint slots")?;
+				let reached = tape.reached.load(Ordering::Acquire);
+				require(end == 0 || (reached - end) < slots as u32, "MTP delta prefix checkpoint was overwritten")?;
 				let (_, keys, heads, width) = delta_extent(node)?;
 				let cells = checked_mul(keys as usize, width as usize, "MTP delta state cells")?;
 				let bytes = checked_mul(cells, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "MTP delta state bytes")?;
 				let pairs = checked_mul(tape.rows as usize, heads as usize, "MTP delta state pairs")?;
 				let live = checked_mul(pairs, bytes, "MTP delta live bytes")?;
 				let base = tape.program.artifact.layout.contexts[index];
-				let image = if tape.program.artifact.layout.contexts_in_values[index] { &mut values } else { &mut contexts };
+				let buffer = if tape.program.artifact.layout.contexts_in_values[index] { &tape.values } else { &tape.contexts };
 				let extent = checked_mul(live, checked_add(slots, 1, "MTP delta slots")?, "MTP delta checkpoint extent")?;
-				require(checked_add(base, extent, "MTP delta checkpoint end")? <= image.len(), "MTP delta checkpoint exceeds its image")?;
-				if end == 0 { image[base..base + live].fill(0); continue; }
+				require(checked_add(base, extent, "MTP delta checkpoint end")? <= buffer.bytes, "MTP delta checkpoint exceeds its buffer")?;
+				if end == 0 { clears.push((buffer, base, live)); continue; }
 				let slot = (end as usize - 1) % slots;
 				for pair in 0..pairs {
 					let cell = checked_add(checked_mul(pair, slots, "MTP delta checkpoint pair")?, slot, "MTP delta checkpoint slot")?;
 					let source = checked_add(checked_add(base, live, "MTP delta checkpoint region")?, checked_mul(cell, bytes, "MTP delta checkpoint offset")?, "MTP delta checkpoint address")?;
 					let target = checked_add(base, checked_mul(pair, bytes, "MTP delta live offset")?, "MTP delta live address")?;
-					image.copy_within(source..source + bytes, target);
+					copies.push((buffer, source, target, bytes));
 				}
 			}
-			images.push((tape, contexts, values));
+
 		}
-		// All images pass their layout and prefix checks before the first device write.
-		for (tape, contexts, values) in &images {
-			tape.contexts.write_bytes(0, contexts)?; tape.values.write_bytes(0, values)?;
-			tape.program.gpu.synchronize()?;
-		}
-		for (tape, _, _) in images { tape.reached.store(end, Ordering::Release); }
+		// Validate the complete prefix before the first state mutation.
+		for (buffer, source, destination, bytes) in copies { buffer.copy_within(source, destination, bytes)?; }
+		for (buffer, destination, bytes) in clears { buffer.clear_range(destination, bytes)?; }
+		for (buffer, destination, bytes) in writes { buffer.write_bytes(destination, &bytes)?; }
+		for tape in self.tapes.iter().flatten() { tape.program.gpu.synchronize()?; tape.reached.store(end, Ordering::Release); }
 		Ok(())
 	}
+
 	fn take_operations(&self, model: &str) -> Vec<OperationReport> {
 		self.tapes.iter().flatten().flat_map(|tape| {
 			std::mem::take(&mut *tape.operations.lock().unwrap()).into_iter().map(|mut observation| {
@@ -19921,13 +20673,32 @@ impl Placed {
 	fn compile_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.compile_seconds).sum() }
 	/// Actual resident arena sizes, available directly to model scripts.
 	pub fn memory(&self) -> Vec<DeviceMemory> {
-		self.tapes.iter().flatten().map(|tape| {
+		let mut memory:Vec<DeviceMemory>=self.tapes.iter().flatten().map(|tape| {
 			let (input, output) = tape.request_bytes();
 			DeviceMemory {
 				device: tape.device_label().unwrap_or_else(|error| panic!("{error}")), input: tape.samples.bytes + input, weights: tape.weights.bytes,
 				values: tape.values.bytes + output, contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
 			}
-		}).collect()
+		}).collect();
+		if let Some(tape)=self.tapes.iter().flatten().find(|tape|tape.expert_first==0 && tape.expert_execution.is_some()) {
+			let execution=tape.expert_execution.as_ref().unwrap().lock().unwrap();
+			for (channel,worker) in execution.workers.iter().enumerate() {
+				let device=device_label(worker.gpu).unwrap();
+				let weights=execution.weights.buffers[worker.die].as_ref().map_or(0,|buffer|buffer.bytes);
+				let scratch=worker.scratch.iter().map(|buffer|buffer.bytes).sum::<usize>()+worker.jobs.bytes+worker.reports.bytes
+					+execution.weights.requests[channel].payload_bytes()+68+execution.weights.requests[channel].resident_ctas() as usize*128+execution.weights.routes[channel].bytes;
+				if let Some(row)=memory.iter_mut().find(|row|row.device==device) {row.weights+=weights;row.scratch+=scratch;}
+				else {memory.push(DeviceMemory {device,input:0,weights,values:0,contexts:0,scratch,dead:0,dead_buffers:0});}
+			}
+			let main=device_label(execution.control.runtime).unwrap();
+			if let Some(row)=memory.iter_mut().find(|row|row.device==main) {
+				row.scratch+=execution.control.bytes+execution.pick_counts.bytes+execution.main_scratch.iter().map(|buffer|buffer.bytes).sum::<usize>()
+					+execution.main_descriptors.iter().chain(&execution.channel_tables).map(|buffer|buffer.bytes).sum::<usize>()+execution.weights.response_table.bytes
+					+execution.weights.responses.iter().map(|packet|packet.payload_bytes()+68+packet.resident_ctas() as usize*128).sum::<usize>()
+					+execution.weights.owners.iter().map(|(_,buffer)|buffer.bytes).sum::<usize>()+execution.main_sync.payload_bytes()+68+execution.main_sync.resident_ctas() as usize*128;
+			}
+		}
+		memory
 	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
 		let mut state = self.decode.lock().unwrap();
@@ -20049,7 +20820,20 @@ impl Placed {
 	}
 	/// Every part receives the original token IDs, independently of transformed
 	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
+	fn run_state_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<()> {
+		let PlacedSource::Bound(input, _) = &self.source else { return Err(RecipeError::new("MTP state refresh requires a bound head")); };
+		let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("MTP head has no ranges"))?;
+		require(ranges.len() == 1 && ranges[0].nodes.last().is_some_and(|node| node.op == Primitive::Contraction)
+			&& ranges[0].nodes.iter().any(|node| node.retain_output), "MTP state refresh requires a retained hidden stream and vocabulary projection")?;
+		require(begin <= end && end as usize <= input.length && samples.len() == input.channels * (end - begin) as usize, "MTP state refresh input window is invalid")?;
+		self.forward_window_mode(ranges, samples, samples, 0, begin, end, None, ForwardMode::StateOnly)?;
+		Ok(())
+	}
 	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+		self.forward_window_mode(tapes, samples, tokens, token_begin, begin, end, progress, ForwardMode::Inference)
+	}
+	fn forward_window_mode(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], token_begin: usize, begin: u32, end: u32, progress: Option<&InferenceLive>, mode: ForwardMode) -> Result<Vec<f64>> {
+
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		require(begin <= end, "window begins after its end")?;
 		let packed_input = samples.len() != first.input.elements();
@@ -20084,7 +20868,7 @@ impl Placed {
 		let input_end = end;
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
-			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
+			tape.forward_window_observed(tape.samples.pointer, begin, end, mode, &mut |reached, _| {
 				// A token has completed prefill only after the final placed range.
 				if index + 1 == tapes.len() && let Some(progress) = progress {
 					progress.prefilled(if reached == end { input_end } else { reached } as usize);
@@ -20100,7 +20884,7 @@ impl Placed {
 				}
 			}
 		}
-		last.predictions()
+		if matches!(mode, ForwardMode::StateOnly) { Ok(Vec::new()) } else { last.predictions() }
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20273,6 +21057,8 @@ struct TrainingState {
 }
 #[derive(Clone)]
 struct Graph {
+	expert_layers: Vec<ExpertLayer>,
+	expert_execution: Option<Arc<Mutex<ExpertExecution>>>,
 	observations: u8,
 	nodes: Vec<Node>,
 	parameters: Vec<f64>,
@@ -20316,6 +21102,7 @@ struct Graph {
 impl Graph {
 	fn new(shape: Shape, epsilon: f64) -> Self {
 		Self {
+			expert_layers: Vec::new(), expert_execution: None,
 			observations: 0,
 			epsilon,
 			nodes: Vec::new(),
@@ -23365,6 +24152,9 @@ struct HostLookup {
 	length: usize,
 }
 struct NativeTape {
+	expert_execution: Option<Arc<Mutex<ExpertExecution>>>,
+	expert_first: usize,
+	expert_count: usize,
 	observations: u8,
 	tensor_history: Mutex<Vec<TensorObservation>>,
 	programs: Vec<f64>,
@@ -23434,13 +24224,13 @@ impl NativeRequest {
 		})
 	}
 }
-macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
 #[derive(Clone, Copy)]
 #[repr(i32)]
 enum ForwardMode {
 	Inference,
 	Training,
+	StateOnly,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23700,6 +24490,11 @@ impl NativeTape {
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
 		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
+		if let Some(execution) = &graph.expert_execution {
+			let execution = execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))?;
+			let (offsets, _) = native_weight_arena(graph, precision.model, true)?;
+			for layer in &graph.expert_layers { weights.write_bytes(offsets[layer.node], &execution.main_descriptors[layer.global].pointer.to_ne_bytes())?; }
+		}
 		if program.model_load.is_some() {
 			let image = &program.artifact.storage;
 			require(!image.is_empty(), "native model-load storage is empty")?;
@@ -23802,6 +24597,9 @@ impl NativeTape {
 			formats.join("+")
 		}).collect();
 		let tape = Self {
+			expert_execution: graph.expert_execution.clone(),
+			expert_first: graph.expert_layers.first().map_or(0, |layer| layer.global),
+			expert_count: graph.expert_layers.len(),
 			observations: graph.observations,
 			tensor_history: Mutex::new(Vec::new()),
 			profile: graph.profile,
@@ -23855,61 +24653,7 @@ impl NativeTape {
 	/// invocation. Preflight every span before changing the saved image. The
 	/// caller restores the image with its other accepted state and poisons the
 	/// transaction if restoration fails.
-	fn commit_index_prefix(&self, contexts: &mut [u8], values: &mut [u8], end: u32) -> Result<()> {
-		require(contexts.len() == self.contexts.bytes && values.len() == self.values.bytes, "indexer prefix image has the wrong capacity")?;
-		let end = end as usize;
-		require(end <= self.reached.load(Ordering::Acquire) as usize, "indexer prefix exceeds evaluated positions")?;
-		let mut patches = Vec::new();
-		for (index, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
-			require(end <= node.output.length, "indexer prefix exceeds its sequence")?;
-			let layout = attention_index_layout(node, self.rows as usize)?;
-			let in_values = self.program.artifact.layout.contexts_in_values[index];
-			let base = self.program.artifact.layout.contexts[index];
-			let image = if in_values { &*values } else { &*contexts };
-			require(checked_add(base, layout.bytes, "indexer prefix context")? <= image.len(), "indexer prefix context exceeds its buffer")?;
-			let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
-			let bytes = checked_mul(width, node.precision.bytes(), "indexer sum row bytes")?;
-			let count_at = checked_add(base, layout.counts, "indexer count address")?;
-			let count_bytes = checked_mul(checked_mul(self.rows as usize, blocks, "indexer count rows")?, size_of::<u64>(), "indexer count bytes")?;
-			let mut counts = image[count_at..count_at + count_bytes].to_vec();
-			for row in 0..self.rows as usize {
-				for b in 0..blocks {
-					let start = checked_mul(b, block, "indexer prefix block start")?;
-					let count = end.saturating_sub(start).min(block);
-					let slot = checked_add(checked_mul(row, blocks, "indexer count row")?, b, "indexer count slot")?;
-					let at = checked_mul(slot, size_of::<u64>(), "indexer count offset")?;
-					let saved = u64::from_le_bytes(counts[at..at + size_of::<u64>()].try_into().unwrap());
-					require(saved <= block.min(node.output.length - start) as u64 && saved >= count as u64, "indexer prefix count is invalid or was not evaluated")?;
-					if saved != count as u64 {
-						let destination = checked_add(base, checked_add(layout.sums, checked_mul(slot, bytes, "indexer sum slot")?, "indexer sum local")?, "indexer sum address")?;
-						let sum = if count == 0 {
-							encode_floats(&vec![0.0; width], node.precision)
-						} else {
-							let position = checked_add(
-								checked_mul(row, node.output.length, "indexer prefix row")?,
-								checked_add(start, count - 1, "indexer prefix last")?,
-								"indexer prefix position",
-							)?;
-							let source = checked_add(
-								base,
-								checked_add(layout.prefix_sums, checked_mul(position, bytes, "indexer prefix row offset")?, "indexer prefix local")?,
-								"indexer prefix address",
-							)?;
-							image[source..source + bytes].to_vec()
-						};
-						patches.push((in_values, destination, sum));
-					}
-					counts[at..at + size_of::<u64>()].copy_from_slice(&(count as u64).to_le_bytes());
-				}
-			}
-			patches.push((in_values, count_at, counts));
-		}
-		for (in_values, destination, bytes) in patches {
-			let image = if in_values { &mut *values } else { &mut *contexts };
-			image[destination..destination + bytes.len()].copy_from_slice(&bytes);
-		}
-		Ok(())
-	}
+
 	/// Applies a runtime contraction schedule to both the host description and
 	/// the words read by the native kernels.
 	fn apply_contraction_schedule(&mut self, contractions: Vec<Option<NativeContractionTiles>>) -> Result<()> {
@@ -24079,7 +24823,7 @@ impl NativeTape {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let mut thread_count = threads;
-		let single = matches!(mode, ForwardMode::Inference) && end - begin == 1;
+		let single = matches!(mode, ForwardMode::Inference | ForwardMode::StateOnly) && end - begin == 1;
 		#[cfg(amd)]
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		#[cfg(nvidia)]
@@ -24087,8 +24831,21 @@ impl NativeTape {
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
 		let machine_started = Instant::now();
-		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
-		self.program.gpu.synchronize()?;
+		let mut expert_guard = self.expert_execution.as_ref().map(|execution| execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))).transpose()?;
+		let expert_count = if mode == ForwardMode::StateOnly as i32 && expert_guard.as_ref().is_some_and(|execution|
+			execution.layers.get(self.expert_first + self.expert_count.saturating_sub(1)).is_some_and(|layer| layer.node + 1 == self.nodes.len()))
+		{ self.expert_count.saturating_sub(1) } else { self.expert_count };
+		if let Some(execution) = expert_guard.as_mut() { execution.start(self.expert_first, expert_count, begin, end, capacity)?; }
+
+		if let Err(error)=self.program.launch_forward(&mut call,single).and_then(|_|self.program.gpu.synchronize()) {
+			if let Some(execution)=expert_guard.as_mut() {execution.abort();} return Err(RecipeError::new(format!("forward: {error}")));
+		}
+		if let Some(execution)=expert_guard.as_mut() {
+			match execution.finish(self.expert_first,expert_count,begin,end,capacity) {
+				Ok(records)=>self.operations.lock().map_err(|_|RecipeError::new("expert operation reports are poisoned"))?.extend(records),
+				Err(error)=>{execution.abort();return Err(error);},
+			}
+		}
 		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
@@ -24119,6 +24876,7 @@ impl NativeTape {
 					self.contexts.download_range::<u64>(offset / 8, channels)?.into_iter().enumerate().map(|(channel, hash)| (channel as u32, hash)).collect()
 				} else { Vec::new() };
 				operations.push(OperationReport {
+					selected_experts:0, weight_bytes:0,
 					device: device.clone(), model: String::new(), block: node.block_index, node: index,
 					operation: node.primitive_name().to_owned(), begin, end, positions: clocks[2] as usize, ticks: clocks[1],
 					packed_calls: packed_routes[index * 5] as usize,
@@ -25568,6 +26326,35 @@ struct Buffer {
 /// The largest host buffer a zero fill stages at once, so an arena of any size
 /// clears without a host copy of its own size.
 const ZERO_FILL_BYTES: usize = 64 << 20;
+impl Gpu {
+	fn copy_device(&self, destination: u64, source: u64, bytes: usize) -> Result<()> {
+		self.activate()?;
+		unsafe {
+			match &self.driver {
+				Driver::Cpu => { ptr::copy(source as *const u8, destination as *mut u8, bytes); Ok(()) }
+				#[cfg(nvidia)]
+				Driver::Cuda(driver) => {
+					self.status((driver.copy_device)(destination, source, bytes), "device copy")
+				}
+				#[cfg(amd)]
+				Driver::Hsa(driver) => self.status((driver.copy)(destination as Ptr, source as *const c_void, bytes), "device copy"),
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_DEVICE_COPY)?; channel.write_u64(destination)?; channel.write_u64(source)?; channel.write_u64(bytes as u64)?; channel.flush()?;
+					channel.read_status("device copy")
+				}
+			}
+		}
+	}
+}
+impl Buffer {
+	fn copy_within(&self, source: usize, destination: usize, bytes: usize) -> Result<()> {
+		require(checked_add(source, bytes, "device copy source")? <= self.bytes && checked_add(destination, bytes, "device copy destination")? <= self.bytes, "device copy exceeds its buffer")?;
+		if bytes == 0 || source == destination { return Ok(()); }
+		require(source + bytes <= destination || destination + bytes <= source, "device copy regions overlap")?;
+		self.runtime.copy_device(self.pointer + destination as u64, self.pointer + source as u64, bytes)
+	}
+}
 impl Buffer {
 	/// Copy bytes after the caller has synchronized the completed pass.
 	fn download_completed_bytes(&self, offset: usize, count: usize) -> Result<Vec<u8>> {
@@ -25626,8 +26413,11 @@ impl Buffer {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
 		let bytes = bytes.max(1);
 		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let mut written = std::collections::BTreeSet::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
+			if inference && external_expert(node) { continue; }
 			if let Some(weight) = packed_weight(graph, index, inference) {
+				if !written.insert((offsets[index], weight.bytes.len())) { continue; }
 				buffer.write_runs(offsets[index], &weight.bytes)?;
 			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
 				// The load kernel writes this node from its stored bytes.
@@ -25888,7 +26678,12 @@ impl Kernel {
 }
 #[cfg(nvidia)]
 struct Cuda {
+	copy_device: unsafe extern "C" fn(u64, u64, usize) -> i32,
+	host_alloc: unsafe extern "C" fn(*mut Ptr,usize,u32)->i32,
+	host_device_pointer: unsafe extern "C" fn(*mut u64,Ptr,u32)->i32,
+	host_free: unsafe extern "C" fn(Ptr)->i32,
 	_runtime: std::sync::Arc<Library>,
+	usable_bytes: Option<u64>,
 	context: Ptr,
 	set: unsafe extern "C" fn(Ptr) -> i32,
 	allocate: unsafe extern "C" fn(*mut u64, usize) -> i32,
@@ -25975,6 +26770,7 @@ const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
 const REMOTE_MEMORY: u8 = 8;
 const REMOTE_CLEAR: u8 = 9;
+const REMOTE_DEVICE_COPY: u8 = 10;
 const REMOTE_NATIVE_EPOCH: u8 = 1;
 const REMOTE_NATIVE_STEP: u8 = 2;
 struct Wire<R: Read, W: Write> {
@@ -26201,7 +26997,7 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<NativeProgram> {
-		let window_positions = inference_window(graph, rows, !epoch);
+		let window_positions = inference_window(graph, rows, !epoch)?;
 		for (index, node) in graph.nodes.iter().enumerate() {
 			let output = window_shape(node.output, graph.input.length, window_positions);
 			let elements = checked_mul(rows, output.elements(), "node batch")?;
@@ -26209,7 +27005,9 @@ impl Gpu {
 		}
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
-		let vector_waves = if cpu {
+		let vector_waves = if self.backend==Backend::Nvidia && !graph.expert_layers.is_empty() {
+			8
+		} else if cpu {
 			1
 		} else {
 			narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32
@@ -26221,7 +27019,9 @@ impl Gpu {
 				if state.bytes() > element.bytes() { element = state; }
 			}
 		}
-		let shared_values = if cpu {
+		let shared_values = if !graph.expert_layers.is_empty() && self.backend == Backend::Nvidia {
+			(PackedMatvec::SHARED_BYTES / element.bytes()) as u32
+		} else if cpu {
 			narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32
 		} else {
 			self.shared_limit / element.bytes() as u32
@@ -26560,7 +27360,7 @@ impl Gpu {
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
 					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
-					let unusable = device_usable_bytes(&self.name)?.map_or(0, |usable| (total as u64).saturating_sub(usable));
+					let unusable = driver.usable_bytes.map_or(0, |usable| (total as u64).saturating_sub(usable));
 					Ok((free as u64).saturating_sub(unusable))
 				}
 				#[cfg(amd)]
@@ -27678,6 +28478,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
+		let get_uuid: unsafe extern "C" fn(*mut [u8; 16], i32) -> i32 = runtime.function(b"cuDeviceGetUuid\0")?;
 		let attribute: NvQuery = runtime.function(b"cuDeviceGetAttribute\0")?;
 		let total: unsafe extern "C" fn(*mut usize, i32) -> i32 = runtime.function(b"cuDeviceTotalMem_v2\0")?;
 		let create: unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32 = runtime.function(b"cuCtxCreate_v2\0")?;
@@ -27695,7 +28496,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let mut count = 0;
 		check(init(0), "initialization")?;
 		check(count_devices(&mut count), "device enumeration")?;
-		let load_device = |device, index| -> Result<Gpu> {
+		let load_device = |device, index, usable_bytes| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
 			let mut context = ptr::null_mut();
 			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -27726,15 +28527,20 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				if attribute(&mut reported, BLOCK_LDS_OPTIN, device) == 0 && reported > block_lds { optin_lds = reported as u32; }
 			}
 			let native_target = BackendTarget::Nvidia { architecture };
-			check(create(&mut context, 0, device), "context creation")?;
+			check(create(&mut context, 8, device), "context creation")?;
 			let cuda = Cuda {
+				host_alloc: runtime.function(b"cuMemHostAlloc\0")?,
+				host_device_pointer: runtime.function(b"cuMemHostGetDevicePointer_v2\0")?,
+				host_free: runtime.function(b"cuMemFreeHost\0")?,
 				_runtime: runtime.clone(),
+				usable_bytes,
 				context,
 				set: runtime.function(b"cuCtxSetCurrent\0")?,
 				allocate: runtime.function(b"cuMemAlloc_v2\0")?,
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				copy_device: runtime.function(b"cuMemcpyDtoD_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
@@ -27772,7 +28578,20 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			devices.push(gpu);
 		}
 		require(!devices.is_empty(), "Nvidia has no GPU")?;
-		devices.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
+		let mut loaded = Vec::new();
+		for (index, device) in devices.into_iter().enumerate() {
+			let name = format!("nv{index}");
+			if _selection.is_some_and(|names| !names.contains(&name)) { continue; }
+			let mut uuid = [0_u8; 16];
+			check(get_uuid(&mut uuid, device), "device UUID")?;
+			let uuid = uuid.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+			if env!("RECIPE_DEVICE_FENCED_UUIDS").split(';').any(|fenced| fenced == uuid) { continue; }
+			let identity = format!("GPU-{}-{}-{}-{}-{}", &uuid[..8], &uuid[8..12], &uuid[12..16], &uuid[16..20], &uuid[20..]);
+			let usable_bytes = device_usable_bytes(&identity)?.or(if std::env::var_os("CUDA_VISIBLE_DEVICES").is_none() { device_usable_bytes(&name)? } else { None });
+			if usable_bytes == Some(0) { continue; }
+			loaded.push(load_device(device, index, usable_bytes)?);
+		}
+		Ok(loaded)
 	}
 }
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
@@ -27853,7 +28672,14 @@ pub fn worker_serve(name: &str) -> Result<()> {
 					wire.write_bytes(&data)?;
 				}
 			}
-			REMOTE_SYNCHRONIZE => wire.status(&gpu.synchronize())?,
+			REMOTE_DEVICE_COPY => {
+				let destination = wire.read_u64()?;
+				let source = wire.read_u64()?;
+				let bytes = wire.read_u64()? as usize;
+				wire.status(&gpu.copy_device(destination, source, bytes))?;
+			}
+			REMOTE_SYNCHRONIZE =>
+ wire.status(&gpu.synchronize())?,
 			REMOTE_MEMORY => {
 				let free = gpu.free_bytes();
 				wire.status(&free.as_ref().map(|_| ()).map_err(Clone::clone))?;
@@ -34134,3 +34960,476 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
+
+/// Owned worker module text for preassembly without allocating model weights.
+pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source() }
+fn expert_forward_functions() -> &'static str { r#"
+// Real forward glue. Every local completion stage has a distinct sequence.
+.func (.param .u32 result) split_grid(.param .u64 s0,.param .u64 f0,.param .u32 q0,.param .u64 d0) {
+	.reg .b64 s,f,d; .reg .b32 q,r;
+	ld.param.u64 s,[s0]; ld.param.u64 f,[f0]; ld.param.u32 q,[q0]; ld.param.u64 d,[d0];
+	{ .param .u64 a,b,c; .param .u32 x,y;
+	st.param.u64 [a],s; st.param.u64 [b],f; st.param.u64 [c],d; st.param.u32 [x],q;
+	call.uni (y),p2p_publish,(a,b,x,c); call.uni (y),p2p_wait,(b,x,c); ld.param.u32 r,[y]; }
+	st.param.u32 [result],r; ret;
+}
+.func (.param .u32 result) split_mv(.param .u64 w0,.param .u32 t0,.param .u64 x0,.param .u64 s0,.param .u64 o0,
+	.param .u32 k0,.param .u32 m0,.param .u32 cap0,.param .u32 cols0,.param .u32 mask0,.param .u32 rank0,.param .u32 count0,.param .u64 sh0) {
+	.reg .b64 w,x,s,o,sh; .reg .b32 t,k,m,cap,cols,mask,rank,count,kind,lanes,ok; .reg .pred p;
+	ld.param.u64 w,[w0]; ld.param.u32 t,[t0]; ld.param.u64 x,[x0]; ld.param.u64 s,[s0]; ld.param.u64 o,[o0];
+	ld.param.u32 k,[k0]; ld.param.u32 m,[m0]; ld.param.u32 cap,[cap0]; ld.param.u32 cols,[cols0]; ld.param.u32 mask,[mask0];
+	ld.param.u32 rank,[rank0]; ld.param.u32 count,[count0]; ld.param.u64 sh,[sh0];
+	// Measured 256-thread expert tuples from 431203e's cta-256 table.
+	mov.u32 kind,0; mov.u32 lanes,8;
+	setp.eq.u32 p,t,17; @!p bra tuple_iq3;
+	setp.eq.u32 p,cap,8; @p mov.u32 kind,2;
+	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; bra tuple_ready;
+tuple_iq3:
+	setp.eq.u32 p,t,18; @!p bra tuple_q8;
+	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; setp.eq.u32 p,cap,8; @p mov.u32 lanes,8; bra tuple_ready;
+tuple_q8:
+	setp.eq.u32 p,t,20; @!p bra tuple_q8_type;
+	setp.le.u32 p,cap,2; @p mov.u32 kind,2; bra tuple_ready;
+tuple_q8_type:
+	setp.eq.u32 p,t,8; @!p bra tuple_ready;
+	setp.eq.u32 p,k,2560; @p mov.u32 lanes,16;
+tuple_ready:
+	{ .param .u32 a,b,c,d,e,f,j,l,n,p,r,z; .param .u64 g,h,i,q;
+	st.param.u32 [a],t; st.param.u32 [b],cap; st.param.u32 [c],cols; st.param.u32 [d],kind; st.param.u32 [e],lanes; st.param.u32 [f],mask;
+	st.param.u64 [g],w; st.param.u64 [h],x; st.param.u64 [i],s; st.param.u64 [q],o;
+	st.param.u32 [j],k; st.param.u32 [l],m; st.param.u32 [n],rank; st.param.u32 [p],count;
+	call.uni (z),packed_matvec,(a,b,c,d,e,f,g,h,i,q,j,l,n,p); ld.param.u32 ok,[z]; }
+	st.param.u32 [result],ok; ret;
+}
+// One logical helper receipt per row-split group, recorded during execution.
+.func split_route_count(.param .u64 report0,.param .u32 rank0,.param .u32 field0,.param .u32 receipt0) {
+	.reg .b64 report,at; .reg .b32 rank,field,receipt,tid,old; .reg .pred p,q;
+	ld.param.u64 report,[report0]; ld.param.u32 rank,[rank0]; ld.param.u32 field,[field0]; ld.param.u32 receipt,[receipt0];
+	setp.eq.u32 p,receipt,0; @p mov.u32 field,4; mul.wide.u32 at,field,4; add.u64 at,report,at;
+	mov.u32 tid,%tid.x; setp.eq.u32 p,tid,0; setp.eq.u32 q,rank,0; and.pred p,p,q;
+	@p atom.global.add.u32 old,[at+32],1; ret;
+}
+.func (.param .u32 result) split_expert_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
+	.reg .b64 a<48>; .reg .b32 r<48>; .reg .pred p<12>; .reg .f32 f<8>;
+	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
+	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+24];
+	ld.global.u64 a7,[a0+32]; ld.global.u64 a8,[a0+40]; ld.global.u64 a9,[a0+48]; ld.global.u64 a10,[a0+56];
+	ld.global.u64 a11,[a0+64]; ld.global.u64 a12,[a0+72]; ld.global.u64 a13,[a0+80]; ld.global.u64 a14,[a0+88];
+	ld.global.u64 a15,[a0+96]; ld.global.u64 a16,[a0+104]; ld.global.u64 a17,[a0+112];
+	ld.global.u32 r2,[a0+128]; ld.global.u32 r3,[a0+132]; ld.global.u32 r4,[a0+136]; ld.global.u32 r5,[a0+140];
+	ld.global.u64 a18,[a0+144]; ld.global.u64 a19,[a0+152]; ld.global.u64 a20,[a0+160];
+	mov.u32 r6,%tid.x; mov.u32 r7,%ctaid.x; mov.u32 r8,%ntid.x; mov.u32 r9,%nctaid.x;
+	mad.lo.u32 r10,r7,r8,r6; mul.lo.u32 r11,r8,r9; setp.eq.u32 p0,r10,0;
+	mov.u32 r12,1; mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2],a21; add.u64 a22,a21,5000000000;
+	mov.u32 r13,0; @p0 st.global.v4.u32 [a2+32],{r13,r13,r13,r13}; @p0 st.global.u32 [a2+48],r13;
+	{ .param .u64 flag,limit; .param .u32 seq,ok; st.param.u64 [flag],a4; st.param.u64 [limit],a22; st.param.u32 [seq],r0;
+	call.uni (ok),p2p_wait,(flag,seq,limit); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,101; @p1 bra worker_done;
+	mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2+8],a21;
+	// Compact the padded packet to k-float columns; zero all selected-slot planes.
+	mul.lo.u32 r14,r2,r1; mov.u32 r15,r10;
+worker_copy:
+	setp.ge.u32 p1,r15,r14; @p1 bra worker_zero_begin;
+	div.u32 r16,r15,r2; rem.u32 r17,r15,r2; mad.lo.u32 r18,r16,4096,r17; mul.wide.u32 a23,r18,4; add.u64 a24,a3,a23;
+	add.u32 r18,r5,1; mul.lo.u32 r18,r18,r16; mul.wide.u32 a25,r18,4; add.u64 a26,a5,a25; ld.volatile.global.u32 r19,[a26];
+	mov.f32 f0,0f00000000; setp.ne.u32 p2,r19,0; @p2 ld.volatile.global.f32 f0,[a24];
+	mul.wide.u32 a23,r15,4; add.u64 a24,a7,a23; st.global.f32 [a24],f0; add.u32 r15,r15,r11; bra worker_copy;
+worker_zero_begin:
+	mul.lo.u32 r14,r14,r5; mov.u32 r15,r10;
+worker_zero:
+	setp.ge.u32 p1,r15,r14; @p1 bra worker_list;
+	mul.wide.u32 a23,r15,4; add.u64 a24,a11,a23; mov.u32 r16,0; st.global.u32 [a24],r16; add.u32 r15,r15,r11; bra worker_zero;
+worker_list:
+	@!p0 bra worker_prepare;
+	mov.u32 r14,0; mov.u32 r15,0;
+list_position:
+	setp.ge.u32 p1,r15,r1; @p1 bra list_done;
+	add.u32 r16,r5,1; mul.lo.u32 r16,r16,r15; mul.wide.u32 a23,r16,4; add.u64 a24,a5,a23; ld.volatile.global.u32 r17,[a24]; mov.u32 r18,0;
+list_slot:
+	setp.ge.u32 p1,r18,r17; @p1 bra list_next_position;
+	mul.wide.u32 a25,r18,4; add.u64 a26,a24,a25; ld.volatile.global.u32 r19,[a26+4]; mov.u32 r20,0;
+list_seen:
+	setp.ge.u32 p1,r20,r14; @p1 bra list_append;
+	mul.wide.u32 a27,r20,4; add.u64 a28,a5,a27; ld.volatile.global.u32 r21,[a28+1028]; setp.eq.u32 p2,r19,r21; @p2 bra list_next_slot;
+	add.u32 r20,r20,1; bra list_seen;
+list_append:
+	mul.wide.u32 a27,r14,4; add.u64 a28,a5,a27; st.volatile.global.u32 [a28+1028],r19; add.u32 r14,r14,1;
+list_next_slot:
+	add.u32 r18,r18,1; bra list_slot;
+list_next_position:
+	add.u32 r15,r15,1; bra list_position;
+list_done:
+	st.volatile.global.u32 [a5+1024],r14; st.global.u32 [a2+56],r14;
+worker_prepare:
+	mul.lo.u32 r22,r0,64;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,102; @p1 bra worker_done;
+	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a7; st.param.u64 [pk],a8; st.param.u64 [sc],a9; st.param.u32 [k],r2; st.param.u32 [c],r1; st.param.u32 [ac],r1;
+	st.param.u32 [rank],r7; st.param.u32 [count],r9; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
+	add.u32 r22,r22,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,103; @p1 bra worker_done;
+	ld.volatile.global.u32 r23,[a5+1024]; mov.u32 r24,0;
+wave_begin:
+	setp.ge.u32 p1,r24,r23; @p1 bra worker_reduce;
+	sub.u32 r25,r23,r24; min.u32 r25,r25,r9; rem.u32 r26,r7,r25; div.u32 r27,r7,r25;
+	add.u32 r28,r9,r25; sub.u32 r28,r28,1; sub.u32 r28,r28,r26; div.u32 r28,r28,r25;
+	add.u32 r29,r24,r26; mul.wide.u32 a23,r29,4; add.u64 a24,a5,a23; ld.volatile.global.u32 r30,[a24+1028];
+	{ .param .u64 ids,word; .param .u32 cols,top,ex; st.param.u64 [ids],a5; st.param.u32 [cols],r1; st.param.u32 [top],r5; st.param.u32 [ex],r30;
+	call.uni (word),mtp_group_cta,(ids,cols,top,ex); ld.param.u64 a29,[word]; }
+	cvt.u32.u64 r31,a29; popc.b32 r32,r31; mov.u32 r33,1; setp.gt.u32 p1,r32,1; @p1 mov.u32 r33,2; setp.gt.u32 p1,r32,2; @p1 mov.u32 r33,4; setp.gt.u32 p1,r32,4; @p1 mov.u32 r33,8;
+	mul.wide.u32 a23,r30,40; add.u64 a30,a10,a23; ld.global.u64 a31,[a30]; ld.global.u64 a32,[a30+8]; ld.global.u64 a33,[a30+16];
+	ld.global.u32 r34,[a30+24]; ld.global.u32 r35,[a30+28]; ld.global.u32 r36,[a30+32];
+	mul.wide.u32 a23,r26,163840; add.u64 a34,a13,a23; add.u64 a35,a34,20480; add.u64 a36,a34,65536;
+	// The measured fused path writes the group's compact active product directly.
+	mov.u32 r43,0; setp.eq.u32 p3,r34,r35; setp.eq.u32 p4,r34,17; setp.eq.u32 p5,r34,18; or.pred p4,p4,p5; and.pred p3,p3,p4;
+	setp.le.u32 p4,r33,2; and.pred p3,p3,p4; @!p3 bra gate_up_separate;
+	mov.u32 r43,1; mul.lo.u32 r44,r3,8; mul.lo.u32 r44,r44,r26; mul.wide.u32 a39,r44,4; add.u64 a39,a18,a39;
+	{ .param .u32 ty,cap,active,lanes,mask,k,m,rank,count,ok; .param .u64 g,u,x,sc,o;
+	st.param.u32 [ty],r34; st.param.u32 [cap],r33; st.param.u32 [active],r32; mov.u32 r44,16; st.param.u32 [lanes],r44; st.param.u32 [mask],r31;
+	st.param.u64 [g],a31; st.param.u64 [u],a32; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a39;
+	st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [rank],r27; st.param.u32 [count],r28;
+	call.uni (ok),packed_gate_up,(ty,cap,active,lanes,mask,g,u,x,sc,o,k,m,rank,count); ld.param.u32 r13,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,206; bra gate_up_complete;
+gate_up_separate:
+	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
+	st.param.u64 [w],a31; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a34; st.param.u64 [sh],a1;
+	st.param.u32 [ty],r34; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
+	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,204;
+	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
+	st.param.u64 [w],a32; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a35; st.param.u64 [sh],a1;
+	st.param.u32 [ty],r35; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
+	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,205;
+gate_up_complete:
+	// Full-die completion before consuming row partitions from other CTAs.
+	div.u32 r37,r24,r9; mad.lo.u32 r22,r0,64,2; mad.lo.u32 r22,r37,8,r22;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,106; @p1 bra worker_done;
+	// Each group's compact product occupies eight columns in one full-die array.
+	mul.lo.u32 r38,r3,8; mul.lo.u32 r39,r3,r32; mad.lo.u32 r15,r27,r8,r6; mul.lo.u32 r16,r28,r8;
+product_loop:
+	setp.ge.u32 p1,r15,r38; @p1 bra product_done;
+	mov.f32 f0,0f00000000; setp.ge.u32 p2,r15,r39; @p2 bra product_store;
+	setp.ne.u32 p3,r43,0; @p3 bra product_next;
+	mul.wide.u32 a23,r15,4; add.u64 a24,a34,a23; add.u64 a25,a35,a23; ld.global.cg.f32 f1,[a24]; ld.global.cg.f32 f2,[a25];
+	mul.f32 f3,f1,0fbfb8aa3b; ex2.approx.f32 f3,f3; add.f32 f3,f3,0f3f800000; rcp.approx.f32 f3,f3; mul.f32 f0,f1,f3; mul.f32 f0,f0,f2;
+product_store:
+	mad.lo.u32 r17,r26,r38,r15; mul.wide.u32 a23,r17,4; add.u64 a24,a18,a23; st.global.f32 [a24],f0;
+product_next:
+	add.u32 r15,r15,r16; bra product_loop;
+product_done:
+	add.u32 r22,r22,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,107; @p1 bra worker_done;
+	mul.lo.u32 r40,r25,8;
+	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a18; st.param.u64 [pk],a19; st.param.u64 [sc],a20; st.param.u32 [k],r3; st.param.u32 [c],r40; st.param.u32 [ac],r40;
+	st.param.u32 [rank],r7; st.param.u32 [count],r9; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
+	add.u32 r22,r22,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,108; @p1 bra worker_done;
+	mul.lo.u32 r17,r26,r3; mul.wide.u32 a23,r17,16; add.u64 a37,a19,a23; mul.wide.u32 a23,r17,2; add.u64 a38,a20,a23;
+	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
+	st.param.u64 [w],a33; st.param.u64 [x],a37; st.param.u64 [sc],a38; st.param.u64 [o],a36; st.param.u64 [sh],a1;
+	st.param.u32 [ty],r36; st.param.u32 [k],r3; st.param.u32 [m],r2; st.param.u32 [cap],r33; st.param.u32 [c],r32; mov.u32 r13,0; st.param.u32 [mask],r13; st.param.u32 [rank],r27; st.param.u32 [count],r28;
+	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,209;
+	add.u32 r22,r22,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,110; @p1 bra worker_done;
+	{ .param .u32 mask,word; st.param.u32 [mask],r31; call.uni (word),mtp_column_word,(mask); ld.param.u32 r41,[word]; }
+	shr.u64 a23,a29,32; cvt.u32.u64 r42,a23; mul.lo.u32 r14,r32,r2; mad.lo.u32 r15,r27,r8,r6;
+scatter_loop:
+	setp.ge.u32 p1,r15,r14; @p1 bra scatter_done;
+	div.u32 r16,r15,r2; rem.u32 r17,r15,r2; mul.lo.u32 r18,r16,4; shr.u32 r19,r41,r18; and.b32 r19,r19,15;
+	mul.lo.u32 r18,r19,4; shr.u32 r20,r42,r18; and.b32 r20,r20,15; mad.lo.u32 r21,r19,r5,r20; mad.lo.u32 r21,r21,r2,r17;
+	mul.wide.u32 a23,r15,4; add.u64 a24,a36,a23; ld.global.cg.f32 f0,[a24]; mul.wide.u32 a25,r21,4; add.u64 a26,a11,a25; st.global.f32 [a26],f0;
+	mul.lo.u32 r16,r28,r8; add.u32 r15,r15,r16; bra scatter_loop;
+scatter_done:
+	add.u32 r22,r22,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,111; @p1 bra worker_done;
+	add.u32 r24,r24,r9; bra wave_begin;
+worker_reduce:
+	mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2+16],a21;
+	{ .param .u64 ids,coef,in,out; .param .u32 top,rows,cols,ok; st.param.u64 [ids],a5; st.param.u64 [coef],a6; st.param.u64 [in],a11; st.param.u64 [out],a12;
+	st.param.u32 [top],r5; st.param.u32 [rows],r2; st.param.u32 [cols],r1; call.uni (ok),split_local_combine,(ids,coef,in,out,top,rows,cols); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,212;
+	mad.lo.u32 r22,r0,64,62;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
+	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,113; @p1 bra worker_done;
+	{ .param .u64 in,out,sl,fl,dl; .param .u32 seq,rows,cols,stride,ok; st.param.u64 [in],a12; st.param.u64 [out],a16; st.param.u64 [sl],a14; st.param.u64 [fl],a17; st.param.u64 [dl],a22;
+	st.param.u32 [seq],r0; st.param.u32 [rows],r2; st.param.u32 [cols],r1; mov.u32 r13,4096; st.param.u32 [stride],r13;
+	call.uni (ok),split_return,(in,out,sl,fl,seq,dl,rows,cols,stride); ld.param.u32 r13,[ok]; }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,114;
+worker_done:
+	mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2+24],a21;
+	setp.eq.u32 p1,r6,0; mul.wide.u32 a23,r7,4; add.u64 a24,a2,a23; @p1 st.global.u32 [a24+64],r12;
+	st.param.u32 [result],r12; ret;
+}
+// Dense slices write disjoint output rows into the main tape.
+.func split_dense_typed(.param .u64 w0,.param .u32 t0,.param .u64 x0,.param .u64 o0,.param .u32 k0,.param .u32 m0,.param .u32 c0) {
+	.reg .b64 w,x,o,a<4>; .reg .b32 t,k,m,c,r<15>; .reg .f32 f<4>; .reg .pred p<3>;
+	ld.param.u64 w,[w0]; ld.param.u32 t,[t0]; ld.param.u64 x,[x0]; ld.param.u64 o,[o0]; ld.param.u32 k,[k0]; ld.param.u32 m,[m0]; ld.param.u32 c,[c0];
+	mov.u32 r0,%tid.x; mov.u32 r1,%ctaid.x; mov.u32 r2,%ntid.x; mov.u32 r3,%nctaid.x;
+	and.b32 r4,r0,31; shr.u32 r5,r0,5; shr.u32 r6,r2,5; mad.lo.u32 r5,r1,r6,r5; mul.lo.u32 r6,r6,r3; mul.lo.u32 r7,m,c;
+dt_row:
+	setp.ge.u32 p0,r5,r7; @p0 ret; rem.u32 r8,r5,m; div.u32 r9,r5,m; mov.f32 f0,0f00000000; mov.u32 r10,r4;
+dt_k:
+	setp.ge.u32 p0,r10,k; @p0 bra dt_sum;
+	mad.lo.u32 r11,r8,k,r10; mad.lo.u32 r12,r9,k,r10; mul.wide.u32 a0,r12,4; add.u64 a1,x,a0; ld.global.f32 f1,[a1];
+	setp.eq.u32 p1,t,30; @p1 bra dt_bf;
+	mul.wide.u32 a0,r11,4; add.u64 a1,w,a0; ld.global.f32 f2,[a1]; bra dt_fma;
+dt_bf:
+	mul.wide.u32 a0,r11,2; add.u64 a1,w,a0; ld.global.u16 r13,[a1]; shl.b32 r13,r13,16; mov.b32 f2,r13;
+dt_fma:
+	fma.rn.f32 f0,f1,f2,f0; add.u32 r10,r10,32; bra dt_k;
+dt_sum:
+	mov.u32 r14,16;
+dt_shuffle:
+	shfl.sync.bfly.b32 r13,f0,r14,31,-1; mov.b32 f3,r13; add.f32 f0,f0,f3; shr.u32 r14,r14,1; setp.ne.u32 p0,r14,0; @p0 bra dt_shuffle;
+	setp.eq.u32 p0,r4,0; mul.wide.u32 a0,r5,4; add.u64 a1,o,a0; @p0 st.global.f32 [a1],f0;
+	add.u32 r5,r5,r6; bra dt_row;
+}
+.func (.param .u32 result) split_dense_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
+	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<5>; .reg .f32 f;
+	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
+	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+40]; ld.global.u64 a8,[a0+48];
+	ld.global.u64 a9,[a0+56]; ld.global.u64 a10,[a0+72]; ld.global.u64 a11,[a0+88]; ld.global.u64 a12,[a0+96]; ld.global.u64 a13,[a0+112];
+	ld.global.u32 r2,[a0+128]; ld.global.u32 r3,[a0+136]; ld.global.u32 r4,[a0+176];
+	mov.u32 r5,%tid.x; mov.u32 r6,%ctaid.x; mov.u32 r7,%ntid.x; mov.u32 r8,%nctaid.x; mad.lo.u32 r9,r6,r7,r5; mul.lo.u32 r10,r7,r8;
+	setp.eq.u32 p0,r9,0; mov.u32 r11,1; mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2],a14; add.u64 a15,a14,5000000000;
+	mov.u32 r12,0; @p0 st.global.v4.u32 [a2+32],{r12,r12,r12,r12}; @p0 st.global.u32 [a2+48],r12;
+	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a4; st.param.u64 [dl],a15; st.param.u32 [sq],r0; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,401; @p1 bra dl_done;
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+8],a14;
+	ld.volatile.global.u64 a16,[a5]; ld.volatile.global.u32 r13,[a5+8]; ld.volatile.global.u32 r14,[a5+12];
+	mov.u32 r15,r9; mul.lo.u32 r16,r2,r1;
+dl_copy:
+	setp.ge.u32 p1,r15,r16; @p1 bra dl_copied; div.u32 r17,r15,r2; rem.u32 r18,r15,r2; mad.lo.u32 r19,r17,r4,r18;
+	mul.wide.u32 a17,r19,4; add.u64 a18,a3,a17; ld.volatile.global.f32 f,[a18]; mul.wide.u32 a17,r15,4; add.u64 a18,a6,a17; st.global.f32 [a18],f;
+	add.u32 r15,r15,r10; bra dl_copy;
+dl_copied:
+	mul.lo.u32 r20,r0,64;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,402; @p1 bra dl_done;
+	ld.global.u32 r27,[a0+180]; setp.eq.u32 p1,r27,0; @p1 bra dl_prepared;
+	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a6; st.param.u64 [pk],a7; st.param.u64 [sc],a8; st.param.u32 [k],r2; st.param.u32 [c],r1; st.param.u32 [ac],r1; st.param.u32 [rank],r6; st.param.u32 [count],r8; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
+dl_prepared:
+	add.u32 r20,r20,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,403; @p1 bra dl_done;
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+16],a14; mov.u32 r21,0;
+	mov.u32 r22,1; setp.gt.u32 p1,r1,1; @p1 mov.u32 r22,2; setp.gt.u32 p1,r1,2; @p1 mov.u32 r22,4; setp.gt.u32 p1,r1,4; @p1 mov.u32 r22,8;
+dl_slice:
+	setp.ge.u32 p1,r21,r3; @p1 bra dl_return; mul.wide.u32 a17,r21,40; add.u64 a18,a9,a17;
+	ld.global.u64 a19,[a18]; ld.global.u32 r23,[a18+8]; ld.global.u32 r24,[a18+12]; ld.global.u32 r25,[a18+16]; ld.global.u64 a20,[a18+32];
+	setp.eq.u32 p1,r23,0; setp.eq.u32 p2,r23,30; or.pred p1,p1,p2; @p1 bra dl_typed;
+	ld.global.u32 r28,[a18+24]; bfind.u32 r30,r22; shl.b32 r30,r30,3; shr.u32 r28,r28,r30; and.b32 r28,r28,255; mov.u32 r29,0;
+	setp.eq.u32 p1,r23,17; setp.eq.u32 p2,r22,8; and.pred p1,p1,p2; @p1 mov.u32 r29,2;
+	{ .param .u64 w,x,s,o; .param .u32 t,k,m,cap,c,kind,lanes,mask,rank,count,ok;
+	st.param.u64 [w],a19; st.param.u64 [x],a7; st.param.u64 [s],a8; st.param.u64 [o],a10;
+	st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [cap],r22; st.param.u32 [c],r1; st.param.u32 [kind],r29; st.param.u32 [lanes],r28;
+	mov.u32 r12,0; st.param.u32 [mask],r12; st.param.u32 [rank],r6; st.param.u32 [count],r8;
+	call.uni (ok),packed_matvec,(t,cap,c,kind,lanes,mask,w,x,s,o,k,m,rank,count); ld.param.u32 r12,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r6; st.param.u32 [receipt],r12;
+	mov.u32 r30,0; st.param.u32 [field],r30; call.uni split_route_count,(rp,rank,field,receipt); }
+
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,404; @p1 bra dl_done; bra dl_computed;
+dl_typed:
+	{ .param .u64 w,x,o; .param .u32 t,k,m,c; st.param.u64 [w],a19; st.param.u64 [x],a6; st.param.u64 [o],a10; st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [c],r1; call.uni split_dense_typed,(w,t,x,o,k,m,c); }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r6;
+	mov.u32 r30,1; st.param.u32 [field],r30; st.param.u32 [receipt],r30; call.uni split_route_count,(rp,rank,field,receipt); }
+dl_computed:
+	add.u32 r20,r20,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,405; @p1 bra dl_done;
+	mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
+dl_scatter:
+	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r25; rem.u32 r18,r15,r25; mul.wide.u32 a17,r18,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_scatter_next; mad.lo.u32 r19,r18,r13,r14; add.u32 r19,r19,r17;
+	mul.wide.u32 a17,r15,4; add.u64 a18,a10,a17; ld.global.f32 f,[a18]; mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
+dl_scatter_next:
+	add.u32 r15,r15,r10; bra dl_scatter;
+dl_scattered:
+	add.u32 r20,r20,1;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,406; @p1 bra dl_done; add.u32 r21,r21,1; bra dl_slice;
+dl_return:
+	mul.lo.u32 r20,r0,64; add.u32 r20,r20,63;
+	{ .param .u64 sl,fl,dl; .param .u32 tag,sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a13; st.param.u64 [dl],a15; st.param.u32 [tag],r20; st.param.u32 [sq],r0; call.uni (ok),p2p_publish_tagged,(sl,fl,tag,sq,dl); ld.param.u32 r12,[ok]; }
+	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,407;
+dl_done:
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+24],a14; @p0 st.global.u32 [a2+56],r3;
+	setp.eq.u32 p1,r5,0; mul.wide.u32 a17,r6,4; add.u64 a18,a2,a17; @p1 st.global.u32 [a18+64],r11; st.param.u32 [result],r11; ret;
+}
+.func (.param .u32 result) split_dense_forward(.param .u64 desc0,.param .u64 source0,.param .u64 output0,.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
+	.reg .b64 a<25>; .reg .b32 r<27>; .reg .pred p<4>; .reg .f32 f;
+	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[output0]; ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a3,[sh0];
+	ld.global.u64 a4,[a0]; ld.global.u64 a5,[a0+8]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+64]; ld.global.u32 r4,[a0+72]; ld.global.u32 r5,[a0+76]; ld.global.u32 r6,[a0+80];
+	ld.global.u64 a8,[a4+32]; ld.global.u64 a9,[a4+40]; ld.volatile.global.u32 r7,[a4]; ld.volatile.global.u32 r8,[a4+4]; ld.volatile.global.u32 r9,[a4+8]; ld.volatile.global.u32 r10,[a4+12]; ld.volatile.global.u32 r11,[a4+16];
+	mov.u32 r12,%tid.x; mov.u32 r13,%ctaid.x; mov.u32 r14,%ntid.x; mov.u32 r15,%nctaid.x; mad.lo.u32 r16,r13,r14,r12; mul.lo.u32 r17,r14,r15; setp.eq.u32 p0,r16,0;
+	mov.u64 a10,%globaltimer; add.u64 a11,a10,5000000000; ld.volatile.global.u32 r18,[a4+24]; setp.ne.u32 p1,r18,0; @p1 bra df_fail;
+	sub.u32 r18,r3,r8; div.u32 r18,r18,r9; mul.lo.u32 r18,r18,r10; sub.u32 r19,r4,r11; add.u32 r18,r18,r19; add.u32 r19,r18,r7; add.u32 r19,r19,1;
+	mov.u32 r20,r16; mul.lo.u32 r21,r6,r2;
+df_gather:
+	setp.ge.u32 p1,r20,r21; @p1 bra df_ready; div.u32 r22,r20,r6; rem.u32 r23,r20,r6; mad.lo.u32 r24,r23,r0,r1; add.u32 r24,r24,r22;
+	mul.wide.u32 a12,r24,4; add.u64 a13,a1,a12; ld.global.f32 f,[a13]; mul.wide.u32 a12,r20,4; add.u64 a13,a6,a12; st.global.f32 [a13],f; add.u32 r20,r20,r17; bra df_gather;
+df_ready:
+	mul.lo.u32 r25,r19,64;
+	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a8; st.param.u64 [fl],a9; st.param.u64 [dl],a11; st.param.u32 [sq],r25; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r26,[ok]; }
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,411; @p1 bra df_failed; mov.u32 r20,0; max.u32 r24,r6,4096;
+df_send:
+	setp.ge.u32 p1,r20,r5; @p1 bra df_local; mul.wide.u32 a12,r20,48; add.u64 a13,a5,a12; ld.global.u64 a14,[a13]; ld.global.u64 a15,[a13+8]; ld.global.u64 a16,[a13+24]; ld.global.u64 a17,[a13+32];
+	@p0 st.volatile.global.u64 [a15],a2; @p0 st.volatile.global.u32 [a15+8],r0; @p0 st.volatile.global.u32 [a15+12],r1;
+	mov.u32 r21,r16; mul.lo.u32 r22,r24,r2;
+df_packet:
+	setp.ge.u32 p1,r21,r22; @p1 bra df_publish; div.u32 r23,r21,r24; rem.u32 r25,r21,r24; setp.lt.u32 p2,r25,r6; mov.f32 f,0f00000000;
+	mad.lo.u32 r25,r23,r6,r25; mul.wide.u32 a12,r25,4; add.u64 a13,a6,a12; @p2 ld.global.f32 f,[a13]; mul.wide.u32 a12,r21,4; add.u64 a13,a14,a12; st.volatile.global.f32 [a13],f;
+	add.u32 r21,r21,r17; bra df_packet;
+df_publish:
+	mul.lo.u32 r25,r19,64; add.u32 r25,r25,32; add.u32 r25,r25,r20;
+	{ .param .u64 sl,fl,dl; .param .u32 tag,sq,ok; st.param.u64 [sl],a16; st.param.u64 [fl],a17; st.param.u64 [dl],a11; st.param.u32 [tag],r25; st.param.u32 [sq],r19; call.uni (ok),p2p_publish_tagged,(sl,fl,tag,sq,dl); ld.param.u32 r26,[ok]; }
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,412; @p1 bra df_failed; add.u32 r20,r20,1; bra df_send;
+df_local:
+	ld.global.u64 a18,[a7+120]; mul.wide.u32 a12,r18,128; add.u64 a18,a18,a12;
+	{ .param .u64 d,sh,rp; .param .u32 sq,c,ok; st.param.u64 [d],a7; st.param.u64 [sh],a3; st.param.u64 [rp],a18; st.param.u32 [sq],r19; st.param.u32 [c],r2; call.uni (ok),split_dense_layer,(d,sq,c,sh,rp); ld.param.u32 r26,[ok]; }
+	setp.ne.u32 p1,r26,1; @p1 bra df_failed; ld.global.u64 a19,[a0+16]; mov.u32 r20,0;
+df_wait:
+	setp.ge.u32 p1,r20,r5; @p1 bra df_success; mul.wide.u32 a12,r20,16; add.u64 a13,a19,a12; ld.global.u64 a17,[a13+8];
+	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a17; st.param.u64 [dl],a11; st.param.u32 [sq],r19; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r26,[ok]; }
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,413; @p1 bra df_failed; add.u32 r20,r20,1; bra df_wait;
+df_success:
+	mov.u32 r26,1; st.param.u32 [result],r26; ret;
+df_failed:
+	@p0 st.volatile.global.u32 [a4+24],r26; @p0 st.volatile.global.u32 [a4+28],r4;
+df_fail:
+	mov.u32 r26,0; st.param.u32 [result],r26; ret;
+}
+
+.visible .entry expert_split_worker(.param .u64 jobs0,.param .u32 first0,.param .u32 layers0,.param .u32 base0,.param .u32 tokens0,.param .u32 capacity0) {
+	.reg .b64 a<8>; .reg .b32 r<16>; .reg .pred p<3>;
+	ld.param.u64 a0,[jobs0]; ld.param.u32 r0,[first0]; ld.param.u32 r1,[layers0]; ld.param.u32 r2,[base0]; ld.param.u32 r3,[tokens0]; ld.param.u32 r4,[capacity0];
+	cvta.shared.u64 a1,scratch; mov.u32 r5,0; mov.u32 r6,0;
+entry_chunk:
+	setp.ge.u32 p0,r5,r3; @p0 ret; sub.u32 r7,r3,r5; min.u32 r7,r7,r4; mov.u32 r8,0;
+entry_layer:
+	add.u32 r9,r0,r8; mul.wide.u32 a2,r9,192; add.u64 a3,a0,a2; ld.global.u64 a4,[a3+120]; mul.wide.u32 a5,r6,128; add.u64 a4,a4,a5;
+	add.u32 r10,r2,r6; add.u32 r10,r10,1;
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1; st.param.u32 [cols],r13; ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
+	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); bra entry_result;
+entry_dense:
+	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report);
+entry_result:
+	ld.param.u32 r11,[ok]; }
+	setp.ne.u32 p0,r11,1; @p0 ret; add.u32 r6,r6,1; add.u32 r8,r8,1; setp.lt.u32 p0,r8,r1; @p0 bra entry_layer;
+	add.u32 r5,r5,r4; bra entry_chunk;
+}
+.func (.param .u32 result) split_main_forward(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
+	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
+	.reg .b64 a<36>; .reg .b32 r<32>; .reg .pred p<8>; .reg .f32 f;
+	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[coef0]; ld.param.u64 a3,[selected0]; ld.param.u64 a4,[output0];
+	ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a5,[sh0];
+	ld.global.u32 r30,[a0+104]; setp.ne.u32 p1,r30,0; @!p1 bra main_expert;
+	{ .param .u64 d,x,o,h; .param .u32 l,b,c,t,ok; st.param.u64 [d],a0; st.param.u64 [x],a1; st.param.u64 [o],a4; st.param.u64 [h],a5; st.param.u32 [l],r0; st.param.u32 [b],r1; st.param.u32 [c],r2; st.param.u32 [t],r3;
+	call.uni (ok),split_dense_forward,(d,x,o,l,b,c,t,h); ld.param.u32 r30,[ok]; }
+	st.param.u32 [result],r30; ret;
+main_expert:
+
+	ld.global.u64 a6,[a0]; ld.global.u64 a7,[a0+8]; ld.global.u64 a8,[a0+16]; ld.global.u64 a9,[a0+24];
+	ld.global.u64 a10,[a0+32]; ld.global.u64 a11,[a0+40]; ld.global.u64 a12,[a0+48]; ld.global.u64 a13,[a0+56]; ld.global.u64 a14,[a0+64];
+	ld.global.u64 a29,[a0+96];
+	ld.global.u32 r4,[a0+72]; ld.global.u32 r5,[a0+76]; ld.global.u32 r6,[a0+80]; ld.global.u32 r7,[a0+84]; ld.global.u32 r8,[a0+88];
+	ld.volatile.global.u32 r9,[a6]; ld.volatile.global.u32 r10,[a6+4]; ld.volatile.global.u32 r11,[a6+8]; ld.volatile.global.u32 r12,[a6+12]; ld.volatile.global.u32 r13,[a6+16];
+	ld.global.u64 a15,[a6+32]; ld.global.u64 a16,[a6+40]; ld.volatile.global.u32 r14,[a6+24]; setp.ne.u32 p0,r14,0; @p0 bra main_invalid;
+	sub.u32 r14,r3,r10; div.u32 r14,r14,r11; mul.lo.u32 r14,r14,r12; sub.u32 r15,r4,r13; add.u32 r14,r14,r15; add.u32 r15,r9,r14; add.u32 r15,r15,1;
+	mov.u32 r16,%tid.x; mov.u32 r17,%ctaid.x; mov.u32 r18,%ntid.x; mov.u32 r19,%nctaid.x; mad.lo.u32 r20,r17,r18,r16; mul.lo.u32 r21,r18,r19;
+	setp.eq.u32 p0,r20,0; mov.u64 a17,%globaltimer; add.u64 a18,a17,5000000000;
+	mov.u32 r22,0;
+main_validate_position:
+	setp.ge.u32 p1,r22,r2; @p1 bra main_validated;
+	add.u32 r23,r8,1; add.u32 r24,r22,r1; mul.lo.u32 r24,r24,r23; mul.wide.u32 a19,r24,4; add.u64 a20,a3,a19; ld.global.cg.u32 r25,[a20];
+	setp.gt.u32 p1,r25,r8; @p1 mov.u32 r30,304; @p1 bra main_failed; mov.u32 r26,0;
+main_validate_slot:
+	setp.ge.u32 p1,r26,r25; @p1 bra main_validate_next;
+	mul.wide.u32 a21,r26,4; add.u64 a22,a20,a21; ld.global.cg.u32 r27,[a22+4];
+	setp.ge.u32 p1,r27,r7; @p1 mov.u32 r30,305; @p1 bra main_failed;
+	add.u32 r26,r26,1; bra main_validate_slot;
+main_validate_next:
+	add.u32 r22,r22,1; bra main_validate_position;
+main_validated:
+	mov.u32 r22,r20; mul.lo.u32 r23,r6,r2;
+main_gather:
+	setp.ge.u32 p1,r22,r23; @p1 bra main_routes;
+	div.u32 r24,r22,r6; rem.u32 r25,r22,r6; mad.lo.u32 r26,r25,r0,r1; add.u32 r26,r26,r24; mul.wide.u32 a19,r26,4; add.u64 a20,a1,a19; ld.global.f32 f,[a20];
+	mul.wide.u32 a19,r22,4; add.u64 a20,a10,a19; st.global.f32 [a20],f; add.u32 r22,r22,r21; bra main_gather;
+main_routes:
+	mov.u32 r22,r20; add.u32 r23,r8,1; mul.lo.u32 r23,r23,r2;
+main_route_loop:
+	setp.ge.u32 p1,r22,r23; @p1 bra main_ready;
+	add.u32 r24,r8,1; div.u32 r25,r22,r24; rem.u32 r26,r22,r24; add.u32 r27,r1,r25; mad.lo.u32 r27,r27,r24,r26;
+	mul.wide.u32 a19,r27,4; add.u64 a20,a3,a19; ld.global.cg.u32 r28,[a20]; mul.wide.u32 a21,r22,4; add.u64 a22,a12,a21; st.global.u32 [a22],r28;
+	setp.eq.u32 p1,r26,0; @p1 bra main_route_next;
+	add.u32 r27,r1,r25; mul.lo.u32 r27,r27,r24; mul.wide.u32 a19,r27,4; add.u64 a20,a3,a19; ld.global.cg.u32 r27,[a20];
+	setp.gt.u32 p1,r26,r27; @p1 bra main_route_next;
+	mul.wide.u32 a30,r28,4; add.u64 a30,a29,a30; atom.global.add.u32 r31,[a30],1;
+	// Router coefficients are expert-major in the native TopK value buffer.
+	mad.lo.u32 r27,r28,r0,r1; add.u32 r27,r27,r25; mul.wide.u32 a19,r27,4; add.u64 a20,a2,a19; ld.global.f32 f,[a20];
+	mad.lo.u32 r27,r25,r8,r26; sub.u32 r27,r27,1; mul.wide.u32 a19,r27,4; add.u64 a20,a11,a19; st.global.f32 [a20],f;
+main_route_next:
+	add.u32 r22,r22,r21; bra main_route_loop;
+main_ready:
+	mul.lo.u32 r29,r15,64;
+	{ .param .u64 sl,fl,dl; .param .u32 seq,ok; st.param.u64 [sl],a15; st.param.u64 [fl],a16; st.param.u64 [dl],a18; st.param.u32 [seq],r29;
+	call.uni (ok),split_grid,(sl,fl,seq,dl); ld.param.u32 r30,[ok]; }
+	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,301; @p1 bra main_failed;
+	mov.u32 r22,0;
+main_send:
+	setp.ge.u32 p1,r22,r5; @p1 bra main_local;
+	mul.wide.u32 a19,r22,48; add.u64 a20,a7,a19; ld.global.u64 a23,[a20]; ld.global.u64 a24,[a20+8]; ld.global.u64 a25,[a20+16]; ld.global.u64 a26,[a20+24]; ld.global.u64 a27,[a20+32]; ld.global.u32 r23,[a20+40];
+	{ .param .u64 x,ids,co,ow,req,rec,routing,sl,fl,dl; .param .u32 seq,die,ex,top,rows,cols,stride,ok;
+	st.param.u64 [x],a10; st.param.u64 [ids],a12; st.param.u64 [co],a11; st.param.u64 [ow],a9; st.param.u64 [req],a23; st.param.u64 [rec],a24; st.param.u64 [routing],a25; st.param.u64 [sl],a26; st.param.u64 [fl],a27; st.param.u64 [dl],a18;
+	st.param.u32 [seq],r15; st.param.u32 [die],r23; st.param.u32 [ex],r7; st.param.u32 [top],r8; st.param.u32 [rows],r6; st.param.u32 [cols],r2; mov.u32 r23,4096; st.param.u32 [stride],r23;
+	call.uni (ok),split_send,(x,ids,co,ow,req,rec,routing,sl,fl,seq,dl,die,ex,top,rows,cols,stride); ld.param.u32 r30,[ok]; }
+	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,302; @p1 bra main_failed;
+	add.u32 r22,r22,1; bra main_send;
+main_local:
+	ld.global.u64 a28,[a14+120]; mul.wide.u32 a19,r14,128; add.u64 a28,a28,a19;
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a14; st.param.u64 [sh],a5; st.param.u64 [report],a28; st.param.u32 [seq],r15; st.param.u32 [cols],r2;
+	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r30,[ok]; }
+	setp.ne.u32 p1,r30,1; @p1 bra main_failed;
+	{ .param .u64 table,out,dl; .param .u32 seq,rows,workers,cols,stride,ok; st.param.u64 [table],a8; st.param.u64 [out],a13; st.param.u64 [dl],a18;
+	st.param.u32 [seq],r15; st.param.u32 [rows],r6; st.param.u32 [workers],r5; st.param.u32 [cols],r2; mov.u32 r23,4096; st.param.u32 [stride],r23;
+	call.uni (ok),split_combine,(table,out,seq,dl,rows,workers,cols,stride); ld.param.u32 r30,[ok]; }
+	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,303; @p1 bra main_failed;
+	mov.u32 r22,r20; mul.lo.u32 r23,r6,r2;
+main_scatter:
+	setp.ge.u32 p1,r22,r23; @p1 bra main_success;
+	div.u32 r24,r22,r6; rem.u32 r25,r22,r6; mad.lo.u32 r26,r25,r0,r1; add.u32 r26,r26,r24;
+	mul.wide.u32 a19,r22,4; add.u64 a20,a13,a19; ld.global.cg.f32 f,[a20]; mul.wide.u32 a21,r26,4; add.u64 a22,a4,a21; st.global.f32 [a22],f;
+	add.u32 r22,r22,r21; bra main_scatter;
+main_success:
+	mov.u32 r30,1; st.param.u32 [result],r30; ret;
+main_failed:
+	@p0 st.volatile.global.u32 [a6+24],r30; @p0 st.volatile.global.u32 [a6+28],r4;
+main_invalid:
+	mov.u32 r30,0; st.param.u32 [result],r30; ret;
+}
+
+"# }

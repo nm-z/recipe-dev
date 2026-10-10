@@ -28,17 +28,17 @@ pub fn model() -> Model {
 }
 
 fn main() {
-	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
-	let model = model();
-	let mut infer = recipe.infer();
-	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }
-	if std::env::args().any(|arg| arg == "--memory") {
-		for (index, memory) in infer.memory(&model, &data, 128).unwrap().iter().enumerate() {
-			println!("planned {} {memory}", if index == 0 { "target" } else { "MTP" });
-			println!("weights_bytes {} values_bytes {} contexts_bytes {} input_bytes {} scratch_bytes {}", memory.weights, memory.values, memory.contexts, memory.input, memory.scratch);
-		}
-		return;
+	let data=recipe.data(GGUF);
+	let model=model();
+	let mut infer=recipe.infer();
+	if let Ok(path)=std::env::var("MTP") {infer=infer.mtp(path);}
+	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:32<<20};8];
+	for line in std::fs::read_to_string("/home/nate/codex/cx-fl-dispatch-build/free.csv").unwrap().lines() {
+		let values=line.split(',').map(|value|value.trim().parse::<usize>().unwrap()).collect::<Vec<_>>();
+		budgets[values[0]].free_bytes=values[1]<<20;
 	}
-	let report = infer.chat([time, pp, tg, input, out, cached, mtp]).run(&model, &data);
-	println!("generation tokens {} rate {} tok/s", report.out, report.tg());
+	let plan=infer.expert_plan(&model,&data,128,budgets).unwrap();
+	println!("{}",plan.table());
+	assert_eq!(plan.unplaced_bytes,0); assert_eq!(plan.unplaced_experts,0); assert_eq!(plan.main_die,4);
+	assert!(plan.placements.iter().all(|item|item.die!=6)); assert!(plan.fits());
 }

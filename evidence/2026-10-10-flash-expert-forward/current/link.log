@@ -1,0 +1,3 @@
+nvlink info    : 1087632 bytes gmem, 128 bytes cmem[3]
+nvlink info    : Function properties for 'expert_split_worker':
+nvlink info    : used 252 registers, 488 stack, 16 bytes smem, 348 bytes cmem[0], 228 bytes cmem[2], 0 bytes lmem
