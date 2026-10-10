@@ -35450,12 +35450,15 @@ entry_chunk:
 entry_layer:
 	add.u32 r9,r0,r8; mul.wide.u32 a2,r9,192; add.u64 a3,a0,a2; ld.global.u64 a4,[a3+120]; mul.wide.u32 a5,r6,128; add.u64 a4,a4,a5;
 	add.u32 r10,r2,r6; add.u32 r10,r10,1;
-	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1; st.param.u32 [cols],r13; ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
-	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); bra entry_result;
+	ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1;
+	ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r13;
+	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
+	bra entry_result;
 entry_dense:
-	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report);
+	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r13;
+	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
 entry_result:
-	ld.param.u32 r11,[ok]; }
 	setp.ne.u32 p0,r11,1; @p0 ret; add.u32 r6,r6,1; add.u32 r8,r8,1; setp.lt.u32 p0,r8,r1; @p0 bra entry_layer;
 	add.u32 r5,r5,r4; bra entry_chunk;
 }
