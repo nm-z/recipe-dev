@@ -19542,6 +19542,7 @@ fn validate_dense_plan(plan:&mut ExpertSplitPlan,target:&Graph,head:Option<&Grap
 	Ok(())
 }
 fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Result<()> {
+	if std::env::var("RECIPE_DENSE_SPLIT").as_deref()!=Ok("1") { return Ok(()); }
 	let nodes=graph.nodes.iter().enumerate().filter_map(|(index,node)|(node.weights()!=0 && node.block_kind!="mtp_input").then_some(index)).collect::<Vec<_>>();
 	require(nodes.len()==binding.nodes.len(),"dense row-split binding count differs from weighted graph nodes")?;
 	for (index,planes) in nodes.into_iter().zip(&binding.nodes) {
