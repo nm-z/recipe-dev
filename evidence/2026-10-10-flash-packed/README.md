@@ -49,3 +49,5 @@ Performance acceptance is not passed. The 85% target is 123.25 GB/s. The current
 Stock IQ2_XS/IQ3_XXS differs from the independently decoded algebra beyond the original 3e-6 float-noise threshold. Both errors are reported. The full-model 10% final-logit gate and 60/80 tok/s checkpoints are not measured by this harness.
 
 The signed codebooks add 1605632 bytes per module, plus the canonical tables. They are format dictionaries; tensor weights remain in their original GGUF layout. Follow-up reductions of spills and codebook traffic are separate, unmeasured work after this stable handoff. The resident full-model load now occupies die 1, so no additional standalone GPU suite is queued from this snapshot.
+
+The shipped library contains only 43 unique measured winner functions. Unlisted kind/CTA/row-lane configurations return 0. Use winners.tsv for the AOT choice; the full candidate generator and benchmark source remain in the evidence directory. The 75,037-line, 2.4 MiB library replaces the 1.1-million-line artifact.
