@@ -143,6 +143,7 @@ reject_paths "$work/answers.json" "$work/./proposal.json"
 reject_paths "$work/./proposal.json" "$work/schema.json"
 reject_paths "$work/fresh.json" "$work/./fresh.json"
 reject_paths "$work/fresh.json" "$work/FRESH.json"
+reject_paths "$work/σ.json" "$work/ς.json"
 mkdir -p "$work/alias-directory"
 reject_paths "$work/answers.json" "$work/alias-directory/../answers.json"
 ln -sf "$work/answers.json" "$work/answer-link.json"
@@ -154,7 +155,7 @@ ln "$work/proposal.json" "$work/proposal-hardlink.json"
 reject_paths "$work/answers.json" "$work/proposal-hardlink.json"
 ln -sf "$work/fresh.json" "$work/dangling-link.json"
 reject_paths "$work/fresh.json" "$work/dangling-link.json"
-[[ ! -e "$work/fresh.json" && ! -e "$work/FRESH.json" ]]
+[[ ! -e "$work/fresh.json" && ! -e "$work/FRESH.json" && ! -e "$work/σ.json" && ! -e "$work/ς.json" ]]
 pass 'reject path, symlink, and hard-link aliases before requests or writes'
 
 printf 'tie' > "$work/mode"

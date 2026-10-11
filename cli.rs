@@ -52,7 +52,8 @@ fn schema_paths_distinct(paths: &[&str]) -> std::io::Result<()> {
 			}
 			Err(error) => return Err(error),
 		};
-		let key = resolved.to_string_lossy().to_lowercase();
+		// Fold both directions so variants such as the two lowercase Greek sigmas share a key.
+		let key = resolved.to_string_lossy().to_lowercase().to_uppercase();
 		if seen.iter().any(|(other, file)| *other == key || identity.is_some() && identity == *file) {
 			return Err(std::io::Error::other("proposal, answers, and schema must name distinct files and differ beyond letter case"));
 		}
