@@ -3079,3 +3079,365 @@ combine_invalid:
 	st.param.u32 [result], r4;
 	ret;
 }
+
+// BEGIN FLASH ROUTER TOP10
+// The caller stages 512 FP32 scores at tile[0,2048), then all CTA lanes call.
+// The existing weights and selected-list bytes hold temporary reductions.
+// On success, weights are at tile[2048,4096), count/ascending IDs at [4096,4140).
+// Nonfinite scores return zero for the original scalar body's handling.
+.func (.param .u32 result) flash_router_top10(.param .u64 tile0) {
+	.reg .b64 a<8>;
+	.reg .b32 r<28>;
+	.reg .f32 f<24>;
+	.reg .pred p<8>;
+	ld.param.u64 a0, [tile0];
+	mov.u32 r0, %tid.x;
+	mov.u32 r1, %ntid.x;
+	and.b32 r2, r0, 31;
+	shr.u32 r3, r0, 5;
+	shr.u32 r4, r1, 5;
+	setp.eq.u32 p0, r0, 0;
+	setp.eq.u32 p1, r2, 0;
+	setp.eq.u32 p2, r1, 256;
+	setp.eq.u32 p3, r1, 512;
+	or.pred p3, p2, p3;
+	mov.u32 r27, 0;
+	@!p3 bra router_return;
+	mul.wide.u32 a1, r0, 4;
+	add.u64 a1, a0, a1;
+	ld.shared.f32 f0, [a1];
+	mov.f32 f1, 0fFF800000;
+	add.u32 r5, r0, r1;
+	setp.lt.u32 p2, r5, 512;
+	mul.wide.u32 a2, r5, 4;
+	add.u64 a2, a0, a2;
+	@p2 ld.shared.f32 f1, [a2];
+	mov.b32 r6, f0;
+	and.b32 r6, r6, 0x7fffffff;
+	setp.ge.u32 p3, r6, 0x7f800000;
+	mov.b32 r6, f1;
+	and.b32 r6, r6, 0x7fffffff;
+	setp.ge.u32 p4, r6, 0x7f800000;
+	and.pred p4, p2, p4;
+	or.pred p3, p3, p4;
+	vote.ballot.b32 r6, p3;
+	mul.wide.u32 a3, r3, 4;
+	add.u64 a3, a0, a3;
+	@p1 st.shared.u32 [a3+2048], r6;
+	bar.sync 0;
+	@!p0 bra router_finite_done;
+	mov.u32 r7, 0;
+	mov.u32 r8, 0;
+router_finite_loop:
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	ld.shared.u32 r6, [a4+2048];
+	or.b32 r8, r8, r6;
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, r4;
+	@p3 bra router_finite_loop;
+	st.shared.u32 [a0+2300], r8;
+router_finite_done:
+	bar.sync 0;
+	ld.shared.u32 r8, [a0+2300];
+	setp.ne.u32 p3, r8, 0;
+	@p3 bra router_return;
+	mov.u32 r7, 0;
+router_pick:
+	mov.f32 f2, f0;
+	mov.u32 r8, r0;
+	setp.gt.f32 p3, f1, f0;
+	and.pred p3, p3, p2;
+	@p3 mov.f32 f2, f1;
+	@p3 mov.u32 r8, r5;
+	setp.eq.f32 p3, f2, 0fFF800000;
+	@p3 mov.u32 r8, 0xffffffff;
+	mov.u32 r9, 16;
+router_warp_reduce:
+	shfl.down.b32 r10, r8, r9, 31;
+	mov.b32 r11, f2;
+	shfl.down.b32 r11, r11, r9, 31;
+	mov.b32 f3, r11;
+	setp.gt.f32 p3, f3, f2;
+	setp.eq.f32 p4, f3, f2;
+	setp.lt.u32 p5, r10, r8;
+	and.pred p4, p4, p5;
+	or.pred p3, p3, p4;
+	@p3 mov.f32 f2, f3;
+	@p3 mov.u32 r8, r10;
+	shr.u32 r9, r9, 1;
+	setp.ne.u32 p3, r9, 0;
+	@p3 bra router_warp_reduce;
+	@p1 st.shared.f32 [a3+2048], f2;
+	@p1 st.shared.u32 [a3+2112], r8;
+	bar.sync 0;
+	setp.eq.u32 p3, r3, 0;
+	@!p3 bra router_cta_done;
+	setp.lt.u32 p4, r2, r4;
+	mov.f32 f2, 0fFF800000;
+	mov.u32 r8, 0xffffffff;
+	@p4 ld.shared.f32 f2, [a1+2048];
+	@p4 ld.shared.u32 r8, [a1+2112];
+	mov.u32 r9, 16;
+router_cta_reduce:
+	shfl.down.b32 r10, r8, r9, 31;
+	mov.b32 r11, f2;
+	shfl.down.b32 r11, r11, r9, 31;
+	mov.b32 f3, r11;
+	setp.gt.f32 p3, f3, f2;
+	setp.eq.f32 p4, f3, f2;
+	setp.lt.u32 p5, r10, r8;
+	and.pred p4, p4, p5;
+	or.pred p3, p3, p4;
+	@p3 mov.f32 f2, f3;
+	@p3 mov.u32 r8, r10;
+	shr.u32 r9, r9, 1;
+	setp.ne.u32 p3, r9, 0;
+	@p3 bra router_cta_reduce;
+	@!p0 bra router_cta_done;
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	st.shared.u32 [a4+2176], r8;
+	st.shared.f32 [a4+2216], f2;
+	setp.eq.u32 p3, r7, 0;
+	@p3 st.shared.f32 [a0+2296], f2;
+router_cta_done:
+	bar.sync 0;
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	ld.shared.u32 r8, [a4+2176];
+	setp.eq.u32 p3, r0, r8;
+	@p3 mov.f32 f0, 0fFF800000;
+	setp.eq.u32 p3, r5, r8;
+	@p3 mov.f32 f1, 0fFF800000;
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, 10;
+	@p3 bra router_pick;
+	bar.sync 0;
+	// Sort only the ten winners by expert ID, matching the scalar sum order.
+	@!p0 bra router_sort_done;
+	mov.u32 r7, 1;
+router_sort_outer:
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	ld.shared.u32 r8, [a4+2176];
+	ld.shared.f32 f2, [a4+2216];
+	mov.u32 r9, r7;
+router_sort_inner:
+	setp.eq.u32 p3, r9, 0;
+	@p3 bra router_sort_store;
+	sub.u32 r10, r9, 1;
+	mul.wide.u32 a5, r10, 4;
+	add.u64 a5, a0, a5;
+	ld.shared.u32 r11, [a5+2176];
+	setp.le.u32 p3, r11, r8;
+	@p3 bra router_sort_store;
+	ld.shared.f32 f3, [a5+2216];
+	st.shared.u32 [a5+2180], r11;
+	st.shared.f32 [a5+2220], f3;
+	mov.u32 r9, r10;
+	bra router_sort_inner;
+router_sort_store:
+	mul.wide.u32 a5, r9, 4;
+	add.u64 a5, a0, a5;
+	st.shared.u32 [a5+2176], r8;
+	st.shared.f32 [a5+2216], f2;
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, 10;
+	@p3 bra router_sort_outer;
+router_sort_done:
+	bar.sync 0;
+	setp.ge.u32 p3, r0, 10;
+	@p3 bra router_exp_done;
+	ld.shared.f32 f2, [a1+2216];
+	ld.shared.f32 f3, [a0+2296];
+	sub.rn.f32 f4, f2, f3;
+	mov.f32 f5, 0f00000000;
+	// Preserve the original FP32 exp polynomial, range limit, and rounding.
+	setp.lt.f32 p3, f4, 0fC2CFF1B5;
+	@p3 bra router_exp_store;
+	mul.rn.f32 f6, f4, 0f3FB8AA3B;
+	add.rn.f32 f7, f6, 0f3F000000;
+	cvt.rmi.f32.f32 f8, f7;
+	cvt.rzi.s32.f32 r8, f8;
+	mul.rn.f32 f9, f8, 0fBF317218;
+	add.rn.f32 f10, f4, f9;
+	mul.rn.f32 f11, f8, 0fAF51CF7A;
+	add.rn.f32 f12, f10, f11;
+	fma.rn.f32 f13, f12, 0f37D00D01, 0f39500D01;
+	fma.rn.f32 f14, f13, f12, 0f3AB60B61;
+	fma.rn.f32 f15, f14, f12, 0f3C088889;
+	fma.rn.f32 f16, f15, f12, 0f3D2AAAAB;
+	fma.rn.f32 f17, f16, f12, 0f3E2AAAAB;
+	fma.rn.f32 f18, f17, f12, 0f3F000000;
+	fma.rn.f32 f19, f18, f12, 0f3F800000;
+	mul.rn.f32 f20, f12, f19;
+	add.rn.f32 f21, f20, 0f3F800000;
+	shr.s32 r9, r8, 1;
+	max.s32 r10, r9, -127;
+	add.s32 r10, r10, 127;
+	min.u32 r10, r10, 254;
+	shl.b32 r10, r10, 23;
+	mov.b32 f22, r10;
+	sub.s32 r11, r8, r9;
+	add.s32 r11, r11, 127;
+	max.s32 r11, r11, 0;
+	min.s32 r11, r11, 254;
+	shl.b32 r11, r11, 23;
+	mov.b32 f23, r11;
+	mul.rn.f32 f5, f21, f22;
+	mul.rn.f32 f5, f5, f23;
+router_exp_store:
+	st.shared.f32 [a1+2256], f5;
+router_exp_done:
+	bar.sync 0;
+	@!p0 bra router_sum_done;
+	mov.f32 f0, 0f00000000;
+	mov.u32 r7, 0;
+router_sum:
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	ld.shared.f32 f1, [a4+2256];
+	add.rn.f32 f0, f0, f1;
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, 10;
+	@p3 bra router_sum;
+	mov.u32 r7, 0;
+	mov.u32 r8, 0;
+router_normalize:
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	ld.shared.f32 f1, [a4+2256];
+	div.rn.f32 f2, f1, f0;
+	st.shared.f32 [a4+2256], f2;
+	setp.eq.f32 p3, f2, 0f00000000;
+	@p3 bra router_normalize_next;
+	ld.shared.u32 r9, [a4+2176];
+	mul.wide.u32 a5, r8, 4;
+	add.u64 a5, a0, a5;
+	st.shared.u32 [a5+4100], r9;
+	add.u32 r8, r8, 1;
+router_normalize_next:
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, 10;
+	@p3 bra router_normalize;
+	st.shared.u32 [a0+4096], r8;
+router_sum_done:
+	bar.sync 0;
+	// Each lane retains its final weights before scratch becomes the output.
+	mov.f32 f0, 0f00000000;
+	mov.f32 f1, 0f00000000;
+	mov.u32 r7, 0;
+router_weight:
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a0, a4;
+	ld.shared.u32 r8, [a4+2176];
+	ld.shared.f32 f2, [a4+2256];
+	setp.eq.u32 p3, r0, r8;
+	@p3 mov.f32 f0, f2;
+	setp.eq.u32 p3, r5, r8;
+	@p3 mov.f32 f1, f2;
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, 10;
+	@p3 bra router_weight;
+	bar.sync 0;
+	st.shared.f32 [a1+2048], f0;
+	@p2 st.shared.f32 [a2+2048], f1;
+	mov.u32 r27, 1;
+router_return:
+	st.param.u32 [result], r27;
+	ret;
+}
+// END FLASH ROUTER TOP10
+
+// BEGIN FLASH WEIGHTED RETURN
+// Fuse the local weighted sum and padded peer return. Existing buffers and
+// record/slot order are unchanged; tagged publication follows every writer.
+.func (.param .u32 result) flash_weighted_return(
+	.param .u64 records, .param .u64 coefficients, .param .u64 expert_outputs,
+	.param .u64 response, .param .u64 slots, .param .u64 remote_sequence,
+	.param .u32 sequence, .param .u64 deadline, .param .u32 top_k,
+	.param .u32 rows, .param .u32 positions, .param .u32 packet_rows
+) {
+	.reg .pred p<4>;
+	.reg .b32 r<24>;
+	.reg .b64 a<16>;
+	.reg .f32 f<3>;
+	ld.param.u64 a0, [records];
+	ld.param.u64 a1, [coefficients];
+	ld.param.u64 a2, [expert_outputs];
+	ld.param.u64 a3, [response];
+	ld.param.u64 a12, [slots];
+	ld.param.u64 a13, [remote_sequence];
+	ld.param.u64 a14, [deadline];
+	ld.param.u32 r0, [top_k];
+	ld.param.u32 r1, [rows];
+	ld.param.u32 r2, [positions];
+	ld.param.u32 r18, [packet_rows];
+	ld.param.u32 r19, [sequence];
+	mov.u32 r3, %tid.x;
+	mov.u32 r4, %ctaid.x;
+	mov.u32 r5, %ntid.x;
+	mov.u32 r6, %nctaid.x;
+	mad.lo.u32 r7, r4, r5, r3;
+	mul.lo.u32 r8, r5, r6;
+	mul.lo.u32 r9, r18, r2;
+weighted_return_row:
+	setp.ge.u32 p0, r7, r9;
+	@p0 bra weighted_return_publish;
+	div.u32 r10, r7, r18;
+	rem.u32 r11, r7, r18;
+	mov.f32 f0, 0f00000000;
+	setp.ge.u32 p0, r11, r1;
+	@p0 bra weighted_return_store;
+	add.u32 r12, r0, 1;
+	mul.lo.u32 r12, r12, r10;
+	mul.wide.u32 a4, r12, 4;
+	add.u64 a5, a0, a4;
+	ld.volatile.global.u32 r13, [a5];
+	setp.gt.u32 p0, r13, r0;
+	@p0 bra weighted_return_invalid;
+	mov.u32 r14, 0;
+weighted_return_slot:
+	setp.ge.u32 p0, r14, r13;
+	@p0 bra weighted_return_store;
+	mad.lo.u32 r15, r10, r0, r14;
+	mul.wide.u32 a6, r15, 4;
+	add.u64 a7, a1, a6;
+	ld.volatile.global.f32 f1, [a7];
+	mad.lo.u32 r16, r15, r1, r11;
+	mul.wide.u32 a8, r16, 4;
+	add.u64 a9, a2, a8;
+	ld.global.cg.f32 f2, [a9];
+	fma.rn.f32 f0, f1, f2, f0;
+	add.u32 r14, r14, 1;
+	bra weighted_return_slot;
+weighted_return_store:
+	mul.wide.u32 a10, r7, 4;
+	add.u64 a11, a3, a10;
+	st.volatile.global.f32 [a11], f0;
+	add.u32 r7, r7, r8;
+	bra weighted_return_row;
+weighted_return_publish:
+	{
+		.param .u64 s, peer, limit;
+		.param .u32 seq, tag, ok;
+		st.param.u64 [s], a12;
+		st.param.u64 [peer], a13;
+		st.param.u64 [limit], a14;
+		st.param.u32 [seq], r19;
+		mad.lo.u32 r20, r19, 64, 63;
+		st.param.u32 [tag], r20;
+		call.uni (ok), p2p_publish_tagged, (s, peer, tag, seq, limit);
+		ld.param.u32 r17, [ok];
+	}
+	setp.eq.u32 p0, r17, 0;
+	@p0 mov.u32 r17, 114;
+	st.param.u32 [result], r17;
+	ret;
+weighted_return_invalid:
+	mov.u32 r17, 212;
+	st.param.u32 [result], r17;
+	ret;
+}
+// END FLASH WEIGHTED RETURN
