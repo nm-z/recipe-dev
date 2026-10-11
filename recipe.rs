@@ -20404,7 +20404,7 @@ struct ExchangeBuffer {
 	/// The first die's buffer the others reach directly, or zero.
 	device: u64,
 	gpu: &'static Gpu,
-	/// The bytes of the first die's buffer, or zero for pinned machine RAM.
+	/// The allocated bytes, in device memory or pinned machine RAM.
 	bytes: usize,
 }
 impl ExchangeBuffer {
@@ -20468,7 +20468,7 @@ impl Gpu {
 				// Portable to every context, and mapped into each device's addresses.
 				driver_status(Backend::Nvidia, (driver.host_alloc)(&mut pointer, bytes, 0x01 | 0x02), "exchange allocation")?;
 				ptr::write_bytes(pointer.cast::<u8>(), 0, bytes);
-				Ok(ExchangeBuffer { pointer, device: 0, gpu: self, bytes: 0 })
+				Ok(ExchangeBuffer { pointer, device: 0, gpu: self, bytes })
 			},
 			_ => Err(RecipeError::new(format!("{} cannot hold a tensor split's exchange", self.name))),
 		}
