@@ -255,6 +255,20 @@ place(path, &[blocks])
 
 ## GGUF tensors
 
+An ordered plan supplies every weighted node directly, including transformed planes. `infer`, `decode`, and `place_bound` use the supplied graph and plan.
+
+```rust
+let file = recipe.gguf(path);
+let decay = file.tensor("blk.0.ssm_a").unwrap();
+let plan = file.plan()
+	.node(&[query, key, value])
+	.node(&[]).values(decay, file.values(decay).unwrap().iter().map(|a| (-a).ln()).collect());
+let prediction = file.infer(&model, &plan, &input, channels);
+let placed = file.place_bound(&model, &plan, positions, &[]);
+```
+
+`tensor.rows(first, count).every(period)` selects periodic row views. `attention_from` names rotary factors; `attn(heads).window(positions)` selects the sliding window. `node(&[])` starts a node whose planes are all transformed; `values` appends a transformed plane to that node.
+
 A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, a hyper-connection block its gate projections and head mixer, a per-layer embedding block its projections, scales and taps, and a normalization its scale.
 
 ```rust
