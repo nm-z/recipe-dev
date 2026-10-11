@@ -48,7 +48,7 @@ fn main() {
 	let table = format!("{work}/rows.csv");
 	let mut rows = std::fs::File::create(&table).unwrap();
 	writeln!(rows, "token_0,token_1,{}", columns.join(",")).unwrap();
-	let inference_data = recipe.data(&path);
+	let inference_data = recipe.data(path.as_str());
 	let placed = recipe.infer().place(model, &inference_data, 2, &[]);
 	let mut reference = Vec::new();
 	let mut expected_loss = 0.0;
