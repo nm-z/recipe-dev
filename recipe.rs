@@ -6,6 +6,497 @@
 #[path = "build.rs"]
 mod native_build;
 use native_build::{encoding, fp8};
+/// Hand-written decode bodies for the resident Flash shapes. Prefill keeps the
+/// tiled bodies. Rewriting preserves entries, arguments, and allocated buffers.
+pub struct FlashDecode;
+impl FlashDecode {
+	fn delta() -> String {
+		let mut ptx = String::from(r#"// One checkpointed decode position. Keep each column's state in registers
+// between its key prediction and query readout. Shared Q/K values replace
+// duplicate global loads by every value column.
+.func flash_delta_step_48x128(
+	.param .b64 fd_0,
+	.param .b64 fd_1,
+	.param .b64 fd_2,
+	.param .b64 fd_3,
+	.param .b64 fd_4,
+	.param .b64 fd_5,
+	.param .b32 fd_6,
+	.param .b32 fd_7,
+	.param .b32 fd_8,
+	.param .b64 fd_9
+)
+{
+	.reg .b64 input, output, context, prepared, pair, row, head, keyhead;
+	.reg .b64 qbase, kbase, vbase, obase, prior, next, live, vectors, qvec, kvec, a, b, off;
+	.reg .b32 position, column, slot, tid, localhead, base;
+	.reg .f32 cell<128>, prediction, readout, decay, beta, scale, key, query, value, term, error;
+	.reg .pred fresh;
+	ld.param.u64 input, [fd_0];
+	ld.param.u64 output, [fd_3];
+	ld.param.u64 context, [fd_4];
+	ld.param.u64 pair, [fd_5];
+	ld.param.u32 position, [fd_7];
+	ld.param.u32 column, [fd_8];
+	ld.param.u64 prepared, [fd_9];
+	div.u64 row, pair, 48;
+	rem.u64 head, pair, 48;
+	and.b64 keyhead, head, 15;
+	mul.lo.u64 qbase, row, 51200;
+	mad.lo.u64 qbase, keyhead, 640, qbase;
+	add.u64 kbase, qbase, 10240;
+	mul.lo.u64 vbase, row, 51200;
+	mad.lo.u64 vbase, head, 640, vbase;
+	add.u64 vbase, vbase, 20480;
+	mul.lo.u64 obase, row, 30720;
+	mad.lo.u64 obase, head, 640, obase;
+	mul.lo.u64 live, pair, 65536;
+	add.u64 live, live, context;
+	sub.u32 slot, position, 1;
+	rem.u32 slot, slot, 5;
+	mul.wide.u32 prior, slot, 65536;
+	mad.lo.u64 prior, pair, 327680, prior;
+	add.u64 prior, prior, 3145728;
+	add.u64 prior, prior, context;
+	rem.u32 slot, position, 5;
+	mul.wide.u32 next, slot, 65536;
+	mad.lo.u64 next, pair, 327680, next;
+	add.u64 next, next, 3145728;
+	add.u64 next, next, context;
+	mul.wide.u32 off, column, 4;
+	add.u64 prior, prior, off;
+	add.u64 next, next, off;
+	add.u64 live, live, off;
+	ld.global.f32 scale, [prepared];
+	ld.global.f32 decay, [prepared+4];
+	ld.global.f32 beta, [prepared+8];
+	mov.u32 tid, %tid.x;
+	shr.u32 localhead, tid, 7;
+	shl.b32 base, localhead, 10;
+	mov.u64 vectors, contraction_tile_f32;
+	cvt.u64.u32 off, base;
+	add.u64 qvec, vectors, off;
+	add.u64 kvec, qvec, 512;
+	mul.wide.u32 off, column, 20;
+	shl.b64 qbase, qbase, 2;
+	shl.b64 kbase, kbase, 2;
+	add.u64 qbase, qbase, input;
+	add.u64 kbase, kbase, input;
+	add.u64 a, qbase, off;
+	add.u64 b, kbase, off;
+	ld.global.f32 query, [a];
+	ld.global.f32 key, [b];
+	mul.rn.f32 query, query, scale;
+	mul.wide.u32 off, column, 4;
+	add.u64 a, qvec, off;
+	add.u64 b, kvec, off;
+	st.shared.f32 [a], query;
+	st.shared.f32 [b], key;
+	bar.sync 0;
+	setp.eq.u32 fresh, position, 0;
+	mov.f32 prediction, 0f00000000;
+"#);
+		for i in 0..128 {
+			ptx.push_str(&format!("\tmov.f32 cell{i}, 0f00000000;\n\t@!fresh ld.global.f32 cell{i}, [prior+{state}];\n\tmul.rn.f32 cell{i}, cell{i}, decay;\n\tld.shared.f32 key, [kvec+{vector}];\n\tmul.rn.f32 term, cell{i}, key;\n\tadd.rn.f32 prediction, prediction, term;\n", state=i*512, vector=i*4));
+		}
+		ptx.push_str(r#"	mul.wide.u32 off, column, 20;
+	shl.b64 vbase, vbase, 2;
+	add.u64 a, vbase, off;
+	add.u64 a, a, input;
+	ld.global.f32 value, [a];
+	sub.rn.f32 error, value, prediction;
+	mul.rn.f32 error, error, beta;
+	mov.f32 readout, 0f00000000;
+"#);
+		for i in 0..128 {
+			ptx.push_str(&format!("\tld.shared.f32 key, [kvec+{vector}];\n\tmul.rn.f32 term, error, key;\n\tadd.rn.f32 cell{i}, cell{i}, term;\n\tst.global.f32 [live+{state}], cell{i};\n\tst.global.f32 [next+{state}], cell{i};\n\tld.shared.f32 query, [qvec+{vector}];\n\tmul.rn.f32 term, cell{i}, query;\n\tadd.rn.f32 readout, readout, term;\n", state=i*512, vector=i*4));
+		}
+		ptx.push_str(r#"	shl.b64 obase, obase, 2;
+	add.u64 a, obase, off;
+	add.u64 a, a, output;
+	st.global.f32 [a], readout;
+	bar.sync 0;
+	ret;
+}
+"#);
+		ptx
+	}
+	fn attention() -> String { String::from(r#"// One decode position per CTA/head. Key lanes read contiguous cache positions;
+// dots and softmax run in parallel. The caller retains the grid barriers.
+.func flash_attention_step_24x256(
+	.param .b64 fa_0,
+	.param .b64 fa_1,
+	.param .b64 fa_2,
+	.param .b64 fa_3,
+	.param .b32 fa_4,
+	.param .b32 fa_5,
+	.param .b32 fa_6,
+	.param .b32 fa_7,
+	.param .b32 fa_8,
+	.param .b32 fa_9
+)
+{
+	.reg .b64 input, output, context, cache, tile, address, address2, query, scores, probabilities, reductions;
+	.reg .b64 offset, rowinput, rowcache, keycache, valuecache, selectbase, stats, outputbase, gatebase;
+	.reg .b32 rows, position, span, threads, origin, tid, block, group, groups, job, jobs, row, head, kvhead;
+	.reg .b32 localposition, keyposition, channel, lane, warp, index, keylimit, bits, magnitude, remainder, sign;
+	.reg .b32 parity, increment, encoded, small;
+	.reg .b16 half;
+	.reg .f32 value, qvalue, product, score, maximum, denominator, probability, partner, accumulator, gate;
+	.reg .pred p, q, r, active;
+	ld.param.u64 input, [fa_0];
+	ld.param.u64 output, [fa_1];
+	ld.param.u64 context, [fa_2];
+	ld.param.u64 cache, [fa_3];
+	ld.param.u32 rows, [fa_4];
+	ld.param.u32 position, [fa_5];
+	ld.param.u32 threads, [fa_8];
+	ld.param.u32 origin, [fa_9];
+	mov.u32 tid, %tid.x;
+	mov.u32 group, %ctaid.x;
+	mov.u32 block, %ntid.x;
+	div.u32 groups, threads, block;
+	mul.lo.u32 jobs, rows, 24;
+	mov.u32 job, group;
+	mov.u64 tile, contraction_tile_f16_f16_kvf8;
+	mov.u64 query, tile;
+	add.u64 scores, tile, 1024;
+	add.u64 probabilities, tile, 1536;
+	add.u64 reductions, tile, 2048;
+	and.b32 lane, tid, 31;
+	shr.u32 warp, tid, 5;
+	and.b32 localposition, position, 127;
+	sub.u32 localposition, localposition, origin;
+	add.u32 keylimit, position, 1;
+flash_attention_job:
+	setp.ge.u32 p, job, jobs;
+	@p bra flash_attention_done;
+	div.u32 row, job, 24;
+	rem.u32 head, job, 24;
+	div.u32 kvhead, head, 12;
+	mul.wide.u32 rowinput, row, 133120;
+	add.u64 rowinput, rowinput, input;
+	mul.wide.u32 rowcache, row, 131072;
+	add.u64 rowcache, rowcache, cache;
+	mul.wide.u32 offset, kvhead, 32768;
+	add.u64 keycache, rowcache, offset;
+	add.u64 valuecache, keycache, 65536;
+	mul.wide.u32 selectbase, rows, 20480;
+	mul.wide.u32 offset, row, 16384;
+	add.u64 selectbase, selectbase, offset;
+	mul.wide.u32 offset, position, 128;
+	add.u64 selectbase, selectbase, offset;
+	add.u64 selectbase, selectbase, context;
+	add.u64 selectbase, selectbase, 64;
+	mad.lo.u32 index, head, 256, tid;
+	mul.wide.u32 offset, index, 10;
+	add.u64 address, rowinput, offset;
+	mul.wide.u32 offset, localposition, 2;
+	add.u64 address, address, offset;
+	ld.global.b16 half, [address];
+	cvt.f32.f16 qvalue, half;
+	mul.wide.u32 offset, tid, 4;
+	add.u64 address2, query, offset;
+	st.shared.f32 [address2], qvalue;
+	mad.lo.u32 index, kvhead, 256, tid;
+	mul.wide.u32 offset, index, 10;
+	add.u64 address, rowinput, offset;
+	mul.wide.u32 offset, localposition, 2;
+	add.u64 address, address, offset;
+	ld.global.b16 half, [address+61440];
+	cvt.u32.u16 bits, half;
+	and.b32 magnitude, bits, 32767;
+	shr.u32 sign, bits, 8;
+	and.b32 sign, sign, 128;
+	and.b32 remainder, magnitude, 127;
+	shr.u32 encoded, magnitude, 7;
+	and.b32 parity, encoded, 1;
+	setp.gt.u32 p, remainder, 64;
+	setp.eq.u32 q, remainder, 64;
+	setp.ne.u32 r, parity, 0;
+	and.pred q, q, r;
+	or.pred p, p, q;
+	selp.u32 increment, 1, 0, p;
+	add.u32 encoded, encoded, increment;
+	sub.u32 encoded, encoded, 64;
+	min.u32 encoded, encoded, 126;
+	cvt.f32.f16 value, half;
+	abs.f32 value, value;
+	mul.rn.f32 value, value, 0f44000000;
+	cvt.rni.u32.f32 small, value;
+	setp.lt.u32 p, magnitude, 9216;
+	selp.u32 encoded, small, encoded, p;
+	setp.gt.u32 p, magnitude, 31744;
+	selp.u32 encoded, 127, encoded, p;
+	or.b32 encoded, encoded, sign;
+
+	mad.lo.u32 index, tid, 128, position;
+	cvt.u64.u32 offset, index;
+	add.u64 address2, keycache, offset;
+	st.global.u8 [address2], encoded;
+	ld.global.b16 half, [address+66560];
+	cvt.u32.u16 bits, half;
+	and.b32 magnitude, bits, 32767;
+	shr.u32 sign, bits, 8;
+	and.b32 sign, sign, 128;
+	and.b32 remainder, magnitude, 127;
+	shr.u32 encoded, magnitude, 7;
+	and.b32 parity, encoded, 1;
+	setp.gt.u32 p, remainder, 64;
+	setp.eq.u32 q, remainder, 64;
+	setp.ne.u32 r, parity, 0;
+	and.pred q, q, r;
+	or.pred p, p, q;
+	selp.u32 increment, 1, 0, p;
+	add.u32 encoded, encoded, increment;
+	sub.u32 encoded, encoded, 64;
+	min.u32 encoded, encoded, 126;
+	cvt.f32.f16 value, half;
+	abs.f32 value, value;
+	mul.rn.f32 value, value, 0f44000000;
+	cvt.rni.u32.f32 small, value;
+	setp.lt.u32 p, magnitude, 9216;
+	selp.u32 encoded, small, encoded, p;
+	setp.gt.u32 p, magnitude, 31744;
+	selp.u32 encoded, 127, encoded, p;
+	or.b32 encoded, encoded, sign;
+
+	add.u64 address2, valuecache, offset;
+	st.global.u8 [address2], encoded;
+	bar.sync 0;
+	mov.f32 score, 0fFF800000;
+	setp.lt.u32 active, tid, keylimit;
+	@!active bra flash_attention_score_ready;
+	shr.u32 index, tid, 2;
+	mul.wide.u32 offset, index, 2;
+	add.u64 address, selectbase, offset;
+	ld.global.b16 half, [address];
+	cvt.f32.f16 value, half;
+	setp.gt.f32 active, value, 0f3F000000;
+	@!active bra flash_attention_score_ready;
+	mov.f32 score, 0f00000000;
+	mov.u32 channel, 0;
+	cvt.u64.u32 offset, tid;
+	add.u64 address, keycache, offset;
+	mov.u64 address2, query;
+flash_attention_dot:
+	ld.global.u8 encoded, [address];
+	and.b32 magnitude, encoded, 127;
+	shl.b32 bits, magnitude, 20;
+	add.u32 bits, bits, 1006632960;
+	and.b32 small, magnitude, 7;
+	cvt.rn.f32.u32 value, small;
+	mul.rn.f32 value, value, 0f3B000000;
+	setp.lt.u32 p, magnitude, 8;
+	selp.b32 bits, value, bits, p;
+	setp.eq.u32 p, magnitude, 127;
+	selp.b32 bits, 2143289344, bits, p;
+	shl.b32 sign, encoded, 24;
+	and.b32 sign, sign, 2147483648;
+	or.b32 bits, bits, sign;
+	mov.b32 value, bits;
+
+	ld.shared.f32 qvalue, [address2];
+	mul.rn.f32 product, qvalue, value;
+	add.rn.f32 score, score, product;
+	add.u64 address, address, 128;
+	add.u64 address2, address2, 4;
+	add.u32 channel, channel, 1;
+	setp.lt.u32 p, channel, 256;
+	@p bra flash_attention_dot;
+	mul.rn.f32 score, score, 0f3D800000;
+	cvt.rn.f16.f32 half, score;
+	cvt.f32.f16 score, half;
+flash_attention_score_ready:
+	mov.f32 maximum, score;
+	shfl.bfly.b32 partner, maximum, 16, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 8, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 4, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 2, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 1, 31;
+	max.f32 maximum, maximum, partner;
+	mul.wide.u32 offset, warp, 4;
+	add.u64 address, reductions, offset;
+	setp.eq.u32 p, lane, 0;
+	@p st.shared.f32 [address], maximum;
+	bar.sync 0;
+	ld.shared.f32 maximum, [reductions];
+	ld.shared.f32 partner, [reductions+4];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+8];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+12];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+16];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+20];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+24];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+28];
+	max.f32 maximum, maximum, partner;
+	mov.f32 probability, 0f00000000;
+	@!active bra flash_attention_probability_ready;
+	sub.rn.f32 probability, score, maximum;
+	mul.rn.f32 probability, probability, 0f3FB8AA3B;
+	ex2.approx.f32 probability, probability;
+flash_attention_probability_ready:
+	setp.lt.u32 p, tid, 128;
+	mul.wide.u32 offset, tid, 4;
+	add.u64 address, probabilities, offset;
+	@p st.shared.f32 [address], probability;
+	mov.f32 denominator, probability;
+	shfl.bfly.b32 partner, denominator, 16, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 8, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 4, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 2, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 1, 31;
+	add.rn.f32 denominator, denominator, partner;
+	mul.wide.u32 offset, warp, 4;
+	add.u64 address, reductions, offset;
+	setp.eq.u32 p, lane, 0;
+	@p st.shared.f32 [address], denominator;
+	bar.sync 0;
+	ld.shared.f32 denominator, [reductions];
+	ld.shared.f32 partner, [reductions+4];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+8];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+12];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+16];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+20];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+24];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+28];
+	add.rn.f32 denominator, denominator, partner;
+	mov.f32 accumulator, 0f00000000;
+	mov.u32 keyposition, 0;
+	mul.wide.u32 offset, tid, 128;
+	add.u64 address, valuecache, offset;
+	mov.u64 address2, probabilities;
+flash_attention_values:
+	ld.global.u8 encoded, [address];
+	and.b32 magnitude, encoded, 127;
+	shl.b32 bits, magnitude, 20;
+	add.u32 bits, bits, 1006632960;
+	and.b32 small, magnitude, 7;
+	cvt.rn.f32.u32 value, small;
+	mul.rn.f32 value, value, 0f3B000000;
+	setp.lt.u32 p, magnitude, 8;
+	selp.b32 bits, value, bits, p;
+	setp.eq.u32 p, magnitude, 127;
+	selp.b32 bits, 2143289344, bits, p;
+	shl.b32 sign, encoded, 24;
+	and.b32 sign, sign, 2147483648;
+	or.b32 bits, bits, sign;
+	mov.b32 value, bits;
+
+	ld.shared.f32 probability, [address2];
+	mul.rn.f32 product, value, probability;
+	add.rn.f32 accumulator, accumulator, product;
+	add.u64 address, address, 1;
+	add.u64 address2, address2, 4;
+	add.u32 keyposition, keyposition, 1;
+	setp.lt.u32 p, keyposition, keylimit;
+	@p bra flash_attention_values;
+	setp.gt.f32 p, denominator, 0f00000000;
+	@p div.rn.f32 accumulator, accumulator, denominator;
+	@!p mov.f32 accumulator, 0f00000000;
+	mad.lo.u32 index, head, 256, tid;
+	mad.lo.u32 index, row, 6144, index;
+	mul.wide.u32 outputbase, index, 10;
+	add.u64 outputbase, outputbase, output;
+	mul.wide.u32 offset, localposition, 2;
+	add.u64 outputbase, outputbase, offset;
+	mad.lo.u32 index, head, 256, tid;
+	mul.wide.u32 gatebase, index, 10;
+	add.u64 gatebase, gatebase, rowinput;
+	add.u64 gatebase, gatebase, offset;
+	ld.global.b16 half, [gatebase+71680];
+	cvt.f32.f16 gate, half;
+	mul.rn.f32 gate, gate, 0fBFB8AA3B;
+	ex2.approx.f32 gate, gate;
+	add.rn.f32 gate, gate, 0f3F800000;
+	div.rn.f32 accumulator, accumulator, gate;
+	cvt.rn.f16.f32 half, accumulator;
+	st.global.b16 [outputbase], half;
+	setp.eq.u32 p, tid, 0;
+	mad.lo.u32 index, job, 128, position;
+	mul.wide.u32 stats, index, 2;
+	add.u64 stats, stats, context;
+	cvt.rn.f16.f32 half, maximum;
+	@p st.global.b16 [stats], half;
+	mul.wide.u32 offset, rows, 6144;
+	add.u64 stats, stats, offset;
+	cvt.rn.f16.f32 half, denominator;
+	@p st.global.b16 [stats], half;
+	bar.sync 0;
+	add.u32 job, job, groups;
+	bra.uni flash_attention_job;
+flash_attention_done:
+	ret;
+}
+"#) }
+	/// Replace only the checked decode ABI and shape in an existing PTX module.
+	/// A different precision, shape, or checkpoint contract retains its body.
+	pub fn ptx(mut source: String) -> String {
+		let mut declarations = String::new();
+		for (name, helper, shapes, widths, prepared) in [
+			("delta_forward_body", Self::delta(), &["51200", "3147264", "327680", "15872"][..], &[64,64,64,64,64,64,32,32,32,64][..], true),
+			("attention_forward_body_f16_kvf8", Self::attention(), &["1703936", "917504", "65536", "20480"][..], &[64,64,64,64,32,32,32,32,32,32][..], false),
+		] {
+			let Some(start) = source.find(&format!(".func {name}(\n")) else { continue };
+			let Some(close) = source[start..].find("\n}\n") else { continue };
+			let end = start + close + 3;
+			let original = source[start..end].to_owned();
+			let Some(body) = original.find("\n{\n") else { continue };
+			let parameters = original[..body].lines().filter_map(|line| {
+				let words = line.split_whitespace().collect::<Vec<_>>();
+				(words.first() == Some(&".param")).then(|| (words[1].to_owned(), words[2].trim_end_matches(',').to_owned()))
+			}).collect::<Vec<_>>();
+			if parameters.len() != widths.len() || parameters.iter().zip(widths).any(|((ty,_),width)| *ty != format!(".b{width}")) || shapes.iter().any(|shape| !original.contains(shape)) { continue; }
+			let helper_start = helper.find(".func ").expect("Flash decode function");
+			let helper_body = helper[helper_start..].find("\n{").expect("Flash decode body") + helper_start;
+			let helper_name = helper[helper_start+6..].split('(').next().expect("Flash decode symbol").trim();
+			declarations.push_str(&helper[helper_start..helper_body]); declarations.push_str(";\n");
+			let general = format!("{helper_name}_general");
+			let mut wrapper = format!("{}\n{{\n\t.reg .b64 d<10>;\n\t.reg .b32 r<10>, block;\n\t.reg .pred p;\n", &original[..body]);
+			for (i,((_,parameter),width)) in parameters.iter().zip(widths).enumerate() {
+				wrapper.push_str(&format!("\tld.param.u{width} {register}{i}, [{parameter}];\n", register=if *width == 64 {"d"} else {"r"}));
+			}
+			wrapper.push_str("\tmov.u32 block, %ntid.x;\n\tsetp.ne.u32 p, block, 256;\n\t@p bra flash_decode_general;\n\tsetp.ne.u32 p, r6, 1;\n\t@p bra flash_decode_general;\n");
+			if prepared { wrapper.push_str("\tsetp.eq.u64 p, d9, 0;\n\t@p bra flash_decode_general;\n"); }
+			for (case,callee) in [helper_name,general.as_str()].into_iter().enumerate() {
+				if case == 1 { wrapper.push_str("flash_decode_general:\n"); }
+				wrapper.push_str("\t{\n");
+				for (i,width) in widths.iter().enumerate() { wrapper.push_str(&format!("\t.param .b{width} a{i};\n")); }
+				for (i,width) in widths.iter().enumerate() { wrapper.push_str(&format!("\tst.param.b{width} [a{i}], {register}{i};\n", register=if *width == 64 {"d"} else {"r"})); }
+				let arguments = (0..widths.len()).map(|i|format!("a{i}")).collect::<Vec<_>>().join(", ");
+				wrapper.push_str(&format!("\tcall.uni {callee}, ({arguments});\n\t}}\n"));
+				if case == 0 { wrapper.push_str("\tbra.uni flash_decode_done;\n"); }
+			}
+			wrapper.push_str("flash_decode_done:\n\tret;\n}\n");
+			source.replace_range(start..end,&format!("{}\n{wrapper}",original.replace(name,&general)));
+			source.push_str(&helper);
+		}
+		if !declarations.is_empty() {
+			if let Some(at) = source.find(".address_size 64") { source.insert_str(at+".address_size 64".len(), &format!("\n{declarations}")); }
+		}
+		source
+	}
+}
+
 /// Packed GGUF matvec functions for Maxwell, callable inside the native step.
 pub struct PackedMatvec;
 impl PackedMatvec {
@@ -27,7 +518,71 @@ impl PackedMatvec {
 			}
 			offset += line.len() + 1;
 		}
+		declarations.push_str(".func packed_prepare_tape(.param .b64 x,.param .b64 pk,.param .b64 sc,.param .b32 k,.param .b32 c,.param .b32 a,.param .b32 r,.param .b32 n,.param .b32 stride);\n.func (.param .b32 result) packed_matvec_tape(.param .b32 t,.param .b32 c,.param .b32 a,.param .b32 d,.param .b32 l,.param .b32 z,.param .b64 w,.param .b64 x,.param .b64 s,.param .b64 o,.param .b32 k,.param .b32 m,.param .b32 r,.param .b32 n,.param .b32 stride,.param .b32 relu);\n");
 		declarations
+	}
+	/// Derive single-position tape access from the shipped packed arithmetic.
+	/// Only addresses and the existing optional ReLU change; weight decoding and
+	/// reduction instructions remain the public helper's instructions.
+	fn tape_ptx() -> Result<String> {
+		let source = Self::ptx();
+		let mut result = String::from("\n.shared .align 4 .b8 packed_tape_layout[8];\n");
+		let mut dispatch = String::new();
+		for (name, prepare) in std::iter::once(("packed_prepare".to_owned(), true)).chain([8,12,13,14,17,18,20].into_iter().flat_map(|kind| [256,512].into_iter().map(move |block| {
+			let word = packed_contraction_word(kind,block).expect("packed tape tuple coverage");
+			let (method,lanes) = (word & 255,(word >> 8) & 255);
+			let name = if matches!(kind,12|13) && method == 0 {format!("packed_h_{kind}_1_{}_{lanes}",block/32)} else {format!("packed_g_{kind}_1_{}_{method}_{lanes}",block/32)};
+			(name,false)
+		}))) {
+			let start = source.find(&format!(".func {name}(\n")).ok_or_else(||RecipeError::new(format!("packed tape helper {name} is absent")))?;
+			let body = start + source[start..].find("\n{\n").ok_or_else(||RecipeError::new("packed tape helper has no body"))?;
+			let end = body + source[body..].find("\n}\n").ok_or_else(||RecipeError::new("packed tape helper has no end"))? + 3;
+			let tape = if prepare {"packed_prepare_tape".to_owned()} else {name.replacen("packed_","packed_tape_",1)};
+			let function = source[start..end].replace(&name,&tape);
+			let mut changed = String::new();
+			let mut stores = 0;
+			for line in function.lines() {
+				if prepare && line.trim() == format!(".param .b32 {tape}_param_7") {
+					changed.push_str(&format!("{line},\n\t.param .b32 {tape}_param_8\n")); continue;
+				}
+				changed.push_str(line); changed.push('\n');
+				if line == "{" {
+					changed.push_str("\t.reg .b64 tape_base,tape_offset,tape_address,tape_stride64;\n\t.reg .b32 tape_stride,tape_relu;\n\t.reg .pred tape_clamp;\n\t.reg .f32 tape_value;\n");
+				}
+				if line.trim_start().starts_with("ld.param.u64") && line.contains(&format!("{tape}_param_{}",if prepare {0} else {3})) {
+					changed.push_str(&format!("\tld.param.u64 tape_base,[{tape}_param_{}];\n\tcvta.to.global.u64 tape_base,tape_base;\n",if prepare {0} else {3}));
+					if prepare {changed.push_str(&format!("\tld.param.u32 tape_stride,[{tape}_param_8];\n"));}
+					else {changed.push_str("\tld.shared.u32 tape_stride,[packed_tape_layout];\n\tld.shared.u32 tape_relu,[packed_tape_layout+4];\n\tsetp.ne.u32 tape_clamp,tape_relu,0;\n");}
+					changed.push_str("\tcvt.u64.u32 tape_stride64,tape_stride;\n");
+				}
+				let access = if prepare {"ld.global.f32"} else {"st.global.f32"};
+				if line.trim_start().starts_with(access) {
+					let begin = line.find('[').ok_or_else(||RecipeError::new("packed tape address is absent"))?;
+					let finish = line.find(']').ok_or_else(||RecipeError::new("packed tape address is unterminated"))?;
+					let address = &line[begin+1..finish];
+					let cut = changed.len()-line.len()-1; changed.truncate(cut);
+					changed.push_str(&format!("\tsub.u64 tape_offset,{address},tape_base;\n\tmul.lo.u64 tape_offset,tape_offset,tape_stride64;\n\tadd.u64 tape_address,tape_base,tape_offset;\n"));
+					if prepare {changed.push_str(&line.replace(&format!("[{address}]"),"[tape_address]"));changed.push('\n');}
+					else {
+						let value = line[finish+1..].trim().trim_start_matches(',').trim().trim_end_matches(';');
+						changed.push_str(&format!("\tmov.f32 tape_value,{value};\n\t@tape_clamp max.f32 tape_value,tape_value,0f00000000;\n\tst.global.f32 [tape_address],tape_value;\n"));
+					}
+					stores += 1;
+				}
+			}
+			require(stores==1,format!("packed tape {name} must have exactly one {}",if prepare {"activation read"} else {"output store"}))?;
+			result.push_str(&changed);
+			if !prepare {
+				let fields = name.split('_').collect::<Vec<_>>();
+				let (kind,warps) = (fields[2],fields[4]);
+				let (method,lanes) = if fields[1]=="h" {("0",fields[5])} else {(fields[5],fields[6])};
+				dispatch.push_str(&format!("\tsetp.eq.u32 p,t,{kind};setp.eq.u32 q,block,{};and.pred p,p,q;setp.eq.u32 q,method,{method};and.pred p,p,q;setp.eq.u32 q,lanes,{lanes};and.pred p,p,q;@!p bra tape_next_{};\n\t{{ .param .b64 cw,cx,cs,co; .param .b32 ck,cm,ca,cz,cr,cn; st.param.b64 [cw],w;st.param.b64 [cx],x;st.param.b64 [cs],s;st.param.b64 [co],o;st.param.b32 [ck],k;st.param.b32 [cm],m;st.param.b32 [ca],active;st.param.b32 [cz],mask;st.param.b32 [cr],rank;st.param.b32 [cn],count;call.uni {tape},(cw,cx,cs,co,ck,cm,ca,cz,cr,cn); }}\n\tst.param.b32 [result],1;ret;\ntape_next_{}:\n",warps.parse::<u32>().unwrap()*32,tape,tape));
+			}
+		}
+		result.push_str(".func (.param .b32 result) packed_matvec_tape(.param .b32 at,.param .b32 ac,.param .b32 aa,.param .b32 ad,.param .b32 al,.param .b32 az,.param .b64 aw,.param .b64 ax,.param .b64 as,.param .b64 ao,.param .b32 ak,.param .b32 am,.param .b32 ar,.param .b32 an,.param .b32 astride,.param .b32 arelu)\n{\n\t.reg .b32 t,capacity,active,method,lanes,mask,k,m,rank,count,block,tid,stride,relu;\n\t.reg .b64 w,x,s,o;\n\t.reg .pred p,q;\n\tld.param.u32 t,[at];ld.param.u32 capacity,[ac];ld.param.u32 active,[aa];ld.param.u32 method,[ad];ld.param.u32 lanes,[al];ld.param.u32 mask,[az];ld.param.u64 w,[aw];ld.param.u64 x,[ax];ld.param.u64 s,[as];ld.param.u64 o,[ao];ld.param.u32 k,[ak];ld.param.u32 m,[am];ld.param.u32 rank,[ar];ld.param.u32 count,[an];ld.param.u32 stride,[astride];ld.param.u32 relu,[arelu];mov.u32 block,%ntid.x;mov.u32 tid,%tid.x;\n\tsetp.ne.u32 p,capacity,1;setp.gt.u32 q,active,1;or.pred p,p,q;@p bra tape_rejected;setp.ne.u32 p,mask,0;setp.eq.u32 q,count,0;or.pred p,p,q;setp.ge.u32 q,rank,count;or.pred p,p,q;setp.eq.u32 q,stride,0;or.pred p,p,q;@p bra tape_rejected;setp.eq.u32 p,active,0;@p bra tape_empty;\n\tsetp.eq.u32 p,tid,0;@p st.shared.u32 [packed_tape_layout],stride;@p st.shared.u32 [packed_tape_layout+4],relu;bar.sync 0;\n");
+		result.push_str(&dispatch);
+		result.push_str("tape_rejected:\n\tst.param.b32 [result],0;ret;\ntape_empty:\n\tst.param.b32 [result],1;ret;\n}\n");
+		Ok(result)
 	}
 }
 
@@ -1726,6 +2281,8 @@ pub(crate) struct NativeLayout {
 	/// Only the current invocation occupies device memory; reports live in RAM.
 	pub clocks: Option<usize>,
 	pub packed_scratch: Option<usize>,
+	/// Single-position packed inputs, shared by contractions with the same source.
+	pub packed_inputs: Vec<Option<(usize, usize)>>,
 	pub packed_routes: Option<usize>,
 	/// Output and retained-KV fingerprint planes for reference runs. Each plane
 	/// holds one bounded window; collected observations live in RAM.
@@ -2438,8 +2995,35 @@ impl NativeLayout {
 		let clocks = if inference || tracing() {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 24, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
-		let packed_size = if inference && rows == 1 { graph.nodes.iter().enumerate().filter(|(index, node)| packed_contraction_parts(node, graph.stored.get(*index).and_then(Option::as_ref), packed_weight(graph, *index, true).is_some()).is_some()).map(|(_, node)| packed_contraction_bytes(node,window_shape(node.output,graph.input.length,window_positions).length.min(8).max(1).next_power_of_two())).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0) } else { 0 };
-		let packed_scratch = if packed_size != 0 { Some(context_plan.allocate(&[(packed_size, BufferLifetime::Retained)], 16, 0, false)?) } else { None };
+		let mut packed_workspace = BufferPlan::default();
+		if inference && rows==1 {
+			for (index,node) in graph.nodes.iter().enumerate().filter(|(index,node)|packed_contraction_parts(node,graph.stored.get(*index).and_then(Option::as_ref),packed_weight(graph,*index,true).is_some()).is_some()) {
+				let bytes=packed_contraction_bytes(node,window_shape(node.output,graph.input.length,window_positions).length.min(8).max(1).next_power_of_two())?;
+				packed_workspace.bytes=packed_workspace.bytes.max(bytes);
+				// Reserve each operation's general-path writes even during decode.
+				// A retained prepared input can use only bytes idle for its whole lifetime.
+				packed_workspace.spans.push(BufferSpan {begin:0,end:bytes,first:index,last:Some(index),read_only:false});
+			}
+		}
+		let mut packed_inputs = vec![None; graph.nodes.len()];
+		if packed_workspace.bytes!=0 {
+			let mut consumers = std::collections::BTreeMap::<(i32,usize),Vec<usize>>::new();
+			for (index,node) in graph.nodes.iter().enumerate() {
+				if node.precision != Compute::FP32 || casts[index][0].is_some() || node.source < 0 || node.block_kind=="split_dense"
+					|| packed_contraction_parts(node,graph.stored.get(index).and_then(Option::as_ref),packed_weight(graph,index,true).is_some()).is_none() {continue;}
+				let source = &graph.nodes[node.source as usize];
+				if source.output != node.input {continue;}
+				consumers.entry((node.source,node.input.channels)).or_default().push(index);
+			}
+			for ((_,channels),indices) in consumers.into_iter().filter(|(_,indices)|indices.len()>1) {
+				let first = indices[0]; let last = *indices.last().unwrap();
+				let bytes = checked_add(checked_mul(channels,2,"shared packed pairs")?,channels/4,"shared packed scales")?;
+				let slot = packed_workspace.allocate(&[(bytes,BufferLifetime::Until(last))],16,first,true)?;
+				for index in indices {packed_inputs[index]=Some((slot,first));}
+			}
+		}
+		let packed_scratch = if packed_workspace.bytes!=0 {Some(context_plan.allocate(&[(packed_workspace.bytes,BufferLifetime::Retained)],16,0,false)?)} else {None};
+		if let Some(scratch)=packed_scratch {for (slot,_) in packed_inputs.iter_mut().flatten() {*slot=checked_add(scratch,*slot,"shared packed input offset")?;}}
 		let packed_routes = if inference && rows == 1 { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len(), 20, "packed route records")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let fingerprints = if inference && rows == 1 && ["RECIPE_REFERENCE", "RECIPE_REFERENCE_WRITE"].iter().any(|name| std::env::var_os(name).is_some()) {
 			let bytes = checked_mul(checked_mul(window_positions, graph.nodes.len(), "operation fingerprint count")?, 16, "output and KV fingerprint bytes")?;
@@ -2452,7 +3036,7 @@ impl NativeLayout {
 			context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false).map(Some)
 		}).collect::<Result<Vec<_>>>()?;
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_routes, fingerprints, cache_channel_fingerprints })
+		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_inputs, packed_routes, fingerprints, cache_channel_fingerprints })
 	}
 }
 
@@ -7008,6 +7592,37 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		ir.push_str(&format!("%{name}.counter = getelementptr i8, {pointer} %contexts, i64 {}\ncall void asm sideeffect \"{{ .reg .pred p,q; .reg .b32 old; setp.eq.u32 p,$1,0; setp.ne.u32 q,$2,0; and.pred p,p,q; @p atom.global.add.u32 old,[$0],1; }}\", \"l,r,r,~{{memory}}\"({pointer} %{name}.counter,i32 %tid,i32 {span})\n", offset + index * 20 + field * 4));
 	}
+	fn emit_packed_decode(&self,index: usize,plan: &NodePlan,pointers: &ModelPointers,window: &NodeWindow,scratch: usize,parts: &[PackedContractionPart],words: &[(u64,u64)],ir: &mut String) -> Result<()> {
+		let node = &plan.node;
+		let p = format!("n{index}.packed.decode");
+		let k = node.input.channels;
+		let capacity = node.output.length.min(8).max(1).next_power_of_two();
+		let (pairs,scales,prepare) = if let Some((slot,first))=self.layout.packed_inputs[index] {(slot,slot+k*2,first==index)}
+		else {(scratch+k*capacity*4,scratch+k*capacity*6,true)};
+		ir.push_str(&format!("%{p}.grid = call {{i32,i32,i32}} asm \"mov.u32 $0,%ctaid.x;mov.u32 $1,%nctaid.x;mov.u32 $2,%ntid.x;\",\"=r,=r,=r\"()\n%{p}.rank = extractvalue {{i32,i32,i32}} %{p}.grid,0\n%{p}.count = extractvalue {{i32,i32,i32}} %{p}.grid,1\n%{p}.block = extractvalue {{i32,i32,i32}} %{p}.grid,2\n%{p}.b256 = icmp eq i32 %{p}.block,256\n%{p}.b512 = icmp eq i32 %{p}.block,512\n%{p}.geometry = or i1 %{p}.b256,%{p}.b512\n%{p}.single = icmp eq i32 {span},1\n%{p}.run = and i1 %{p}.single,%{p}.geometry\nbr i1 %{p}.run,label %{p}.entry,label %n{index}.packed.entry\n{p}.entry:\n%{p}.input = getelementptr float,ptr addrspace(1) {source},i32 {begin}\n%{p}.pairs = getelementptr i8,ptr addrspace(1) %contexts,i64 {pairs}\n%{p}.scales = getelementptr i8,ptr addrspace(1) %contexts,i64 {scales}\n",span=window.span,begin=window.begin,source=pointers.source));
+		if prepare {
+			let (function,extra,arguments,constraints) = if node.input.length==1 {("packed_prepare","",String::new(),"l,l,l,r,r,r,r,r,~{memory}")}
+			else {("packed_prepare_tape", ",stride",",i32 ".to_owned()+&node.input.length.to_string(),"l,l,l,r,r,r,r,r,r,~{memory}")};
+			let stride = if node.input.length==1 {String::new()} else {".param .b32 stride;st.param.b32 [stride],$8;".to_owned()};
+			ir.push_str(&format!("call void asm sideeffect \"{{ .param .b64 x,pk,sc; .param .b32 k,c,a,r,n; {stride}st.param.b64 [x],$0;st.param.b64 [pk],$1;st.param.b64 [sc],$2;st.param.b32 [k],$3;st.param.b32 [c],$4;st.param.b32 [a],$5;st.param.b32 [r],$6;st.param.b32 [n],$7;call.uni {function},(x,pk,sc,k,c,a,r,n{extra}); }}\",\"{constraints}\"(ptr addrspace(1) %{p}.input,ptr addrspace(1) %{p}.pairs,ptr addrspace(1) %{p}.scales,i32 {k},i32 1,i32 1,i32 %{p}.rank,i32 %{p}.count{arguments})\n"));
+			ir.push_str(barrier(Backend::Nvidia));
+		}
+		for (part,(desc,(word256,word512))) in parts.iter().zip(words).enumerate() {
+			let q = format!("{p}.part{part}");
+			let (function,extra,arguments,constraints) = if node.output.length==1 && node.argument[1]==0.0 {("packed_matvec","",String::new(),"=r,r,r,r,r,r,r,l,l,l,l,r,r,r,r,~{memory}")}
+			else {("packed_matvec_tape",",stride,relu",format!(",i32 {},i32 {}",node.output.length,usize::from(node.argument[1]==1.0)),"=r,r,r,r,r,r,r,l,l,l,l,r,r,r,r,r,r,~{memory}")};
+			let layout = if extra.is_empty() {""} else {".param .b32 stride,relu;st.param.b32 [stride],$15;st.param.b32 [relu],$16;"};
+			ir.push_str(&format!("%{q}.weights = getelementptr i8,ptr addrspace(1) {weights},i64 {bytes}\n%{q}.position = add i32 {begin},{row}\n%{q}.output = getelementptr float,ptr addrspace(1) {output},i32 %{q}.position\n%{q}.word = select i1 %{p}.b512,i64 {word512},i64 {word256}\n%{q}.tuple = trunc i64 %{q}.word to i32\n%{q}.kind = and i32 %{q}.tuple,255\n%{q}.lanes0 = lshr i32 %{q}.tuple,8\n%{q}.lanes = and i32 %{q}.lanes0,255\n%{q}.ok = call i32 asm sideeffect \"{{ .param .b32 t,c,a,d,l,z,k,m,r,n,ret; .param .b64 w,x,s,o; {layout}st.param.b32 [t],$1;st.param.b32 [c],$2;st.param.b32 [a],$3;st.param.b32 [d],$4;st.param.b32 [l],$5;st.param.b32 [z],$6;st.param.b64 [w],$7;st.param.b64 [x],$8;st.param.b64 [s],$9;st.param.b64 [o],$10;st.param.b32 [k],$11;st.param.b32 [m],$12;st.param.b32 [r],$13;st.param.b32 [n],$14;call.uni (ret),{function},(t,c,a,d,l,z,w,x,s,o,k,m,r,n{extra});ld.param.b32 $0,[ret]; }}\",\"{constraints}\"(i32 {kind},i32 1,i32 1,i32 %{q}.kind,i32 %{q}.lanes,i32 0,ptr addrspace(1) %{q}.weights,ptr addrspace(1) %{p}.pairs,ptr addrspace(1) %{p}.scales,ptr addrspace(1) %{q}.output,i32 {k},i32 {rows},i32 %{p}.rank,i32 %{p}.count{arguments})\n%{q}.accepted = icmp eq i32 %{q}.ok,1\nbr i1 %{q}.accepted,label %{q}.accepted.body,label %{p}.rejected\n{q}.accepted.body:\n",weights=pointers.weights,bytes=desc.bytes,begin=window.begin,row=desc.row*node.output.length,output=pointers.value,kind=desc.kind,rows=desc.rows));
+			self.packed_count(Backend::Nvidia,index,0,&format!("{q}.executed"),"1",ir);
+		}
+		// All row planes write disjoint tape ranges. Completion is required once,
+		// when the next operation can consume them, not between independent planes.
+		ir.push_str(barrier(Backend::Nvidia));
+		ir.push_str(&format!("br label %n{index}.packed.done\n{p}.rejected:\n"));
+		self.packed_count(Backend::Nvidia,index,4,&format!("{p}.failure"),"1",ir);
+		ir.push_str("call void asm sideeffect \"trap;\",\"~{memory}\"()\nunreachable\n");
+		Ok(())
+	}
 	fn emit_packed_contraction(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, direct: &str, ir: &mut String) -> Result<bool> {
 		if backend != Backend::Nvidia || !self.inference || self.rows != 1 { return Ok(false); }
 		let node = &plan.node;
@@ -7027,7 +7642,10 @@ impl NativeModelIr {
 		let scales = checked_mul(slots,6,"packed activation pairs")?;
 		let output = checked_add(scales,slots/4,"packed activation scales")?.next_multiple_of(16);
 		let words = parts.iter().map(|part| Ok((packed_contraction_word(part.kind,256).ok_or_else(||RecipeError::new("packed 256-thread tuple coverage is absent"))?,packed_contraction_word(part.kind,512).ok_or_else(||RecipeError::new("packed 512-thread tuple coverage is absent"))?))).collect::<Result<Vec<_>>>()?;
-		ir.push_str(&format!("br label %{p}.entry\n{p}.entry:\n%{p}.grid = call {{i32,i32,i32}} asm \"mov.u32 $0,%ctaid.x;mov.u32 $1,%nctaid.x;mov.u32 $2,%ntid.x;\",\"=r,=r,=r\"()\n%{p}.rank = extractvalue {{i32,i32,i32}} %{p}.grid,0\n%{p}.count = extractvalue {{i32,i32,i32}} %{p}.grid,1\n%{p}.block = extractvalue {{i32,i32,i32}} %{p}.grid,2\n%{p}.b256 = icmp eq i32 %{p}.block,256\n%{p}.b512 = icmp eq i32 %{p}.block,512\n%{p}.geometry = or i1 %{p}.b256,%{p}.b512\n%{p}.input = getelementptr i8,{pointer} %contexts,i64 {scratch}\n%{p}.pairs = getelementptr i8,{pointer} %{p}.input,i64 {pairs}\n%{p}.scales = getelementptr i8,{pointer} %{p}.input,i64 {scales}\n%{p}.output = getelementptr i8,{pointer} %{p}.input,i64 {output}\nbr i1 %{p}.geometry,label %{p}.loop,label %{p}.direct\n{p}.loop:\n%{p}.off = phi i32 [0,%{p}.entry],[%{p}.next,%{p}.advance]\n%{p}.more = icmp ult i32 %{p}.off,{span}\nbr i1 %{p}.more,label %{p}.chunk,label %{p}.done\n{p}.chunk:\n%{p}.remaining = sub i32 {span},%{p}.off\n%{p}.over8 = icmp ugt i32 %{p}.remaining,8\n%{p}.cols = select i1 %{p}.over8,i32 8,i32 %{p}.remaining\n%{p}.over1 = icmp ugt i32 %{p}.cols,1\n%{p}.over2 = icmp ugt i32 %{p}.cols,2\n%{p}.over4 = icmp ugt i32 %{p}.cols,4\n%{p}.cap2 = select i1 %{p}.over1,i32 2,i32 1\n%{p}.cap4 = select i1 %{p}.over2,i32 4,i32 %{p}.cap2\n%{p}.cap = select i1 %{p}.over4,i32 8,i32 %{p}.cap4\n%{p}.shift2 = select i1 %{p}.over1,i64 16,i64 0\n%{p}.shift4 = select i1 %{p}.over2,i64 32,i64 %{p}.shift2\n%{p}.shift = select i1 %{p}.over4,i64 48,i64 %{p}.shift4\n%{p}.items = mul i32 %{p}.cols,{k}\nbr label %{p}.gather\n{p}.gather:\n%{p}.at = phi i32 [%tid,%{p}.chunk],[%{p}.at.next,%{p}.gather.body]\n%{p}.at.more = icmp ult i32 %{p}.at,%{p}.items\nbr i1 %{p}.at.more,label %{p}.gather.body,label %{p}.gather.done\n{p}.gather.body:\n%{p}.column = udiv i32 %{p}.at,{k}\n%{p}.channel = urem i32 %{p}.at,{k}\n%{p}.position0 = add i32 {begin},%{p}.off\n%{p}.position = add i32 %{p}.position0,%{p}.column\n%{p}.channel.base = mul i32 %{p}.channel,{in_length}\n%{p}.source.index = add i32 %{p}.channel.base,%{p}.position\n%{p}.source.ptr = getelementptr {ty},{pointer} {source},i32 %{p}.source.index\n%{p}.raw = load {ty},{pointer} %{p}.source.ptr,align {align}\n%{p}.f32 = call float @recipe.to.f32{v}({ty} %{p}.raw)\n%{p}.input.ptr = getelementptr float,{pointer} %{p}.input,i32 %{p}.at\nstore float %{p}.f32,{pointer} %{p}.input.ptr,align 4\n%{p}.at.next = add i32 %{p}.at,%threads\nbr label %{p}.gather\n{p}.gather.done:\n",span=window.span,begin=window.begin,in_length=node.input.length,source=pointers.source,align=alignment(ty)));
+		let decode = ty=="float";
+		if decode {self.emit_packed_decode(index,plan,pointers,window,scratch,&parts,&words,ir)?;}
+		let entry = if decode {String::new()} else {format!("br label %{p}.entry\n")};
+		ir.push_str(&format!("{entry}{p}.entry:\n%{p}.grid = call {{i32,i32,i32}} asm \"mov.u32 $0,%ctaid.x;mov.u32 $1,%nctaid.x;mov.u32 $2,%ntid.x;\",\"=r,=r,=r\"()\n%{p}.rank = extractvalue {{i32,i32,i32}} %{p}.grid,0\n%{p}.count = extractvalue {{i32,i32,i32}} %{p}.grid,1\n%{p}.block = extractvalue {{i32,i32,i32}} %{p}.grid,2\n%{p}.b256 = icmp eq i32 %{p}.block,256\n%{p}.b512 = icmp eq i32 %{p}.block,512\n%{p}.geometry = or i1 %{p}.b256,%{p}.b512\n%{p}.input = getelementptr i8,{pointer} %contexts,i64 {scratch}\n%{p}.pairs = getelementptr i8,{pointer} %{p}.input,i64 {pairs}\n%{p}.scales = getelementptr i8,{pointer} %{p}.input,i64 {scales}\n%{p}.output = getelementptr i8,{pointer} %{p}.input,i64 {output}\nbr i1 %{p}.geometry,label %{p}.loop,label %{p}.direct\n{p}.loop:\n%{p}.off = phi i32 [0,%{p}.entry],[%{p}.next,%{p}.advance]\n%{p}.more = icmp ult i32 %{p}.off,{span}\nbr i1 %{p}.more,label %{p}.chunk,label %{p}.done\n{p}.chunk:\n%{p}.remaining = sub i32 {span},%{p}.off\n%{p}.over8 = icmp ugt i32 %{p}.remaining,8\n%{p}.cols = select i1 %{p}.over8,i32 8,i32 %{p}.remaining\n%{p}.over1 = icmp ugt i32 %{p}.cols,1\n%{p}.over2 = icmp ugt i32 %{p}.cols,2\n%{p}.over4 = icmp ugt i32 %{p}.cols,4\n%{p}.cap2 = select i1 %{p}.over1,i32 2,i32 1\n%{p}.cap4 = select i1 %{p}.over2,i32 4,i32 %{p}.cap2\n%{p}.cap = select i1 %{p}.over4,i32 8,i32 %{p}.cap4\n%{p}.shift2 = select i1 %{p}.over1,i64 16,i64 0\n%{p}.shift4 = select i1 %{p}.over2,i64 32,i64 %{p}.shift2\n%{p}.shift = select i1 %{p}.over4,i64 48,i64 %{p}.shift4\n%{p}.items = mul i32 %{p}.cols,{k}\nbr label %{p}.gather\n{p}.gather:\n%{p}.at = phi i32 [%tid,%{p}.chunk],[%{p}.at.next,%{p}.gather.body]\n%{p}.at.more = icmp ult i32 %{p}.at,%{p}.items\nbr i1 %{p}.at.more,label %{p}.gather.body,label %{p}.gather.done\n{p}.gather.body:\n%{p}.column = udiv i32 %{p}.at,{k}\n%{p}.channel = urem i32 %{p}.at,{k}\n%{p}.position0 = add i32 {begin},%{p}.off\n%{p}.position = add i32 %{p}.position0,%{p}.column\n%{p}.channel.base = mul i32 %{p}.channel,{in_length}\n%{p}.source.index = add i32 %{p}.channel.base,%{p}.position\n%{p}.source.ptr = getelementptr {ty},{pointer} {source},i32 %{p}.source.index\n%{p}.raw = load {ty},{pointer} %{p}.source.ptr,align {align}\n%{p}.f32 = call float @recipe.to.f32{v}({ty} %{p}.raw)\n%{p}.input.ptr = getelementptr float,{pointer} %{p}.input,i32 %{p}.at\nstore float %{p}.f32,{pointer} %{p}.input.ptr,align 4\n%{p}.at.next = add i32 %{p}.at,%threads\nbr label %{p}.gather\n{p}.gather.done:\n",span=window.span,begin=window.begin,in_length=node.input.length,source=pointers.source,align=alignment(ty)));
 		ir.push_str(barrier(backend));
 		ir.push_str(&format!("call void asm sideeffect \"{{ .param .b64 x,pk,sc; .param .b32 k,c,a,r,n; st.param.b64 [x],$0;st.param.b64 [pk],$1;st.param.b64 [sc],$2;st.param.b32 [k],$3;st.param.b32 [c],$4;st.param.b32 [a],$5;st.param.b32 [r],$6;st.param.b32 [n],$7;call.uni packed_prepare,(x,pk,sc,k,c,a,r,n); }}\",\"l,l,l,r,r,r,r,r,~{{memory}}\"({pointer} %{p}.input,{pointer} %{p}.pairs,{pointer} %{p}.scales,i32 {k},i32 %{p}.cap,i32 %{p}.cols,i32 %{p}.rank,i32 %{p}.count)\n"));
 		ir.push_str(barrier(backend));
@@ -8512,6 +9130,8 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	let local_p2p = local_p2p_functions();
+	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
+	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
 	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]); }
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	for part in parts {
@@ -8899,7 +9519,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(&local_p2p_functions());
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
+			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
+			ptx_source = FlashDecode::ptx(ptx_source);
 			let entries = ptx_source.lines().filter_map(|line| {
 				let words = line.split_whitespace().collect::<Vec<_>>();
 				let at = words.iter().position(|word| *word == ".entry")?;
@@ -9093,6 +9715,10 @@ impl FloatFormat {
 	fn unpack(self, bits: u64) -> f64 {
 		if self == Self::FP8 { return fp8::Encoding::E4M3.unpack(bits); }
 		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.unpack(bits); }
+		if self.arithmetic == self.storage && self.storage.exp == 8 && self.storage.man == 23 && bits >> 32 == 0 {
+			let value = f64::from(f32::from_bits(bits as u32));
+			return if value.is_nan() { f64::NAN.copysign(value) } else { value };
+		}
 		self.arithmetic.unpack(self.arithmetic.pack(self.storage.unpack(bits)))
 	}
 }
@@ -19431,7 +20057,7 @@ fn external_expert(node: &Node) -> bool { matches!(node.block_kind,"split_expert
 #[derive(Clone)]
 enum SplitWork { Expert([GgufTensor;3]), Dense(Vec<GgufTensor>) }
 #[derive(Clone)]
-struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, last_only: bool, work: SplitWork }
+struct ExpertLayer { node: usize, global: usize, mtp: bool, layer: usize, last_only: bool, terminal: bool, work: SplitWork }
 impl ExpertLayer {
 	fn tensors(&self)->&[GgufTensor] {match &self.work {SplitWork::Expert(tensors)=>tensors,SplitWork::Dense(tensors)=>tensors}}
 	fn dense(&self)->bool {matches!(self.work,SplitWork::Dense(_))}
@@ -19462,7 +20088,7 @@ fn wire_expert_graph(graph: &mut Graph, binding: &Binding, mtp: bool, first: usi
 		graph.nodes[out].input = input;
 		graph.nodes[out].block_kind = "split_expert";
 		graph.nodes[out].argument[8] = (group + 1) as f64;
-		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, last_only:false, work:SplitWork::Expert([tensors[0].clone(),tensors[1].clone(),tensors[2].clone()]) });
+		graph.expert_layers.push(ExpertLayer { node: out, global: first + group, mtp, layer, last_only:false, terminal:false, work:SplitWork::Expert([tensors[0].clone(),tensors[1].clone(),tensors[2].clone()]) });
 	}
 	Ok(())
 }
@@ -19531,7 +20157,7 @@ fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Res
 		require(tensors.iter().map(|tensor|&tensor.name).collect::<std::collections::HashSet<_>>().len()<=16 && tensors.iter().all(|tensor|matches!(tensor.kind,0|8|12|13|14|17|18|20|30) && tensor.shape[0]<=10240 && (matches!(tensor.kind,0|30) || tensor.shape[0]%32==0)),format!("dense row split needs supported types, aligned quantized widths, and at most sixteen source matrices: {tensors:?}"))?;
 		let layer=node.block_index;let last_only=node.output.length==1;
 		graph.nodes[index].block_kind="split_dense";graph.nodes[index].precision=Compute::FP32;graph.nodes[index].acc=Compute::FP32;graph.nodes[index].argument[8]=1.0;
-		graph.expert_layers.push(ExpertLayer {node:index,global:0,mtp,layer,last_only,work:SplitWork::Dense(tensors)});
+		graph.expert_layers.push(ExpertLayer {node:index,global:0,mtp,layer,last_only,terminal:index+1==graph.nodes.len(),work:SplitWork::Dense(tensors)});
 	}
 	graph.expert_layers.sort_by_key(|layer|layer.node);
 	for (local,layer) in graph.expert_layers.iter_mut().enumerate() {layer.global=first+local;graph.nodes[layer.node].argument[8]=(local+1) as f64;}
@@ -19682,6 +20308,7 @@ impl ExpertExecution {
 				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
 				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
 				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),layer.input_width().max(4096) as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				record.extend(u32::from(layer.terminal).to_ne_bytes());
 				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
 				value.channel_tables.push(table);
 			}
@@ -24963,6 +25590,12 @@ impl NativeTape {
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
+		self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?.push(OperationReport {
+			device: self.device_label()?, model: String::new(), block: 0, node: usize::MAX, operation: "ForwardWindow".to_owned(), begin, end,
+			positions: (end - begin) as usize, ticks: ticks[1].wrapping_sub(ticks[0]).max(0) as u64,
+			seconds: (self.program.gpu.backend != Backend::Cpu).then_some(seconds), selected_experts: 0, weight_bytes: 0, packed_calls: 0,
+			packed_fallbacks: [0; 4], fingerprints: Vec::new(), cache_fingerprints: Vec::new(), cache_channel_fingerprints: Vec::new(),
+		});
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
@@ -25127,11 +25760,11 @@ impl NativeTape {
 	fn request_bytes(&self) -> (usize, usize) {
 		self.request.lock().unwrap().as_ref().map_or((0, 0), |request| (request.input.bytes, request.output.bytes + request.hidden.bytes + request.lookups.iter().map(|buffer| buffer.bytes).sum::<usize>()))
 	}
-	/// The logits of the last reached position in `begin..end`, read from the full output tensor.
+	/// The logits of the last reached position, using the current request's output layout.
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let (_, reached) = self.output_window(begin, end)?;
 		require(reached != 0, "decode window reaches no output position")?;
-		select_last_logits(predictions, self.output, reached as usize - 1)
+		self.logits_at(predictions, reached as usize - 1)
 	}
 	fn logits_at(&self, predictions: &[f64], position: usize) -> Result<Vec<f64>> {
 		if predictions.len() == self.output.elements() { return select_last_logits(predictions, self.output, position); }
@@ -35335,7 +35968,7 @@ dt_shuffle:
 	add.u32 r5,r5,r6; bra dt_row;
 }
 .func (.param .u32 result) split_dense_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
-	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<5>; .reg .f32 f;
+	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<6>; .reg .f32 f;
 	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
 	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+40]; ld.global.u64 a8,[a0+48];
 	ld.global.u64 a9,[a0+56]; ld.global.u64 a10,[a0+72]; ld.global.u64 a11,[a0+88]; ld.global.u64 a12,[a0+96]; ld.global.u64 a13,[a0+112];
@@ -35387,12 +36020,27 @@ dl_computed:
 	add.u32 r20,r20,1;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
 	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,405; @p1 bra dl_done;
-	mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
+	// Terminal compact rows have no later consumers of inactive positions.
+	// Writing the complete row coalesces peer traffic while retaining its active logit.
+	ld.global.u32 r31,[a0+184]; setp.ne.u32 p1,r31,0; setp.eq.u32 p2,r1,1; and.pred p1,p1,p2;
+	setp.gt.u32 p2,r13,1; and.pred p1,p1,p2; setp.le.u32 p2,r13,8; and.pred p1,p1,p2;
+	@p1 bra dl_padded_begin;
+	 mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
 dl_scatter:
 	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r25; rem.u32 r18,r15,r25; mul.wide.u32 a17,r18,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_scatter_next; mad.lo.u32 r19,r18,r13,r14; add.u32 r19,r19,r17;
 	mul.wide.u32 a17,r15,4; add.u64 a18,a10,a17; ld.global.f32 f,[a18]; mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
 dl_scatter_next:
 	add.u32 r15,r15,r10; bra dl_scatter;
+dl_padded_begin:
+	mov.u32 r15,r9; mul.lo.u32 r16,r25,r13;
+dl_padded:
+	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r13; rem.u32 r26,r15,r13;
+	mul.wide.u32 a17,r17,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_padded_next;
+	mad.lo.u32 r19,r18,r13,r26; mov.f32 f,0f00000000; setp.eq.u32 p2,r26,r14;
+	mul.wide.u32 a17,r17,4; add.u64 a18,a10,a17; @p2 ld.global.f32 f,[a18];
+	mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
+dl_padded_next:
+	add.u32 r15,r15,r10; bra dl_padded;
 dl_scattered:
 	add.u32 r20,r20,1;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
