@@ -266,6 +266,9 @@ fn check_layer_norm(report: &mut Report, work: &Path) {
 		}
 		let worst = worst_absolute(&got, &want);
 		report.record(name, worst < 2e-6, format!("worst_abs_err={worst:.9} scale={scale} shift={shift} epsilon=0.25 positions=3"));
+		let sequence = file.place(&model.last(), 3, &[]).infer(&[0.0, 1.0, 2.0]);
+		let sequence_worst = worst_absolute(&sequence, &want[6..9]);
+		report.record("layer_norm_sequence", sequence_worst < 2e-6, format!("worst_abs_err={sequence_worst:.9} scale={scale} shift={shift} positions=3"));
 		let explicit = model.e(0.5);
 		let got = file.place(&explicit, 1, &[]).infer(&[0.0]);
 		let want = (1.0 - 7.0 / 3.0) / (14.0f64 / 9.0 + 0.5).sqrt() * if scale { 2.0 } else { 1.0 } + if shift { 0.25 } else { 0.0 };
@@ -286,7 +289,7 @@ fn check_layer_norm(report: &mut Report, work: &Path) {
 		let data = recipe.data(path.to_str().unwrap()).target(["y0", "y1", "y2"]);
 		let model = recipe.model().e(0.25).norm(layer).fp(32).loss(mse);
 		let bundle = work.join(format!("{name}.ogdl"));
-		let trained = recipe.train().seed(SEED).lr(0.03).stop(0.0).epochs(160).save(&bundle).run(&model, &data);
+		let trained = recipe.train().seed(SEED).lr(0.03).stop(0.0).epochs(EPOCHS).save(&bundle).run(&model, &data);
 		let persisted = recipe.predict(&bundle, &[0.0, -2.0, 0.0]);
 		let denominator = (8.0f64 / 9.0 + 0.25).sqrt();
 		let want = [2.0 / 3.0, -4.0 / 3.0, 2.0 / 3.0].map(|value| value / denominator * gamma + beta);
@@ -374,8 +377,9 @@ fn main() {
 	let multi_source = root.join("data/multi.csv");
 	let mut report = Report { checks: Vec::new() };
 	// Select the LayerNorm group while keeping the checks on the public API.
-	if std::env::var("RECIPE_SUITE_GROUP").is_ok_and(|group| group == "layer-norm") {
-		check_layer_norm(&mut report, &work);
+	if let Ok(group) = std::env::var("RECIPE_SUITE_GROUP") && matches!(group.as_str(), "layer-norm" | "gpt2") {
+		if group == "layer-norm" { check_layer_norm(&mut report, &work); }
+		else { assert!(std::env::var_os("RECIPE_LAYER_NORM_GGUF").is_some(), "the GPT-2 group requires RECIPE_LAYER_NORM_GGUF"); }
 		check_gpt2_layer_norm(&mut report);
 		let failed = report.checks.iter().filter(|check| !check.passed).map(|check| check.name).collect::<Vec<_>>();
 		write_document(&evidence, &format!("{{\"schema\":\"recipe-layer-norm/1\",\"executed\":{},\"failed\":{}}}", report.checks.len(), failed.len()));
