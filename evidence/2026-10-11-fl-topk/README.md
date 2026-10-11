@@ -65,6 +65,8 @@ V1 main cubin SHA-256: `1b94641b4878273e6199a57d159149ba45038495d931936f0004e325
 
 V2 main PTX SHA-256: `88445f1661c3bdf0cf9a581c7db10cd3b98b978aa8ab05b73efa05980206e5f4`. Cubin SHA-256: `c57462ab5adab706274a08db403219ea7870103f0ccebdd2cd851fc25040018b`. Make assembly/link exits 0; the helper has no frame or spills. Queue jobs `20261011T005146-fl-topk-weighted-worker-v1` and `20261011T005352-fl-topk-router-v2` are submitted once. Their resident gates remain pending.
 
+Cx-flash confirms that controller 1057747 is intentionally stopped for the CEO's lookup-file localization. Idle job 16 has already completed; no input needs replay. The holder allocation owner remains alive at an input wait. Cx-flash resumes the controller after its NFS remap and lookup readback gates pass. Both worker jobs retain their original queue entries. This worker does not resume the controller, duplicate the lookup copy, or change the holder's mappings.
+
 Build and check through the repository Makefile on Benji or Archy only. When Benji is available, wrap each command in one CEO build slot, use nice 19 and three jobs, and write artifacts only under the worker's owned target directory. The CEO permits Flash builds and measurements on Archy; no sudo or package actions are authorized. Benji SSH remains paused.
 
 ```bash
