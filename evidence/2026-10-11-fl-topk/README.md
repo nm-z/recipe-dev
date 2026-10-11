@@ -47,11 +47,13 @@ Publication retains the existing `p2p_publish_tagged` call with tag `sequence * 
 
 `splice-weighted-return.sh` replaces only the recognized `worker_reduce` region of `split_expert_layer`, adds the helper prototype, and appends the helper. It retains the operation and worker clock boundaries. Apply it independently to the compatible main and worker PTX; no entry signature, allocation layout, packed kernel, or coefficient table changes.
 
-## Pending validation
+## Validation
 
 `check-router.c` compares the scalar algorithm and a modeled 256/512-lane reduction across ties, signed zeros, finite extremes, underflow, and randomized finite inputs. It also checks nonfinite fallback and compares compact-combine/return against direct weighted return for active counts 0 through 10 and one through five positions. This CPU model check does not execute PTX or prove GPU publication.
 
-Build and check through the repository Makefile on Benji or Archy only. When Benji is available, wrap each command in one CEO build slot, use nice 19 and three jobs, and write artifacts only under the worker's owned target directory. Archy builds and Benji SSH are currently paused by the owners.
+The Archy Make check exits 0 with 4,206,592 coefficient comparisons, 8,216 selected-list comparisons, 3,072 nonfinite fallback cases, and 675,840 weighted-return output-word comparisons; zero mismatches. Checker source SHA-256: `27b0af8667925438ddfd268ee79817100e9cd9f7081423499145802753657f92`. Executable SHA-256: `fccfe840dc2d031f08c5d543ceabc5ebeb5779a64ce4c932619102cf35fdd25d`. Receipts: `archy:/home/nate/codex/fl-topk-build/{router-check.log,router-check.exit,check-router}`. Numbers are posted on #1092, comment 6103875386.
+
+Build and check through the repository Makefile on Benji or Archy only. When Benji is available, wrap each command in one CEO build slot, use nice 19 and three jobs, and write artifacts only under the worker's owned target directory. The CEO permits Flash builds and measurements on Archy; no sudo or package actions are authorized. Benji SSH remains paused.
 
 ```bash
 flock --close /home/nate/work/.build-slot-$((RANDOM%4+1)).lock nice -n 19 env CARGO_BUILD_JOBS=3 CARGO_TARGET_DIR=/home/nate/work/target-fl-topk make -j3 router-check ROUTER_CHECK=/home/nate/work/target-fl-topk/check-router
