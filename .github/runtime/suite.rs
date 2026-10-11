@@ -220,43 +220,52 @@ fn main() {
 	let multi_source = root.join("data/multi.csv");
 	let mut report = Report { checks: Vec::new() };
 
-	// Zero queries and keys give uniform attention. The values alternate 1 and 2,
-	// so every even prefix has mean 1.5, including after an fp16 sum would stop growing.
-	let attention = work.join("attention.gguf");
-	write_stepper_checkpoint(&attention, 4096, 0.0, 1.0);
-	let attention_model = recipe.model().no(bias).embed(2, 1).fp(32).res([attn(1).fp(32).kv(1).fp(16)]).fp(32).layer(2).fp(32);
-	let attention_file = recipe.gguf(attention.to_str().expect("attention path is not UTF-8"));
-	let attention_placed = attention_file.place(&attention_model, 4096, &[]);
-	let attention_ids: Vec<u32> = (0..4096).map(|position| (position % 2) as u32).collect();
-	let whole = attention_placed.prefill(&attention_ids);
-	let prefix = attention_placed.prefill(&attention_ids[..4094]);
-	let odd = attention_placed.step(0);
-	let even = attention_placed.step(1);
-	let expected_odd = (2048.0 + 2047.0 * 2.0) / 4095.0;
-	let worst = worst_absolute(&whole, &[3.5, -3.5]).max(worst_absolute(&prefix, &[3.5, -3.5]))
-		.max(worst_absolute(&odd, &[1.0 + expected_odd, -1.0 - expected_odd])).max(worst_absolute(&even, &[3.5, -3.5]));
-	report.record("attention_fp16_kv_wide_sum", worst < 1e-6, format!("positions=4096 worst_abs_err={worst:.9} tolerance=0.000001"));
-	// Scores 2 and 4 raise the running maximum after the first value was accumulated.
-	// The earlier contribution must be rescaled without rounding it through fp16 KV.
-	let rescale = work.join("attention-rescale.gguf");
-	write_stepper_checkpoint(&rescale, 2, 1.0, 1.0);
-	let rescale_file = recipe.gguf(rescale.to_str().expect("rescale path is not UTF-8"));
-	let rescale_placed = rescale_file.place(&attention_model, 2, &[]);
-	let rescale_whole = rescale_placed.prefill(&[0, 1]);
-	rescale_placed.prefill(&[0]);
-	let rescale_step = rescale_placed.step(1);
-	let expected = 2.0 + (1.0 + 2.0 * 2.0_f64.exp()) / (1.0 + 2.0_f64.exp());
-	let rescale_worst = worst_absolute(&rescale_whole, &[expected, -expected]).max(worst_absolute(&rescale_step, &[expected, -expected]));
-	report.record("attention_fp16_kv_wide_rescale", rescale_worst < 1e-6, format!("scores=2,4 worst_abs_err={rescale_worst:.9} tolerance=0.000001"));
-	if std::env::args().any(|argument| argument == "--attention") {
-		assert!(worst < 1e-6, "fp16 KV storage rounded the attention value sum: {worst}");
-		assert!(rescale_worst < 1e-6, "fp16 KV storage rounded the attention value rescale: {rescale_worst}");
+	// Each process describes one GGUF model. Isolate these fixtures from the stepper below.
+	if let Some(attention_mode) = std::env::args().find(|argument| matches!(argument.as_str(), "--attention" | "--attention-rescale")) {
+		let rescaling = attention_mode == "--attention-rescale";
+		let positions = if rescaling { 2 } else { 4096 };
+		let attention = work.join("attention.gguf");
+		write_stepper_checkpoint(&attention, positions, if rescaling { 1.0 } else { 0.0 }, 1.0);
+		let attention_model = recipe.model().no(bias).embed(2, 1).fp(32).res([attn(1).fp(32).kv(1).fp(16)]).fp(32).layer(2).fp(32);
+		let attention_file = recipe.gguf(attention.to_str().expect("attention path is not UTF-8"));
+		let attention_placed = attention_file.place(&attention_model, positions as usize, &[]);
+		if rescaling {
+			// Scores 2 and 4 raise the maximum after accumulating a nonzero value.
+			let whole = attention_placed.prefill(&[0, 1]);
+			attention_placed.prefill(&[0]);
+			let stepped = attention_placed.step(1);
+			let expected = 2.0 + (1.0 + 2.0 * 2.0_f64.exp()) / (1.0 + 2.0_f64.exp());
+			let worst = worst_absolute(&whole, &[expected, -expected]).max(worst_absolute(&stepped, &[expected, -expected]));
+			report.record("attention_fp16_kv_wide_rescale", worst < 1e-6, format!("scores=2,4 worst_abs_err={worst:.9} tolerance=0.000001"));
+			assert!(worst < 1e-6, "fp16 KV storage rounded the attention value rescale: {worst}");
+		} else {
+			// Uniform attention averages alternating values 1 and 2; the residual adds the last input.
+			let ids: Vec<u32> = (0..4096).map(|position| (position % 2) as u32).collect();
+			let whole = attention_placed.prefill(&ids);
+			let prefix = attention_placed.prefill(&ids[..4094]);
+			let odd = attention_placed.step(0);
+			let even = attention_placed.step(1);
+			let expected_odd = (2048.0 + 2047.0 * 2.0) / 4095.0;
+			let worst = worst_absolute(&whole, &[3.5, -3.5]).max(worst_absolute(&prefix, &[3.5, -3.5]))
+				.max(worst_absolute(&odd, &[1.0 + expected_odd, -1.0 - expected_odd])).max(worst_absolute(&even, &[3.5, -3.5]));
+			report.record("attention_fp16_kv_wide_sum", worst < 1e-6, format!("positions=4096 worst_abs_err={worst:.9} tolerance=0.000001"));
+			assert!(worst < 1e-6, "fp16 KV storage rounded the attention value sum: {worst}");
+		}
 		return;
 	}
-	let online_check = std::process::Command::new(std::env::current_exe().expect("cannot locate the suite"))
-		.arg("--attention").env("RECIPE_CONFIG", "llamacpp").output().expect("cannot execute online attention check");
-	report.record("attention_online_fp16_kv_wide_sum", online_check.status.success(), String::from_utf8_lossy(&online_check.stdout).trim().to_owned());
-	assert!(online_check.status.success(), "online attention check failed: {}", String::from_utf8_lossy(&online_check.stderr));
+	for (mode, config, name) in [
+		("--attention", None, "attention_fp16_kv_wide_sum"),
+		("--attention-rescale", None, "attention_fp16_kv_wide_rescale"),
+		("--attention", Some("llamacpp"), "attention_online_fp16_kv_wide_sum"),
+		("--attention-rescale", Some("llamacpp"), "attention_online_fp16_kv_wide_rescale"),
+	] {
+		let mut attention_command = std::process::Command::new(std::env::current_exe().expect("cannot locate the suite"));
+		attention_command.arg(mode);
+		if let Some(config) = config { attention_command.env("RECIPE_CONFIG", config); }
+		let attention_check = attention_command.output().expect("cannot execute attention check");
+		report.record(name, attention_check.status.success(), String::from_utf8_lossy(&attention_check.stdout).trim().to_owned());
+		assert!(attention_check.status.success(), "{name} failed: {}", String::from_utf8_lossy(&attention_check.stderr));
+	}
 
 	// 1. A linear model recovers an exact linear relationship, checked against
 	//    the closed form rather than against a recorded value.
