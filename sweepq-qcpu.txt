@@ -1,0 +1,18 @@
+case=509 exit=0 wall=5.323094595 load=1.75 artifacts=2 RESULT case=509 data=data/temporal/chronological_splits train_seconds=2.6 loss=0.6931474702737823 
+case=621 exit=0 wall=9.222689862 load=12.23 artifacts=2 RESULT case=621 data=data/temporal/chronological_splits train_seconds=9.0 loss=0.6962784530175441 
+case=622 exit=0 wall=7.597552204 load=15.41 artifacts=4 RESULT case=622 data=data/temporal/chronological_splits train_seconds=7.2 loss=0.8005050289784027 
+case=633 exit=0 wall=4.977862987 load=18.26 artifacts=2 RESULT case=633 data=data/temporal/chronological_splits train_seconds=4.5 loss=0.17749973896313062 
+case=629 exit=0 wall=7.809950916 load=25.43 artifacts=2 RESULT case=629 data=data/temporal/chronological_splits train_seconds=7.4 loss=3.634497182850184 
+case=623 exit=0 wall=30.454669388 load=41.67 artifacts=4 RESULT case=623 data=data/image/archive_zip.zip train_seconds=30.0 loss=0.21357714018548235 
+case=619 exit=0 wall=14.932283840 load=42.70 artifacts=2 RESULT case=619 data=data/temporal/series_sqlite.sqlite train_seconds=14.5 loss=0.6435969929678798 
+case=618 exit=0 wall=14.299859053 load=46.61 artifacts=2 RESULT case=618 data=data/temporal/series_sqlite.sqlite train_seconds=14.1 loss=5.412850597339528 
+case=611 exit=0 wall=11.256778271 load=50.66 artifacts=4 RESULT case=611 data=data/temporal/chronological_splits train_seconds=10.9 loss=0.8300895653209366 
+case=520 exit=0 wall=56.577796836 load=61.88 artifacts=2 RESULT case=520 data=data/image/arrays_npz.npz train_seconds=56.1 loss=0.7183568524469702 
+case=518 exit=0 wall=14.609677076 load=62.43 artifacts=2 RESULT case=518 data=data/temporal/chronological_splits train_seconds=14.2 loss=0.1745116820517528 
+case=512 exit=0 wall=15.190906865 load=62.39 artifacts=4 RESULT case=512 data=data/temporal/chronological_splits train_seconds=14.8 loss=4.392738473690199 
+case=511 exit=0 wall=8.940776646 load=62.45 artifacts=2 RESULT case=511 data=data/temporal/chronological_splits train_seconds=8.5 loss=3.161365086658536 
+case=510 exit=0 wall=6.492035308 load=62.10 artifacts=2 RESULT case=510 data=data/temporal/chronological_splits train_seconds=6.1 loss=4.355295508356465 
+case=497 exit=0 wall=23.840314374 load=64.02 artifacts=3 RESULT case=497 data=data/temporal/series_sqlite.sqlite train_seconds=23.4 loss=27.43146089320282 
+case=491 exit=0 wall=7.743156534 load=65.61 artifacts=2 RESULT case=491 data=data/temporal/chronological_splits train_seconds=7.4 loss=19.249509637694135 
+case=277 exit=0 wall=8.117005982 load=65.40 artifacts=2 RESULT case=277 data=data/categoric/sample_subfolders train_seconds=7.7 loss=0.727209909021268 
+done

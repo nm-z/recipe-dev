@@ -1,0 +1,4 @@
+device schedule-v3;device=archy:nv3;backend=Nvidia;target=sm_52;memory=8524136448;shared=49152;driver=cuda;cus=16;wave=32;workgroup=1024;block_lds=49152;sm_lds=98304;registers=65536;threads=2048;candidates=3;measurements=2;warmups=1;budget=64;allocation=64;minimum_improvement=3fa999999999999a;surrogate_epochs=8;surrogate_width=8;surrogate_rate=3f847ae147ae147b;random_seed=17
+node 0 8 8 128 56 8 64 64 24 8
+node 1 8 8 8 8 8 64 16 8 4
+node 4 16 8 4 8 8 64 16 8 1
