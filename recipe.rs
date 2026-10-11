@@ -480,7 +480,7 @@ mod program_ir {
 		pub row: &'a str,
 		pub features: usize,
 		pub weights: &'a str,
-		pub offset: usize,
+		pub context: &'a str,
 		pub parameters: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
@@ -500,6 +500,7 @@ mod program_ir {
 
 	/// Emit a predictor without a runtime stack, local array, or opcode switch.
 	/// Stores and loads are resolved at compile time into SSA values.
+	#[rustfmt::skip]
 	pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorContext<'_>) -> Result<PredictorForward, EmitError> {
 		let instructions = parse_predictor(code)?;
 		let mut output = String::new();
@@ -614,75 +615,44 @@ mod program_ir {
 					let p = format!("{}.nearest.{sequence}", context.prefix);
 					sequence += 1;
 					let (zero, maximum) = ((context.literal)(0.0, ty), (context.literal)(f64::MAX, ty));
-					// Row loop head: induction variable plus the k best (distance, target) pairs as phis.
-					let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
-					let _ = writeln!(output, "%{p}.i = phi i32 [ 0, %{p}.entry ], [ %{p}.i.next, %{p}.latch ]");
-					for slot in 0..count {
-						let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}.new, %{p}.latch ]");
-						let _ = writeln!(output, "%{p}.t{slot} = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.t{slot}.new, %{p}.latch ]");
+					if maximum == zero {
+						let result = format!("%{p}.result");
+						let _ = writeln!(output, "{result} = call {ty} @recipe.div({ty} {zero}, {ty} {count})", count = (context.literal)(count as f64, ty));
+						stack.push(result);
+						continue;
 					}
-					let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.i, {rows}\nbr i1 %{p}.more, label %{p}.distance, label %{p}.done");
-					// Squared distance between the query row and stored row i, accumulated per feature.
-					let _ = writeln!(output, "{p}.distance:\nbr label %{p}.d.head\n{p}.d.head:");
-					let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.distance ], [ %{p}.j.next, %{p}.d.body ]");
-					let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.distance ], [ %{p}.acc.next, %{p}.d.body ]");
-					let _ = writeln!(output, "%{p}.d.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.d.more, label %{p}.d.body, label %{p}.d.done", features = context.features);
-					let _ = writeln!(output, "{p}.d.body:");
-					let _ = writeln!(
-						output,
-						"%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}",
-						row = context.row,
-						features = context.features,
-						input = context.input
-					);
-					let _ = writeln!(
-						output,
-						"%{p}.w.base = mul i32 %{p}.i, {features}\n%{p}.w.relative = add i32 %{p}.w.base, %{p}.j\n%{p}.w.index = add i32 %{p}.w.relative, {offset}\n%{p}.w.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.w.index\n%{p}.w = load {ty}, {ptr} %{p}.w.ptr, align {align}",
-						features = context.features,
-						offset = context.offset,
-						weights = context.weights
-					);
-					let _ = writeln!(
-						output,
-						"%{p}.diff = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.w)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.diff, {ty} %{p}.diff)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.square)"
-					);
-					let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.d.head\n{p}.d.done:");
-					let candidate_distance = if exclude {
-						let _ = writeln!(output, "%{p}.self = icmp eq i32 %{p}.i, {row}\n%{p}.candidate = select i1 %{p}.self, {ty} {maximum}, {ty} %{p}.acc", row = context.row);
-						format!("%{p}.candidate")
-					} else {
-						format!("%{p}.acc")
-					};
-					let _ = writeln!(
-						output,
-						"%{p}.target.relative = add i32 {base}, %{p}.i\n%{p}.target.index = add i32 %{p}.target.relative, {offset}\n%{p}.target.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index\n%{p}.target = load {ty}, {ptr} %{p}.target.ptr, align {align}",
-						base = rows * context.features,
-						offset = context.offset,
-						weights = context.weights
-					);
-					// Bubble the candidate through the k slots. A displaced entry precedes every later
-					// equal-distance slot because rows are visited in ascending index order.
-					let (mut carry_distance, mut carry_target) = (candidate_distance, format!("%{p}.target"));
-					let mut carry_precedes = "false".to_owned();
+					let leaves = rows.div_ceil(super::NEAREST_LEAF_ROWS).next_power_of_two();
+					let node_slots = 2 * leaves - 1;
+					let permutation = node_slots * super::NEAREST_NODE_FIELDS;
+					let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.tree\n{p}.tree:");
+					let _ = writeln!(output, "%{p}.node = phi i32 [ 0, %{p}.entry ], [ %{p}.internal.next, %{p}.internal ], [ %{p}.leaf.parent, %{p}.leaf.done ]\n%{p}.previous = phi i32 [ -1, %{p}.entry ], [ %{p}.node, %{p}.internal ], [ %{p}.node, %{p}.leaf.done ]");
 					for slot in 0..count {
-						let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
-						let _ = writeln!(output, "%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.d{slot}, {ty} {carry_distance})");
-						let _ = writeln!(output, "%{p}.tie{slot} = and i1 %{p}.equal{slot}, {carry_precedes}");
-						let _ = writeln!(output, "%{p}.swap{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}");
-						let _ = writeln!(output, "%{p}.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.d{slot}");
-						let _ = writeln!(output, "%{p}.t{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_target}, {ty} %{p}.t{slot}");
-						let _ = writeln!(output, "%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.d{slot}, {ty} {carry_distance}");
-						let _ = writeln!(output, "%{p}.carry.t{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.t{slot}, {ty} {carry_target}");
-						let _ = writeln!(output, "%{p}.carry.precedes{slot} = or i1 {carry_precedes}, %{p}.swap{slot}");
+						let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}, %{p}.internal ], [ %{p}.leaf.d{slot}, %{p}.leaf.done ]");
+						let _ = writeln!(output, "%{p}.r{slot} = phi i32 [ -1, %{p}.entry ], [ %{p}.r{slot}, %{p}.internal ], [ %{p}.leaf.r{slot}, %{p}.leaf.done ]");
+					}
+					let _ = writeln!(output, "%{p}.active = icmp ne i32 %{p}.node, -1\nbr i1 %{p}.active, label %{p}.load, label %{p}.done\n{p}.load:\n%{p}.node.base = mul i32 %{p}.node, {fields}", fields = super::NEAREST_NODE_FIELDS);
+					for (field, name) in ["minimum", "first", "second", "dimension", "parent"].into_iter().enumerate() {
+						let _ = writeln!(output, "%{p}.{name}.index = add i32 %{p}.node.base, {field}\n%{p}.{name}.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.{name}.index\n%{p}.{name} = load i32, {ptr} %{p}.{name}.ptr, align 4", context = context.context);
+					}
+					let _ = writeln!(output, "%{p}.is.leaf = icmp eq i32 %{p}.dimension, -1\nbr i1 %{p}.is.leaf, label %{p}.leaf.entry, label %{p}.internal\n{p}.internal:\n%{p}.left = add i32 %{p}.node, 1\n%{p}.query.base = mul i32 {row}, {features}\n%{p}.query.index = add i32 %{p}.query.base, %{p}.dimension\n%{p}.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.query.index\n%{p}.query = load {ty}, {ptr} %{p}.query.ptr, align {align}\n%{p}.threshold.base = mul i32 %{p}.first, {features}\n%{p}.threshold.index = add i32 %{p}.threshold.base, %{p}.dimension\n%{p}.threshold.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.threshold.index\n%{p}.threshold = load {ty}, {ptr} %{p}.threshold.ptr, align {align}\n%{p}.right.first = call i1 @recipe.ogt({ty} %{p}.query, {ty} %{p}.threshold)\n%{p}.near = select i1 %{p}.right.first, i32 %{p}.second, i32 %{p}.left\n%{p}.far = select i1 %{p}.right.first, i32 %{p}.left, i32 %{p}.second\n%{p}.far.base = mul i32 %{p}.far, {fields}\n%{p}.far.minimum.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.far.base\n%{p}.far.minimum = load i32, {ptr} %{p}.far.minimum.ptr, align 4\n%{p}.gap.raw = call {ty} @recipe.sub({ty} %{p}.query, {ty} %{p}.threshold)\n%{p}.gap = call {ty} @recipe.mul({ty} %{p}.gap.raw, {ty} %{p}.gap.raw)\n%{p}.farther = call i1 @recipe.ogt({ty} %{p}.gap, {ty} %{p}.d{last})\n%{p}.same.gap = call i1 @recipe.oeq({ty} %{p}.gap, {ty} %{p}.d{last})\n%{p}.later.row = icmp ugt i32 %{p}.far.minimum, %{p}.r{last}\n%{p}.tie.prune = and i1 %{p}.same.gap, %{p}.later.row\n%{p}.bounded = or i1 %{p}.farther, %{p}.tie.prune\n%{p}.full = icmp ne i32 %{p}.r{last}, -1\n%{p}.prune = and i1 %{p}.full, %{p}.bounded\n%{p}.entering = icmp eq i32 %{p}.previous, %{p}.parent\n%{p}.from.near = icmp eq i32 %{p}.previous, %{p}.near\n%{p}.visit.far.raw = xor i1 %{p}.prune, true\n%{p}.visit.far = and i1 %{p}.from.near, %{p}.visit.far.raw\n%{p}.returned.next = select i1 %{p}.visit.far, i32 %{p}.far, i32 %{p}.parent\n%{p}.internal.next = select i1 %{p}.entering, i32 %{p}.near, i32 %{p}.returned.next\nbr label %{p}.tree", row = context.row, features = context.features, input = context.input, weights = context.weights, context = context.context, fields = super::NEAREST_NODE_FIELDS, last = count - 1);
+					let _ = writeln!(output, "{p}.leaf.entry:\nbr label %{p}.leaf.head\n{p}.leaf.head:\n%{p}.leaf.i = phi i32 [ %{p}.first, %{p}.leaf.entry ], [ %{p}.leaf.i.next, %{p}.leaf.latch ]");
+					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.leaf.d{slot} = phi {ty} [ %{p}.d{slot}, %{p}.leaf.entry ], [ %{p}.leaf.d{slot}.new, %{p}.leaf.latch ]\n%{p}.leaf.r{slot} = phi i32 [ %{p}.r{slot}, %{p}.leaf.entry ], [ %{p}.leaf.r{slot}.new, %{p}.leaf.latch ]");
+					}
+					let allowed = if exclude { format!("xor i1 %{p}.self, true") } else { "icmp eq i1 false, false".to_owned() };
+					let _ = writeln!(output, "%{p}.leaf.more = icmp ult i32 %{p}.leaf.i, %{p}.second\nbr i1 %{p}.leaf.more, label %{p}.leaf.distance, label %{p}.leaf.done\n{p}.leaf.distance:\n%{p}.candidate.position = add i32 %{p}.leaf.i, {permutation}\n%{p}.candidate.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.candidate.position\n%{p}.candidate = load i32, {ptr} %{p}.candidate.ptr, align 4\nbr label %{p}.distance.head\n{p}.distance.head:\n%{p}.feature = phi i32 [ 0, %{p}.leaf.distance ], [ %{p}.feature.next, %{p}.distance.body ]\n%{p}.distance = phi {ty} [ {zero}, %{p}.leaf.distance ], [ %{p}.distance.next, %{p}.distance.body ]\n%{p}.feature.more = icmp ult i32 %{p}.feature, {features}\nbr i1 %{p}.feature.more, label %{p}.distance.body, label %{p}.distance.done\n{p}.distance.body:\n%{p}.leaf.query.base = mul i32 {row}, {features}\n%{p}.leaf.query.index = add i32 %{p}.leaf.query.base, %{p}.feature\n%{p}.leaf.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.leaf.query.index\n%{p}.leaf.query = load {ty}, {ptr} %{p}.leaf.query.ptr, align {align}\n%{p}.candidate.base = mul i32 %{p}.candidate, {features}\n%{p}.candidate.index = add i32 %{p}.candidate.base, %{p}.feature\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.candidate.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}\n%{p}.difference = call {ty} @recipe.sub({ty} %{p}.leaf.query, {ty} %{p}.weight)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.difference, {ty} %{p}.difference)\n%{p}.distance.next = call {ty} @recipe.add({ty} %{p}.distance, {ty} %{p}.square)\n%{p}.feature.next = add i32 %{p}.feature, 1\nbr label %{p}.distance.head\n{p}.distance.done:\n%{p}.finite = call i1 @recipe.olt({ty} %{p}.distance, {ty} {maximum})\n%{p}.self = icmp eq i32 %{p}.candidate, {row}\n%{p}.not.self = {allowed}\n%{p}.candidate.valid = and i1 %{p}.finite, %{p}.not.self", permutation = permutation, context = context.context, features = context.features, row = context.row, input = context.input, weights = context.weights);
+					let (mut carry_distance, mut carry_row) = (format!("%{p}.distance"), format!("%{p}.candidate"));
+					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.leaf.d{slot}, {ty} {carry_distance})\n%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.leaf.d{slot}, {ty} {carry_distance})\n%{p}.row.before{slot} = icmp ult i32 {carry_row}, %{p}.leaf.r{slot}\n%{p}.tie{slot} = and i1 %{p}.equal{slot}, %{p}.row.before{slot}\n%{p}.ordered{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}\n%{p}.swap{slot} = and i1 %{p}.candidate.valid, %{p}.ordered{slot}\n%{p}.leaf.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.leaf.d{slot}\n%{p}.leaf.r{slot}.new = select i1 %{p}.swap{slot}, i32 {carry_row}, i32 %{p}.leaf.r{slot}\n%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.leaf.d{slot}, {ty} {carry_distance}\n%{p}.carry.r{slot} = select i1 %{p}.swap{slot}, i32 %{p}.leaf.r{slot}, i32 {carry_row}");
 						carry_distance = format!("%{p}.carry.d{slot}");
-						carry_target = format!("%{p}.carry.t{slot}");
-						carry_precedes = format!("%{p}.carry.precedes{slot}");
+						carry_row = format!("%{p}.carry.r{slot}");
 					}
-					let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.i.next = add i32 %{p}.i, 1\nbr label %{p}.head\n{p}.done:");
-					let mut sum = zero;
+					let _ = writeln!(output, "br label %{p}.leaf.latch\n{p}.leaf.latch:\n%{p}.leaf.i.next = add i32 %{p}.leaf.i, 1\nbr label %{p}.leaf.head\n{p}.leaf.done:\n%{p}.leaf.parent = add i32 %{p}.parent, 0\nbr label %{p}.tree\n{p}.done:");
+					let mut sum = zero.clone();
 					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.present{slot} = icmp ne i32 %{p}.r{slot}, -1\n%{p}.safe{slot} = select i1 %{p}.present{slot}, i32 %{p}.r{slot}, i32 0\n%{p}.target.index{slot} = add i32 {base}, %{p}.safe{slot}\n%{p}.target.ptr{slot} = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index{slot}\n%{p}.target.raw{slot} = load {ty}, {ptr} %{p}.target.ptr{slot}, align {align}\n%{p}.target{slot} = select i1 %{p}.present{slot}, {ty} %{p}.target.raw{slot}, {ty} {zero}", base = rows * context.features, weights = context.weights);
 						let name = format!("%{p}.sum{slot}");
-						let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.t{slot})");
+						let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.target{slot})");
 						sum = name;
 					}
 					let _ = writeln!(output, "%{p}.result = call {ty} @recipe.div({ty} {sum}, {ty} {count})", count = (context.literal)(count as f64, ty));
@@ -1207,7 +1177,8 @@ pub(crate) struct NativePrecision {
 const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
-const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
+const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
+const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
@@ -1256,7 +1227,7 @@ impl NativeLayout {
 			contexts.push(context_offset);
 			adjoints.push(adjoint_offset);
 			value_offset = checked_add(value_offset, graph_rows_buffer(node.output, rows, element)?, "model value arena")?;
-			context_offset = checked_add(context_offset, node_context(node, rows, element)?, "model context arena")?;
+			context_offset = checked_add(context_offset, node_context(graph, node, rows, precision)?, "model context arena")?;
 			adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, element)?, "model adjoint arena")?;
 		}
 		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
@@ -1435,7 +1406,7 @@ fn prune_internal_definitions(mut ir: String) -> String {
 
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
-		Backend::Cpu => "",
+		Backend::Cpu => "call void @recipe.cpu.barrier()",
 		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
 	}
 }
@@ -2399,7 +2370,7 @@ impl NativeModelIr {
 							row: &row,
 							features: node.input.elements(),
 							weights: &pointers.weights,
-							offset: node.offset,
+							context: &pointers.context,
 							parameters: node.parameters,
 							prefix: &prefix,
 							literal: &literal,
@@ -2867,7 +2838,7 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
 		let thread = match backend {
-			Backend::Cpu => "add i32 0, 0".to_owned(),
+			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let kernel = match backend {
@@ -2932,7 +2903,7 @@ impl NativeModelIr {
 			Backend::Nvidia => "protected ptx_kernel ",
 		};
 		let thread = match backend {
-			Backend::Cpu => "add i32 0, 0".to_owned(),
+			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
@@ -2947,7 +2918,14 @@ impl NativeModelIr {
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
+		let forward_entry_args = format!("{forward_args}, i32 %training");
+		if loss.is_some() {
+			body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
+		} else {
+			body.push_str(&format!(
+				"define {kernel}void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+			));
+		}
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
@@ -6031,7 +6009,7 @@ impl Recipe {
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
 			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
-			tape.forward()?;
+			tape.forward(ForwardMode::Inference)?;
 			tape.predictions()
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
@@ -6186,8 +6164,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
 	}
-	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..));
-	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
+	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
+	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..)) || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
+	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
@@ -6230,7 +6209,7 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 		source_rows: 1,
 		features: saved.input.elements(),
 		schema: DataSchema::default(),
-		sequence: (saved.input.length > 1).then_some(saved.input),
+		sequence: (saved.input.length > 1).then_some((saved.input, saved.input)),
 		target_categorical: false,
 		norm_mean: saved.norm_mean.clone(),
 		norm_scale: saved.norm_scale.clone(),
@@ -6297,6 +6276,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
+			graph.refresh_storage(config)?;
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
@@ -6676,7 +6656,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 		(program, surrogate)
 	} else {
 		(estimator.validate)(estimator.param, rows)?;
-		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
+		let inputs = graph_inputs(graph, &data.samples, rows, gpu, config.precision)?;
 		let prepared = Prepared {
 			samples: inputs.clone(),
 			targets: targets[..rows].to_vec(),
@@ -6947,6 +6927,13 @@ struct NativeTape {
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
+#[derive(Clone, Copy)]
+#[repr(i32)]
+enum ForwardMode {
+	Inference,
+	Training,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum EpochOperation {
 	Full,
@@ -6962,7 +6949,19 @@ impl EpochOperation {
 		matches!(self, Self::Full | Self::Optimizer)
 	}
 }
-
+fn native_context_values(graph: &Graph, layout: &NativeLayout, weights: &Buffer, precision: Compute) -> Result<Vec<u8>> {
+	let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
+	let nearest = graph.nodes.iter().map(|node| nearest_layout(node, &graph.programs)).collect::<Result<Vec<_>>>()?;
+	if precision.pack(f64::MAX) == precision.pack(0.0) || nearest.iter().all(Option::is_none) {
+		return Ok(contexts);
+	}
+	let effective = weights.download_float(graph.parameters.len(), precision)?;
+	for (index, (node, nearest)) in graph.nodes.iter().zip(nearest).enumerate() {
+		let Some((features, rows, bytes)) = nearest else { continue };
+		NearestIndex::build(&effective[node.offset..node.offset + rows * features], features, rows).write(&mut contexts[layout.contexts[index]..layout.contexts[index] + bytes]);
+	}
+	Ok(contexts)
+}
 impl NativeTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
@@ -7007,7 +7006,7 @@ impl NativeTape {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
+			contexts: Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?,
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
@@ -7027,11 +7026,12 @@ impl NativeTape {
 			capacity: rows,
 		})
 	}
-	fn forward(&mut self) -> Result<()> {
+	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
+		let mode = mode as i32;
+		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
@@ -7313,7 +7313,9 @@ fn optimizer_work(graph: &Graph) -> f64 {
 /// dispatch isolates fixed cost, and the gradient dispatch measures planned work
 /// without allocating, forwarding, training, or dispatching the placed model.
 fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
+	let workers = if matches!(&gpu.driver, Driver::Cpu) { cpu_worker_threads()? as usize } else { 1 };
+	let rows = checked_mul(checked_mul(config.surrogate_epochs, config.surrogate_width, "surrogate rows")?, workers, "parallel surrogate rows")?;
+	let features = config.surrogate_width;
 	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
 	let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
 	let prepared = Prepared {
@@ -7347,7 +7349,9 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	timed(&mut tape, true)?;
 	let overhead = timed(&mut tape, false)?;
 	let epoch = timed(&mut tape, true)?;
-	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
+	let gradient = epoch - overhead;
+	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
+	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
 }
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
@@ -7449,7 +7453,7 @@ impl DeviceTape {
 		Ok(Self { shards, placement })
 	}
 	fn forward(&mut self) -> Result<()> {
-		self.shards.iter_mut().try_for_each(NativeTape::forward)
+		self.shards.iter_mut().try_for_each(|tape| tape.forward(ForwardMode::Inference))
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let mut predictions = Vec::new();
@@ -7578,7 +7582,31 @@ fn structural(value: f64) -> Result<i32> {
 fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> {
 	checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes")
 }
-fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
+const NEAREST_LEAF_ROWS: usize = 16;
+const NEAREST_NODE_FIELDS: usize = 5;
+fn nearest_rows(parameters: usize, features: usize) -> Option<usize> {
+	let width = features.checked_add(1)?;
+	parameters.checked_div(width).filter(|rows| *rows != 0 && *rows * width == parameters)
+}
+fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize, usize)>> {
+	if node.op != Primitive::Predictor {
+		return Ok(None);
+	}
+	let end = node.program_offset.checked_add(checked_mul(node.program_count, 2, "predictor program")?).ok_or_else(|| RecipeError::new("predictor program range overflows"))?;
+	let program = programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("predictor program range is invalid"))?;
+	if !program.chunks_exact(2).any(|instruction| instruction[0] == PredictorOpcode::Nearest as i32 as f64) {
+		return Ok(None);
+	}
+	let table_rows = nearest_rows(node.parameters, node.input.elements()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+	let leaves = table_rows.div_ceil(NEAREST_LEAF_ROWS).checked_next_power_of_two().ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
+	let nodes = checked_mul(leaves, 2, "nearest index nodes")?.checked_sub(1).ok_or_else(|| RecipeError::new("nearest index nodes are empty"))?;
+	let bytes = checked_mul(checked_add(checked_mul(nodes, NEAREST_NODE_FIELDS, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?;
+	Ok(Some((node.input.elements(), table_rows, bytes)))
+}
+fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> Result<usize> {
+	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
+		return Ok(bytes);
+	}
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
@@ -7601,7 +7629,7 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		}
 		_ => 1,
 	};
-	checked_mul(elements.max(1), element, "context bytes")
+	checked_mul(elements.max(1), precision.bytes(), "context bytes")
 }
 fn narrow(value: usize, role: &str) -> Result<i32> {
 	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))
@@ -7688,8 +7716,9 @@ struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
 }
-type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
+type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
+type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
@@ -7706,6 +7735,7 @@ enum NativeCpuEpoch {
 #[cfg(unix)]
 struct NativeCpuProgram {
 	_library: Library,
+	thread: NativeCpuThread,
 	forward: NativeForward,
 	epoch: Option<NativeCpuEpoch>,
 	model_load: Option<NativeModelLoad>,
@@ -8085,6 +8115,7 @@ impl Drop for Library {
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
 	let library = Library::open(path)?;
+	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
 		match artifact.precision.state.bytes() {
@@ -8097,7 +8128,7 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	};
 	let epoch = artifact.training.then(epoch).transpose()?;
 	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
-	Ok(NativeCpuProgram { _library: library, forward, epoch, model_load })
+	Ok(NativeCpuProgram { _library: library, thread, forward, epoch, model_load })
 }
 
 #[cfg(any(amd, nvidia))]
@@ -8407,6 +8438,11 @@ impl Gpu {
 	}
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
+fn cpu_worker_threads() -> Result<u32> {
+	let limit = count("CPU worker threads", env!("RECIPE_CPU_WORKER_THREADS"))?;
+	let available = std::thread::available_parallelism().map_err(|error| RecipeError::new(format!("cannot read available CPU parallelism: {error}")))?.get();
+	u32::try_from(if limit == 0 { available } else { available.min(limit) }).map_err(|_| RecipeError::new("CPU worker threads exceed u32"))
+}
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
@@ -8746,134 +8782,102 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 }
 
 #[cfg(unix)]
-unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
+unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
+	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
+}
+
+#[cfg(unix)]
+unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
 	unsafe {
 		match entry {
 			NativeEntry::Forward => {
 				require(arguments.len() == NATIVE_FORWARD_LAYOUT.len(), "native CPU forward argument count is invalid")?;
-				(cpu.forward)(
+				forward(
 					native_cpu_pointer(arguments, 0),
 					native_cpu_pointer(arguments, 1),
 					native_cpu_pointer(arguments, 2),
 					native_cpu_pointer(arguments, 3),
 					native_cpu_value(arguments, 4),
 					native_cpu_value(arguments, 5),
+					native_cpu_value(arguments, 6),
 				);
 			}
 			NativeEntry::Epoch => {
 				require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
 				let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
-				match cpu.epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
-					NativeCpuEpoch::F64(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
-					NativeCpuEpoch::F32(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
-					NativeCpuEpoch::F16(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
-					NativeCpuEpoch::F8(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
+				macro_rules! launch {
+					($function:expr) => {
+						$function(
+							pointers[0],
+							pointers[1],
+							pointers[2],
+							pointers[3],
+							pointers[4],
+							pointers[5],
+							pointers[6],
+							pointers[7],
+							pointers[8],
+							pointers[9],
+							pointers[10],
+							pointers[11],
+							native_cpu_value(arguments, 12),
+							native_cpu_value(arguments, 13),
+							native_cpu_value(arguments, 14),
+							native_cpu_value(arguments, 15),
+							native_cpu_value(arguments, 16),
+							native_cpu_value(arguments, 17),
+							native_cpu_value(arguments, 18),
+							native_cpu_value(arguments, 19),
+							native_cpu_value(arguments, 20),
+							native_cpu_value(arguments, 21),
+							native_cpu_value(arguments, 22),
+						)
+					};
+				}
+				match epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
+					NativeCpuEpoch::F64(function) => launch!(function),
+					NativeCpuEpoch::F32(function) => launch!(function),
+					NativeCpuEpoch::F16(function) => launch!(function),
+					NativeCpuEpoch::F8(function) => launch!(function),
 				}
 			}
 			NativeEntry::ModelLoad => {
 				require(arguments.len() == NATIVE_MODEL_LOAD_LAYOUT.len(), "native CPU model-load argument count is invalid")?;
-				let function = cpu.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
+				let function = model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
 				function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_value(arguments, 2));
 			}
 		}
 		Ok(())
 	}
+}
+
+#[cfg(unix)]
+unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr], threads: u32) -> Result<()> {
+	require(threads != 0, "native CPU worker count is empty")?;
+	let slots = arguments.iter().map(|argument| *argument as usize).collect::<Vec<_>>();
+	let barrier = std::sync::Barrier::new(threads as usize);
+	let context = ptr::from_ref(&barrier) as usize;
+	let wait = native_cpu_barrier as *const () as usize;
+	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward, cpu.epoch, cpu.model_load);
+	std::thread::scope(|scope| {
+		let workers = (0..threads)
+			.map(|thread_id| {
+				let slots = &slots;
+				scope.spawn(move || -> Result<()> {
+					let thread_id = i32::try_from(thread_id).map_err(|_| RecipeError::new("native CPU worker ID exceeds i32"))?;
+					let arguments = slots.iter().map(|slot| *slot as Ptr).collect::<Vec<_>>();
+					unsafe {
+						thread(thread_id, context as Ptr, wait as Ptr);
+						launch_native_cpu_entry(forward, epoch, model_load, entry, &arguments)
+					}
+				})
+			})
+			.collect::<Vec<_>>();
+		for worker in workers {
+			worker.join().map_err(|_| RecipeError::new("native CPU worker panicked"))??;
+		}
+		Ok(())
+	})
 }
 
 impl NativeProgram {
@@ -8886,13 +8890,11 @@ impl NativeProgram {
 				#[cfg(unix)]
 				{
 					let cpu = load_native_cpu(&artifact)?;
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
-					let epoch = artifact.training.then_some(Dispatch {
-						kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout),
-						geometry: Geometry { groups: 1, block: 1 },
-					});
-					let model_load = (!artifact.storage.is_empty())
-						.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+					let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
+					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
+					let model_load =
+						(!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
 				#[cfg(not(unix))]
@@ -9015,7 +9017,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 	unsafe {
 		match (backend, &gpu.driver) {
 			#[cfg(unix)]
-			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
+			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 			#[cfg(amd)]
 			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
 				require(program.executable.handle != 0, "native AMD executable is absent")?;
@@ -9486,14 +9488,13 @@ fn distance(left: &[f64], right: &[f64]) -> f64 {
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 	state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY))
 }
-fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
+fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
 	if graph.nodes.is_empty() {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
-	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
-	tape.forward()?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
+	tape.forward(ForwardMode::Training)?;
 	tape.predictions()
 }
 fn surrogate_model(hidden: usize) -> Model {
@@ -9529,77 +9530,79 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	graph.frozen.fill(1);
 	Ok(graph)
 }
-#[derive(Clone)]
-struct NearestNode {
-	minimum: u32,
-	start: u32,
-	end: u32,
-	split: Option<(usize, f64, Box<NearestNode>, Box<NearestNode>)>,
-}
+type NearestNode = [u32; NEAREST_NODE_FIELDS];
 #[derive(Clone)]
 struct NearestIndex {
 	features: usize,
 	permutation: Vec<u32>,
-	root: NearestNode,
+	nodes: Vec<NearestNode>,
 }
 impl NearestIndex {
 	fn build(samples: &[f64], features: usize, rows: usize) -> Self {
-		let mut permutation = (0..rows as u32).collect::<Vec<_>>();
-		let root = Self::partition(samples, features, &mut permutation, 0);
-		Self { features, permutation, root }
+		let (mut permutation, mut nodes) = ((0..rows as u32).collect::<Vec<_>>(), Vec::new());
+		Self::partition(samples, features, &mut permutation, 0, u32::MAX, &mut nodes);
+		Self { features, permutation, nodes }
 	}
-	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32) -> NearestNode {
+	fn write(&self, target: &mut [u8]) {
+		let slots = (target.len() / size_of::<u32>() - self.permutation.len()) / NEAREST_NODE_FIELDS;
+		let nodes = self.nodes.iter().flatten().copied().enumerate();
+		for (position, value) in nodes.chain(self.permutation.iter().copied().enumerate().map(|(position, row)| (slots * NEAREST_NODE_FIELDS + position, row))) {
+			target[position * size_of::<u32>()..(position + 1) * size_of::<u32>()].copy_from_slice(&value.to_le_bytes())
+		}
+	}
+	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32, parent: u32, nodes: &mut Vec<NearestNode>) -> u32 {
+		let index = nodes.len() as u32;
 		let minimum = permutation.iter().copied().min().unwrap_or(0);
-		let end = start + permutation.len() as u32;
-		if permutation.len() <= 16 {
-			return NearestNode { minimum, start, end, split: None };
+		nodes.push([minimum, start, start + permutation.len() as u32, u32::MAX, parent]);
+		if permutation.len() <= NEAREST_LEAF_ROWS {
+			return index;
 		}
-		let mut widest = (f64::NEG_INFINITY, 0);
-		for feature in 0..features {
-			let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
-			for &row in permutation.iter() {
-				let value = samples[row as usize * features + feature];
-				(low, high) = (low.min(value), high.max(value));
-			}
-			widest = if high - low > widest.0 { (high - low, feature) } else { widest };
-		}
-		let (dimension, middle) = (widest.1, permutation.len() / 2);
+		let dimension = (0..features)
+			.fold((f64::NEG_INFINITY, 0), |widest, feature| {
+				let (low, high) = permutation
+					.iter()
+					.map(|&row| samples[row as usize * features + feature])
+					.fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
+				if high - low > widest.0 { (high - low, feature) } else { widest }
+			})
+			.1;
+		let middle = permutation.len() / 2;
 		permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
-		let threshold = samples[permutation[middle] as usize * features + dimension];
+		let pivot = permutation[middle];
 		let (left, right) = permutation.split_at_mut(middle);
-		let left = Box::new(Self::partition(samples, features, left, start));
-		let right = Box::new(Self::partition(samples, features, right, start + middle as u32));
-		NearestNode { minimum, start, end, split: Some((dimension, threshold, left, right)) }
+		Self::partition(samples, features, left, start, index, nodes);
+		let right = Self::partition(samples, features, right, start + middle as u32, index, nodes);
+		nodes[index as usize] = [minimum, pivot, right, dimension as u32, parent];
+		index
 	}
-	fn nearest(&self, node: &NearestNode, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
-		let Some((dimension, threshold, left, right)) = &node.split else {
-			for &candidate in &self.permutation[node.start as usize..node.end as usize] {
+	fn nearest(&self, index: usize, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
+		let [_, first, second, dimension, _] = self.nodes[index];
+		if dimension == u32::MAX {
+			for &candidate in &self.permutation[first as usize..second as usize] {
 				if exclude && candidate as usize == row {
 					continue;
 				}
-				let base = candidate as usize * self.features;
-				let measured = distance(query, &samples[base..base + self.features]);
-				let keeps = best.len() < count || best.last().is_some_and(|&(kept, index)| measured < kept || (measured == kept && candidate < index));
-				if measured < f64::MAX && keeps {
-					let position = best.iter().position(|&(kept, index)| kept > measured || (kept == measured && index > candidate)).unwrap_or(best.len());
+				let base = candidate as usize * query.len();
+				let measured = distance(query, &samples[base..base + query.len()]);
+				let position = best.partition_point(|&(kept, index)| kept < measured || (kept == measured && index < candidate));
+				if measured < f64::MAX && position < count {
 					best.insert(position, (measured, candidate));
 					best.truncate(count);
 				}
 			}
 			return;
-		};
-		// On an equal coordinate the left child holds the lower row indices, so it is
-		// searched first to settle tie-breaks before the far bound is consulted.
-		let (near, far) = if query[*dimension] <= *threshold { (left, right) } else { (right, left) };
+		}
+		let (dimension, threshold) = (dimension as usize, samples[first as usize * query.len() + dimension as usize]);
+		let (left, right) = (index + 1, second as usize);
+		// Equal coordinates search lower rows first, and the bound preserves distance-row ties.
+		let (near, far) = if query[dimension] <= threshold { (left, right) } else { (right, left) };
 		self.nearest(near, samples, query, row, count, exclude, best);
-		// The squared split coordinate gap lower-bounds every far-side distance, so the
-		// far subtree is skipped only when no far row can displace or tie a kept one.
-		if best.len() == count {
-			if let Some(&(kept, index)) = best.last() {
-				let gap = (query[*dimension] - threshold).powi(2);
-				if gap > kept || (gap == kept && far.minimum > index) {
-					return;
-				}
+		if best.len() == count
+			&& let Some(&(kept, index)) = best.last()
+		{
+			let gap = (query[dimension] - threshold).powi(2);
+			if gap > kept || (gap == kept && self.nodes[far][0] > index) {
+				return;
 			}
 		}
 		self.nearest(far, samples, query, row, count, exclude, best);
@@ -9666,21 +9669,13 @@ impl PredictorProgram {
 					let count = instruction[1].abs() as usize;
 					let exclude = instruction[1] < 0.0;
 					let features = query.len();
-					let rows = self
-						.table
-						.len()
-						.checked_div(features + 1)
-						.filter(|rows| rows * (features + 1) == self.table.len())
-						.ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+					let rows = nearest_rows(self.table.len(), features).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
 					let (samples, targets) = self.table.split_at(rows * features);
-					// An index is built beside the table it searches and neither is replaced afterwards, so a
-					// program that carries an absent or differently shaped index rebuilds from the table it holds
-					// now rather than answering from one that never saw these values.
 					let rebuilt =
 						self.nearest.as_ref().filter(|index| index.features == features && index.permutation.len() == rows).is_none().then(|| NearestIndex::build(samples, features, rows));
 					let index = rebuilt.as_ref().or(self.nearest.as_ref()).ok_or_else(|| RecipeError::new("nearest index is absent"))?;
 					let mut best = Vec::with_capacity(count);
-					index.nearest(&index.root, samples, query, row, count, exclude, &mut best);
+					index.nearest(0, samples, query, row, count, exclude, &mut best);
 					stack.push((0..count).map(|slot| best.get(slot).map_or(0.0, |&(_, candidate)| targets[candidate as usize])).sum::<f64>() / count as f64)
 				}
 				value if value == PredictorOpcode::Affine as i32 => {
@@ -9932,35 +9927,50 @@ fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: boo
 	program.binary(PredictorOpcode::Divide);
 	Ok(Predictor::new(program.finish()?))
 }
-fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Result<Vec<f64>> {
-	let width = values.len();
-	require(matrix.len() == width * width && width != 0, "linear system shape is invalid")?;
-	for column in 0..width {
-		let pivot = (column..width)
-			.max_by(|left, right| matrix[*left * width + column].abs().total_cmp(&matrix[*right * width + column].abs()))
-			.ok_or_else(|| RecipeError::new("linear system has no pivot"))?;
-		require(matrix[pivot * width + column].abs() > epsilon, "linear system is singular")?;
-		for entry in 0..width {
-			matrix.swap(column * width + entry, pivot * width + entry)
+fn solve_bayes(samples: &[f64], targets: &[f64], means: &[f64], target_mean: f64, config: Config) -> Result<Vec<f64>> {
+	let (rows, features) = (targets.len(), means.len());
+	require(rows != 0 && features != 0 && samples.len() == checked_mul(rows, features, "Bayes sample matrix")?, "Bayes system shape is invalid")?;
+	// Solve the smaller equivalent ridge system: feature space when features fit, or row space otherwise.
+	let dual = rows < features;
+	let (width, terms) = if dual { (rows, features) } else { (features, rows) };
+	let centered = |axis: usize, term: usize| {
+		if dual { samples[axis * features + term] - means[term] } else { samples[term * features + axis] - means[axis] }
+	};
+	let mut matrix = vec![0.0; checked_mul(width, width, "Bayes system matrix")?];
+	for row in 0..width {
+		for column in 0..=row {
+			matrix[row * width + column] = (0..terms).map(|term| centered(row, term) * centered(column, term) / config.bayes_noise_variance).sum()
 		}
-		values.swap(column, pivot);
-		let scale = matrix[column * width + column];
-		for entry in column..width {
-			matrix[column * width + entry] /= scale
-		}
-		values[column] /= scale;
-		for row in 0..width {
+		matrix[row * width + row] += config.bayes_prior_precision
+	}
+	let mut values = if dual {
+		targets.iter().map(|target| (target - target_mean) / config.bayes_noise_variance).collect::<Vec<_>>()
+	} else {
+		(0..features)
+			.map(|feature| samples.chunks_exact(features).zip(targets).map(|(sample, target)| (sample[feature] - means[feature]) * (target - target_mean) / config.bayes_noise_variance).sum())
+			.collect()
+	};
+	// Ridge regularization makes the system positive definite, so factor only its lower triangle.
+	for row in 0..width {
+		for column in 0..=row {
+			let value = matrix[row * width + column] - (0..column).map(|inner| matrix[row * width + inner] * matrix[column * width + inner]).sum::<f64>();
 			if row == column {
-				continue;
+				require(value > config.bayes_variance_epsilon, "Bayes system is not positive definite")?;
+				matrix[row * width + column] = value.sqrt()
+			} else {
+				matrix[row * width + column] = value / matrix[column * width + column]
 			}
-			let factor = matrix[row * width + column];
-			for entry in column..width {
-				matrix[row * width + entry] -= factor * matrix[column * width + entry]
-			}
-			values[row] -= factor * values[column];
 		}
 	}
-	require(values.iter().all(|value| value.is_finite()), "linear system produced a nonfinite solution").map(|_| values)
+	for row in 0..width {
+		values[row] = (values[row] - (0..row).map(|column| matrix[row * width + column] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	for row in (0..width).rev() {
+		values[row] = (values[row] - (row + 1..width).map(|column| matrix[column * width + row] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	let weights =
+		if dual { (0..features).map(|feature| samples.chunks_exact(features).zip(&values).map(|(sample, value)| (sample[feature] - means[feature]) * value).sum()).collect() } else { values };
+	require(weights.iter().all(|value| value.is_finite()), "Bayes system produced a nonfinite solution").map(|_| weights)
 }
 fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse: &[f64]) {
 	program.constant(base);
@@ -9978,28 +9988,10 @@ fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse
 fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
-		let mut means = vec![0.0; data.features];
+		let samples = &data.samples[..rows * data.features];
 		let target_mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-		for sample in data.samples[..rows * data.features].chunks_exact(data.features) {
-			for (mean, value) in means.iter_mut().zip(sample) {
-				*mean += value / rows as f64
-			}
-		}
-		let mut matrix = vec![0.0; data.features * data.features];
-		let mut values = vec![0.0; data.features];
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			for left in 0..data.features {
-				let centered = sample[left] - means[left];
-				values[left] += centered * (target - target_mean) / config.bayes_noise_variance;
-				for right in 0..data.features {
-					matrix[left * data.features + right] += centered * (sample[right] - means[right]) / config.bayes_noise_variance
-				}
-			}
-		}
-		for feature in 0..data.features {
-			matrix[feature * data.features + feature] += config.bayes_prior_precision
-		}
-		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
+		let means = (0..data.features).map(|feature| samples.chunks_exact(data.features).map(|sample| sample[feature]).sum::<f64>() / rows as f64).collect::<Vec<_>>();
+		let weights = solve_bayes(samples, &data.targets[..rows], &means, target_mean, config)?;
 		let bias = target_mean - weights.iter().zip(&means).map(|(weight, mean)| weight * mean).sum::<f64>();
 		let mut program = PredictorBuilder::new();
 		program.constant(bias);
@@ -10760,7 +10752,7 @@ struct Prepared {
 	source_rows: usize,
 	features: usize,
 	schema: DataSchema,
-	sequence: Option<Shape>,
+	sequence: Option<(Shape, Shape)>,
 	target_categorical: bool,
 	norm_mean: Vec<f64>,
 	norm_scale: Vec<f64>,
@@ -10771,6 +10763,8 @@ struct Table {
 	name: String,
 	headers: Vec<String>,
 	rows: Vec<Vec<String>>,
+	/// Row-major image values are channel-major when each image row is one channel.
+	attention: Option<Shape>,
 }
 enum FeatureType {
 	Numeric,
@@ -10790,6 +10784,9 @@ fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool 
 		|| name == format!("{}.col{}", table.name, column + 1)
 		|| header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))
 		|| header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))))
+}
+fn headerless_header(column: usize, width: usize) -> String {
+	if column == width { "target".to_owned() } else { format!("col{column}") }
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
 	let mut paths = Vec::new();
@@ -10848,14 +10845,13 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	Ok((tables, paths))
 }
-/// One interpretation of directory layout for sample trees whose target is not a table
-/// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
-/// subdirectories. Each file is read once; text samples contribute their content and image
-/// samples their decoded pixels. Anything else falls through to the table flow.
+/// Recognizes flat, class-labeled, and paired sample trees; other layouts use table flow.
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
 	let [target] = data.target.as_slice() else { return Ok(None) };
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	if parsed.iter().any(|(_, table)| {
+		target_column(table, target).is_some() && (table.rows.len() > 1 || !table.headers.iter().enumerate().all(|(column, header)| *header == headerless_header(column + 1, table.headers.len())))
+	}) {
 		return Ok(None);
 	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
@@ -10913,54 +10909,43 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
 	let sample_target = stems[0].contains(target);
 	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
-	// Per-sample subdirectories: identical file stems per directory, one stem naming the
-	// target. Each directory is one sample and each file stem one column.
-	if aligned && sample_target {
-		let columns = stems[0].iter().cloned().collect::<Vec<_>>();
-		let mut headers = Vec::new();
-		let mut rows: Vec<Vec<String>> = vec![Vec::new(); directories.len()];
-		for column in &columns {
-			let mut width = None;
-			for (row, entries) in directories.values().enumerate() {
-				let (path, bytes) = entries.iter().find(|(path, _)| stem(path) == *column).unwrap();
-				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-					require(column != target, format!("per-sample target files {column:?} hold images, not values"))?;
-					image_values(path, bytes)?
-				} else {
-					vec![sample_text(path, bytes)?]
-				};
-				require(*width.get_or_insert(values.len()) == values.len(), format!("sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
-				rows[row].extend(values);
-			}
-			match width.unwrap_or(0) {
-				1 => headers.push(column.clone()),
-				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
-			}
-		}
-		return Ok(Some(Table { name, headers, rows }));
-	}
-	if aligned && paired_target {
+	// Per-sample layouts use directories as rows; paired layouts use directories as columns.
+	if aligned && (sample_target || paired_target) {
 		let mut columns = Vec::new();
-		for (directory, entries) in &directories {
-			let mut ordered = entries.clone();
-			ordered.sort_by_key(|(path, _)| stem(path));
-			columns.push((singular(directory), ordered));
+		if sample_target {
+			for column in &stems[0] {
+				columns.push((column.clone(), directories.values().map(|entries| entries.iter().copied().find(|(path, _)| stem(path) == *column).unwrap()).collect()));
+			}
+		} else {
+			for (directory, entries) in &directories {
+				let mut entries = entries.clone();
+				entries.sort_by_key(|(path, _)| stem(path));
+				columns.push((singular(directory), entries));
+			}
 		}
 		let mut headers = Vec::new();
-		let mut rows: Vec<Vec<String>> = vec![Vec::new(); stems[0].len()];
-		for (column, ordered) in &columns {
-			let mut width = None;
-			for (row, (path, bytes)) in ordered.iter().enumerate() {
-				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) { image_values(path, bytes)? } else { vec![sample_text(path, bytes)?] };
-				require(*width.get_or_insert(values.len()) == values.len(), format!("paired sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+		let mut attention = Some(Shape { channels: 0, length: 0 });
+		let mut rows = vec![Vec::new(); columns[0].1.len()];
+		for (column, entries) in &columns {
+			let mut kind = None;
+			for (row, (path, bytes)) in entries.iter().enumerate() {
+				let (shape, values) = sample_values(path, bytes)?;
+				require(!sample_target || column != target || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
+				let current = (shape, values.len());
+				require(*kind.get_or_insert(current) == current, format!("sample {} expected {:?}, received {current:?}", path.display(), kind.unwrap()))?;
 				rows[row].extend(values);
 			}
-			match width.unwrap_or(0) {
-				1 => headers.push(column.clone()),
-				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
+			let (shape, width) = kind.unwrap_or((None, 0));
+			if column != target
+				&& let Some(previous) = attention
+			{
+				attention = shape
+					.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+					.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels })
 			}
+			headers.extend((1..=width).map(|index| if width == 1 { column.clone() } else { format!("{column}.{index}") }));
 		}
-		return Ok(Some(Table { name, headers, rows }));
+		return Ok(Some(Table { name, headers, rows, attention: attention.filter(|shape| shape.channels != 0) }));
 	}
 	if aligned {
 		return Ok(None);
@@ -10977,40 +10962,44 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 /// Rows of one sample table: each sample contributes its content columns plus the target.
 struct SampleTableBuilder {
 	target: String,
+	shape: Option<Shape>,
 	headers: Vec<String>,
 	rows: Vec<Vec<String>>,
 }
 impl SampleTableBuilder {
 	fn new(target: String) -> Self {
-		Self { target, headers: Vec::new(), rows: Vec::new() }
+		Self { target, shape: None, headers: Vec::new(), rows: Vec::new() }
 	}
 	fn push(&mut self, path: &Path, bytes: &[u8], target: String) -> Result<()> {
-		let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) { image_values(path, bytes)? } else { vec![sample_text(path, bytes)?] };
+		let (shape, values) = sample_values(path, bytes)?;
 		if self.headers.is_empty() {
-			self.headers = match values.len() {
-				1 => vec!["content".to_owned()],
-				width => (1..=width).map(|index| format!("pixel.{index}")).collect(),
-			};
+			self.shape = shape;
+			let name = if shape.is_some() { "pixel" } else { "content" };
+			self.headers = (1..=values.len()).map(|index| if values.len() == 1 { name.to_owned() } else { format!("{name}.{index}") }).collect();
 			self.headers.push(self.target.clone());
 		}
-		require(values.len() + 1 == self.headers.len(), format!("sample {} expected {} values, received {}", path.display(), self.headers.len() - 1, values.len()))?;
+		let (expected, received) = ((self.shape, self.headers.len() - 1), (shape, values.len()));
+		require(expected == received, format!("sample {} expected {expected:?}, received {received:?}", path.display()))?;
 		let mut row = values;
 		row.push(target);
 		self.rows.push(row);
 		Ok(())
 	}
 	fn finish(self, name: String) -> Result<Table> {
-		Ok(Table { name, headers: self.headers, rows: self.rows })
+		Ok(Table { name, headers: self.headers, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
 	}
 }
 fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
 	Ok(str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("sample {} is not UTF-8: {error}", path.display())))?.trim().to_owned())
 }
-fn image_values(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+fn sample_values(path: &Path, bytes: &[u8]) -> Result<(Option<Shape>, Vec<String>)> {
+	if !path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+		return Ok((None, vec![sample_text(path, bytes)?]));
+	}
 	let jpeg = path.extension().and_then(|value| value.to_str()).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
 	let decoded = if jpeg { jpeg_pixels(bytes) } else { png_pixels(bytes) };
-	let (_, _, _, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
-	Ok(pixels.iter().map(|value| value.to_string()).collect())
+	let (width, height, channels, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+	Ok((Some(Shape { channels: checked_mul(width, channels, "image row width")?, length: height }), pixels.iter().map(|value| value.to_string()).collect()))
 }
 fn is_image(extension: &str) -> bool {
 	matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
@@ -11362,7 +11351,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
 		require(tables.len() == tests.len(), "test data table count differs from training data")?;
 		for (table, test) in tables.iter_mut().zip(tests) {
-			require(table.headers == test.headers, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
+			require(table.headers == test.headers && table.attention == test.attention, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
 			table.rows.extend(test.rows);
 		}
 	}
@@ -11410,6 +11399,8 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	});
 	let sequence = (repeated && sequence_widths.len() > 1 && sequence_widths.keys().copied().eq(1..=sequence_widths.len()) && sequence_widths.values().all(|width| *width == sequence_widths[&1]))
 		.then(|| Shape { channels: sequence_widths[&1], length: sequence_widths.len() });
+	let attention = tables.iter().filter_map(|table| table.attention).find(|shape| shape.elements() == features);
+	let shapes = sequence.map(|sequence| (sequence, attention.unwrap_or(sequence)));
 	require(features != 0, "dataset has no training features")?;
 	let target_categories = selected.iter().map(|target| categories(&tables[target.0], target.1, source_table_rows)).collect::<Vec<_>>();
 	let target_categorical =
@@ -11477,7 +11468,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		.map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1])))
 		.chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target)))
 		.collect();
-	finish_prepared(data, samples, targets, target_width, source_rows, features, sequence, target_categorical, schema)
+	finish_prepared(data, samples, targets, target_width, source_rows, features, shapes, target_categorical, schema)
 }
 fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	let mut sequences = Vec::new();
@@ -11515,10 +11506,12 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
-	finish_prepared(data, samples, targets, 1, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
+	let sequence = Shape { channels: CHAR_IDS.len(), length };
+	finish_prepared(data, samples, targets, 1, source_rows, features, Some((sequence, sequence)), true, schema)
 }
 fn finish_prepared(
-	data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, target_width: usize, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema,
+	data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, target_width: usize, source_rows: usize, features: usize, sequence: Option<(Shape, Shape)>, target_categorical: bool,
+	schema: DataSchema,
 ) -> Result<Prepared> {
 	require(target_width != 0 && targets.len() % target_width == 0, "target vector width does not divide the target buffer")?;
 	let rows = targets.len() / target_width;
@@ -11690,7 +11683,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row);
 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, rows }])
+	Ok(vec![Table { name: "data".to_owned(), headers, rows, attention: None }])
 }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[String]) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
@@ -11708,7 +11701,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 			}
 		}
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new() };
+	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new(), attention: None };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
 			let ignored = targets.iter().chain(exclusions).any(|name| column_match(name, &union, header, column));
@@ -11727,7 +11720,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 		}
 	}
 	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, rows }])
+	Ok(vec![Table { name, headers, rows, attention: None }])
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -11800,7 +11793,7 @@ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize_with(headers.len(), String::new);
 		}
-		tables.push(Table { name: name.clone(), headers, rows });
+		tables.push(Table { name: name.clone(), headers, rows, attention: None });
 	}
 	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
@@ -12333,7 +12326,7 @@ fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<
 	}
 	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
 	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
-	Ok(Table { name, headers, rows: table_rows })
+	Ok(Table { name, headers, rows: table_rows, attention: None })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
@@ -12556,7 +12549,7 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 		}
 		rows.push(row);
 	}
-	Ok(Table { name, headers, rows })
+	Ok(Table { name, headers, rows, attention: None })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
@@ -12570,10 +12563,8 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let first = rows.remove(0);
 	let numeric = |value: &String| value.parse::<f64>().is_ok();
 	let headerless = first.iter().all(numeric) || rows.is_empty();
-	// A headerless table carries its label in the conventional final position, so that
-	// column's authoritative name is "target" and the earlier columns take positional
-	// names. Positional colN forms still match every column through column_match.
-	let headers = if headerless { (1..=first.len()).map(|column| if column == first.len() { "target".to_owned() } else { format!("col{column}") }).collect() } else { first.clone() };
+	// Headerless tables use positional features and a final "target" column.
+	let headers = if headerless { (1..=first.len()).map(|column| headerless_header(column, first.len())).collect() } else { first.clone() };
 	if headerless {
 		rows.insert(0, first);
 	}
@@ -12581,7 +12572,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok((Table { name, headers, rows }, blank))
+	Ok((Table { name, headers, rows, attention: None }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
@@ -12965,7 +12956,7 @@ impl Train {
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
-				validation.forward()?;
+				validation.forward(ForwardMode::Inference)?;
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
 				raw_outputs.push(raw[0]);
@@ -12988,7 +12979,7 @@ impl Train {
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
-			validation.forward()?;
+			validation.forward(ForwardMode::Inference)?;
 			let raw = validation.predictions()?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
