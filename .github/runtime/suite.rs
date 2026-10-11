@@ -224,7 +224,7 @@ fn main() {
 	// so every even prefix has mean 1.5, including after an fp16 sum would stop growing.
 	let attention = work.join("attention.gguf");
 	write_stepper_checkpoint(&attention, 4096, 0.0, 1.0);
-	let attention_model = recipe.model().no(bias).embed(2, 1).fp(32).attn(1).fp(32).kv(1).fp(16).layer(2).fp(32);
+	let attention_model = recipe.model().no(bias).embed(2, 1).fp(32).res([attn(1).fp(32).kv(1).fp(16)]).fp(32).layer(2).fp(32);
 	let attention_file = recipe.gguf(attention.to_str().expect("attention path is not UTF-8"));
 	let attention_placed = attention_file.place(&attention_model, 4096, &[]);
 	let attention_ids: Vec<u32> = (0..4096).map(|position| (position % 2) as u32).collect();
@@ -233,8 +233,8 @@ fn main() {
 	let odd = attention_placed.step(0);
 	let even = attention_placed.step(1);
 	let expected_odd = (2048.0 + 2047.0 * 2.0) / 4095.0;
-	let worst = worst_absolute(&whole, &[1.5, -1.5]).max(worst_absolute(&prefix, &[1.5, -1.5]))
-		.max(worst_absolute(&odd, &[expected_odd, -expected_odd])).max(worst_absolute(&even, &[1.5, -1.5]));
+	let worst = worst_absolute(&whole, &[3.5, -3.5]).max(worst_absolute(&prefix, &[3.5, -3.5]))
+		.max(worst_absolute(&odd, &[1.0 + expected_odd, -1.0 - expected_odd])).max(worst_absolute(&even, &[3.5, -3.5]));
 	report.record("attention_fp16_kv_wide_sum", worst < 1e-6, format!("positions=4096 worst_abs_err={worst:.9} tolerance=0.000001"));
 	// Scores 2 and 4 raise the running maximum after the first value was accumulated.
 	// The earlier contribution must be rescaled without rounding it through fp16 KV.
@@ -245,7 +245,7 @@ fn main() {
 	let rescale_whole = rescale_placed.prefill(&[0, 1]);
 	rescale_placed.prefill(&[0]);
 	let rescale_step = rescale_placed.step(1);
-	let expected = (1.0 + 2.0 * 2.0_f64.exp()) / (1.0 + 2.0_f64.exp());
+	let expected = 2.0 + (1.0 + 2.0 * 2.0_f64.exp()) / (1.0 + 2.0_f64.exp());
 	let rescale_worst = worst_absolute(&rescale_whole, &[expected, -expected]).max(worst_absolute(&rescale_step, &[expected, -expected]));
 	report.record("attention_fp16_kv_wide_rescale", rescale_worst < 1e-6, format!("scores=2,4 worst_abs_err={rescale_worst:.9} tolerance=0.000001"));
 	if std::env::args().any(|argument| argument == "--attention") {
