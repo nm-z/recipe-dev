@@ -70,8 +70,10 @@ static void scalar(const float scores[512], Routing *out) {
 	}
 }
 static int cta(const float scores[512], uint32_t width, Routing *out) {
+	if (width != 256 && width != 512) return 0;
 	for (uint32_t id = 0; id < 512; id++) if (!isfinite(scores[id])) return 0;
-	Candidate lanes[512], warps[32], winners[10];
+	Candidate lanes[512], warps[32], lists[16][10], heads[32], winners[10];
+	uint32_t indices[16] = {0};
 	float current[512];
 	memcpy(current, scores, sizeof(current));
 	memset(out, 0, sizeof(*out));
@@ -85,14 +87,25 @@ static int cta(const float scores[512], uint32_t width, Routing *out) {
 		for (uint32_t step = 16; step; step >>= 1)
 			for (uint32_t lane = 0; lane < width; lane++)
 				if ((lane & 31) + step < 32) lanes[lane] = better(lanes[lane], lanes[lane + step]);
-		for (uint32_t lane = 0; lane < 32; lane++) {
-			Candidate invalid = { -INFINITY, UINT32_MAX };
-			warps[lane] = lane < width / 32 ? lanes[lane * 32] : invalid;
+		for (uint32_t warp = 0; warp < width / 32; warp++) {
+			lists[warp][pick] = lanes[warp * 32];
+			current[lists[warp][pick].id] = -INFINITY;
 		}
+	}
+	for (uint32_t lane = 0; lane < 32; lane++) {
+		Candidate invalid = { -INFINITY, UINT32_MAX };
+		heads[lane] = lane < width / 32 ? lists[lane][0] : invalid;
+	}
+	for (uint32_t pick = 0; pick < 10; pick++) {
+		memcpy(warps, heads, sizeof(warps));
 		for (uint32_t step = 16; step; step >>= 1)
 			for (uint32_t lane = 0; lane + step < 32; lane++) warps[lane] = better(warps[lane], warps[lane + step]);
 		winners[pick] = warps[0];
-		current[winners[pick].id] = -INFINITY;
+		for (uint32_t warp = 0; warp < width / 32; warp++) if (heads[warp].id == winners[pick].id) {
+			Candidate invalid = { -INFINITY, UINT32_MAX };
+			indices[warp]++;
+			heads[warp] = indices[warp] < 10 ? lists[warp][indices[warp]] : invalid;
+		}
 	}
 	float maximum = winners[0].value;
 	for (uint32_t i = 1; i < 10; i++) {

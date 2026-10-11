@@ -3136,12 +3136,14 @@ router_finite_loop:
 	add.u32 r7, r7, 1;
 	setp.lt.u32 p3, r7, r4;
 	@p3 bra router_finite_loop;
-	st.shared.u32 [a0+2300], r8;
+	st.shared.u32 [a0+4080], r8;
 router_finite_done:
 	bar.sync 0;
-	ld.shared.u32 r8, [a0+2300];
+	ld.shared.u32 r8, [a0+4080];
 	setp.ne.u32 p3, r8, 0;
 	@p3 bra router_return;
+	mul.wide.u32 a3, r3, 40;
+	add.u64 a3, a0, a3;
 	mov.u32 r7, 0;
 router_pick:
 	mov.f32 f2, f0;
@@ -3168,18 +3170,36 @@ router_warp_reduce:
 	shr.u32 r9, r9, 1;
 	setp.ne.u32 p3, r9, 0;
 	@p3 bra router_warp_reduce;
-	@p1 st.shared.f32 [a3+2048], f2;
-	@p1 st.shared.u32 [a3+2112], r8;
+	mul.wide.u32 a4, r7, 4;
+	add.u64 a4, a3, a4;
+	@p1 st.shared.u32 [a4+2048], r8;
+	@p1 st.shared.f32 [a4+2688], f2;
+	shfl.idx.b32 r8, r8, 0, 31;
+	setp.eq.u32 p3, r0, r8;
+	@p3 mov.f32 f0, 0fFF800000;
+	setp.eq.u32 p3, r5, r8;
+	@p3 mov.f32 f1, 0fFF800000;
+	add.u32 r7, r7, 1;
+	setp.lt.u32 p3, r7, 10;
+	@p3 bra router_pick;
 	bar.sync 0;
+	// Each warp contributes a sorted list. Warp zero merges its list heads.
 	setp.eq.u32 p3, r3, 0;
-	@!p3 bra router_cta_done;
-	setp.lt.u32 p4, r2, r4;
-	mov.f32 f2, 0fFF800000;
-	mov.u32 r8, 0xffffffff;
-	@p4 ld.shared.f32 f2, [a1+2048];
-	@p4 ld.shared.u32 r8, [a1+2112];
+	@!p3 bra router_merge_done;
+	mul.wide.u32 a3, r2, 40;
+	add.u64 a3, a0, a3;
+	setp.lt.u32 p6, r2, r4;
+	mov.f32 f0, 0fFF800000;
+	mov.u32 r6, 0xffffffff;
+	@p6 ld.shared.u32 r6, [a3+2048];
+	@p6 ld.shared.f32 f0, [a3+2688];
+	mov.u32 r12, 0;
+	mov.u32 r7, 0;
+router_merge_pick:
+	mov.f32 f2, f0;
+	mov.u32 r8, r6;
 	mov.u32 r9, 16;
-router_cta_reduce:
+router_merge_reduce:
 	shfl.down.b32 r10, r8, r9, 31;
 	mov.b32 r11, f2;
 	shfl.down.b32 r11, r11, r9, 31;
@@ -3193,26 +3213,31 @@ router_cta_reduce:
 	@p3 mov.u32 r8, r10;
 	shr.u32 r9, r9, 1;
 	setp.ne.u32 p3, r9, 0;
-	@p3 bra router_cta_reduce;
-	@!p0 bra router_cta_done;
+	@p3 bra router_merge_reduce;
 	mul.wide.u32 a4, r7, 4;
 	add.u64 a4, a0, a4;
-	st.shared.u32 [a4+2176], r8;
-	st.shared.f32 [a4+2216], f2;
+	@p0 st.shared.u32 [a4+3328], r8;
+	@p0 st.shared.f32 [a4+3368], f2;
 	setp.eq.u32 p3, r7, 0;
-	@p3 st.shared.f32 [a0+2296], f2;
-router_cta_done:
-	bar.sync 0;
-	mul.wide.u32 a4, r7, 4;
-	add.u64 a4, a0, a4;
-	ld.shared.u32 r8, [a4+2176];
-	setp.eq.u32 p3, r0, r8;
-	@p3 mov.f32 f0, 0fFF800000;
-	setp.eq.u32 p3, r5, r8;
-	@p3 mov.f32 f1, 0fFF800000;
+	and.pred p3, p3, p0;
+	@p3 st.shared.f32 [a0+3408], f2;
+	shfl.idx.b32 r8, r8, 0, 31;
+	setp.eq.u32 p3, r6, r8;
+	@p3 add.u32 r12, r12, 1;
+	setp.lt.u32 p4, r12, 10;
+	and.pred p4, p3, p4;
+	setp.ge.u32 p5, r12, 10;
+	and.pred p5, p3, p5;
+	@p5 mov.f32 f0, 0fFF800000;
+	@p5 mov.u32 r6, 0xffffffff;
+	mul.wide.u32 a4, r12, 4;
+	add.u64 a4, a3, a4;
+	@p4 ld.shared.u32 r6, [a4+2048];
+	@p4 ld.shared.f32 f0, [a4+2688];
 	add.u32 r7, r7, 1;
 	setp.lt.u32 p3, r7, 10;
-	@p3 bra router_pick;
+	@p3 bra router_merge_pick;
+router_merge_done:
 	bar.sync 0;
 	// Sort only the ten winners by expert ID, matching the scalar sum order.
 	@!p0 bra router_sort_done;
@@ -3220,8 +3245,8 @@ router_cta_done:
 router_sort_outer:
 	mul.wide.u32 a4, r7, 4;
 	add.u64 a4, a0, a4;
-	ld.shared.u32 r8, [a4+2176];
-	ld.shared.f32 f2, [a4+2216];
+	ld.shared.u32 r8, [a4+3328];
+	ld.shared.f32 f2, [a4+3368];
 	mov.u32 r9, r7;
 router_sort_inner:
 	setp.eq.u32 p3, r9, 0;
@@ -3229,19 +3254,19 @@ router_sort_inner:
 	sub.u32 r10, r9, 1;
 	mul.wide.u32 a5, r10, 4;
 	add.u64 a5, a0, a5;
-	ld.shared.u32 r11, [a5+2176];
+	ld.shared.u32 r11, [a5+3328];
 	setp.le.u32 p3, r11, r8;
 	@p3 bra router_sort_store;
-	ld.shared.f32 f3, [a5+2216];
-	st.shared.u32 [a5+2180], r11;
-	st.shared.f32 [a5+2220], f3;
+	ld.shared.f32 f3, [a5+3368];
+	st.shared.u32 [a5+3332], r11;
+	st.shared.f32 [a5+3372], f3;
 	mov.u32 r9, r10;
 	bra router_sort_inner;
 router_sort_store:
 	mul.wide.u32 a5, r9, 4;
 	add.u64 a5, a0, a5;
-	st.shared.u32 [a5+2176], r8;
-	st.shared.f32 [a5+2216], f2;
+	st.shared.u32 [a5+3328], r8;
+	st.shared.f32 [a5+3368], f2;
 	add.u32 r7, r7, 1;
 	setp.lt.u32 p3, r7, 10;
 	@p3 bra router_sort_outer;
@@ -3249,8 +3274,8 @@ router_sort_done:
 	bar.sync 0;
 	setp.ge.u32 p3, r0, 10;
 	@p3 bra router_exp_done;
-	ld.shared.f32 f2, [a1+2216];
-	ld.shared.f32 f3, [a0+2296];
+	ld.shared.f32 f2, [a1+3368];
+	ld.shared.f32 f3, [a0+3408];
 	sub.rn.f32 f4, f2, f3;
 	mov.f32 f5, 0f00000000;
 	// Preserve the original FP32 exp polynomial, range limit, and rounding.
@@ -3288,31 +3313,41 @@ router_sort_done:
 	mul.rn.f32 f5, f21, f22;
 	mul.rn.f32 f5, f5, f23;
 router_exp_store:
-	st.shared.f32 [a1+2256], f5;
+	st.shared.f32 [a1+3412], f5;
 router_exp_done:
 	bar.sync 0;
-	@!p0 bra router_sum_done;
+	@!p0 bra router_sum_ready;
 	mov.f32 f0, 0f00000000;
 	mov.u32 r7, 0;
 router_sum:
 	mul.wide.u32 a4, r7, 4;
 	add.u64 a4, a0, a4;
-	ld.shared.f32 f1, [a4+2256];
+	ld.shared.f32 f1, [a4+3412];
 	add.rn.f32 f0, f0, f1;
 	add.u32 r7, r7, 1;
 	setp.lt.u32 p3, r7, 10;
 	@p3 bra router_sum;
+	st.shared.f32 [a0+3452], f0;
+router_sum_ready:
+	bar.sync 0;
+	setp.ge.u32 p3, r0, 10;
+	@p3 bra router_divide_done;
+	ld.shared.f32 f0, [a0+3452];
+	ld.shared.f32 f1, [a1+3412];
+	div.rn.f32 f2, f1, f0;
+	st.shared.f32 [a1+3412], f2;
+router_divide_done:
+	bar.sync 0;
+	@!p0 bra router_sum_done;
 	mov.u32 r7, 0;
 	mov.u32 r8, 0;
 router_normalize:
 	mul.wide.u32 a4, r7, 4;
 	add.u64 a4, a0, a4;
-	ld.shared.f32 f1, [a4+2256];
-	div.rn.f32 f2, f1, f0;
-	st.shared.f32 [a4+2256], f2;
+	ld.shared.f32 f2, [a4+3412];
 	setp.eq.f32 p3, f2, 0f00000000;
 	@p3 bra router_normalize_next;
-	ld.shared.u32 r9, [a4+2176];
+	ld.shared.u32 r9, [a4+3328];
 	mul.wide.u32 a5, r8, 4;
 	add.u64 a5, a0, a5;
 	st.shared.u32 [a5+4100], r9;
@@ -3331,8 +3366,8 @@ router_sum_done:
 router_weight:
 	mul.wide.u32 a4, r7, 4;
 	add.u64 a4, a0, a4;
-	ld.shared.u32 r8, [a4+2176];
-	ld.shared.f32 f2, [a4+2256];
+	ld.shared.u32 r8, [a4+3328];
+	ld.shared.f32 f2, [a4+3412];
 	setp.eq.u32 p3, r0, r8;
 	@p3 mov.f32 f0, f2;
 	setp.eq.u32 p3, r5, r8;
