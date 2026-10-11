@@ -5,7 +5,8 @@ Refs #979. `predict-compute.mjs` updates the existing evaluator from
 
 The evaluator reads `precision node` and `probe phase` records from the same
 capture. Each phase joins its device and node index to that device's precision
-record. The input JSONL corpus and split-region dimension estimates are removed.
+record. Preliminary graph records without placement fields are skipped. The
+input JSONL corpus and split-region dimension estimates are removed.
 Rows and terms come from `local_rows` and `local_terms`. Mixed-format rows come
 from captured stored weight counts divided by the captured local term count.
 SASS lookup uses the captured `run_key`; a mixed-format node uses its segment
@@ -46,10 +47,11 @@ evaluator run on a CPU machine without disassembling again.
 ## CPU verification on Benji
 
 Build with `CARGO_BUILD_JOBS=3` and
-`CARGO_TARGET_DIR=/home/nate/work/cx-shared-target`, using the standard dev and
-release profiles. Evidence directories contain logs and small outputs.
+`CARGO_TARGET_DIR=/home/nate/work/target-cx-recipe979`, using the release profile.
+Delete that target directory after the PR is merged or closed. Evidence
+directories contain logs and small outputs.
 
 The evaluator's syntax check and historical-trace rejection run on Benji.
-The original Flash Next capture fails with `precision node 0 is missing
-device` before SASS processing. CPU execution does not establish the held-out
+The original Flash Next capture fails with `no captured per-device compute
+nodes` before SASS processing. CPU execution does not establish the held-out
 GPU error result.

@@ -108,7 +108,12 @@ const captures = traces.map((trace) => {
 		const match = /^precision node (\d+) .*?, node \d+ (\w+), input (\d+x\d+), output (\d+x\d+),/.exec(line);
 		if (!match) continue;
 		const fields = Object.fromEntries([...line.matchAll(/(?:^|\s)(\w+)=([^\s]+)/g)].map((field) => [field[1], field[2]]));
-		if (fields.device === undefined) fail(trace + ": precision node " + match[1] + " is missing device");
+		if (fields.device === undefined) {
+			if (["stored_formats", "stored_bytes", "shard_rows", "shard_terms", "local_rows", "local_terms", "run_key", "packed"].some((name) => fields[name] !== undefined)) {
+				fail(trace + ": precision node " + match[1] + " is missing device");
+			}
+			continue;
+		}
 		if (!OPS.has(match[2])) {
 			metadata.set(fields.device + "|" + match[1], { op: match[2], inp: match[3], out: match[4], fields });
 			continue;
