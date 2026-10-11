@@ -1,0 +1,25 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'split_probe_worker' for 'sm_52'
+ptxas info    : Function properties for split_probe_worker
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 27 registers, 4 bytes smem, 396 bytes cmem[0]
+ptxas info    : Function properties for p2p_publish
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for p2p_wait
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_accumulate
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_return
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'split_probe_main' for 'sm_52'
+ptxas info    : Function properties for split_probe_main
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 31 registers, 4 bytes smem, 428 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Function properties for p2p_publish
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for p2p_wait
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_combine
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_send
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads

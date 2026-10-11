@@ -1,0 +1,29 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Function properties for p2p_wait
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_combine
+    32 bytes stack frame, 28 bytes spill stores, 28 bytes spill loads
+ptxas info    : Function properties for p2p_publish
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_return
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_local_combine
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for split_send
+    8 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Compiling entry function 'p2p_grid_relay' for 'sm_52'
+ptxas info    : Function properties for p2p_grid_relay
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem, 376 bytes cmem[0]
+ptxas info    : Compiling entry function 'p2p_layers' for 'sm_52'
+ptxas info    : Function properties for p2p_layers
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, 10244 bytes smem, 416 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function 'layer' for 'sm_52'
+ptxas info    : Function properties for layer
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 67 registers, 13332 bytes smem, 392 bytes cmem[0], 20 bytes cmem[2]
+ptxas info    : Compiling entry function 'relay' for 'sm_52'
+ptxas info    : Function properties for relay
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, 1044 bytes smem, 368 bytes cmem[0]
