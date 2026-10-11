@@ -1,0 +1,28 @@
+	CPU	AMD	NV
+Linux	Yes	Yes	Yes
+macOS	Yes	No	No
+WinOS	Yes	No	Yes
+---
+	POSIX		ELF		XDG	FHS	SystemV
+Linux	yes		yes		yes	yes	yes
+macOS	yes		no[^1]	no	no	no
+WinOS	no[^2]	no[^3]	no	no	no
+
+	CPU		AMD		NVIDIA
+Linux	dlopen	ROCr/HSA	CUDA Driver
+macOS	dlopen	Metal[^4]	Metal[^4]
+WinOS	LoadLibrary	HIP[^8]	CUDA Driver
+
+	CPU		AMD		NV
+Linux	0		0		0
+macOS	+1[^1]	(+1100 shared[^4])
+WinOS	+4[^2][^3]	+114[^8]	+8[^5]
+
+[^1]: .init_array -> __DATA,__mod_init_func
+[^2]: signal(SIGINT, handler) -> SetConsoleCtrlHandler()
+	$HOME -> %USERPROFILE%
+[^3]: `ar rcs` -> `lib.exe`
+	.init_array -> .CRT$XCU
+[^4]: one Metal backend, all macOS GPU vendors share it
+[^5]: +8 dlopen -> LoadLibrary/GetProcAddress
+[^8]: +114 HIP lines
