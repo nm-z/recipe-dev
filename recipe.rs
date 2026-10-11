@@ -16752,6 +16752,70 @@ struct MtpRuntime {
 	poisoned: bool,
 }
 impl MtpRuntime {
+	fn reference(&mut self, path: &Path) -> Result<MtpReferenceReport> {
+		use std::io::Read as _;
+		require(!self.poisoned, "MTP state is invalid after an unsuccessful transaction")?;
+		let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open MTP reference input {}: {error}", path.display())))?;
+		let mut header = [0_u8; 32];
+		file.read_exact(&mut header).map_err(|error| RecipeError::new(format!("cannot read MTP reference header: {error}")))?;
+		require(&header[..8] == b"RCPMTP1\0", "MTP reference input has an invalid signature")?;
+		let word = |index: usize| u32::from_le_bytes(header[8 + index * 4..12 + index * 4].try_into().unwrap()) as usize;
+		let positions = word(1);
+		require(word(0) == 1 && word(5) == 0, "MTP reference input has an unsupported version or flags")?;
+		require(positions > 0 && positions <= self.sequence && positions <= 128, "MTP reference positions exceed the bounded head context")?;
+		require(word(2) == self.head.width && word(3) == self.head.lanes && word(4) == positions, "MTP reference hidden shape differs from the resident head")?;
+		let stream = checked_mul(self.head.width, self.head.lanes, "MTP reference hidden stream")?;
+		let id_bytes = checked_mul(positions, size_of::<i32>(), "MTP reference IDs")?;
+		let hidden_bytes = checked_mul(checked_mul(positions, stream, "MTP reference hidden elements")?, size_of::<f32>(), "MTP reference hidden bytes")?;
+		let bytes = checked_add(checked_mul(id_bytes, 2, "MTP reference token and position bytes")?, hidden_bytes, "MTP reference payload")?;
+		let mut payload = Vec::with_capacity(checked_add(bytes, 1, "MTP reference bounded read")?);
+		file.take((bytes + 1) as u64).read_to_end(&mut payload).map_err(|error| RecipeError::new(format!("cannot read MTP reference payload: {error}")))?;
+		require(payload.len() == bytes, "MTP reference payload has the wrong length")?;
+		let mut input_ids = Vec::with_capacity(positions);
+		for (position, encoded) in payload[..id_bytes].chunks_exact(4).enumerate() {
+			let id = i32::from_le_bytes(encoded.try_into().unwrap());
+			require(id >= 0 && (id as usize) < self.head.bound.vocabulary, format!("MTP reference token at position {position} exceeds the head vocabulary"))?;
+			input_ids.push(id as u32);
+		}
+		for (position, encoded) in payload[id_bytes..2 * id_bytes].chunks_exact(4).enumerate() {
+			require(i32::from_le_bytes(encoded.try_into().unwrap()) == position as i32, "MTP reference positions must be the contiguous prefix starting at zero")?;
+		}
+		for (index, encoded) in payload[2 * id_bytes..].chunks_exact(4).enumerate() {
+			let value = f32::from_le_bytes(encoded.try_into().unwrap());
+			require(value.is_finite(), "MTP reference hidden state is nonfinite")?;
+			require(index >= stream || value == 0.0, "MTP reference first hidden row must be zero")?;
+		}
+		let tapes = self.placed.tapes.first().ok_or_else(|| RecipeError::new("resident MTP head has no ranges"))?;
+		require(self.placed.tapes.len() == 1 && tapes.len() == 1, "MTP reference requires one resident head range")?;
+		for tape in tapes { tape.require_request_capacity(positions)?; }
+		let prior_operations = tapes.iter().map(|tape| {
+			tape.operations.lock().map(|operations| operations.len()).map_err(|_| RecipeError::new("operation reports are poisoned"))
+		}).collect::<Result<Vec<_>>>()?;
+		self.samples.resize(checked_mul(stream + 1, positions, "MTP reference samples")?, 0.0);
+		for (position, id) in input_ids.iter().copied().enumerate() { self.samples[position] = f64::from(id); }
+		for (index, encoded) in payload[2 * id_bytes..].chunks_exact(4).enumerate() {
+			let (position, channel) = (index / stream, index % stream);
+			self.samples[(channel + 1) * positions + position] = f64::from(f32::from_le_bytes(encoded.try_into().unwrap()));
+		}
+		self.clear();
+		let started = Instant::now();
+		let predictions = match self.placed.run_window(&self.samples, 0, positions as u32) {
+			Ok(predictions) => predictions,
+			Err(error) => { self.poisoned = true; return Err(error); }
+		};
+		let seconds = started.elapsed().as_secs_f64();
+		let tape = &self.placed.tapes[0][0];
+		let mut logits = Vec::with_capacity(checked_mul(positions, self.head.bound.vocabulary, "MTP reference logits")?);
+		for position in 0..positions { logits.extend(tape.logits_at(&predictions, position)?); }
+		let mut operations = Vec::new();
+		for (tape, prior) in self.placed.tapes[0].iter().zip(prior_operations) {
+			operations.extend(tape.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?.split_off(prior).into_iter().map(|mut operation| {
+				operation.model = "mtp".to_owned(); operation
+			}));
+		}
+		self.clear();
+		Ok(MtpReferenceReport { input_ids, width: self.head.width, lanes: self.head.lanes, vocabulary: self.head.bound.vocabulary, logits, seconds, operations })
+	}
 	fn place(head: MtpHead, sequence: usize, devices: &'static [&'static Gpu]) -> Result<Self> {
 		let lookup = MtpLookup { hash: head.lookup_hash.clone(), ..MtpLookup::default() };
 		let lookup_enabled = match std::env::var("RECIPE_MTP_LOOKUP").ok().as_deref() {
@@ -16974,6 +17038,14 @@ pub struct MtpPlaced {
 	runtime: MtpRuntime,
 }
 impl MtpPlaced {
+	/// Run a bounded reference packet through the existing head without evaluating the target or growing device buffers.
+	/// The 32-byte header is `RCPMTP1\0` followed by six little-endian u32 words:
+	/// version 1, position count, lane width, lane count, hidden-row count, and flags 0.
+	/// Hidden-row count equals position count. The payload contains little-endian i32
+	/// token IDs, contiguous i32 positions starting at zero, and token-major f32 hidden
+	/// rows with contiguous lanes. Row zero is zero; row t contains raw target HC[t-1].
+	/// Position count is at most 128 and the existing head context and request capacities.
+	pub fn reference(&mut self, path: impl AsRef<Path>) -> Result<MtpReferenceReport> { self.runtime.reference(path.as_ref()) }
 	/// Change draft count without replacing either placement or reloading weights.
 	pub fn decode(&mut self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, drafts: usize, lookup: bool, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
 		require(drafts <= 4, "MTP draft tokens must be in 0..=4")?;
@@ -18016,6 +18088,18 @@ impl Infer {
 					}
 					continue;
 				}
+				if let Some(paths) = line.trim().strip_prefix("/mtp_reference ") {
+					let result = (|| -> Result<()> {
+						let paths = paths.split_whitespace().collect::<Vec<_>>();
+						require(paths.len() == 3 && paths.iter().all(|path| Path::new(path).is_absolute()), "MTP reference requires absolute input, logits, and report paths")?;
+						let runtime = mtp.as_mut().ok_or_else(|| RecipeError::new("MTP head is not resident"))?;
+						let report = runtime.reference(Path::new(paths[0]))?;
+						report.write_logits(paths[1])?;
+						report.write_report(paths[2])
+					})();
+					if let Err(error) = result { eprintln!("cannot run MTP reference: {error}"); }
+					continue;
+				}
 				if line.trim() == "/report" || line.trim().starts_with("/report ") {
 					if let Err(error)=placed.export_router_picks() {eprintln!("cannot export router picks: {error}");}
 					use std::fmt::Write as _;
@@ -18683,6 +18767,37 @@ pub struct MtpReport {
 	pub step_seconds: f64,
 	/// Index is the actual draft count, 0..=4; each verification also evaluates its leading token.
 	pub batches: [MtpBatchReport; 5],
+}
+/// One direct head forward from a canonical token prefix and externally captured raw hidden rows.
+pub struct MtpReferenceReport {
+	pub input_ids: Vec<u32>,
+	pub width: usize,
+	pub lanes: usize,
+	pub vocabulary: usize,
+	/// Position-major logits, with one complete vocabulary row per input position.
+	pub logits: Vec<f64>,
+	/// The existing head forward, including staging and output download.
+	pub seconds: f64,
+	pub operations: Vec<OperationReport>,
+}
+impl MtpReferenceReport {
+	pub fn write_logits(&self, path: impl AsRef<Path>) -> Result<()> {
+		let mut file = std::io::BufWriter::new(fs::File::create(path.as_ref()).map_err(|error| RecipeError::new(format!("cannot create MTP reference logits: {error}")))?);
+		for value in &self.logits { file.write_all(&(*value as f32).to_le_bytes()).map_err(|error| RecipeError::new(format!("cannot write MTP reference logits: {error}")))?; }
+		file.flush().map_err(|error| RecipeError::new(format!("cannot finish MTP reference logits: {error}")))
+	}
+	pub fn write_report(&self, path: impl AsRef<Path>) -> Result<()> {
+		use std::fmt::Write as _;
+		let mut text = format!("positions\tlane_width\tlane_count\tvocabulary\tseconds\tpositions_per_second\n{}\t{}\t{}\t{}\t{}\t{}\nposition\ttoken_id\n",
+			self.input_ids.len(), self.width, self.lanes, self.vocabulary, self.seconds, self.input_ids.len() as f64 / self.seconds);
+		for (position, id) in self.input_ids.iter().enumerate() { writeln!(text, "{position}\t{id}")?; }
+		text.push_str("model\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\n");
+		for operation in &self.operations {
+			writeln!(text, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block, operation.node,
+				operation.operation, operation.begin, operation.end, operation.positions, operation.ticks, operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()))?;
+		}
+		fs::write(path.as_ref(), text).map_err(|error| RecipeError::new(format!("cannot write MTP reference report: {error}")))
+	}
 }
 impl MtpReport {
 	pub fn acceptance_rate(&self) -> f64 { if self.drafted == 0 { 0.0 } else { self.accepted as f64 / self.drafted as f64 } }
@@ -24975,6 +25090,37 @@ impl NativeTape {
 		}
 		self.forward_window(0, self.positions, mode)
 	}
+	fn request_sizes(&self, positions: usize) -> Result<(usize, usize, usize)> {
+		let layout = &self.program.artifact.layout;
+		let input_bytes = if self.vocabulary > 0.0 { size_of::<i32>() } else { layout.input_precision.bytes() };
+		let input = checked_mul(checked_mul(self.input.channels, positions, "request input elements")?, input_bytes, "request input bytes")?;
+		let output_positions = if self.output.length == 1 { 1 } else { positions };
+		let output = checked_mul(checked_mul(self.output.channels, output_positions, "request output elements")?, layout.output_precision.bytes(), "request output bytes")?;
+		let hidden = self.nodes.iter().enumerate().find(|(_, node)| node.retain_output).map(|(index, node)| {
+			checked_mul(checked_mul(node.output.channels, positions, "request hidden elements")?, layout.precisions[index].bytes(), "request hidden bytes")
+		}).transpose()?.unwrap_or(0);
+		Ok((input, output, hidden))
+	}
+	fn lookup_request_bytes(&self, index: usize, positions: usize) -> Result<usize> {
+		let lookup = &self.lookups[index];
+		let channels = lookup.hash.as_ref().map_or(1, RowHash::heads) * lookup.width;
+		checked_mul(checked_mul(positions, channels, "lookup request elements")?, lookup.precision.bytes(), "lookup request bytes")
+	}
+	fn require_request_capacity(&self, positions: usize) -> Result<()> {
+		if self.program.artifact.layout.request_control.is_none() { return Ok(()); }
+		let state = self.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))?;
+		let request = state.as_ref().ok_or_else(|| RecipeError::new("MTP reference requires existing request buffers"))?;
+		let (input, output, hidden) = self.request_sizes(positions)?;
+		for (name, buffer, bytes) in [("input", &request.input, input), ("output", &request.output, output), ("hidden", &request.hidden, hidden)] {
+			require(buffer.bytes >= bytes, format!("MTP reference {name} requires {bytes} existing bytes, available {}", buffer.bytes))?;
+		}
+		for index in 0..self.lookups.len() {
+			let bytes = self.lookup_request_bytes(index, positions)?;
+			let available = request.lookups.get(index).map_or(0, |buffer| buffer.bytes);
+			require(available >= bytes, format!("MTP reference lookup {index} requires {bytes} existing bytes, available {available}"))?;
+		}
+		Ok(())
+	}
 	fn prepare_request(&self, begin: u32, end: u32) -> Result<()> {
 		let layout = &self.program.artifact.layout;
 		if layout.request_control.is_none() { return Ok(()) }
@@ -24983,13 +25129,10 @@ impl NativeTape {
 		if state.is_none() { *state = Some(NativeRequest::new(self.program.gpu)?); }
 		let request = state.as_mut().unwrap();
 		let positions = (end - begin) as usize;
-		let input_bytes = if self.vocabulary > 0.0 { size_of::<i32>() } else { layout.input_precision.bytes() };
-		NativeRequest::grow(&mut request.input, checked_mul(checked_mul(self.input.channels, positions, "request input elements")?, input_bytes, "request input bytes")?)?;
-		let output_positions = if self.output.length == 1 { 1 } else { positions };
-		NativeRequest::grow(&mut request.output, checked_mul(checked_mul(self.output.channels, output_positions, "request output elements")?, layout.output_precision.bytes(), "request output bytes")?)?;
-		if let Some((index, node)) = self.nodes.iter().enumerate().find(|(_, node)| node.retain_output) {
-			NativeRequest::grow(&mut request.hidden, checked_mul(checked_mul(node.output.channels, positions, "request hidden elements")?, layout.precisions[index].bytes(), "request hidden bytes")?)?;
-		}
+		let (input, output, hidden) = self.request_sizes(positions)?;
+		NativeRequest::grow(&mut request.input, input)?;
+		NativeRequest::grow(&mut request.output, output)?;
+		NativeRequest::grow(&mut request.hidden, hidden)?;
 		request.begin = begin;
 		request.positions = positions;
 		Ok(())
@@ -25014,7 +25157,7 @@ impl NativeTape {
 			let (buffer, base, length, first) = if let Some(request) = request.as_mut() {
 				if index == request.lookups.len() { request.lookups.push(Buffer::zeroed(self.program.gpu, 1)?); }
 				let buffer = &mut request.lookups[index];
-				NativeRequest::grow(buffer, checked_mul(checked_mul(end - begin, channels, "lookup request elements")?, bytes, "lookup request bytes")?)?;
+				NativeRequest::grow(buffer, self.lookup_request_bytes(index, end - begin)?)?;
 				self.contexts.write_bytes(lookup.context, &buffer.pointer.to_ne_bytes())?;
 				(&*buffer, 0, end - begin, 0)
 			} else { (&self.contexts, lookup.context, lookup.length, begin) };
