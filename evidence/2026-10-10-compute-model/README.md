@@ -56,6 +56,11 @@ Wrap each build or test command on Archy with
 `flock --close /home/nate/work/.build-slot-1.lock`, and run it with
 `nice -n 19`. Run one command at a time for this worker.
 
+If Archy is unavailable, use Sentry with `CARGO_BUILD_JOBS=2`, target
+`/tmp/agent-builds/target-cx-recipe979`, and
+`flock --close /tmp/agent-builds/.build-slot-$((RANDOM%2+1)).lock`.
+Delete the Sentry target after the checks finish.
+
 The evaluator's syntax check and historical-trace rejection run on the CPU.
 The original Flash Next capture fails with `no captured per-device compute
 nodes` before SASS processing. CPU execution does not establish the held-out
