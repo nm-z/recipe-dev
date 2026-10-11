@@ -34,6 +34,7 @@ fn match_row(row: usize, distances: &[Vec<f64>], seen: &mut [bool], owner: &mut 
 fn main() {
 	let path = std::env::var("RECIPE_TRAIN_GGUF").unwrap();
 	let work = std::env::var("RECIPE_TRAIN_WORK").unwrap();
+	std::fs::create_dir_all(&work).unwrap();
 	let file = recipe.gguf(&path);
 	let bound = file.model();
 	let model = bound.model();
