@@ -1,0 +1,1 @@
+/home/nate/Developer/wt-minbase/target/release/librecipe.rlib: /home/nate/Developer/wt-minbase/Cargo.toml /home/nate/Developer/wt-minbase/amd-nv-cpu.ll /home/nate/Developer/wt-minbase/build.rs /home/nate/Developer/wt-minbase/recipe.rs
