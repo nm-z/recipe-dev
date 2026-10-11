@@ -24898,7 +24898,9 @@ impl NativeTape {
 			window_begin: std::sync::atomic::AtomicU32::new(0),
 			tuner: Mutex::new(None),
 		};
-		tape.stage_lookups(0, tape.positions)?;
+		// Epochs read the whole training batch. Inference stages each bounded
+		// window in forward_window_gated, whose lookup buffer holds that window.
+		if training { tape.stage_lookups(0, tape.positions)?; }
 		tape.bind_knobs(graph)?;
 		Ok(tape)
 	}
