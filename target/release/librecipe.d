@@ -1,0 +1,1 @@
+/home/nate/Developer/wt-642-base/target/release/librecipe.rlib: /home/nate/Developer/wt-642-base/Cargo.toml /home/nate/Developer/wt-642-base/amd-nv-cpu.ll /home/nate/Developer/wt-642-base/build.rs /home/nate/Developer/wt-642-base/recipe.rs
