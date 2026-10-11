@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #define GGML_COMMON_DECL_C
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
@@ -10,16 +11,25 @@ typedef struct { uint32_t x,y,z,w; } uint4;
 #define __align__(value)
 #include "codebooks.inc"
 static uint32_t pair16(int a,int b){return (a&65535u)|((uint32_t)(b&65535)<<16);}
+static uint32_t prmt_cpu(uint32_t a,uint32_t b,unsigned selector){
+	uint64_t bytes=(uint64_t)a|((uint64_t)b<<32);uint32_t result=0;
+	for(unsigned i=0;i<4;i++){unsigned at=(selector>>(4*i))&15;if(at>=8)return UINT32_MAX;result|=((bytes>>(8*at))&255u)<<(8*i);}
+	return result;
+}
 static float half_cpu(unsigned h){unsigned exponent=(h>>10)&31,mantissa=h&1023;float v=exponent?ldexpf(1024+mantissa,(int)exponent-25):ldexpf(mantissa,-24);return h&32768?-v:v;}
 int main(void){
-	unsigned mismatch=0,iq2_cases=0,iq3_cases=0,index_cases=0,scale_cases=0;
+	unsigned mismatch=0,iq2_cases=0,iq2_unsigned_cases=0,iq3_cases=0,index_cases=0,scale_cases=0;
 	for(unsigned code=0;code<65536;code++){
-		uint64_t grid=iq2xs_grid[code&511];unsigned sign=ksigns_iq2xs[code>>9];uint4 entry=packed_iq2[code];uint32_t values[4]={entry.x,entry.y,entry.z,entry.w};
+		uint64_t grid=iq2xs_grid[code&511];unsigned sign=ksigns_iq2xs[code>>9];uint4 entry;memcpy(&entry,(const unsigned char*)packed_iq2+16*code,sizeof(entry));uint32_t values[4]={entry.x,entry.y,entry.z,entry.w};
 		for(int p=0;p<4;p++){int a=(grid>>(16*p))&255,b=(grid>>(16*p+8))&255;if(sign&(1u<<(2*p)))a=-a;if(sign&(2u<<(2*p)))b=-b;
-			mismatch+=values[p]!=pair16(a,b);iq2_cases++;}
+			mismatch+=values[p]!=pair16(a,b);iq2_cases++;
+			uint32_t magnitude=(uint32_t)(grid>>(32*(p/2))),sign_word=(uint32_t)(ksigns64[code>>9]>>(32*(p/2)));
+			uint32_t lanes=prmt_cpu(magnitude,0,p%2?0x4342:0x4140),mask=prmt_cpu(sign_word,sign_word,p%2?0x3322:0x1100);
+			uint32_t decoded=(lanes^mask)+(mask&0x00010001u);
+			mismatch+=decoded!=pair16(a,b);mismatch+=((grid>>(16*p))&255)==0||((grid>>(16*p+8))&255)==0;iq2_unsigned_cases++;}
 	}
 	for(unsigned s=0;s<128;s++)for(unsigned g=0;g<256;g++)for(int half=0;half<2;half++){
-		unsigned sign=ksigns_iq2xs[s],code=g+(((sign>>(4*half))&15)<<8);uint32_t grid=iq3xxs_grid[g];uint2 entry=packed_iq3[code];
+		unsigned sign=ksigns_iq2xs[s],code=g+(((sign>>(4*half))&15)<<8);uint32_t grid=iq3xxs_grid[g];uint2 entry;memcpy(&entry,(const unsigned char*)packed_iq3+8*code,sizeof(entry));
 		for(int p=0;p<2;p++){int a=(grid>>(16*p))&255,b=(grid>>(16*p+8))&255;if(sign&(1u<<(4*half+2*p)))a=-a;if(sign&(2u<<(4*half+2*p)))b=-b;
 			mismatch+=(p?entry.y:entry.x)!=pair16(a,b);iq3_cases++;}
 	}
@@ -34,6 +44,6 @@ int main(void){
 		float d=half_cpu(h);volatile float quarter=d*0.25f;union{float f;uint32_t u;}old={.f=quarter*(1+2*s)},new={.f=d*fmaf((float)s,0.5f,0.25f)};
 		mismatch+=old.u!=new.u;scale_cases++;
 	}
-	printf("iq2_pair_checks=%u iq3_pair_checks=%u iq3_index_checks=%u iq3_scale_checks=%u mismatches=%u\n",iq2_cases,iq3_cases,index_cases,scale_cases,mismatch);
+	printf("iq2_pair_checks=%u iq2_unsigned_pair_checks=%u iq3_pair_checks=%u iq3_index_checks=%u iq3_scale_checks=%u mismatches=%u\n",iq2_cases,iq2_unsigned_cases,iq3_cases,index_cases,scale_cases,mismatch);
 	return mismatch?1:0;
 }

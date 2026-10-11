@@ -155212,6 +155212,40 @@ $L__BB94_103:
 	mov.u32 	%r1, %tid.x;
 	and.b32  	%r2, %r1, 15;
 	bar.sync 	0;
+{
+	.reg .pred iq_stage_p<2>;
+	.reg .b32 iq_stage_r<5>;
+	.reg .b64 iq_stage_d<5>;
+	mov.u32 iq_stage_r0, %tid.x;
+	shl.b32 iq_stage_r0, iq_stage_r0, 3;
+	mov.u32 iq_stage_r1, %ntid.x;
+	shl.b32 iq_stage_r1, iq_stage_r1, 3;
+	mov.u64 iq_stage_d0, iq2xs_grid;
+	cvta.global.u64 iq_stage_d0, iq_stage_d0;
+	mov.u64 iq_stage_d1, ksigns64;
+	cvta.global.u64 iq_stage_d1, iq_stage_d1;
+	mov.u32 iq_stage_r2, scratch;
+	add.u32 iq_stage_r2, iq_stage_r2, 16384;
+iq_stage_loop:
+	setp.ge.u32 iq_stage_p0, iq_stage_r0, 5120;
+	@iq_stage_p0 bra iq_stage_done;
+	setp.ge.u32 iq_stage_p1, iq_stage_r0, 4096;
+	cvt.u64.u32 iq_stage_d2, iq_stage_r0;
+	add.u64 iq_stage_d3, iq_stage_d0, iq_stage_d2;
+	add.u64 iq_stage_d4, iq_stage_d1, iq_stage_d2;
+	sub.u64 iq_stage_d4, iq_stage_d4, 4096;
+	selp.u64 iq_stage_d3, iq_stage_d4, iq_stage_d3, iq_stage_p1;
+	ld.global.nc.v2.u32 {iq_stage_r3,iq_stage_r4}, [iq_stage_d3];
+	{
+		.reg .b32 iq_stage_at;
+		add.u32 iq_stage_at, iq_stage_r2, iq_stage_r0;
+		st.shared.v2.u32 [iq_stage_at], {iq_stage_r3,iq_stage_r4};
+	}
+	add.u32 iq_stage_r0, iq_stage_r0, iq_stage_r1;
+	bra iq_stage_loop;
+iq_stage_done:
+	bar.sync 0;
+}
 	brev.b32 	%r90, %r83;
 	bfind.shiftamt.u32 	%r91, %r90;
 	selp.b32 	%r3, 0, %r91, %p8;
@@ -155600,7 +155634,38 @@ $L__BB95_39:
 	cvta.global.u64 	%rd95, %rd94;
 	add.s64 	%rd76, %rd95, %rd93;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r242,%r243,%r244,%r245}, [%rd76];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r423, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r423, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r242, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r242, %r242, iq_load_r6;
+	add.u32 %r242, %r242, iq_load_r7;
+	prmt.b32 %r243, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r243, %r243, iq_load_r6;
+	add.u32 %r243, %r243, iq_load_r7;
+	prmt.b32 %r244, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r244, %r244, iq_load_r6;
+	add.u32 %r244, %r244, iq_load_r7;
+	prmt.b32 %r245, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r245, %r245, iq_load_r6;
+	add.u32 %r245, %r245, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd96, %rd1, %rd107;
 	add.s64 	%rd97, %rd14, %rd107;
@@ -155617,7 +155682,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd98, %r424, 16;
 	add.s64 	%rd78, %rd95, %rd98;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r246,%r247,%r248,%r249}, [%rd78];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r424, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r424, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r246, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r246, %r246, iq_load_r6;
+	add.u32 %r246, %r246, iq_load_r7;
+	prmt.b32 %r247, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r247, %r247, iq_load_r6;
+	add.u32 %r247, %r247, iq_load_r7;
+	prmt.b32 %r248, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r248, %r248, iq_load_r6;
+	add.u32 %r248, %r248, iq_load_r7;
+	prmt.b32 %r249, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r249, %r249, iq_load_r6;
+	add.u32 %r249, %r249, iq_load_r7;
+}
 	// end inline asm
 	// begin inline asm
 	ld.shared.v4.b32 {%r250,%r251,%r252,%r253},[%r490];
@@ -155657,7 +155753,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd99, %r425, 16;
 	add.s64 	%rd80, %rd95, %rd99;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r287,%r288,%r289,%r290}, [%rd80];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r425, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r425, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r287, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r287, %r287, iq_load_r6;
+	add.u32 %r287, %r287, iq_load_r7;
+	prmt.b32 %r288, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r288, %r288, iq_load_r6;
+	add.u32 %r288, %r288, iq_load_r7;
+	prmt.b32 %r289, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r289, %r289, iq_load_r6;
+	add.u32 %r289, %r289, iq_load_r7;
+	prmt.b32 %r290, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r290, %r290, iq_load_r6;
+	add.u32 %r290, %r290, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd81, %rd12, %rd107;
 	// begin inline asm
@@ -155667,7 +155794,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd100, %r426, 16;
 	add.s64 	%rd82, %rd95, %rd100;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r291,%r292,%r293,%r294}, [%rd82];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r426, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r426, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r291, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r291, %r291, iq_load_r6;
+	add.u32 %r291, %r291, iq_load_r7;
+	prmt.b32 %r292, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r292, %r292, iq_load_r6;
+	add.u32 %r292, %r292, iq_load_r7;
+	prmt.b32 %r293, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r293, %r293, iq_load_r6;
+	add.u32 %r293, %r293, iq_load_r7;
+	prmt.b32 %r294, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r294, %r294, iq_load_r6;
+	add.u32 %r294, %r294, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r299, %r490, 16;
 	// begin inline asm
@@ -155713,7 +155871,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd101, %r429, 16;
 	add.s64 	%rd84, %rd95, %rd101;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r332,%r333,%r334,%r335}, [%rd84];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r429, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r429, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r332, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r332, %r332, iq_load_r6;
+	add.u32 %r332, %r332, iq_load_r7;
+	prmt.b32 %r333, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r333, %r333, iq_load_r6;
+	add.u32 %r333, %r333, iq_load_r7;
+	prmt.b32 %r334, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r334, %r334, iq_load_r6;
+	add.u32 %r334, %r334, iq_load_r7;
+	prmt.b32 %r335, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r335, %r335, iq_load_r6;
+	add.u32 %r335, %r335, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u8 	%rs22, [%rd97];
 	shr.u16 	%rs23, %rs22, 3;
@@ -155727,7 +155916,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd102, %r430, 16;
 	add.s64 	%rd86, %rd95, %rd102;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r336,%r337,%r338,%r339}, [%rd86];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r430, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r430, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r336, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r336, %r336, iq_load_r6;
+	add.u32 %r336, %r336, iq_load_r7;
+	prmt.b32 %r337, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r337, %r337, iq_load_r6;
+	add.u32 %r337, %r337, iq_load_r7;
+	prmt.b32 %r338, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r338, %r338, iq_load_r6;
+	add.u32 %r338, %r338, iq_load_r7;
+	prmt.b32 %r339, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r339, %r339, iq_load_r6;
+	add.u32 %r339, %r339, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r344, %r490, 32;
 	// begin inline asm
@@ -155772,7 +155992,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd103, %r431, 16;
 	add.s64 	%rd88, %rd95, %rd103;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r377,%r378,%r379,%r380}, [%rd88];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r431, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r431, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r377, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r377, %r377, iq_load_r6;
+	add.u32 %r377, %r377, iq_load_r7;
+	prmt.b32 %r378, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r378, %r378, iq_load_r6;
+	add.u32 %r378, %r378, iq_load_r7;
+	prmt.b32 %r379, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r379, %r379, iq_load_r6;
+	add.u32 %r379, %r379, iq_load_r7;
+	prmt.b32 %r380, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r380, %r380, iq_load_r6;
+	add.u32 %r380, %r380, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u16 	%rs9, [%rd96];
 	// begin inline asm
@@ -155787,7 +156038,38 @@ $L__BB95_39:
 	mul.wide.u32 	%rd104, %r432, 16;
 	add.s64 	%rd90, %rd95, %rd104;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r381,%r382,%r383,%r384}, [%rd90];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r432, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r432, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r381, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r381, %r381, iq_load_r6;
+	add.u32 %r381, %r381, iq_load_r7;
+	prmt.b32 %r382, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r382, %r382, iq_load_r6;
+	add.u32 %r382, %r382, iq_load_r7;
+	prmt.b32 %r383, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r383, %r383, iq_load_r6;
+	add.u32 %r383, %r383, iq_load_r7;
+	prmt.b32 %r384, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r384, %r384, iq_load_r6;
+	add.u32 %r384, %r384, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r389, %r490, 48;
 	// begin inline asm
@@ -158670,6 +158952,40 @@ $L__BB97_49:
 	mov.u32 	%r1, %tid.x;
 	and.b32  	%r2, %r1, 15;
 	bar.sync 	0;
+{
+	.reg .pred iq_stage_p<2>;
+	.reg .b32 iq_stage_r<5>;
+	.reg .b64 iq_stage_d<5>;
+	mov.u32 iq_stage_r0, %tid.x;
+	shl.b32 iq_stage_r0, iq_stage_r0, 3;
+	mov.u32 iq_stage_r1, %ntid.x;
+	shl.b32 iq_stage_r1, iq_stage_r1, 3;
+	mov.u64 iq_stage_d0, iq2xs_grid;
+	cvta.global.u64 iq_stage_d0, iq_stage_d0;
+	mov.u64 iq_stage_d1, ksigns64;
+	cvta.global.u64 iq_stage_d1, iq_stage_d1;
+	mov.u32 iq_stage_r2, scratch;
+	add.u32 iq_stage_r2, iq_stage_r2, 16384;
+iq_stage_loop:
+	setp.ge.u32 iq_stage_p0, iq_stage_r0, 5120;
+	@iq_stage_p0 bra iq_stage_done;
+	setp.ge.u32 iq_stage_p1, iq_stage_r0, 4096;
+	cvt.u64.u32 iq_stage_d2, iq_stage_r0;
+	add.u64 iq_stage_d3, iq_stage_d0, iq_stage_d2;
+	add.u64 iq_stage_d4, iq_stage_d1, iq_stage_d2;
+	sub.u64 iq_stage_d4, iq_stage_d4, 4096;
+	selp.u64 iq_stage_d3, iq_stage_d4, iq_stage_d3, iq_stage_p1;
+	ld.global.nc.v2.u32 {iq_stage_r3,iq_stage_r4}, [iq_stage_d3];
+	{
+		.reg .b32 iq_stage_at;
+		add.u32 iq_stage_at, iq_stage_r2, iq_stage_r0;
+		st.shared.v2.u32 [iq_stage_at], {iq_stage_r3,iq_stage_r4};
+	}
+	add.u32 iq_stage_r0, iq_stage_r0, iq_stage_r1;
+	bra iq_stage_loop;
+iq_stage_done:
+	bar.sync 0;
+}
 	brev.b32 	%r183, %r176;
 	bfind.shiftamt.u32 	%r184, %r183;
 	selp.b32 	%r3, 0, %r184, %p9;
@@ -159585,7 +159901,38 @@ $L__BB98_94:
 	cvta.global.u64 	%rd182, %rd181;
 	add.s64 	%rd163, %rd182, %rd180;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r583,%r584,%r585,%r586}, [%rd163];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r913, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r913, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r583, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r583, %r583, iq_load_r6;
+	add.u32 %r583, %r583, iq_load_r7;
+	prmt.b32 %r584, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r584, %r584, iq_load_r6;
+	add.u32 %r584, %r584, iq_load_r7;
+	prmt.b32 %r585, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r585, %r585, iq_load_r6;
+	add.u32 %r585, %r585, iq_load_r7;
+	prmt.b32 %r586, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r586, %r586, iq_load_r6;
+	add.u32 %r586, %r586, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd183, %rd1, %rd193;
 	add.s64 	%rd184, %rd16, %rd193;
@@ -159602,7 +159949,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd185, %r914, 16;
 	add.s64 	%rd165, %rd182, %rd185;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r587,%r588,%r589,%r590}, [%rd165];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r914, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r914, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r587, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r587, %r587, iq_load_r6;
+	add.u32 %r587, %r587, iq_load_r7;
+	prmt.b32 %r588, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r588, %r588, iq_load_r6;
+	add.u32 %r588, %r588, iq_load_r7;
+	prmt.b32 %r589, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r589, %r589, iq_load_r6;
+	add.u32 %r589, %r589, iq_load_r7;
+	prmt.b32 %r590, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r590, %r590, iq_load_r6;
+	add.u32 %r590, %r590, iq_load_r7;
+}
 	// end inline asm
 	// begin inline asm
 	ld.shared.v4.b32 {%r591,%r592,%r593,%r594},[%r1044];
@@ -159672,7 +160050,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd186, %r915, 16;
 	add.s64 	%rd167, %rd182, %rd186;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r665,%r666,%r667,%r668}, [%rd167];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r915, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r915, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r665, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r665, %r665, iq_load_r6;
+	add.u32 %r665, %r665, iq_load_r7;
+	prmt.b32 %r666, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r666, %r666, iq_load_r6;
+	add.u32 %r666, %r666, iq_load_r7;
+	prmt.b32 %r667, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r667, %r667, iq_load_r6;
+	add.u32 %r667, %r667, iq_load_r7;
+	prmt.b32 %r668, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r668, %r668, iq_load_r6;
+	add.u32 %r668, %r668, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd168, %rd14, %rd193;
 	// begin inline asm
@@ -159682,7 +160091,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd187, %r916, 16;
 	add.s64 	%rd169, %rd182, %rd187;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r669,%r670,%r671,%r672}, [%rd169];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r916, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r916, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r669, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r669, %r669, iq_load_r6;
+	add.u32 %r669, %r669, iq_load_r7;
+	prmt.b32 %r670, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r670, %r670, iq_load_r6;
+	add.u32 %r670, %r670, iq_load_r7;
+	prmt.b32 %r671, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r671, %r671, iq_load_r6;
+	add.u32 %r671, %r671, iq_load_r7;
+	prmt.b32 %r672, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r672, %r672, iq_load_r6;
+	add.u32 %r672, %r672, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r677, %r1044, 16;
 	// begin inline asm
@@ -159760,7 +160200,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd188, %r921, 16;
 	add.s64 	%rd171, %rd182, %rd188;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r747,%r748,%r749,%r750}, [%rd171];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r921, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r921, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r747, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r747, %r747, iq_load_r6;
+	add.u32 %r747, %r747, iq_load_r7;
+	prmt.b32 %r748, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r748, %r748, iq_load_r6;
+	add.u32 %r748, %r748, iq_load_r7;
+	prmt.b32 %r749, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r749, %r749, iq_load_r6;
+	add.u32 %r749, %r749, iq_load_r7;
+	prmt.b32 %r750, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r750, %r750, iq_load_r6;
+	add.u32 %r750, %r750, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u8 	%rs22, [%rd184];
 	shr.u16 	%rs23, %rs22, 3;
@@ -159774,7 +160245,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd189, %r922, 16;
 	add.s64 	%rd173, %rd182, %rd189;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r751,%r752,%r753,%r754}, [%rd173];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r922, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r922, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r751, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r751, %r751, iq_load_r6;
+	add.u32 %r751, %r751, iq_load_r7;
+	prmt.b32 %r752, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r752, %r752, iq_load_r6;
+	add.u32 %r752, %r752, iq_load_r7;
+	prmt.b32 %r753, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r753, %r753, iq_load_r6;
+	add.u32 %r753, %r753, iq_load_r7;
+	prmt.b32 %r754, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r754, %r754, iq_load_r6;
+	add.u32 %r754, %r754, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r759, %r1044, 32;
 	// begin inline asm
@@ -159850,7 +160352,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd190, %r923, 16;
 	add.s64 	%rd175, %rd182, %rd190;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r829,%r830,%r831,%r832}, [%rd175];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r923, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r923, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r829, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r829, %r829, iq_load_r6;
+	add.u32 %r829, %r829, iq_load_r7;
+	prmt.b32 %r830, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r830, %r830, iq_load_r6;
+	add.u32 %r830, %r830, iq_load_r7;
+	prmt.b32 %r831, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r831, %r831, iq_load_r6;
+	add.u32 %r831, %r831, iq_load_r7;
+	prmt.b32 %r832, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r832, %r832, iq_load_r6;
+	add.u32 %r832, %r832, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u16 	%rs9, [%rd183];
 	// begin inline asm
@@ -159866,7 +160399,38 @@ $L__BB98_94:
 	mul.wide.u32 	%rd191, %r924, 16;
 	add.s64 	%rd177, %rd182, %rd191;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r833,%r834,%r835,%r836}, [%rd177];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r924, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r924, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r833, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r833, %r833, iq_load_r6;
+	add.u32 %r833, %r833, iq_load_r7;
+	prmt.b32 %r834, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r834, %r834, iq_load_r6;
+	add.u32 %r834, %r834, iq_load_r7;
+	prmt.b32 %r835, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r835, %r835, iq_load_r6;
+	add.u32 %r835, %r835, iq_load_r7;
+	prmt.b32 %r836, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r836, %r836, iq_load_r6;
+	add.u32 %r836, %r836, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r841, %r1044, 48;
 	// begin inline asm
@@ -161211,6 +161775,40 @@ $L__BB99_49:
 	mov.u32 	%r1, %tid.x;
 	and.b32  	%r2, %r1, 15;
 	bar.sync 	0;
+{
+	.reg .pred iq_stage_p<2>;
+	.reg .b32 iq_stage_r<5>;
+	.reg .b64 iq_stage_d<5>;
+	mov.u32 iq_stage_r0, %tid.x;
+	shl.b32 iq_stage_r0, iq_stage_r0, 3;
+	mov.u32 iq_stage_r1, %ntid.x;
+	shl.b32 iq_stage_r1, iq_stage_r1, 3;
+	mov.u64 iq_stage_d0, iq2xs_grid;
+	cvta.global.u64 iq_stage_d0, iq_stage_d0;
+	mov.u64 iq_stage_d1, ksigns64;
+	cvta.global.u64 iq_stage_d1, iq_stage_d1;
+	mov.u32 iq_stage_r2, scratch;
+	add.u32 iq_stage_r2, iq_stage_r2, 16384;
+iq_stage_loop:
+	setp.ge.u32 iq_stage_p0, iq_stage_r0, 5120;
+	@iq_stage_p0 bra iq_stage_done;
+	setp.ge.u32 iq_stage_p1, iq_stage_r0, 4096;
+	cvt.u64.u32 iq_stage_d2, iq_stage_r0;
+	add.u64 iq_stage_d3, iq_stage_d0, iq_stage_d2;
+	add.u64 iq_stage_d4, iq_stage_d1, iq_stage_d2;
+	sub.u64 iq_stage_d4, iq_stage_d4, 4096;
+	selp.u64 iq_stage_d3, iq_stage_d4, iq_stage_d3, iq_stage_p1;
+	ld.global.nc.v2.u32 {iq_stage_r3,iq_stage_r4}, [iq_stage_d3];
+	{
+		.reg .b32 iq_stage_at;
+		add.u32 iq_stage_at, iq_stage_r2, iq_stage_r0;
+		st.shared.v2.u32 [iq_stage_at], {iq_stage_r3,iq_stage_r4};
+	}
+	add.u32 iq_stage_r0, iq_stage_r0, iq_stage_r1;
+	bra iq_stage_loop;
+iq_stage_done:
+	bar.sync 0;
+}
 	brev.b32 	%r90, %r83;
 	bfind.shiftamt.u32 	%r91, %r90;
 	selp.b32 	%r3, 0, %r91, %p8;
@@ -161599,7 +162197,38 @@ $L__BB100_39:
 	cvta.global.u64 	%rd95, %rd94;
 	add.s64 	%rd76, %rd95, %rd93;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r242,%r243,%r244,%r245}, [%rd76];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r423, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r423, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r242, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r242, %r242, iq_load_r6;
+	add.u32 %r242, %r242, iq_load_r7;
+	prmt.b32 %r243, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r243, %r243, iq_load_r6;
+	add.u32 %r243, %r243, iq_load_r7;
+	prmt.b32 %r244, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r244, %r244, iq_load_r6;
+	add.u32 %r244, %r244, iq_load_r7;
+	prmt.b32 %r245, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r245, %r245, iq_load_r6;
+	add.u32 %r245, %r245, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd96, %rd1, %rd107;
 	add.s64 	%rd97, %rd14, %rd107;
@@ -161616,7 +162245,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd98, %r424, 16;
 	add.s64 	%rd78, %rd95, %rd98;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r246,%r247,%r248,%r249}, [%rd78];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r424, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r424, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r246, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r246, %r246, iq_load_r6;
+	add.u32 %r246, %r246, iq_load_r7;
+	prmt.b32 %r247, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r247, %r247, iq_load_r6;
+	add.u32 %r247, %r247, iq_load_r7;
+	prmt.b32 %r248, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r248, %r248, iq_load_r6;
+	add.u32 %r248, %r248, iq_load_r7;
+	prmt.b32 %r249, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r249, %r249, iq_load_r6;
+	add.u32 %r249, %r249, iq_load_r7;
+}
 	// end inline asm
 	// begin inline asm
 	ld.shared.v4.b32 {%r250,%r251,%r252,%r253},[%r490];
@@ -161656,7 +162316,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd99, %r425, 16;
 	add.s64 	%rd80, %rd95, %rd99;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r287,%r288,%r289,%r290}, [%rd80];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r425, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r425, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r287, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r287, %r287, iq_load_r6;
+	add.u32 %r287, %r287, iq_load_r7;
+	prmt.b32 %r288, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r288, %r288, iq_load_r6;
+	add.u32 %r288, %r288, iq_load_r7;
+	prmt.b32 %r289, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r289, %r289, iq_load_r6;
+	add.u32 %r289, %r289, iq_load_r7;
+	prmt.b32 %r290, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r290, %r290, iq_load_r6;
+	add.u32 %r290, %r290, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd81, %rd12, %rd107;
 	// begin inline asm
@@ -161666,7 +162357,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd100, %r426, 16;
 	add.s64 	%rd82, %rd95, %rd100;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r291,%r292,%r293,%r294}, [%rd82];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r426, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r426, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r291, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r291, %r291, iq_load_r6;
+	add.u32 %r291, %r291, iq_load_r7;
+	prmt.b32 %r292, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r292, %r292, iq_load_r6;
+	add.u32 %r292, %r292, iq_load_r7;
+	prmt.b32 %r293, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r293, %r293, iq_load_r6;
+	add.u32 %r293, %r293, iq_load_r7;
+	prmt.b32 %r294, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r294, %r294, iq_load_r6;
+	add.u32 %r294, %r294, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r299, %r490, 16;
 	// begin inline asm
@@ -161712,7 +162434,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd101, %r429, 16;
 	add.s64 	%rd84, %rd95, %rd101;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r332,%r333,%r334,%r335}, [%rd84];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r429, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r429, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r332, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r332, %r332, iq_load_r6;
+	add.u32 %r332, %r332, iq_load_r7;
+	prmt.b32 %r333, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r333, %r333, iq_load_r6;
+	add.u32 %r333, %r333, iq_load_r7;
+	prmt.b32 %r334, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r334, %r334, iq_load_r6;
+	add.u32 %r334, %r334, iq_load_r7;
+	prmt.b32 %r335, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r335, %r335, iq_load_r6;
+	add.u32 %r335, %r335, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u8 	%rs22, [%rd97];
 	shr.u16 	%rs23, %rs22, 3;
@@ -161726,7 +162479,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd102, %r430, 16;
 	add.s64 	%rd86, %rd95, %rd102;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r336,%r337,%r338,%r339}, [%rd86];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r430, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r430, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r336, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r336, %r336, iq_load_r6;
+	add.u32 %r336, %r336, iq_load_r7;
+	prmt.b32 %r337, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r337, %r337, iq_load_r6;
+	add.u32 %r337, %r337, iq_load_r7;
+	prmt.b32 %r338, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r338, %r338, iq_load_r6;
+	add.u32 %r338, %r338, iq_load_r7;
+	prmt.b32 %r339, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r339, %r339, iq_load_r6;
+	add.u32 %r339, %r339, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r344, %r490, 32;
 	// begin inline asm
@@ -161771,7 +162555,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd103, %r431, 16;
 	add.s64 	%rd88, %rd95, %rd103;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r377,%r378,%r379,%r380}, [%rd88];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r431, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r431, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r377, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r377, %r377, iq_load_r6;
+	add.u32 %r377, %r377, iq_load_r7;
+	prmt.b32 %r378, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r378, %r378, iq_load_r6;
+	add.u32 %r378, %r378, iq_load_r7;
+	prmt.b32 %r379, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r379, %r379, iq_load_r6;
+	add.u32 %r379, %r379, iq_load_r7;
+	prmt.b32 %r380, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r380, %r380, iq_load_r6;
+	add.u32 %r380, %r380, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u16 	%rs9, [%rd96];
 	// begin inline asm
@@ -161786,7 +162601,38 @@ $L__BB100_39:
 	mul.wide.u32 	%rd104, %r432, 16;
 	add.s64 	%rd90, %rd95, %rd104;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r381,%r382,%r383,%r384}, [%rd90];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r432, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r432, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r381, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r381, %r381, iq_load_r6;
+	add.u32 %r381, %r381, iq_load_r7;
+	prmt.b32 %r382, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r382, %r382, iq_load_r6;
+	add.u32 %r382, %r382, iq_load_r7;
+	prmt.b32 %r383, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r383, %r383, iq_load_r6;
+	add.u32 %r383, %r383, iq_load_r7;
+	prmt.b32 %r384, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r384, %r384, iq_load_r6;
+	add.u32 %r384, %r384, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r389, %r490, 48;
 	// begin inline asm
@@ -165113,6 +165959,40 @@ $L__BB102_103:
 	mov.u32 	%r1, %tid.x;
 	and.b32  	%r2, %r1, 15;
 	bar.sync 	0;
+{
+	.reg .pred iq_stage_p<2>;
+	.reg .b32 iq_stage_r<5>;
+	.reg .b64 iq_stage_d<5>;
+	mov.u32 iq_stage_r0, %tid.x;
+	shl.b32 iq_stage_r0, iq_stage_r0, 3;
+	mov.u32 iq_stage_r1, %ntid.x;
+	shl.b32 iq_stage_r1, iq_stage_r1, 3;
+	mov.u64 iq_stage_d0, iq2xs_grid;
+	cvta.global.u64 iq_stage_d0, iq_stage_d0;
+	mov.u64 iq_stage_d1, ksigns64;
+	cvta.global.u64 iq_stage_d1, iq_stage_d1;
+	mov.u32 iq_stage_r2, scratch;
+	add.u32 iq_stage_r2, iq_stage_r2, 16384;
+iq_stage_loop:
+	setp.ge.u32 iq_stage_p0, iq_stage_r0, 5120;
+	@iq_stage_p0 bra iq_stage_done;
+	setp.ge.u32 iq_stage_p1, iq_stage_r0, 4096;
+	cvt.u64.u32 iq_stage_d2, iq_stage_r0;
+	add.u64 iq_stage_d3, iq_stage_d0, iq_stage_d2;
+	add.u64 iq_stage_d4, iq_stage_d1, iq_stage_d2;
+	sub.u64 iq_stage_d4, iq_stage_d4, 4096;
+	selp.u64 iq_stage_d3, iq_stage_d4, iq_stage_d3, iq_stage_p1;
+	ld.global.nc.v2.u32 {iq_stage_r3,iq_stage_r4}, [iq_stage_d3];
+	{
+		.reg .b32 iq_stage_at;
+		add.u32 iq_stage_at, iq_stage_r2, iq_stage_r0;
+		st.shared.v2.u32 [iq_stage_at], {iq_stage_r3,iq_stage_r4};
+	}
+	add.u32 iq_stage_r0, iq_stage_r0, iq_stage_r1;
+	bra iq_stage_loop;
+iq_stage_done:
+	bar.sync 0;
+}
 	brev.b32 	%r183, %r176;
 	bfind.shiftamt.u32 	%r184, %r183;
 	selp.b32 	%r3, 0, %r184, %p9;
@@ -166028,7 +166908,38 @@ $L__BB103_94:
 	cvta.global.u64 	%rd182, %rd181;
 	add.s64 	%rd163, %rd182, %rd180;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r583,%r584,%r585,%r586}, [%rd163];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r913, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r913, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r583, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r583, %r583, iq_load_r6;
+	add.u32 %r583, %r583, iq_load_r7;
+	prmt.b32 %r584, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r584, %r584, iq_load_r6;
+	add.u32 %r584, %r584, iq_load_r7;
+	prmt.b32 %r585, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r585, %r585, iq_load_r6;
+	add.u32 %r585, %r585, iq_load_r7;
+	prmt.b32 %r586, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r586, %r586, iq_load_r6;
+	add.u32 %r586, %r586, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd183, %rd1, %rd193;
 	add.s64 	%rd184, %rd16, %rd193;
@@ -166045,7 +166956,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd185, %r914, 16;
 	add.s64 	%rd165, %rd182, %rd185;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r587,%r588,%r589,%r590}, [%rd165];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r914, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r914, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r587, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r587, %r587, iq_load_r6;
+	add.u32 %r587, %r587, iq_load_r7;
+	prmt.b32 %r588, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r588, %r588, iq_load_r6;
+	add.u32 %r588, %r588, iq_load_r7;
+	prmt.b32 %r589, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r589, %r589, iq_load_r6;
+	add.u32 %r589, %r589, iq_load_r7;
+	prmt.b32 %r590, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r590, %r590, iq_load_r6;
+	add.u32 %r590, %r590, iq_load_r7;
+}
 	// end inline asm
 	// begin inline asm
 	ld.shared.v4.b32 {%r591,%r592,%r593,%r594},[%r1044];
@@ -166115,7 +167057,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd186, %r915, 16;
 	add.s64 	%rd167, %rd182, %rd186;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r665,%r666,%r667,%r668}, [%rd167];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r915, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r915, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r665, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r665, %r665, iq_load_r6;
+	add.u32 %r665, %r665, iq_load_r7;
+	prmt.b32 %r666, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r666, %r666, iq_load_r6;
+	add.u32 %r666, %r666, iq_load_r7;
+	prmt.b32 %r667, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r667, %r667, iq_load_r6;
+	add.u32 %r667, %r667, iq_load_r7;
+	prmt.b32 %r668, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r668, %r668, iq_load_r6;
+	add.u32 %r668, %r668, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd168, %rd14, %rd193;
 	// begin inline asm
@@ -166125,7 +167098,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd187, %r916, 16;
 	add.s64 	%rd169, %rd182, %rd187;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r669,%r670,%r671,%r672}, [%rd169];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r916, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r916, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r669, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r669, %r669, iq_load_r6;
+	add.u32 %r669, %r669, iq_load_r7;
+	prmt.b32 %r670, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r670, %r670, iq_load_r6;
+	add.u32 %r670, %r670, iq_load_r7;
+	prmt.b32 %r671, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r671, %r671, iq_load_r6;
+	add.u32 %r671, %r671, iq_load_r7;
+	prmt.b32 %r672, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r672, %r672, iq_load_r6;
+	add.u32 %r672, %r672, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r677, %r1044, 16;
 	// begin inline asm
@@ -166203,7 +167207,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd188, %r921, 16;
 	add.s64 	%rd171, %rd182, %rd188;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r747,%r748,%r749,%r750}, [%rd171];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r921, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r921, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r747, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r747, %r747, iq_load_r6;
+	add.u32 %r747, %r747, iq_load_r7;
+	prmt.b32 %r748, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r748, %r748, iq_load_r6;
+	add.u32 %r748, %r748, iq_load_r7;
+	prmt.b32 %r749, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r749, %r749, iq_load_r6;
+	add.u32 %r749, %r749, iq_load_r7;
+	prmt.b32 %r750, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r750, %r750, iq_load_r6;
+	add.u32 %r750, %r750, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u8 	%rs22, [%rd184];
 	shr.u16 	%rs23, %rs22, 3;
@@ -166217,7 +167252,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd189, %r922, 16;
 	add.s64 	%rd173, %rd182, %rd189;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r751,%r752,%r753,%r754}, [%rd173];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r922, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r922, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r751, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r751, %r751, iq_load_r6;
+	add.u32 %r751, %r751, iq_load_r7;
+	prmt.b32 %r752, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r752, %r752, iq_load_r6;
+	add.u32 %r752, %r752, iq_load_r7;
+	prmt.b32 %r753, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r753, %r753, iq_load_r6;
+	add.u32 %r753, %r753, iq_load_r7;
+	prmt.b32 %r754, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r754, %r754, iq_load_r6;
+	add.u32 %r754, %r754, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r759, %r1044, 32;
 	// begin inline asm
@@ -166293,7 +167359,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd190, %r923, 16;
 	add.s64 	%rd175, %rd182, %rd190;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r829,%r830,%r831,%r832}, [%rd175];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r923, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r923, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r829, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r829, %r829, iq_load_r6;
+	add.u32 %r829, %r829, iq_load_r7;
+	prmt.b32 %r830, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r830, %r830, iq_load_r6;
+	add.u32 %r830, %r830, iq_load_r7;
+	prmt.b32 %r831, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r831, %r831, iq_load_r6;
+	add.u32 %r831, %r831, iq_load_r7;
+	prmt.b32 %r832, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r832, %r832, iq_load_r6;
+	add.u32 %r832, %r832, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u16 	%rs9, [%rd183];
 	// begin inline asm
@@ -166309,7 +167406,38 @@ $L__BB103_94:
 	mul.wide.u32 	%rd191, %r924, 16;
 	add.s64 	%rd177, %rd182, %rd191;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r833,%r834,%r835,%r836}, [%rd177];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r924, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r924, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r833, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r833, %r833, iq_load_r6;
+	add.u32 %r833, %r833, iq_load_r7;
+	prmt.b32 %r834, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r834, %r834, iq_load_r6;
+	add.u32 %r834, %r834, iq_load_r7;
+	prmt.b32 %r835, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r835, %r835, iq_load_r6;
+	add.u32 %r835, %r835, iq_load_r7;
+	prmt.b32 %r836, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r836, %r836, iq_load_r6;
+	add.u32 %r836, %r836, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r841, %r1044, 48;
 	// begin inline asm
@@ -166604,6 +167732,40 @@ $L__BB103_100:
 	mov.u32 	%r1, %tid.x;
 	and.b32  	%r2, %r1, 7;
 	bar.sync 	0;
+{
+	.reg .pred iq_stage_p<2>;
+	.reg .b32 iq_stage_r<5>;
+	.reg .b64 iq_stage_d<5>;
+	mov.u32 iq_stage_r0, %tid.x;
+	shl.b32 iq_stage_r0, iq_stage_r0, 3;
+	mov.u32 iq_stage_r1, %ntid.x;
+	shl.b32 iq_stage_r1, iq_stage_r1, 3;
+	mov.u64 iq_stage_d0, iq2xs_grid;
+	cvta.global.u64 iq_stage_d0, iq_stage_d0;
+	mov.u64 iq_stage_d1, ksigns64;
+	cvta.global.u64 iq_stage_d1, iq_stage_d1;
+	mov.u32 iq_stage_r2, scratch;
+	add.u32 iq_stage_r2, iq_stage_r2, 16384;
+iq_stage_loop:
+	setp.ge.u32 iq_stage_p0, iq_stage_r0, 5120;
+	@iq_stage_p0 bra iq_stage_done;
+	setp.ge.u32 iq_stage_p1, iq_stage_r0, 4096;
+	cvt.u64.u32 iq_stage_d2, iq_stage_r0;
+	add.u64 iq_stage_d3, iq_stage_d0, iq_stage_d2;
+	add.u64 iq_stage_d4, iq_stage_d1, iq_stage_d2;
+	sub.u64 iq_stage_d4, iq_stage_d4, 4096;
+	selp.u64 iq_stage_d3, iq_stage_d4, iq_stage_d3, iq_stage_p1;
+	ld.global.nc.v2.u32 {iq_stage_r3,iq_stage_r4}, [iq_stage_d3];
+	{
+		.reg .b32 iq_stage_at;
+		add.u32 iq_stage_at, iq_stage_r2, iq_stage_r0;
+		st.shared.v2.u32 [iq_stage_at], {iq_stage_r3,iq_stage_r4};
+	}
+	add.u32 iq_stage_r0, iq_stage_r0, iq_stage_r1;
+	bra iq_stage_loop;
+iq_stage_done:
+	bar.sync 0;
+}
 	brev.b32 	%r90, %r83;
 	bfind.shiftamt.u32 	%r91, %r90;
 	selp.b32 	%r3, 0, %r91, %p8;
@@ -166988,7 +168150,38 @@ $L__BB104_39:
 	cvta.global.u64 	%rd92, %rd91;
 	add.s64 	%rd73, %rd92, %rd90;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r242,%r243,%r244,%r245}, [%rd73];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r423, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r423, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r242, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r242, %r242, iq_load_r6;
+	add.u32 %r242, %r242, iq_load_r7;
+	prmt.b32 %r243, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r243, %r243, iq_load_r6;
+	add.u32 %r243, %r243, iq_load_r7;
+	prmt.b32 %r244, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r244, %r244, iq_load_r6;
+	add.u32 %r244, %r244, iq_load_r7;
+	prmt.b32 %r245, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r245, %r245, iq_load_r6;
+	add.u32 %r245, %r245, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd93, %rd1, %rd104;
 	add.s64 	%rd94, %rd13, %rd104;
@@ -167005,7 +168198,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd95, %r424, 16;
 	add.s64 	%rd75, %rd92, %rd95;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r246,%r247,%r248,%r249}, [%rd75];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r424, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r424, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r246, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r246, %r246, iq_load_r6;
+	add.u32 %r246, %r246, iq_load_r7;
+	prmt.b32 %r247, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r247, %r247, iq_load_r6;
+	add.u32 %r247, %r247, iq_load_r7;
+	prmt.b32 %r248, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r248, %r248, iq_load_r6;
+	add.u32 %r248, %r248, iq_load_r7;
+	prmt.b32 %r249, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r249, %r249, iq_load_r6;
+	add.u32 %r249, %r249, iq_load_r7;
+}
 	// end inline asm
 	// begin inline asm
 	ld.shared.v4.b32 {%r250,%r251,%r252,%r253},[%r485];
@@ -167045,7 +168269,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd96, %r425, 16;
 	add.s64 	%rd77, %rd92, %rd96;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r287,%r288,%r289,%r290}, [%rd77];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r425, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r425, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r287, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r287, %r287, iq_load_r6;
+	add.u32 %r287, %r287, iq_load_r7;
+	prmt.b32 %r288, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r288, %r288, iq_load_r6;
+	add.u32 %r288, %r288, iq_load_r7;
+	prmt.b32 %r289, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r289, %r289, iq_load_r6;
+	add.u32 %r289, %r289, iq_load_r7;
+	prmt.b32 %r290, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r290, %r290, iq_load_r6;
+	add.u32 %r290, %r290, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd78, %rd11, %rd104;
 	// begin inline asm
@@ -167055,7 +168310,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd97, %r426, 16;
 	add.s64 	%rd79, %rd92, %rd97;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r291,%r292,%r293,%r294}, [%rd79];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r426, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r426, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r291, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r291, %r291, iq_load_r6;
+	add.u32 %r291, %r291, iq_load_r7;
+	prmt.b32 %r292, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r292, %r292, iq_load_r6;
+	add.u32 %r292, %r292, iq_load_r7;
+	prmt.b32 %r293, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r293, %r293, iq_load_r6;
+	add.u32 %r293, %r293, iq_load_r7;
+	prmt.b32 %r294, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r294, %r294, iq_load_r6;
+	add.u32 %r294, %r294, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r299, %r485, 16;
 	// begin inline asm
@@ -167101,7 +168387,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd98, %r429, 16;
 	add.s64 	%rd81, %rd92, %rd98;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r332,%r333,%r334,%r335}, [%rd81];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r429, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r429, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r332, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r332, %r332, iq_load_r6;
+	add.u32 %r332, %r332, iq_load_r7;
+	prmt.b32 %r333, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r333, %r333, iq_load_r6;
+	add.u32 %r333, %r333, iq_load_r7;
+	prmt.b32 %r334, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r334, %r334, iq_load_r6;
+	add.u32 %r334, %r334, iq_load_r7;
+	prmt.b32 %r335, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r335, %r335, iq_load_r6;
+	add.u32 %r335, %r335, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u8 	%rs22, [%rd94];
 	shr.u16 	%rs23, %rs22, 3;
@@ -167115,7 +168432,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd99, %r430, 16;
 	add.s64 	%rd83, %rd92, %rd99;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r336,%r337,%r338,%r339}, [%rd83];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r430, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r430, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r336, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r336, %r336, iq_load_r6;
+	add.u32 %r336, %r336, iq_load_r7;
+	prmt.b32 %r337, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r337, %r337, iq_load_r6;
+	add.u32 %r337, %r337, iq_load_r7;
+	prmt.b32 %r338, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r338, %r338, iq_load_r6;
+	add.u32 %r338, %r338, iq_load_r7;
+	prmt.b32 %r339, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r339, %r339, iq_load_r6;
+	add.u32 %r339, %r339, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r344, %r485, 32;
 	// begin inline asm
@@ -167160,7 +168508,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd100, %r431, 16;
 	add.s64 	%rd85, %rd92, %rd100;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r377,%r378,%r379,%r380}, [%rd85];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r431, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r431, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r377, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r377, %r377, iq_load_r6;
+	add.u32 %r377, %r377, iq_load_r7;
+	prmt.b32 %r378, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r378, %r378, iq_load_r6;
+	add.u32 %r378, %r378, iq_load_r7;
+	prmt.b32 %r379, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r379, %r379, iq_load_r6;
+	add.u32 %r379, %r379, iq_load_r7;
+	prmt.b32 %r380, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r380, %r380, iq_load_r6;
+	add.u32 %r380, %r380, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u16 	%rs9, [%rd93];
 	// begin inline asm
@@ -167175,7 +168554,38 @@ $L__BB104_39:
 	mul.wide.u32 	%rd101, %r432, 16;
 	add.s64 	%rd87, %rd92, %rd101;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r381,%r382,%r383,%r384}, [%rd87];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r432, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r432, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r381, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r381, %r381, iq_load_r6;
+	add.u32 %r381, %r381, iq_load_r7;
+	prmt.b32 %r382, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r382, %r382, iq_load_r6;
+	add.u32 %r382, %r382, iq_load_r7;
+	prmt.b32 %r383, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r383, %r383, iq_load_r6;
+	add.u32 %r383, %r383, iq_load_r7;
+	prmt.b32 %r384, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r384, %r384, iq_load_r6;
+	add.u32 %r384, %r384, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r389, %r485, 48;
 	// begin inline asm
@@ -167353,6 +168763,40 @@ $L__BB104_43:
 	mov.u32 	%r1, %tid.x;
 	and.b32  	%r2, %r1, 7;
 	bar.sync 	0;
+{
+	.reg .pred iq_stage_p<2>;
+	.reg .b32 iq_stage_r<5>;
+	.reg .b64 iq_stage_d<5>;
+	mov.u32 iq_stage_r0, %tid.x;
+	shl.b32 iq_stage_r0, iq_stage_r0, 3;
+	mov.u32 iq_stage_r1, %ntid.x;
+	shl.b32 iq_stage_r1, iq_stage_r1, 3;
+	mov.u64 iq_stage_d0, iq2xs_grid;
+	cvta.global.u64 iq_stage_d0, iq_stage_d0;
+	mov.u64 iq_stage_d1, ksigns64;
+	cvta.global.u64 iq_stage_d1, iq_stage_d1;
+	mov.u32 iq_stage_r2, scratch;
+	add.u32 iq_stage_r2, iq_stage_r2, 16384;
+iq_stage_loop:
+	setp.ge.u32 iq_stage_p0, iq_stage_r0, 5120;
+	@iq_stage_p0 bra iq_stage_done;
+	setp.ge.u32 iq_stage_p1, iq_stage_r0, 4096;
+	cvt.u64.u32 iq_stage_d2, iq_stage_r0;
+	add.u64 iq_stage_d3, iq_stage_d0, iq_stage_d2;
+	add.u64 iq_stage_d4, iq_stage_d1, iq_stage_d2;
+	sub.u64 iq_stage_d4, iq_stage_d4, 4096;
+	selp.u64 iq_stage_d3, iq_stage_d4, iq_stage_d3, iq_stage_p1;
+	ld.global.nc.v2.u32 {iq_stage_r3,iq_stage_r4}, [iq_stage_d3];
+	{
+		.reg .b32 iq_stage_at;
+		add.u32 iq_stage_at, iq_stage_r2, iq_stage_r0;
+		st.shared.v2.u32 [iq_stage_at], {iq_stage_r3,iq_stage_r4};
+	}
+	add.u32 iq_stage_r0, iq_stage_r0, iq_stage_r1;
+	bra iq_stage_loop;
+iq_stage_done:
+	bar.sync 0;
+}
 	brev.b32 	%r183, %r176;
 	bfind.shiftamt.u32 	%r184, %r183;
 	selp.b32 	%r3, 0, %r184, %p9;
@@ -168264,7 +169708,38 @@ $L__BB105_94:
 	cvta.global.u64 	%rd179, %rd178;
 	add.s64 	%rd160, %rd179, %rd177;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r583,%r584,%r585,%r586}, [%rd160];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r913, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r913, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r583, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r583, %r583, iq_load_r6;
+	add.u32 %r583, %r583, iq_load_r7;
+	prmt.b32 %r584, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r584, %r584, iq_load_r6;
+	add.u32 %r584, %r584, iq_load_r7;
+	prmt.b32 %r585, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r585, %r585, iq_load_r6;
+	add.u32 %r585, %r585, iq_load_r7;
+	prmt.b32 %r586, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r586, %r586, iq_load_r6;
+	add.u32 %r586, %r586, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd180, %rd1, %rd190;
 	add.s64 	%rd181, %rd15, %rd190;
@@ -168281,7 +169756,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd182, %r914, 16;
 	add.s64 	%rd162, %rd179, %rd182;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r587,%r588,%r589,%r590}, [%rd162];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r914, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r914, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r587, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r587, %r587, iq_load_r6;
+	add.u32 %r587, %r587, iq_load_r7;
+	prmt.b32 %r588, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r588, %r588, iq_load_r6;
+	add.u32 %r588, %r588, iq_load_r7;
+	prmt.b32 %r589, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r589, %r589, iq_load_r6;
+	add.u32 %r589, %r589, iq_load_r7;
+	prmt.b32 %r590, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r590, %r590, iq_load_r6;
+	add.u32 %r590, %r590, iq_load_r7;
+}
 	// end inline asm
 	// begin inline asm
 	ld.shared.v4.b32 {%r591,%r592,%r593,%r594},[%r1033];
@@ -168351,7 +169857,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd183, %r915, 16;
 	add.s64 	%rd164, %rd179, %rd183;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r665,%r666,%r667,%r668}, [%rd164];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r915, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r915, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r665, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r665, %r665, iq_load_r6;
+	add.u32 %r665, %r665, iq_load_r7;
+	prmt.b32 %r666, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r666, %r666, iq_load_r6;
+	add.u32 %r666, %r666, iq_load_r7;
+	prmt.b32 %r667, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r667, %r667, iq_load_r6;
+	add.u32 %r667, %r667, iq_load_r7;
+	prmt.b32 %r668, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r668, %r668, iq_load_r6;
+	add.u32 %r668, %r668, iq_load_r7;
+}
 	// end inline asm
 	add.s64 	%rd165, %rd13, %rd190;
 	// begin inline asm
@@ -168361,7 +169898,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd184, %r916, 16;
 	add.s64 	%rd166, %rd179, %rd184;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r669,%r670,%r671,%r672}, [%rd166];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r916, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r916, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r669, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r669, %r669, iq_load_r6;
+	add.u32 %r669, %r669, iq_load_r7;
+	prmt.b32 %r670, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r670, %r670, iq_load_r6;
+	add.u32 %r670, %r670, iq_load_r7;
+	prmt.b32 %r671, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r671, %r671, iq_load_r6;
+	add.u32 %r671, %r671, iq_load_r7;
+	prmt.b32 %r672, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r672, %r672, iq_load_r6;
+	add.u32 %r672, %r672, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r677, %r1033, 16;
 	// begin inline asm
@@ -168439,7 +170007,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd185, %r921, 16;
 	add.s64 	%rd168, %rd179, %rd185;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r747,%r748,%r749,%r750}, [%rd168];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r921, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r921, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r747, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r747, %r747, iq_load_r6;
+	add.u32 %r747, %r747, iq_load_r7;
+	prmt.b32 %r748, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r748, %r748, iq_load_r6;
+	add.u32 %r748, %r748, iq_load_r7;
+	prmt.b32 %r749, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r749, %r749, iq_load_r6;
+	add.u32 %r749, %r749, iq_load_r7;
+	prmt.b32 %r750, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r750, %r750, iq_load_r6;
+	add.u32 %r750, %r750, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u8 	%rs22, [%rd181];
 	shr.u16 	%rs23, %rs22, 3;
@@ -168453,7 +170052,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd186, %r922, 16;
 	add.s64 	%rd170, %rd179, %rd186;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r751,%r752,%r753,%r754}, [%rd170];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r922, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r922, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r751, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r751, %r751, iq_load_r6;
+	add.u32 %r751, %r751, iq_load_r7;
+	prmt.b32 %r752, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r752, %r752, iq_load_r6;
+	add.u32 %r752, %r752, iq_load_r7;
+	prmt.b32 %r753, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r753, %r753, iq_load_r6;
+	add.u32 %r753, %r753, iq_load_r7;
+	prmt.b32 %r754, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r754, %r754, iq_load_r6;
+	add.u32 %r754, %r754, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r759, %r1033, 32;
 	// begin inline asm
@@ -168529,7 +170159,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd187, %r923, 16;
 	add.s64 	%rd172, %rd179, %rd187;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r829,%r830,%r831,%r832}, [%rd172];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r923, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r923, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r829, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r829, %r829, iq_load_r6;
+	add.u32 %r829, %r829, iq_load_r7;
+	prmt.b32 %r830, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r830, %r830, iq_load_r6;
+	add.u32 %r830, %r830, iq_load_r7;
+	prmt.b32 %r831, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r831, %r831, iq_load_r6;
+	add.u32 %r831, %r831, iq_load_r7;
+	prmt.b32 %r832, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r832, %r832, iq_load_r6;
+	add.u32 %r832, %r832, iq_load_r7;
+}
 	// end inline asm
 	ld.global.u16 	%rs9, [%rd180];
 	// begin inline asm
@@ -168545,7 +170206,38 @@ $L__BB105_94:
 	mul.wide.u32 	%rd188, %r924, 16;
 	add.s64 	%rd174, %rd179, %rd188;
 	// begin inline asm
-	ld.global.nc.v4.u32 {%r833,%r834,%r835,%r836}, [%rd174];
+{
+	.reg .b32 iq_load_r<9>;
+	mov.u32 iq_load_r0, scratch;
+	and.b32 iq_load_r1, %r924, 511;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r2,iq_load_r3}, [iq_load_r1+16384];
+	shr.u32 iq_load_r1, %r924, 9;
+	shl.b32 iq_load_r1, iq_load_r1, 3;
+	add.u32 iq_load_r1, iq_load_r1, iq_load_r0;
+	ld.shared.v2.u32 {iq_load_r4,iq_load_r5}, [iq_load_r1+20480];
+	prmt.b32 %r833, iq_load_r2, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r833, %r833, iq_load_r6;
+	add.u32 %r833, %r833, iq_load_r7;
+	prmt.b32 %r834, iq_load_r2, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r4, iq_load_r4, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r834, %r834, iq_load_r6;
+	add.u32 %r834, %r834, iq_load_r7;
+	prmt.b32 %r835, iq_load_r3, 0, 0x4140;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x1100;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r835, %r835, iq_load_r6;
+	add.u32 %r835, %r835, iq_load_r7;
+	prmt.b32 %r836, iq_load_r3, 0, 0x4342;
+	prmt.b32 iq_load_r6, iq_load_r5, iq_load_r5, 0x3322;
+	and.b32 iq_load_r7, iq_load_r6, 0x00010001;
+	xor.b32 %r836, %r836, iq_load_r6;
+	add.u32 %r836, %r836, iq_load_r7;
+}
 	// end inline asm
 	add.s32 	%r841, %r1033, 48;
 	// begin inline asm
