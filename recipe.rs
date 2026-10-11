@@ -1818,9 +1818,9 @@ pub(crate) struct NativeLayout {
 	pub adjoints_bytes: usize,
 	/// Two i64 device timestamps for the current forward: entry and completion.
 	pub timing: usize,
-	/// Under a traced run, the byte offset in the context arena of one i64
-	/// device clock per node, written by thread 0 as each node begins; a
-	/// traced forward reads them back and logs the time between nodes.
+	/// Byte offset of one i64 device clock per node, written by thread 0 after
+	/// its node completes. CPU timing and lane tuning keep node-ending grid
+	/// barriers; other traced forwards observe only thread 0's completion.
 	pub clocks: Option<usize>,
 	/// Five device timestamps per exchange under a trace: entry, completed
 	/// writes, posted flag, completed peer wait, and post-grid acquire.
@@ -2414,6 +2414,7 @@ impl NativeLayout {
 	/// transient regions share storage after their last reader's barrier.
 	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool, timed: bool) -> Result<Self> {
 		let window_positions = inference_window(graph, rows, inference);
+		let tuned = inference && lane_tuning();
 		let element = precision.bytes();
 		let unit = 8;
 		let mut values = Vec::with_capacity(graph.nodes.len());
@@ -2483,7 +2484,9 @@ impl NativeLayout {
 			// A contraction or an elementwise node touches only its operands' values,
 			// the converted copies it makes of them, its weights, which nothing
 			// writes, and its own value.
-			barrier_access.push((inference && matches!(node.op, Primitive::Contraction | Primitive::Elementwise)).then(|| {
+			// Per-node CPU measurements and lane tuning require synchronized node
+			// completion. Keep their node-ending barriers instead of deferring them.
+			barrier_access.push((inference && !timed && !tuned && matches!(node.op, Primitive::Contraction | Primitive::Elementwise)).then(|| {
 				let operands = [node.source, node.second].into_iter().filter_map(|operand| usize::try_from(operand).ok());
 				ValueAccess {
 					reads: operands.filter_map(|operand| ValueAccess::range(values[operand], value_bytes[operand])).collect(),
@@ -2538,7 +2541,6 @@ impl NativeLayout {
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
 		// The lane tuner reads the node clocks too.
-		let tuned = inference && lane_tuning();
 		let clocks = if tracing() || tuned || (inference && timed) {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
