@@ -35656,17 +35656,6 @@ entry_result:
 	setp.ne.u32 p0,r11,1; @p0 ret; add.u32 r6,r6,1; add.u32 r8,r8,1; setp.lt.u32 p0,r8,r1; @p0 bra entry_layer;
 	add.u32 r5,r5,r4; bra entry_chunk;
 }
-.func (.param .u32 result) split_main_forward(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
-	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
-	.reg .b64 d,x,c,s,o,h; .reg .b32 l,b,p,t,phase,r;
-	ld.param.u64 d,[desc0]; ld.param.u64 x,[source0]; ld.param.u64 c,[coef0]; ld.param.u64 s,[selected0]; ld.param.u64 o,[output0]; ld.param.u64 h,[sh0];
-	ld.param.u32 l,[length0]; ld.param.u32 b,[begin0]; ld.param.u32 p,[cols0]; ld.param.u32 t,[absolute0]; mov.u32 phase,0;
-	{ .param .u64 dd,xx,cc,ss,oo,hh; .param .u32 ll,bb,pp,tt,ph,rr;
-	st.param.u64 [dd],d; st.param.u64 [xx],x; st.param.u64 [cc],c; st.param.u64 [ss],s; st.param.u64 [oo],o; st.param.u64 [hh],h;
-	st.param.u32 [ll],l; st.param.u32 [bb],b; st.param.u32 [pp],p; st.param.u32 [tt],t; st.param.u32 [ph],phase;
-	call.uni (rr),split_main_exchange,(dd,xx,cc,ss,oo,ll,bb,pp,tt,hh,ph); ld.param.u32 r,[rr]; }
-	st.param.u32 [result],r; ret;
-}
 .func (.param .u32 result) split_main_exchange(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
 	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0,.param .u32 phase0) {
 	.reg .b64 a<36>; .reg .b32 r<33>; .reg .pred p<8>; .reg .f32 f;
@@ -35758,6 +35747,18 @@ main_failed:
 	@p0 st.volatile.global.u32 [a6+24],r30; @p0 st.volatile.global.u32 [a6+28],r4;
 main_invalid:
 	mov.u32 r30,0; st.param.u32 [result],r30; ret;
+}
+
+.func (.param .u32 result) split_main_forward(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
+	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
+	.reg .b64 d,x,c,s,o,h; .reg .b32 l,b,p,t,phase,r;
+	ld.param.u64 d,[desc0]; ld.param.u64 x,[source0]; ld.param.u64 c,[coef0]; ld.param.u64 s,[selected0]; ld.param.u64 o,[output0]; ld.param.u64 h,[sh0];
+	ld.param.u32 l,[length0]; ld.param.u32 b,[begin0]; ld.param.u32 p,[cols0]; ld.param.u32 t,[absolute0]; mov.u32 phase,0;
+	{ .param .u64 dd,xx,cc,ss,oo,hh; .param .u32 ll,bb,pp,tt,ph,rr;
+	st.param.u64 [dd],d; st.param.u64 [xx],x; st.param.u64 [cc],c; st.param.u64 [ss],s; st.param.u64 [oo],o; st.param.u64 [hh],h;
+	st.param.u32 [ll],l; st.param.u32 [bb],b; st.param.u32 [pp],p; st.param.u32 [tt],t; st.param.u32 [ph],phase;
+	call.uni (rr),split_main_exchange,(dd,xx,cc,ss,oo,ll,bb,pp,tt,hh,ph); ld.param.u32 r,[rr]; }
+	st.param.u32 [result],r; ret;
 }
 
 "# }
