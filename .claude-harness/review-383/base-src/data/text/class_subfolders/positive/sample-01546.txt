@@ -1,0 +1,1 @@
+Sample 01546: the compiler learns at night.

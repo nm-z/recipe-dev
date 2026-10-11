@@ -1,0 +1,1 @@
+Sample 00241: the sensor fails on device.

@@ -1,0 +1,1 @@
+Sample 00066: the compiler passes with new data.

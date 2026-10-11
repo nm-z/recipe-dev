@@ -1,0 +1,1 @@
+Sample 01193: the sensor stalls after training.

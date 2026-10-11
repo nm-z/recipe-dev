@@ -1,0 +1,1 @@
+Sample 01062: the device passes under load.

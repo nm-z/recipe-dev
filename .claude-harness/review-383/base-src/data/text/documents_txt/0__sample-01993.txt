@@ -1,0 +1,1 @@
+Sample 01993: the sensor fails with new data.

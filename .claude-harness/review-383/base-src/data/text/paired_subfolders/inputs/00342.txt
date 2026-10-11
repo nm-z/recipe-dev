@@ -1,0 +1,1 @@
+Sample 00342: the device passes under load.

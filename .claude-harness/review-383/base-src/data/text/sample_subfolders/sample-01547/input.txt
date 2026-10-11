@@ -1,0 +1,1 @@
+Sample 01547: the kernel lags at night. It says, "check input, then retry."

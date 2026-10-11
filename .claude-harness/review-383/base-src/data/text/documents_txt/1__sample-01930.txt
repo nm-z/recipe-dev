@@ -1,0 +1,1 @@
+Sample 01930: the compiler learns after training.

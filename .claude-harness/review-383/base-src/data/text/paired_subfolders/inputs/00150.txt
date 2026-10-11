@@ -1,0 +1,1 @@
+Sample 00150: the device passes on device.

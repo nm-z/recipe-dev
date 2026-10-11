@@ -1,0 +1,1 @@
+Sample 00569: the sensor stalls during testing.

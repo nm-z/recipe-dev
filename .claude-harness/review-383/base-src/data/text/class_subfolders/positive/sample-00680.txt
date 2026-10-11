@@ -1,0 +1,1 @@
+Sample 00680: the engine responds with new data. It says, "check input, then retry."

@@ -1,0 +1,1 @@
+Sample 00174: the device passes with new data.

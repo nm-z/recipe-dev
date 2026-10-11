@@ -1,0 +1,1 @@
+Sample 00672: the engine works on device.

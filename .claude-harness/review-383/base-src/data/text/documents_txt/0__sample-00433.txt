@@ -1,0 +1,1 @@
+Sample 00433: the sensor fails under load.

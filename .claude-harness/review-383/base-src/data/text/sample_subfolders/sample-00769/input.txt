@@ -1,0 +1,1 @@
+Sample 00769: the sensor fails with new data.

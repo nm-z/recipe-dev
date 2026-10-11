@@ -1,0 +1,1 @@
+Sample 00330: the compiler passes on device.

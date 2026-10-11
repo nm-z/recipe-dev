@@ -1,0 +1,1 @@
+Sample 00673: the sensor fails on device.

@@ -1,0 +1,1 @@
+Sample 01306: the compiler learns during testing.

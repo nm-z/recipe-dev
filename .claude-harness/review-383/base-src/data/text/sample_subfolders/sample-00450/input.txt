@@ -1,0 +1,1 @@
+Sample 00450: the compiler passes under load.

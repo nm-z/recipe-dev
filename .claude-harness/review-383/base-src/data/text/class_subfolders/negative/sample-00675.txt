@@ -1,0 +1,1 @@
+Sample 00675: the kernel drifts during testing.

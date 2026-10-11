@@ -1,0 +1,1 @@
+Sample 02193: the sensor diverges at night. It says, "check input, then retry."

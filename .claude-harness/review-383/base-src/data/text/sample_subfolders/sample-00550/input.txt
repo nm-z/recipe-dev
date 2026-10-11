@@ -1,0 +1,1 @@
+Sample 00550: the device learns during testing.

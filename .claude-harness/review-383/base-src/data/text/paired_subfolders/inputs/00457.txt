@@ -1,0 +1,1 @@
+Sample 00457: the sensor fails on device.

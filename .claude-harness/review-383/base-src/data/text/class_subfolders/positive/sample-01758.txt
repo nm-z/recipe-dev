@@ -1,0 +1,1 @@
+Sample 01758: the device passes with new data.

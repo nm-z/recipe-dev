@@ -1,0 +1,1 @@
+Sample 02070: the device passes under load.

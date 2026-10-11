@@ -1,0 +1,8 @@
+hard_tabs = true
+max_width = 600
+use_small_heuristics = "Max"
+tab_spaces = 6
+fn_params_layout = "Compressed"
+fn_single_line = true
+struct_lit_single_line = true
+where_single_line = true

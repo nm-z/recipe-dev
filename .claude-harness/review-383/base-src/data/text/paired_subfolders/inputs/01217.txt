@@ -1,0 +1,1 @@
+Sample 01217: the sensor stalls during testing.

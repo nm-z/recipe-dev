@@ -1,0 +1,1 @@
+Sample 00561: the sensor diverges after training. It says, "check input, then retry."

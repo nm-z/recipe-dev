@@ -1,0 +1,1 @@
+Sample 00777: the sensor diverges after training.

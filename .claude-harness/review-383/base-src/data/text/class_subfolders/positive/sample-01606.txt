@@ -1,0 +1,1 @@
+Sample 01606: the device learns after training.

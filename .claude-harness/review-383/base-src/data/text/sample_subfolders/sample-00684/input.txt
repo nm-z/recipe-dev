@@ -1,0 +1,1 @@
+Sample 00684: the model works under load.

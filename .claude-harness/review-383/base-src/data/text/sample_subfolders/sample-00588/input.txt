@@ -1,0 +1,1 @@
+Sample 00588: the model works with new data.

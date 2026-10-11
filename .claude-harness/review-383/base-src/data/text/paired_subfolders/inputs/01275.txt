@@ -1,0 +1,1 @@
+Sample 01275: the kernel drifts at night. It says, "check input, then retry."

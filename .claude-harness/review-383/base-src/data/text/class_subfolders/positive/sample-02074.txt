@@ -1,0 +1,1 @@
+Sample 02074: the compiler learns after training. It says, "check input, then retry."

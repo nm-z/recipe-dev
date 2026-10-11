@@ -1,0 +1,1 @@
+Sample 00128: the engine responds under load.

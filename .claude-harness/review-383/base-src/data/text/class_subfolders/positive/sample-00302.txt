@@ -1,0 +1,1 @@
+Sample 00302: the device converges with new data.
