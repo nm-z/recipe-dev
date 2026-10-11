@@ -5478,6 +5478,12 @@ fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: 
 	}
 	Ok(weights)
 }
+/// Encodes each `block`-wide slice of the weights on the configured CPU workers
+/// and concatenates the encoded blocks in order.
+fn encode_blocks(weights: &[f64], block: usize, encode: impl Fn(usize, &[f64]) -> Vec<u8> + Sync) -> Result<Vec<u8>> {
+	let chunks = weights.chunks(block).collect::<Vec<_>>();
+	Ok(parallel_map(chunks.len(), |chunk| encode(chunk, chunks[chunk]))?.concat())
+}
 impl Integer for StorageFormat {
 	fn bits(self) -> u8 {
 		self.0 as u8
@@ -5486,8 +5492,8 @@ impl Integer for StorageFormat {
 		let quantizer = self.spec().ok_or_else(|| self.unavailable())?.codec.quantization().quantizer;
 		if let Quantizer::Scalar { bits, variant } = quantizer {
 			let block = 32;
-			let mut data = Vec::new();
-			for values in weights.chunks(block) {
+			let data = encode_blocks(weights, block, |_, values| {
+				let mut data = Vec::new();
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
 				let (minimum, maximum) = (0..block).map(value).fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
 				let extreme = (0..block).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
@@ -5536,12 +5542,13 @@ impl Integer for StorageFormat {
 						_ => unreachable!(),
 					}],
 				);
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Q2K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
+			let data = encode_blocks(weights, 256, |_, values| {
+				let mut data = Vec::new();
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
 				let (mut codes, mut scales, mut minima) = ([0_u8; 256], [0.0_f32; 16], [0.0_f32; 16]);
 				for block in 0..16 {
@@ -5573,12 +5580,13 @@ impl Integer for StorageFormat {
 				data.extend(packed);
 				put_half(&mut data, scale);
 				put_half(&mut data, minimum);
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Q3K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
+			let data = encode_blocks(weights, 256, |_, values| {
+				let mut data = Vec::new();
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
@@ -5624,12 +5632,13 @@ impl Integer for StorageFormat {
 				data.extend(low);
 				data.extend(scales);
 				put_half(&mut data, scale);
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if let Quantizer::Q45K { bits } = quantizer {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
+			let data = encode_blocks(weights, 256, |_, values| {
+				let mut data = Vec::new();
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
 				let (mut codes, mut block_scales, mut minima) = ([0_u8; 256], [0.0_f32; 8], [0.0_f32; 8]);
 				for block in 0..8 {
@@ -5678,12 +5687,13 @@ impl Integer for StorageFormat {
 					data.extend(high)
 				}
 				data.extend(packed);
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Q6K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
+			let data = encode_blocks(weights, 256, |_, values| {
+				let mut data = Vec::new();
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
@@ -5720,12 +5730,13 @@ impl Integer for StorageFormat {
 				data.extend(high);
 				data.extend(scales.map(|value| value as u8));
 				put_half(&mut data, scale);
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Q8K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
+			let data = encode_blocks(weights, 256, |_, values| {
+				let mut data = Vec::new();
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
 				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum };
@@ -5736,7 +5747,8 @@ impl Integer for StorageFormat {
 				for block in codes.chunks(16) {
 					data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes())
 				}
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Nf4) {
@@ -5773,20 +5785,21 @@ impl Integer for StorageFormat {
 			return Ok((data, metadata));
 		}
 		if matches!(quantizer, Quantizer::Iq4Nl) {
-			let mut data = Vec::new();
-			for values in weights.chunks(32) {
+			let data = encode_blocks(weights, 32, |_, values| {
+				let mut data = Vec::new();
 				let values = (0..32).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
 				let (scale, codes) = iq4_fit(&values, -1);
 				put_half(&mut data, scale);
 				for index in 0..16 {
 					data.push(codes[index] | codes[index + 16] << 4)
 				}
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Iq4Xs) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
+			let data = encode_blocks(weights, 256, |_, values| {
+				let mut data = Vec::new();
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
 				let (mut scales, mut codes) = ([0.0_f32; 8], [0_u8; 256]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
@@ -5821,38 +5834,40 @@ impl Integer for StorageFormat {
 						data.push(codes[block * 32 + offset] | codes[block * 32 + offset + 16] << 4)
 					}
 				}
-			}
+				data
+			})?;
 			return Ok((data, Vec::new()));
 		}
+		let single = |values: &[f64]| values.iter().map(|value| *value as f32).collect::<Vec<_>>();
 		if matches!(quantizer, Quantizer::Iq2Xxs) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XXS requires trained importance weights",
 			)?;
-			return Ok((iq2_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return Ok((encode_blocks(weights, 256, |chunk, values| iq2_xxs(&single(values), &single(&importance[chunk * 256..chunk * 256 + values.len()])))?, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: true, xs: true }) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XS requires trained importance weights",
 			)?;
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), Some(&importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), true), Vec::new()));
+			return Ok((encode_blocks(weights, 256, |chunk, values| iq2_16(&single(values), Some(&single(&importance[chunk * 256..chunk * 256 + values.len()])), true))?, Vec::new()));
 		}
 		if let Quantizer::Iq1 { medium } = quantizer {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				format!("GGML IQ1_{} requires trained importance weights", if medium { "M" } else { "S" }),
 			)?;
-			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), medium), Vec::new()));
+			return Ok((encode_blocks(weights, 256, |chunk, values| iq1(&single(values), &single(&importance[chunk * 256..chunk * 256 + values.len()]), medium))?, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Iq3Xxs) {
-			return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return Ok((encode_blocks(weights, 256, |_, values| iq3_xxs(&single(values)))?, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: false, xs: false }) {
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), None, false), Vec::new()));
+			return Ok((encode_blocks(weights, 256, |_, values| iq2_16(&single(values), None, false))?, Vec::new()));
 		}
 		if matches!(quantizer, Quantizer::Iq3S) {
-			return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return Ok((encode_blocks(weights, 256, |_, values| iq3_s(&single(values)))?, Vec::new()));
 		}
 		Err(self.unavailable())
 	}
@@ -10245,11 +10260,11 @@ fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize)
 		})
 		.collect()
 }
-fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
-	let groups = 1_usize.checked_shl((level + 1) as u32)?;
+fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Result<Option<(usize, f64)>> {
+	let Some(groups) = 1_usize.checked_shl((level + 1) as u32) else { return Ok(None) };
 	// Each feature's candidate scan is independent; the reduction keeps the first
 	// strict minimum in feature order, matching the sequential scan.
-	parallel_map(borders.len(), |feature| {
+	Ok(parallel_map(borders.len(), |feature| {
 		let candidates = &borders[feature];
 		let (mut counts, mut sums, mut best) = (vec![0_usize; groups], vec![0.0; groups], None);
 		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
@@ -10267,12 +10282,12 @@ fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[
 			}
 		}
 		best
-	})
+	})?
 	.into_iter()
 	.enumerate()
 	.filter_map(|(feature, best)| best.map(|(error, threshold)| (error, feature, threshold)))
 	.reduce(|best, candidate| if candidate.0 < best.0 { candidate } else { best })
-	.map(|(_, feature, threshold)| (feature, threshold))
+	.map(|(_, feature, threshold)| (feature, threshold)))
 }
 fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: usize) -> TreeNode {
 	if level == splits.len() {
@@ -10298,7 +10313,7 @@ fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool)
 		let mut codes = vec![0_usize; rows];
 		let mut splits = Vec::with_capacity(config.tree_depth);
 		for level in 0..config.tree_depth {
-			let Some(split) = ordered_split(&borders, &residuals, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows) else { break };
+			let Some(split) = ordered_split(&borders, &residuals, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows)? else { break };
 			for row in 0..rows {
 				codes[row] |= usize::from(data.samples[row * data.features + split.0] < split.1) << level
 			}
@@ -10357,10 +10372,10 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 	program.nearest(1, false, data.features, table);
 	Ok(Predictor::new(program.finish()?))
 }
-/// Runs the work over disjoint index ranges, one worker per available core, and
-/// returns the results in index order. A worker panic resumes on the caller.
-fn parallel_map<R: Send>(count: usize, work: impl Fn(usize) -> R + Sync) -> Vec<R> {
-	let span = count.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
+/// Runs the work over disjoint index ranges, one worker per configured CPU worker
+/// thread, and returns the results in index order. A worker panic resumes on the caller.
+fn parallel_map<R: Send>(count: usize, work: impl Fn(usize) -> R + Sync) -> Result<Vec<R>> {
+	let span = count.div_ceil(cpu_worker_threads()? as usize).max(1);
 	let mut results = Vec::with_capacity(count);
 	std::thread::scope(|scope| {
 		let handles = (0..count)
@@ -10374,12 +10389,12 @@ fn parallel_map<R: Send>(count: usize, work: impl Fn(usize) -> R + Sync) -> Vec<
 			results.extend(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
 		}
 	});
-	results
+	Ok(results)
 }
 /// Evaluates the immutable teacher once for each prepared sample.
 fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<Vec<f64>> {
 	require(features != 0, "teacher prediction has no features")?;
-	parallel_map(inputs.len() / features, |row| (teacher.predict)(row, &inputs[row * features..row * features + features])).into_iter().collect()
+	parallel_map(inputs.len() / features, |row| (teacher.predict)(row, &inputs[row * features..row * features + features]))?.into_iter().collect()
 }
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
 	require(count != 0 && count <= rows.checked_sub(usize::from(exclude)).unwrap_or(0), "knn neighbor count is invalid")?;
