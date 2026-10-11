@@ -1207,6 +1207,7 @@ pub(crate) struct NativePrecision {
 const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
+const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
@@ -1435,7 +1436,7 @@ fn prune_internal_definitions(mut ir: String) -> String {
 
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
-		Backend::Cpu => "",
+		Backend::Cpu => "call void @recipe.cpu.barrier()",
 		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
 	}
 }
@@ -2867,7 +2868,7 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
 		let thread = match backend {
-			Backend::Cpu => "add i32 0, 0".to_owned(),
+			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let kernel = match backend {
@@ -2932,7 +2933,7 @@ impl NativeModelIr {
 			Backend::Nvidia => "protected ptx_kernel ",
 		};
 		let thread = match backend {
-			Backend::Cpu => "add i32 0, 0".to_owned(),
+			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
@@ -4374,7 +4375,7 @@ pub const fn layer(width: usize) -> Residual {
 pub const fn conv(filters: usize, kernel: usize) -> Residual {
 	Residual::Conv(filters, kernel)
 }
-type FitFn = fn(usize, &Prepared, usize, Config, bool) -> Result<Predictor>;
+type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
 #[derive(Clone, Copy, Debug)]
 struct Estimator {
@@ -6692,10 +6693,9 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			identities: Vec::new(),
 			fitted: Vec::new(),
 		};
-		let teacher = estimator.fit(&prepared, rows, config, true)?;
-		let targets = predict_rows(&teacher, &inputs, input.elements())?;
-		let predictor = estimator.fit(&prepared, rows, config, false)?;
-		(predictor.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+		let fitted = estimator.fit(&prepared, rows, config)?;
+		let targets = predict_rows(&fitted, &inputs, input.elements())?;
+		(fitted.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
 	};
 	reset(graph, source, input);
 	push_predictor(graph, predictor)?;
@@ -7313,7 +7313,9 @@ fn optimizer_work(graph: &Graph) -> f64 {
 /// dispatch isolates fixed cost, and the gradient dispatch measures planned work
 /// without allocating, forwarding, training, or dispatching the placed model.
 fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
+	let workers = if matches!(&gpu.driver, Driver::Cpu) { cpu_worker_threads()? as usize } else { 1 };
+	let rows = checked_mul(checked_mul(config.surrogate_epochs, config.surrogate_width, "surrogate rows")?, workers, "parallel surrogate rows")?;
+	let features = config.surrogate_width;
 	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
 	let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
 	let prepared = Prepared {
@@ -7347,7 +7349,9 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	timed(&mut tape, true)?;
 	let overhead = timed(&mut tape, false)?;
 	let epoch = timed(&mut tape, true)?;
-	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
+	let gradient = epoch - overhead;
+	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
+	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
 }
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
@@ -7690,6 +7694,7 @@ struct Dispatch {
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
+type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
@@ -7706,6 +7711,7 @@ enum NativeCpuEpoch {
 #[cfg(unix)]
 struct NativeCpuProgram {
 	_library: Library,
+	thread: NativeCpuThread,
 	forward: NativeForward,
 	epoch: Option<NativeCpuEpoch>,
 	model_load: Option<NativeModelLoad>,
@@ -8085,6 +8091,7 @@ impl Drop for Library {
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
 	let library = Library::open(path)?;
+	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
 		match artifact.precision.state.bytes() {
@@ -8097,7 +8104,7 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	};
 	let epoch = artifact.training.then(epoch).transpose()?;
 	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
-	Ok(NativeCpuProgram { _library: library, forward, epoch, model_load })
+	Ok(NativeCpuProgram { _library: library, thread, forward, epoch, model_load })
 }
 
 #[cfg(any(amd, nvidia))]
@@ -8407,6 +8414,11 @@ impl Gpu {
 	}
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
+fn cpu_worker_threads() -> Result<u32> {
+	let limit = count("CPU worker threads", env!("RECIPE_CPU_WORKER_THREADS"))?;
+	let available = std::thread::available_parallelism().map_err(|error| RecipeError::new(format!("cannot read available CPU parallelism: {error}")))?.get();
+	u32::try_from(if limit == 0 { available } else { available.min(limit) }).map_err(|_| RecipeError::new("CPU worker threads exceed u32"))
+}
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
@@ -8746,12 +8758,17 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 }
 
 #[cfg(unix)]
-unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
+unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
+	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
+}
+
+#[cfg(unix)]
+unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
 	unsafe {
 		match entry {
 			NativeEntry::Forward => {
 				require(arguments.len() == NATIVE_FORWARD_LAYOUT.len(), "native CPU forward argument count is invalid")?;
-				(cpu.forward)(
+				forward(
 					native_cpu_pointer(arguments, 0),
 					native_cpu_pointer(arguments, 1),
 					native_cpu_pointer(arguments, 2),
@@ -8763,117 +8780,79 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 			NativeEntry::Epoch => {
 				require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
 				let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
-				match cpu.epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
-					NativeCpuEpoch::F64(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
-					NativeCpuEpoch::F32(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
-					NativeCpuEpoch::F16(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
-					NativeCpuEpoch::F8(function) => function(
-						pointers[0],
-						pointers[1],
-						pointers[2],
-						pointers[3],
-						pointers[4],
-						pointers[5],
-						pointers[6],
-						pointers[7],
-						pointers[8],
-						pointers[9],
-						pointers[10],
-						pointers[11],
-						native_cpu_value(arguments, 12),
-						native_cpu_value(arguments, 13),
-						native_cpu_value(arguments, 14),
-						native_cpu_value(arguments, 15),
-						native_cpu_value(arguments, 16),
-						native_cpu_value(arguments, 17),
-						native_cpu_value(arguments, 18),
-						native_cpu_value(arguments, 19),
-						native_cpu_value(arguments, 20),
-						native_cpu_value(arguments, 21),
-						native_cpu_value(arguments, 22),
-					),
+				macro_rules! launch {
+					($function:expr) => {
+						$function(
+							pointers[0],
+							pointers[1],
+							pointers[2],
+							pointers[3],
+							pointers[4],
+							pointers[5],
+							pointers[6],
+							pointers[7],
+							pointers[8],
+							pointers[9],
+							pointers[10],
+							pointers[11],
+							native_cpu_value(arguments, 12),
+							native_cpu_value(arguments, 13),
+							native_cpu_value(arguments, 14),
+							native_cpu_value(arguments, 15),
+							native_cpu_value(arguments, 16),
+							native_cpu_value(arguments, 17),
+							native_cpu_value(arguments, 18),
+							native_cpu_value(arguments, 19),
+							native_cpu_value(arguments, 20),
+							native_cpu_value(arguments, 21),
+							native_cpu_value(arguments, 22),
+						)
+					};
+				}
+				match epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
+					NativeCpuEpoch::F64(function) => launch!(function),
+					NativeCpuEpoch::F32(function) => launch!(function),
+					NativeCpuEpoch::F16(function) => launch!(function),
+					NativeCpuEpoch::F8(function) => launch!(function),
 				}
 			}
 			NativeEntry::ModelLoad => {
 				require(arguments.len() == NATIVE_MODEL_LOAD_LAYOUT.len(), "native CPU model-load argument count is invalid")?;
-				let function = cpu.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
+				let function = model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
 				function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_value(arguments, 2));
 			}
 		}
 		Ok(())
 	}
+}
+
+#[cfg(unix)]
+unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr], threads: u32) -> Result<()> {
+	require(threads != 0, "native CPU worker count is empty")?;
+	let slots = arguments.iter().map(|argument| *argument as usize).collect::<Vec<_>>();
+	let barrier = std::sync::Barrier::new(threads as usize);
+	let context = ptr::from_ref(&barrier) as usize;
+	let wait = native_cpu_barrier as *const () as usize;
+	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward, cpu.epoch, cpu.model_load);
+	std::thread::scope(|scope| {
+		let workers = (0..threads)
+			.map(|thread_id| {
+				let slots = &slots;
+				scope.spawn(move || -> Result<()> {
+					let thread_id = i32::try_from(thread_id).map_err(|_| RecipeError::new("native CPU worker ID exceeds i32"))?;
+					let arguments = slots.iter().map(|slot| *slot as Ptr).collect::<Vec<_>>();
+					unsafe {
+						thread(thread_id, context as Ptr, wait as Ptr);
+						launch_native_cpu_entry(forward, epoch, model_load, entry, &arguments)
+					}
+				})
+			})
+			.collect::<Vec<_>>();
+		for worker in workers {
+			worker.join().map_err(|_| RecipeError::new("native CPU worker panicked"))??;
+		}
+		Ok(())
+	})
 }
 
 impl NativeProgram {
@@ -8886,13 +8865,11 @@ impl NativeProgram {
 				#[cfg(unix)]
 				{
 					let cpu = load_native_cpu(&artifact)?;
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
-					let epoch = artifact.training.then_some(Dispatch {
-						kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout),
-						geometry: Geometry { groups: 1, block: 1 },
-					});
-					let model_load = (!artifact.storage.is_empty())
-						.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+					let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
+					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
+					let model_load =
+						(!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
 				#[cfg(not(unix))]
@@ -9015,7 +8992,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 	unsafe {
 		match (backend, &gpu.driver) {
 			#[cfg(unix)]
-			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
+			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 			#[cfg(amd)]
 			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
 				require(program.executable.handle != 0, "native AMD executable is absent")?;
@@ -9709,9 +9686,10 @@ impl PredictorBuilder {
 	fn new() -> Self {
 		Self { code: Vec::new(), locals: 0, depth: 0, stack: 0, table: Vec::new(), index: None }
 	}
-	fn nearest(&mut self, count: usize, exclude: bool, features: usize, table: Vec<f64>) {
+	fn nearest(mut self, count: usize, exclude: bool, features: usize, table: Vec<f64>) -> Result<PredictorProgram> {
 		(self.index, self.table) = (Some(NearestIndex::build(&table, features, table.len() / (features + 1))), table);
 		self.push(PredictorOpcode::Nearest, if exclude { -(count as f64) } else { count as f64 });
+		self.finish()
 	}
 	fn affine(&mut self, table: Vec<f64>) {
 		(self.index, self.table) = (None, table);
@@ -9848,7 +9826,7 @@ fn cluster_estimator(value: usize, rows: usize) -> Result<()> {
 fn neighbor_estimator(value: usize, rows: usize) -> Result<()> {
 	require(value != 0 && value < rows, format!("knn neighbor count {value} is invalid for {rows} training rows"))
 }
-fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "SVM requires training rows and features")?;
 	let mut means = vec![0.0; data.features];
 	for sample in data.samples[..rows * data.features].chunks_exact(data.features) {
@@ -9908,7 +9886,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> R
 	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))
 }
-fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "forest requires enough training rows and features")?;
 	let feature_count = ((data.features as f64 * config.forest_feature_fraction).ceil() as usize).clamp(1, data.features);
 	let mut state = config.random_seed as u64;
@@ -9975,7 +9953,7 @@ fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse
 		program.binary(PredictorOpcode::Add);
 	}
 }
-fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
 		let mut means = vec![0.0; data.features];
@@ -10115,7 +10093,7 @@ fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &
 		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)),
 	}
 }
-fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "XGBoost requires enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
@@ -10186,7 +10164,7 @@ fn materialize_lightgbm(nodes: &[LightNode], index: usize) -> TreeNode {
 		None => TreeNode::Leaf(nodes[index].value),
 	}
 }
-fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(config.lightgbm_bins >= 2, "LightGBM histogram bins must be at least two")?;
 	require(config.lightgbm_leaves >= 2 && rows >= config.tree_min_rows && data.features != 0, "LightGBM requires at least two leaves and enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
@@ -10286,7 +10264,7 @@ fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: u
 	let (feature, threshold) = splits[level];
 	TreeNode::Split { feature, threshold, left: Box::new(oblivious_tree(splits, leaves, level + 1, code | 1 << level)), right: Box::new(oblivious_tree(splits, leaves, level + 1, code)) }
 }
-fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "CatBoost requires enough training rows and features")?;
 	require(config.tree_depth < usize::BITS as usize, "CatBoost tree depth is too large")?;
 	let borders = catboost_borders(&data.samples, data.features, rows, config.catboost_borders);
@@ -10351,16 +10329,14 @@ fn cluster(data: &[f64], width: usize, clusters: usize, iterations: usize, impor
 	}
 	Ok((centers, assignments))
 }
-fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	// Assigning a row to its closest centre is the one-neighbour case of the nearest
 	// table, whose lowering is a loop. Emitting the distance per centre per feature
 	// instead unrolls the whole comparison into the kernel.
 	let (mut table, _) = cluster(&data.samples[..rows * data.features], data.features, clusters, config.kmeans_iterations, None)?;
 	let groups = table.len() / data.features.max(1);
 	table.extend((0..groups).map(|group| group as f64));
-	let mut program = PredictorBuilder::new();
-	program.nearest(1, false, data.features, table);
-	Ok(Predictor::new(program.finish()?))
+	Ok(Predictor::new(PredictorBuilder::new().nearest(1, false, data.features, table)?))
 }
 /// Runs the work over disjoint index ranges, one worker per available core, and
 /// returns the results in index order. A worker panic resumes on the caller.
@@ -10386,18 +10362,17 @@ fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<
 	require(features != 0, "teacher prediction has no features")?;
 	parallel_map(inputs.len() / features, |row| (teacher.predict)(row, &inputs[row * features..row * features + features])).into_iter().collect()
 }
-fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
-	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
-	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
+fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config) -> Result<Predictor> {
+	require(count != 0 && count < rows, "knn neighbor count is invalid")?;
 	let mut table = data.samples[..rows * data.features].to_vec();
 	table.extend_from_slice(&data.targets[..rows]);
-	let mut program = PredictorBuilder::new();
-	program.nearest(count, exclude, data.features, table);
-	Ok(Predictor::new(program.finish()?))
+	// The teacher labels each training row leave one out, while the lowered program searches the whole table.
+	let teacher = PredictorBuilder::new().nearest(count, true, data.features, table.clone())?;
+	Ok(Predictor { program: PredictorBuilder::new().nearest(count, false, data.features, table)?, predict: Box::new(move |row, query| teacher.evaluate(row, query)) })
 }
 impl Estimator {
-	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> {
-		(self.fit)(self.param, data, rows, config, exclude)
+	fn fit(&self, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+		(self.fit)(self.param, data, rows, config)
 	}
 }
 fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<NativeContractionShapes>>> {
