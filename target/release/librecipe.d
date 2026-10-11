@@ -1,0 +1,1 @@
+/home/nate/Developer/recipe-qwen-stack-670-679/target/release/librecipe.rlib: /home/nate/Developer/recipe-qwen-stack-670-679/Cargo.toml /home/nate/Developer/recipe-qwen-stack-670-679/amd-nv-cpu.ll /home/nate/Developer/recipe-qwen-stack-670-679/build.rs /home/nate/Developer/recipe-qwen-stack-670-679/recipe.rs
