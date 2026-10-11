@@ -1,0 +1,17 @@
+die=0 uuid_hex=ccb8b3a3f45d8962215bc2b140e4bb28
+die=1 uuid_hex=c767d2504454d181d6488706b5f2fb64
+relay bytes=16384 hops=1 trials=200 machine_total_us=4824.340 token_us=24.122 hop_us=24.122 device_token_us=11.796 device_hop_us=11.796 p50_token_us=23.880 p99_token_us=28.184 errors=0
+relay bytes=16384 hops=7 trials=200 machine_total_us=12871.824 token_us=64.359 hop_us=9.194 device_token_us=52.506 device_hop_us=7.501 p50_token_us=64.187 p99_token_us=66.010 errors=0
+relay bytes=16384 hops=100 trials=200 machine_total_us=138690.859 token_us=693.454 hop_us=6.935 device_token_us=680.571 device_hop_us=6.806 p50_token_us=692.736 p99_token_us=702.378 errors=0
+delay_publication_ns=5000 hops=7 errors=0
+missing_sequence die0_timeout=2 die1_timeout=1
+cudaMemcpyPeer bytes=4096 hops=1 trials=200 total_us=1941.110 token_us=9.706 hop_us=9.706 errors=0
+cudaMemcpyPeer bytes=4096 hops=7 trials=200 total_us=13682.666 token_us=68.413 hop_us=9.773 errors=0
+cudaMemcpyPeer bytes=4096 hops=100 trials=200 total_us=194261.445 token_us=971.307 hop_us=9.713 errors=0
+cudaMemcpyPeer bytes=16384 hops=1 trials=200 total_us=2377.960 token_us=11.890 hop_us=11.890 errors=0
+cudaMemcpyPeer bytes=16384 hops=7 trials=200 total_us=16430.596 token_us=82.153 hop_us=11.736 errors=0
+cudaMemcpyPeer bytes=16384 hops=100 trials=200 total_us=230481.774 token_us=1152.409 hop_us=11.524 errors=0
+gate_lt_10us=true
+layer die=0 shape=4096x4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 weights_bytes=9437184 device_us=3060.096 errors=0 timeout=0 max_abs=0.00000095 max_rel=0.00009374
+layer die=1 shape=4096x4096 storage=Q4_K activation=Q8_1 accumulator=i32_then_f32 weights_bytes=9437184 device_us=3063.424 errors=0 timeout=0 max_abs=0.00000012 max_rel=0.00000021
+layer_demo trials=8 weights_uploads=2 machine_total_us=24593.066 token_us=3074.133 launches_per_token=2 peer_payload_bytes=16384 cpu_between_layers=0
