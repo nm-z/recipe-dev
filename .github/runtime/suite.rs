@@ -388,8 +388,7 @@ fn main() {
 	let traced_whole = traced.infer(&ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>());
 	traced.prefill(&ids[..159]);
 	let traced_step = traced.step(ids[159]);
-	let expected_step = [whole[159], whole[319]];
-	let unchanged = prediction_bits(&traced_whole) == prediction_bits(&whole) && prediction_bits(&traced_step) == prediction_bits(&expected_step);
+	let unchanged = prediction_bits(&traced_whole) == prediction_bits(&whole) && prediction_bits(&traced_step) == prediction_bits(&whole);
 	let trace = std::fs::read_to_string(&trace_path).expect("traced placement did not write its log");
 	let window = trace.lines().rev().find(|line| line.starts_with("range window ") && line.contains("positions=159..160"));
 	let seconds = window.and_then(|line| line.split_whitespace().find_map(|field| field.strip_prefix("window_seconds=")?.parse::<f64>().ok()));
