@@ -33,7 +33,7 @@ On September 24 at 13:47 PDT, 21 issues previously identified as resolved on tes
 | #938 | R² uses centered device mean/M2 merged across batches. `r2_centered.rs` showed nonzero R² on 9999/10001 imperfect targets and zero on constant targets with 512-row batches, Archy CPU/nv0. `r2_perfect.rs` then generated nonconstant targets from a seeded public model and observed identical 8/8 prediction bits, loss 0, and R² 1 on both CPU and nv0. Commit `a91150e6`. |
 | #943 | CLI uses `--ctx`, `--cfg`, `-p`, and device-only worker startup. Public flags script, worker handshake, and Archy-to-Benji chain passed. Commit `a91150e6`. |
 | #946 | `.budget` and saved budget fields removed; `--ctx` is explicit capacity. RNJ K80 --ctx64 completed 31 input plus 9 output tokens; new attention bundle reloaded; old format rejected explicitly. Commit `a91150e6`. |
-| #947 | Still open. Current attention gate multiplies a gate plane before the attention output projection; ordinary `Block * Block` multiplies two completed block outputs. Replacing the selector directly would change the GGUF checkpoint math and tensor binding. The README deletion of `.gate()` is Nate's preserved unstaged edit, not a published API change. |
+| #947 | Attention ends at `heads * width`. Use `(attn(heads) * layer(heads * width).sigmoid()).layer(d)` for an output gate. GGUF binds the gate rows and final projection. |
 | #948 | Public generic activation name removed; named activation syntax exercised on Archy CPU/nv0. Commit `a91150e6`. |
 | #949 | Second generic activation name removed; named activation syntax exercised on Archy CPU/nv0. Commit `a91150e6`. |
 | #950 | `.e(value)` installed and old `.epsilon` removed; save/reload exercised on Archy CPU/nv0. Commit `a91150e6`. |
