@@ -37055,13 +37055,10 @@ impl Train {
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
 		}
-		// Bind and lower the same file-adapted definition that inference uses.
-		let file_model = data.file.as_ref().map(|file| model.for_file(file));
-		let model = file_model.as_ref().unwrap_or(model);
-		let bound = match &data.file {
-			Some(file) => Some(file.bound(&conventional_plan(file, model)?)?),
-			None => None,
-		};
+		// Resolve the same last-position and file adaptations that inference binds.
+		let file_model = data.file.as_ref().map(|file| explicit_bound(file, model, true)).transpose()?;
+		let model = file_model.as_ref().map_or(model, |bound| &bound.model);
+		let bound = file_model.as_ref().map(|bound| bound.file.bound(&bound.plan)).transpose()?;
 		let owned;
 		let prepared = match bound {
 			Some(bound) => {
