@@ -10670,6 +10670,8 @@ mod tokenizer {
 		family: Family,
 		template: Option<String>,
 		add_bos: bool,
+		/// Whether `encode` prepends a space to the text at the start and after each added token, as llama.cpp does for a `llama` vocabulary.
+		add_prefix: bool,
 		add_eos: bool,
 		bos: Option<u32>,
 		eos: Option<u32>,
@@ -10680,6 +10682,8 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
+			// `llama` vocabularies prefix by default; a file turns it off with `tokenizer.ggml.add_space_prefix`, and `gemma4` never prefixes.
+			let add_prefix = kind == "llama" && !matches!(model.value("tokenizer.ggml.add_space_prefix"), Some(GgufValue::Bool(false)));
 			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
@@ -10738,6 +10742,7 @@ mod tokenizer {
 				family,
 				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
 				add_bos: adds_bos_token(model),
+				add_prefix,
 				add_eos: flag("tokenizer.ggml.add_eos_token"),
 				bos: special_id("tokenizer.ggml.bos_token_id"),
 				eos: special_id("tokenizer.ggml.eos_token_id"),
@@ -10800,7 +10805,7 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
-			let normalized = (self.family == Family::SentencePiece).then(|| text.replace(' ', "▁"));
+			let normalized = (self.family == Family::SentencePiece).then(|| if self.add_prefix && !text.is_empty() { format!("▁{}", text.replace(' ', "▁")) } else { text.replace(' ', "▁") });
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
 				let mut symbols = if self.family == Family::SentencePiece {
@@ -10841,12 +10846,18 @@ mod tokenizer {
 		/// keep their own text.
 		pub fn decode(&self, ids: &[u32]) -> String {
 			let mut bytes = Vec::new();
+			// The prefix `encode` adds is not part of the text: the first piece after the start or an added token loses it.
+			let mut after_special = true;
 			for id in ids {
 				if self.is_added[*id as usize] {
 					bytes.extend(self.tokens[*id as usize].as_bytes());
+					after_special = true;
 					continue;
 				}
-				for symbol in self.tokens[*id as usize].chars() {
+				let token = self.tokens[*id as usize].as_str();
+				let token = if after_special && self.add_prefix { token.strip_prefix('▁').unwrap_or(token) } else { token };
+				after_special = false;
+				for symbol in token.chars() {
 					match self.byte_of.get(&symbol) {
 						Some(byte) => bytes.push(*byte),
 						None => bytes.extend(symbol.to_string().as_bytes()),
@@ -20383,6 +20394,82 @@ enum PlacedSource {
 	Saved(Vec<bundle::SemanticGraph>),
 	Bound(Shape, Vec<u32>),
 }
+/// Device functions for a persistent Flash-Next token kernel. Append this text
+/// after the caller's PTX header and call `p2p_wait` and `p2p_publish` in that kernel.
+/// Every payload writer must call publication; launch no more than one CTA per SM.
+pub fn p2p_functions() -> &'static str {
+	let source = include_str!("barrier.ptx");
+	let start = source.find("// Hand-owned sm_52 peer publication.").expect("owned P2P functions");
+	let end = source[start..].find("// Persistent all-SM packed layer chain.").expect("owned P2P function boundary") + start;
+	&source[start..end]
+}
+/// A receiving die's resident peer packet and local CTA completion slots.
+/// Allocate alongside the weight holder and retain across tokens. Before reuse
+/// or destruction, finish both dies' previous token. Sequence zero means empty.
+pub struct PeerPacket {
+	gpu: &'static Gpu,
+	packet: u64,
+	slots: u64,
+	ctas: u32,
+	sequence: u32,
+}
+impl PeerPacket {
+	pub const PAYLOAD_BYTES: usize = 16384;
+	pub const SEQUENCE_OFFSET: u64 = 16384;
+	pub const SLOT_STRIDE: usize = 128;
+	pub const PACKET_BYTES: usize = 16452;
+
+	/// Use a local named NVIDIA device from `RECIPE_DEVICE`.
+	pub fn new(name: &str) -> Result<Self> {
+		#[cfg(nvidia)]
+		{
+			let gpu = device(Some(name))?;
+			let ctas = match &gpu.driver { Driver::Cuda(driver) => driver.cus, _ => return Err(RecipeError::new("P2P requires a local NVIDIA device")) };
+			require(ctas != 0 && ctas <= 32, "P2P coordinator supports one CTA per SM on devices with 1..32 SMs")?;
+			let packet = gpu.allocate_bytes(Self::PACKET_BYTES)?;
+			let slots = match gpu.allocate_bytes(ctas as usize * Self::SLOT_STRIDE) {
+				Ok(slots) => slots,
+				Err(error) => { gpu.free(packet); return Err(error); }
+			};
+			let value = Self { gpu, packet, slots, ctas, sequence: 0 };
+			gpu.clear(packet, Self::PACKET_BYTES)?;
+			gpu.clear(slots, ctas as usize * Self::SLOT_STRIDE)?;
+			Ok(value)
+		}
+		#[cfg(not(nvidia))]
+		{ let _ = name; Err(RecipeError::new("P2P requires the NVIDIA backend")) }
+	}
+	pub fn address(&self) -> u64 { self.packet }
+	pub fn sequence_address(&self) -> u64 { self.packet + Self::SEQUENCE_OFFSET }
+	pub fn completion_address(&self) -> u64 { self.slots }
+	pub fn resident_ctas(&self) -> u32 { self.ctas }
+	/// Reserve a token's strictly increasing sequence range. The return value is
+	/// its base; hop h uses base+h. Exhaustion requires a new packet after completion.
+	pub fn reserve_sequences(&mut self, hops: u32) -> Result<u32> {
+		require(hops != 0, "P2P token must contain a hop")?;
+		let base = self.sequence;
+		self.sequence = base.checked_add(hops).ok_or_else(|| RecipeError::new("P2P sequence exhausted; allocate a new packet after completion"))?;
+		Ok(base)
+	}
+	/// Enable the sender's access to this receiving packet. No machine-memory fallback.
+	pub fn enable_sender(&self, sender: &Self) -> Result<()> {
+		require(!std::ptr::eq(self.gpu, sender.gpu), "P2P requires distinct dies")?;
+		require(self.gpu.reaches(&[self.gpu, sender.gpu]), "CUDA peer access is unavailable")
+	}
+	/// Select the packet's CUDA context for the caller's resident weights and kernel.
+	pub fn activate(&self) -> Result<()> { self.gpu.activate() }
+	/// Borrow the CUDA context handle for a forward kernel's driver integration.
+	/// The handle remains owned by Recipe and must not be released by the caller.
+	pub fn context_address(&self) -> usize {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.gpu.driver { return driver.context as usize; }
+		0
+	}
+}
+impl Drop for PeerPacket {
+	fn drop(&mut self) { self.gpu.free(self.slots); self.gpu.free(self.packet); }
+}
+
 /// A model placed across the selected devices: contiguous block ranges, each
 /// held by one persistent tape on its own device, run in sequence with the
 /// stream moved at every hop. The tapes are the model's state, so a decode
