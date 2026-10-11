@@ -8302,13 +8302,6 @@ fn constant(graph: &mut Graph, source: i32, shape: Shape, value: f64) -> Result<
 	scalar.constant(value);
 	program(graph, source, -2, shape, &[], scalar)
 }
-fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, config: Config) -> Result<(i32, Shape)> {
-	reset(graph, source, shape);
-	if value != Activation::Linear {
-		lower_activation(graph, value, config)?;
-	}
-	Ok((graph.source, graph.output))
-}
 fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
 	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
@@ -8332,47 +8325,53 @@ fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i
 	scalar.choose(condition, -1.0, -2.0);
 	program(graph, first, second, shape, &[], scalar)
 }
-fn one_minus(graph: &mut Graph, source: i32, shape: Shape) -> Result<i32> {
-	let mut scalar = ScalarProgram(Vec::new());
-	let one = scalar.constant(1.0);
-	scalar.op(ScalarOpcode::Subtract, one, -1.0);
-	program(graph, source, -2, shape, &[], scalar)
-}
-fn greater_than(graph: &mut Graph, value: f64, source: i32, shape: Shape) -> Result<i32> {
-	let mut scalar = ScalarProgram(Vec::new());
-	let limit = scalar.constant(value);
-	scalar.op(ScalarOpcode::Greater, limit, -1.0);
-	program(graph, source, -2, shape, &[], scalar)
-}
-fn rank_mask(graph: &mut Graph, scores: &[i32], selected: usize, shape: Shape, top_k: usize) -> Result<i32> {
-	let mut rank = constant(graph, scores[selected], shape, 0.0)?;
-	for candidate in 0..scores.len() {
-		if candidate == selected {
-			continue;
-		}
-		let higher = binary(graph, scores[candidate], scores[selected], shape, ScalarOpcode::Greater)?;
-		let order = if candidate < selected {
-			let lower = binary(graph, scores[selected], scores[candidate], shape, ScalarOpcode::Greater)?;
-			let unequal = binary(graph, higher, lower, shape, ScalarOpcode::Add)?;
-			let tied = one_minus(graph, unequal, shape)?;
-			binary(graph, higher, tied, shape, ScalarOpcode::Add)?
-		} else {
-			higher
-		};
-		rank = binary(graph, rank, order, shape, ScalarOpcode::Add)?;
+/// Rank one expert from the shared comparisons: `higher[a][b]` holds
+/// `scores[b] > scores[a]` for `a < b`. A later candidate outranks the expert
+/// only when it scores strictly higher, an earlier one when it ties.
+fn rank_mask(graph: &mut Graph, scores: &[i32], higher: &[Vec<i32>], selected: usize, shape: Shape, top_k: usize) -> Result<i32> {
+	if scores.len() == 1 {
+		return constant(graph, scores[selected], shape, 1.0);
 	}
-	greater_than(graph, top_k as f64, rank, shape)
+	let candidates: Vec<usize> = (selected + 1..scores.len()).chain(0..selected).collect();
+	let mut rank = -2;
+	for (index, &candidate) in candidates.iter().enumerate() {
+		let mut scalar = ScalarProgram(Vec::new());
+		let mut term = -1.0;
+		if candidate < selected {
+			let one = scalar.constant(1.0);
+			term = scalar.op(ScalarOpcode::Subtract, one, term);
+		}
+		if rank != -2 {
+			term = scalar.op(ScalarOpcode::Add, -2.0, term);
+		}
+		if index + 1 == candidates.len() {
+			let limit = scalar.constant(top_k as f64);
+			scalar.op(ScalarOpcode::Greater, limit, term);
+		}
+		// Later candidates come first, so an empty program is the comparison itself.
+		rank = if scalar.0.is_empty() { higher[selected][candidate] } else { program(graph, higher[selected][candidate], rank, shape, &[], scalar)? };
+	}
+	Ok(rank)
 }
-fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top_k: usize, config: Config) -> Result<()> {
+fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top_k: usize) -> Result<()> {
 	let mut maximum_score = scores[0];
 	for &score in &scores[1..] {
 		maximum_score = maximum(graph, maximum_score, score, shape)?;
 	}
+	let mut higher = vec![vec![-2; scores.len()]; scores.len()];
+	for earlier in 0..scores.len() {
+		for later in earlier + 1..scores.len() {
+			higher[earlier][later] = binary(graph, scores[later], scores[earlier], shape, ScalarOpcode::Greater)?;
+			higher[later][earlier] = higher[earlier][later];
+		}
+	}
 	let mut weighted = Vec::with_capacity(scores.len());
 	for (index, &score) in scores.iter().enumerate() {
-		let centered = binary(graph, score, maximum_score, shape, ScalarOpcode::Subtract)?;
-		let exponential = activation(graph, centered, shape, Activation::Exp, config)?.0;
-		let mask = rank_mask(graph, scores, index, shape, top_k)?;
+		let mut scalar = ScalarProgram(Vec::new());
+		let centered = scalar.op(ScalarOpcode::Subtract, -1.0, -2.0);
+		scalar.unary(ScalarOpcode::Exp, centered);
+		let exponential = program(graph, score, maximum_score, shape, &[], scalar)?;
+		let mask = rank_mask(graph, scores, &higher, index, shape, top_k)?;
 		weighted.push(binary(graph, mask, exponential, shape, ScalarOpcode::Multiply)?);
 	}
 	let mut denominator = weighted[0];
@@ -8417,7 +8416,7 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, d
 		}
 		scores.push(graph.source);
 	}
-	select(graph, &branches, &scores, output, top_k, config)
+	select(graph, &branches, &scores, output, top_k)
 }
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
