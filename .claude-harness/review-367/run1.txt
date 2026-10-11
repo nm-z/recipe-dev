@@ -1,0 +1,5 @@
+
+thread 'main' (413261) panicked at recipe.rs:9905:152:
+native artifact /home/nate/.cache/recipe/native/recipe-native-a94a22bbb136e9c6/artifact.so is empty
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit:101 elapsed_seconds:45
