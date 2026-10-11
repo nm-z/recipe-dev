@@ -1,0 +1,1 @@
+Sample 00027: The link recovered after a brief drop and now runs clean.

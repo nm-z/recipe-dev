@@ -1,0 +1,61 @@
+title	body	target
+engine status 0000	The engine responds under load and holds its rated output.	0
+cooling report 0001	Cooling stays inside the nominal band for the whole window.	1
+network notice 0002	The link recovered after a brief drop and now runs clean.	0
+storage digest 0003	Free capacity fell slowly and remains above the reserve mark.	1
+sensor summary 0004	All sensors reported on schedule with no gaps in the series.	0
+engine status 0005	The engine responds under load and holds its rated output.	1
+cooling report 0006	Cooling stays inside the nominal band for the whole window.	0
+network notice 0007	The link recovered after a brief drop and now runs clean.	1
+storage digest 0008	Free capacity fell slowly and remains above the reserve mark.	0
+sensor summary 0009	All sensors reported on schedule with no gaps in the series.	1
+engine status 0010	The engine responds under load and holds its rated output.	0
+cooling report 0011	Cooling stays inside the nominal band for the whole window.	1
+network notice 0012	The link recovered after a brief drop and now runs clean.	0
+storage digest 0013	Free capacity fell slowly and remains above the reserve mark.	1
+sensor summary 0014	All sensors reported on schedule with no gaps in the series.	0
+engine status 0015	The engine responds under load and holds its rated output.	1
+cooling report 0016	Cooling stays inside the nominal band for the whole window.	0
+network notice 0017	The link recovered after a brief drop and now runs clean.	1
+storage digest 0018	Free capacity fell slowly and remains above the reserve mark.	0
+sensor summary 0019	All sensors reported on schedule with no gaps in the series.	1
+engine status 0020	The engine responds under load and holds its rated output.	0
+cooling report 0021	Cooling stays inside the nominal band for the whole window.	1
+network notice 0022	The link recovered after a brief drop and now runs clean.	0
+storage digest 0023	Free capacity fell slowly and remains above the reserve mark.	1
+sensor summary 0024	All sensors reported on schedule with no gaps in the series.	0
+engine status 0025	The engine responds under load and holds its rated output.	1
+cooling report 0026	Cooling stays inside the nominal band for the whole window.	0
+network notice 0027	The link recovered after a brief drop and now runs clean.	1
+storage digest 0028	Free capacity fell slowly and remains above the reserve mark.	0
+sensor summary 0029	All sensors reported on schedule with no gaps in the series.	1
+engine status 0030	The engine responds under load and holds its rated output.	0
+cooling report 0031	Cooling stays inside the nominal band for the whole window.	1
+network notice 0032	The link recovered after a brief drop and now runs clean.	0
+storage digest 0033	Free capacity fell slowly and remains above the reserve mark.	1
+sensor summary 0034	All sensors reported on schedule with no gaps in the series.	0
+engine status 0035	The engine responds under load and holds its rated output.	1
+cooling report 0036	Cooling stays inside the nominal band for the whole window.	0
+network notice 0037	The link recovered after a brief drop and now runs clean.	1
+storage digest 0038	Free capacity fell slowly and remains above the reserve mark.	0
+sensor summary 0039	All sensors reported on schedule with no gaps in the series.	1
+engine status 0040	The engine responds under load and holds its rated output.	0
+cooling report 0041	Cooling stays inside the nominal band for the whole window.	1
+network notice 0042	The link recovered after a brief drop and now runs clean.	0
+storage digest 0043	Free capacity fell slowly and remains above the reserve mark.	1
+sensor summary 0044	All sensors reported on schedule with no gaps in the series.	0
+engine status 0045	The engine responds under load and holds its rated output.	1
+cooling report 0046	Cooling stays inside the nominal band for the whole window.	0
+network notice 0047	The link recovered after a brief drop and now runs clean.	1
+storage digest 0048	Free capacity fell slowly and remains above the reserve mark.	0
+sensor summary 0049	All sensors reported on schedule with no gaps in the series.	1
+engine status 0050	The engine responds under load and holds its rated output.	0
+cooling report 0051	Cooling stays inside the nominal band for the whole window.	1
+network notice 0052	The link recovered after a brief drop and now runs clean.	0
+storage digest 0053	Free capacity fell slowly and remains above the reserve mark.	1
+sensor summary 0054	All sensors reported on schedule with no gaps in the series.	0
+engine status 0055	The engine responds under load and holds its rated output.	1
+cooling report 0056	Cooling stays inside the nominal band for the whole window.	0
+network notice 0057	The link recovered after a brief drop and now runs clean.	1
+storage digest 0058	Free capacity fell slowly and remains above the reserve mark.	0
+sensor summary 0059	All sensors reported on schedule with no gaps in the series.	1

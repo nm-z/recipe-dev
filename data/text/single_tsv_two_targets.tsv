@@ -1,0 +1,61 @@
+input	label	length
+Sample 00000: The engine responds under load and holds its rated output.	0	58
+Sample 00001: Cooling stays inside the nominal band for the whole window.	1	59
+Sample 00002: The link recovered after a brief drop and now runs clean.	0	57
+Sample 00003: Free capacity fell slowly and remains above the reserve mark.	1	61
+Sample 00004: All sensors reported on schedule with no gaps in the series.	0	60
+Sample 00005: The engine responds under load and holds its rated output.	1	58
+Sample 00006: Cooling stays inside the nominal band for the whole window.	0	
+Sample 00007: The link recovered after a brief drop and now runs clean.	1	57
+Sample 00008: Free capacity fell slowly and remains above the reserve mark.	0	61
+Sample 00009: All sensors reported on schedule with no gaps in the series.	1	60
+Sample 00010: The engine responds under load and holds its rated output.	0	58
+Sample 00011: Cooling stays inside the nominal band for the whole window.	1	59
+Sample 00012: The link recovered after a brief drop and now runs clean.	0	57
+Sample 00013: Free capacity fell slowly and remains above the reserve mark.	1	
+Sample 00014: All sensors reported on schedule with no gaps in the series.	0	60
+Sample 00015: The engine responds under load and holds its rated output.	1	58
+Sample 00016: Cooling stays inside the nominal band for the whole window.	0	59
+Sample 00017: The link recovered after a brief drop and now runs clean.	1	57
+Sample 00018: Free capacity fell slowly and remains above the reserve mark.	0	61
+Sample 00019: All sensors reported on schedule with no gaps in the series.	1	60
+Sample 00020: The engine responds under load and holds its rated output.	0	
+Sample 00021: Cooling stays inside the nominal band for the whole window.	1	59
+Sample 00022: The link recovered after a brief drop and now runs clean.	0	57
+Sample 00023: Free capacity fell slowly and remains above the reserve mark.	1	61
+Sample 00024: All sensors reported on schedule with no gaps in the series.	0	60
+Sample 00025: The engine responds under load and holds its rated output.	1	58
+Sample 00026: Cooling stays inside the nominal band for the whole window.	0	59
+Sample 00027: The link recovered after a brief drop and now runs clean.	1	
+Sample 00028: Free capacity fell slowly and remains above the reserve mark.	0	61
+Sample 00029: All sensors reported on schedule with no gaps in the series.	1	60
+Sample 00030: The engine responds under load and holds its rated output.	0	58
+Sample 00031: Cooling stays inside the nominal band for the whole window.	1	59
+Sample 00032: The link recovered after a brief drop and now runs clean.	0	57
+Sample 00033: Free capacity fell slowly and remains above the reserve mark.	1	61
+Sample 00034: All sensors reported on schedule with no gaps in the series.	0	
+Sample 00035: The engine responds under load and holds its rated output.	1	58
+Sample 00036: Cooling stays inside the nominal band for the whole window.	0	59
+Sample 00037: The link recovered after a brief drop and now runs clean.	1	57
+Sample 00038: Free capacity fell slowly and remains above the reserve mark.	0	61
+Sample 00039: All sensors reported on schedule with no gaps in the series.	1	60
+Sample 00040: The engine responds under load and holds its rated output.	0	58
+Sample 00041: Cooling stays inside the nominal band for the whole window.	1	
+Sample 00042: The link recovered after a brief drop and now runs clean.	0	57
+Sample 00043: Free capacity fell slowly and remains above the reserve mark.	1	61
+Sample 00044: All sensors reported on schedule with no gaps in the series.	0	60
+Sample 00045: The engine responds under load and holds its rated output.	1	58
+Sample 00046: Cooling stays inside the nominal band for the whole window.	0	59
+Sample 00047: The link recovered after a brief drop and now runs clean.	1	57
+Sample 00048: Free capacity fell slowly and remains above the reserve mark.	0	
+Sample 00049: All sensors reported on schedule with no gaps in the series.	1	60
+Sample 00050: The engine responds under load and holds its rated output.	0	58
+Sample 00051: Cooling stays inside the nominal band for the whole window.	1	59
+Sample 00052: The link recovered after a brief drop and now runs clean.	0	57
+Sample 00053: Free capacity fell slowly and remains above the reserve mark.	1	61
+Sample 00054: All sensors reported on schedule with no gaps in the series.	0	60
+Sample 00055: The engine responds under load and holds its rated output.	1	
+Sample 00056: Cooling stays inside the nominal band for the whole window.	0	59
+Sample 00057: The link recovered after a brief drop and now runs clean.	1	57
+Sample 00058: Free capacity fell slowly and remains above the reserve mark.	0	61
+Sample 00059: All sensors reported on schedule with no gaps in the series.	1	60

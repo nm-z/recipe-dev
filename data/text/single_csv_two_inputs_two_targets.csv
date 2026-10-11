@@ -1,0 +1,101 @@
+title,body,label,length
+Sample 00000: the valve recovers under load.,Sample 00100: the pump fails after restart.,1,43
+Sample 00001: the sensor recovers at rest.,Sample 00101: the valve drifts in the cold.,0,43
+Sample 00002: the relay recovers after restart.,Sample 00102: the engine works at rest.,0,39
+Sample 00003: the valve works during calibration.,Sample 00103: the pump fails after restart.,1,43
+Sample 00004: the pump recovers after restart.,Sample 00104: the valve drifts at rest.,0,39
+Sample 00005: the valve drifts at rest.,Sample 00105: the sensor recovers under load.,0,45
+Sample 00006: the engine fails during calibration.,Sample 00106: the engine works during calibration.,0,
+Sample 00007: the engine fails in the cold.,Sample 00107: the sensor fails under load.,1,42
+Sample 00008: the pump fails in the cold.,Sample 00108: the sensor drifts in the cold.,0,44
+Sample 00009: the pump stalls after restart.,Sample 00109: the engine recovers during calibration.,0,53
+Sample 00010: the relay stalls at rest.,Sample 00110: the engine fails after restart.,1,45
+Sample 00011: the engine recovers in the cold.,Sample 00111: the engine stalls at rest.,1,40
+Sample 00012: the pump recovers under load.,Sample 00112: the relay drifts under load.,0,42
+Sample 00013: the pump recovers after restart.,Sample 00113: the relay works after restart.,0,44
+Sample 00014: the sensor drifts after restart.,Sample 00114: the pump stalls under load.,1,41
+Sample 00015: the relay fails in the cold.,Sample 00115: the valve drifts in the cold.,0,43
+Sample 00016: the pump works during calibration.,Sample 00116: the sensor works after restart.,0,45
+Sample 00017: the engine drifts after restart.,Sample 00117: the pump recovers under load.,0,43
+Sample 00018: the engine drifts at rest.,Sample 00118: the valve recovers during calibration.,0,52
+Sample 00019: the sensor works at rest.,Sample 00119: the engine works during calibration.,0,50
+Sample 00020: the sensor works after restart.,Sample 00120: the pump stalls at rest.,1,38
+Sample 00021: the sensor recovers under load.,Sample 00121: the engine fails in the cold.,1,43
+Sample 00022: the pump stalls under load.,Sample 00122: the valve drifts at rest.,0,39
+Sample 00023: the pump recovers during calibration.,Sample 00123: the engine works in the cold.,0,43
+Sample 00024: the engine recovers under load.,Sample 00124: the sensor works under load.,0,42
+Sample 00025: the pump stalls in the cold.,Sample 00125: the relay stalls in the cold.,1,43
+Sample 00026: the relay works at rest.,Sample 00126: the sensor fails during calibration.,1,
+Sample 00027: the engine works under load.,Sample 00127: the engine stalls during calibration.,1,51
+Sample 00028: the valve drifts at rest.,Sample 00128: the relay fails under load.,1,41
+Sample 00029: the pump fails after restart.,Sample 00129: the valve fails at rest.,1,38
+Sample 00030: the valve works in the cold.,Sample 00130: the valve stalls in the cold.,1,43
+Sample 00031: the pump drifts after restart.,Sample 00131: the engine drifts under load.,0,43
+Sample 00032: the engine stalls after restart.,Sample 00132: the relay drifts at rest.,0,39
+Sample 00033: the pump fails after restart.,Sample 00133: the relay fails during calibration.,1,49
+Sample 00034: the engine drifts after restart.,Sample 00134: the pump stalls under load.,1,41
+Sample 00035: the pump works under load.,Sample 00135: the valve recovers at rest.,0,41
+Sample 00036: the sensor recovers at rest.,Sample 00136: the pump works during calibration.,0,48
+Sample 00037: the valve stalls under load.,Sample 00137: the engine stalls after restart.,1,46
+Sample 00038: the sensor drifts after restart.,Sample 00138: the pump works after restart.,0,43
+Sample 00039: the engine recovers during calibration.,Sample 00139: the valve stalls during calibration.,1,50
+Sample 00040: the valve works under load.,Sample 00140: the relay fails at rest.,1,38
+Sample 00041: the relay drifts under load.,Sample 00141: the engine recovers at rest.,0,42
+Sample 00042: the pump drifts after restart.,Sample 00142: the sensor works in the cold.,0,43
+Sample 00043: the engine works in the cold.,Sample 00143: the pump recovers under load.,0,43
+Sample 00044: the sensor works during calibration.,Sample 00144: the sensor drifts in the cold.,0,44
+Sample 00045: the sensor fails after restart.,Sample 00145: the sensor drifts during calibration.,0,51
+Sample 00046: the sensor drifts in the cold.,Sample 00146: the sensor recovers after restart.,0,
+Sample 00047: the pump works after restart.,Sample 00147: the sensor works at rest.,0,39
+Sample 00048: the valve fails during calibration.,Sample 00148: the pump drifts in the cold.,0,42
+Sample 00049: the sensor recovers under load.,Sample 00149: the pump recovers after restart.,0,46
+Sample 00050: the relay fails at rest.,Sample 00150: the sensor stalls in the cold.,1,44
+Sample 00051: the valve stalls during calibration.,Sample 00151: the relay stalls at rest.,1,39
+Sample 00052: the relay drifts under load.,Sample 00152: the valve stalls under load.,1,42
+Sample 00053: the valve works at rest.,Sample 00153: the sensor recovers at rest.,0,42
+Sample 00054: the relay recovers during calibration.,Sample 00154: the engine works under load.,0,42
+Sample 00055: the pump drifts in the cold.,Sample 00155: the valve drifts in the cold.,0,43
+Sample 00056: the relay recovers in the cold.,Sample 00156: the pump recovers during calibration.,0,51
+Sample 00057: the relay works at rest.,Sample 00157: the relay recovers after restart.,0,47
+Sample 00058: the sensor stalls in the cold.,Sample 00158: the engine works at rest.,0,39
+Sample 00059: the valve drifts under load.,Sample 00159: the valve recovers after restart.,0,47
+Sample 00060: the relay stalls during calibration.,Sample 00160: the valve fails under load.,1,41
+Sample 00061: the relay drifts during calibration.,Sample 00161: the pump stalls in the cold.,1,42
+Sample 00062: the pump drifts at rest.,Sample 00162: the relay works under load.,0,41
+Sample 00063: the sensor drifts during calibration.,Sample 00163: the relay stalls under load.,1,42
+Sample 00064: the engine fails under load.,Sample 00164: the pump drifts in the cold.,0,42
+Sample 00065: the engine fails in the cold.,Sample 00165: the relay stalls during calibration.,1,50
+Sample 00066: the sensor stalls at rest.,Sample 00166: the relay recovers at rest.,0,
+Sample 00067: the pump drifts in the cold.,Sample 00167: the pump recovers after restart.,0,46
+Sample 00068: the sensor drifts during calibration.,Sample 00168: the engine works in the cold.,0,43
+Sample 00069: the pump works after restart.,Sample 00169: the relay fails after restart.,1,44
+Sample 00070: the relay fails at rest.,Sample 00170: the valve recovers in the cold.,0,45
+Sample 00071: the engine stalls after restart.,Sample 00171: the valve works under load.,0,41
+Sample 00072: the relay drifts during calibration.,Sample 00172: the engine fails during calibration.,1,50
+Sample 00073: the engine works after restart.,Sample 00173: the valve fails at rest.,1,38
+Sample 00074: the engine works at rest.,Sample 00174: the sensor drifts under load.,0,43
+Sample 00075: the valve works under load.,Sample 00175: the relay stalls after restart.,1,45
+Sample 00076: the pump works after restart.,Sample 00176: the sensor drifts after restart.,0,46
+Sample 00077: the valve recovers during calibration.,Sample 00177: the pump recovers in the cold.,0,44
+Sample 00078: the engine fails during calibration.,Sample 00178: the valve stalls at rest.,1,39
+Sample 00079: the sensor stalls after restart.,Sample 00179: the engine fails at rest.,1,39
+Sample 00080: the sensor recovers under load.,Sample 00180: the engine stalls at rest.,1,40
+Sample 00081: the engine stalls in the cold.,Sample 00181: the valve works under load.,0,41
+Sample 00082: the pump drifts during calibration.,Sample 00182: the engine stalls in the cold.,1,44
+Sample 00083: the valve stalls during calibration.,Sample 00183: the valve stalls at rest.,1,39
+Sample 00084: the relay stalls in the cold.,Sample 00184: the engine works during calibration.,0,50
+Sample 00085: the engine stalls during calibration.,Sample 00185: the valve drifts during calibration.,0,50
+Sample 00086: the sensor fails under load.,Sample 00186: the relay works during calibration.,0,
+Sample 00087: the relay drifts at rest.,Sample 00187: the pump recovers in the cold.,0,44
+Sample 00088: the relay drifts during calibration.,Sample 00188: the relay fails under load.,1,41
+Sample 00089: the valve recovers in the cold.,Sample 00189: the pump works in the cold.,0,41
+Sample 00090: the relay recovers at rest.,Sample 00190: the engine fails at rest.,1,39
+Sample 00091: the valve drifts after restart.,Sample 00191: the engine stalls under load.,1,43
+Sample 00092: the relay recovers under load.,Sample 00192: the valve works in the cold.,0,42
+Sample 00093: the engine drifts after restart.,Sample 00193: the relay recovers in the cold.,0,45
+Sample 00094: the sensor drifts under load.,Sample 00194: the sensor recovers under load.,0,45
+Sample 00095: the engine drifts in the cold.,Sample 00195: the sensor works at rest.,0,39
+Sample 00096: the pump stalls in the cold.,Sample 00196: the relay drifts at rest.,0,39
+Sample 00097: the sensor recovers in the cold.,Sample 00197: the valve works under load.,0,41
+Sample 00098: the valve fails during calibration.,Sample 00198: the valve works after restart.,0,44
+Sample 00099: the sensor drifts in the cold.,Sample 00199: the valve drifts under load.,0,42

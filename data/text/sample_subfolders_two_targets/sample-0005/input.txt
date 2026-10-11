@@ -1,0 +1,1 @@
+Sample 00005: The engine responds under load and holds its rated output.
