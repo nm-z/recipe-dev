@@ -6303,7 +6303,7 @@ mod bundle {
 			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
-			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
+			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
 				"delta,{},{},{},{},{},{},{},{}",
 				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation as u8, delta.output_activation as u8
@@ -6381,7 +6381,12 @@ mod bundle {
 					blocks.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?,
 				))
 			}
-			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
+			// A bundle written before the taps could sit apart names no dilation, so an
+			// absent field reads as the plain form of one position per tap.
+			"dconv" => Ok(Operation::Dconv(
+				value_at(fields.next(), "depthwise convolution kernel")?,
+				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
+			)),
 			"delta" => {
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
 				// A bundle written before the extents were separable names neither, so
@@ -7206,7 +7211,7 @@ enum Operation {
 	Perceptron(usize),
 	Embed(usize, usize),
 	Hyper(usize, usize, Vec<Block>),
-	Dconv(usize),
+	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
 	/// A normalization that leads a model: the block's own normalization is the
@@ -7385,7 +7390,7 @@ impl Model {
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
 	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
-	fn dconv(kernel: usize) = Operation::Dconv(kernel);
+	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1);
 	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
@@ -7408,6 +7413,19 @@ impl Model {
 		match &mut block.operation {
 			Operation::Delta(delta) => apply(delta),
 			_ => panic!("{selector} requires a preceding delta block"),
+		}
+		model
+	}
+	/// Tap spacing of the preceding `dconv` block: tap `j` of a `kernel`-wide
+	/// convolution reads position `t - (kernel - 1 - j) * steps`, so the block
+	/// carries `(kernel - 1) * steps` positions of history. One is the plain form.
+	pub fn dilate(&self, steps: usize) -> Self {
+		assert!(steps != 0, "a depthwise convolution dilation must be positive");
+		let mut model = self.suffix();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("dilate requires a preceding dconv block"));
+		match &mut block.operation {
+			Operation::Dconv(_, dilation) => *dilation = steps,
+			_ => panic!("dilate requires a preceding dconv block"),
 		}
 		model
 	}
@@ -8958,7 +8976,7 @@ impl Operation {
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
-			Self::Dconv(_) => "dconv",
+			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
 			Self::Norm => "norm",
@@ -10111,9 +10129,13 @@ pub struct Placed {
 	moved: usize,
 }
 /// The saved statistics a batch normalization carries into inference, as the
-/// node index and the channels it normalizes.
-fn carried_state(nodes: &[Node]) -> impl Iterator<Item = (usize, usize)> + '_ {
-	nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels)))
+/// node index and the values it holds, out of what every node declares.
+fn saved_statistics(nodes: &[Node], rows: usize) -> Result<Vec<(usize, usize)>> {
+	Ok(carried_state(nodes, rows)?
+		.into_iter()
+		.filter(|(index, state)| nodes[*index].op == Primitive::Normalize && state.history == History::None)
+		.map(|(index, state)| (index, state.values))
+		.collect())
 }
 /// The bytes a device holds to run one row of a graph part: its input, weight
 /// arena, and value and context arenas for the part's own layout.
@@ -10773,7 +10795,7 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 /// normalization statistics that follow the parts already made.
 fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize) -> Result<NativeTape> {
 	let tape = NativeTape::new(graph, samples, tokens, &[], gpu, precision, None)?;
-	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+	let count = tape.batch_normalizations.iter().map(|(_, values)| values).sum::<usize>();
 	tape.inject_bn_stats(bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
 	Ok(tape)
@@ -10820,7 +10842,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
-		Operation::Dconv(kernel) => lower_dconv(graph, *kernel, 1)?,
+		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
@@ -11851,6 +11873,7 @@ struct NativeTape {
 	lookups: Vec<HostLookup>,
 	tokens: Mutex<Vec<f64>>,
 	adjoints: Buffer,
+	/// The node and value count of every saved batch normalization statistic.
 	batch_normalizations: Vec<(usize, usize)>,
 	samples: Buffer,
 	input_adjoint: Buffer,
@@ -11915,7 +11938,7 @@ impl NativeTape {
 		let moments = if training && !graph.state.moments.is_empty() { graph.state.moments.clone() } else { zeros.clone() };
 		let variances = if training && !graph.state.variances.is_empty() { graph.state.variances.clone() } else { zeros.clone() };
 		let frozen = if training && !graph.frozen.is_empty() { graph.frozen.clone() } else { vec![0_u8; state_values] };
-		let batch_normalizations = carried_state(&graph.nodes).collect();
+		let batch_normalizations = saved_statistics(&graph.nodes, rows)?;
 		let best_loss = if graph.state.best_loss.is_empty() {
 			[f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY]
 		} else {
@@ -12129,11 +12152,11 @@ impl NativeTape {
 		self.weights.bytes + self.samples.bytes + self.values.bytes + self.contexts.bytes
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
-		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+		let expected = self.batch_normalizations.iter().map(|(_, values)| values).sum::<usize>();
 		require(stats.len() == expected, format!("batch normalization expected {expected} saved statistics, received {}", stats.len()))?;
 		let mut offset = 0;
-		for &(node, channels) in &self.batch_normalizations {
-			let end = offset + 2 * channels;
+		for &(node, values) in &self.batch_normalizations {
+			let end = offset + values;
 			self.contexts.write_float_bytes(self.program.artifact.layout.contexts[node], &stats[offset..end], self.precision.model)?;
 			offset = end;
 		}
@@ -12141,8 +12164,8 @@ impl NativeTape {
 	}
 	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
 		let mut stats = Vec::new();
-		for &(node, channels) in &self.batch_normalizations {
-			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
+		for &(node, values) in &self.batch_normalizations {
+			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], values, self.precision.model)?);
 		}
 		Ok(stats)
 	}
@@ -12729,7 +12752,99 @@ fn embedding_row(node: &Node) -> Result<(&'static Quantization, usize)> {
 fn arena_weight<'a>(node: &Node, stored: &'a Option<StoredWeight>) -> Option<&'a StoredWeight> {
 	stored.as_ref().filter(|_| !node.table())
 }
+/// Positions of its source a node reads behind the window it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum History {
+	/// The node reads only the positions it writes.
+	None,
+	/// The node reads that many positions before the window.
+	Positions(usize),
+	/// The node reads every position the sequence has settled.
+	Sequence,
+}
+/// What one node carries across the positions of a sequence: the positions of
+/// its source a step reads behind the window it writes, and the values it keeps
+/// in its own context for the whole sequence. Every arena a decode step reads is
+/// named here rather than inferred from the emitters, so the step, the placement
+/// and any arena that reuses dead spans read one description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Carried {
+	history: History,
+	values: usize,
+}
+impl Carried {
+	const NONE: Self = Self { history: History::None, values: 0 };
+	/// Whether the node carries anything at all across positions.
+	fn any(self) -> bool {
+		self.history != History::None || self.values != 0
+	}
+}
+/// The state `node` declares for one sequence of `rows` rows. Attention reads
+/// the keys and values of every settled position, a scan its previous output and
+/// cell, a delta rule its previous state, a convolution the `kernel - 1` earlier
+/// positions its taps span and a depthwise one the `(kernel - 1) * dilation` its
+/// dilated taps span, a pool every position it reduces, a per-layer embedding the
+/// rows the host staged for every settled position, and an evaluation
+/// normalization the statistics its training saved.
+fn carried(node: &Node, rows: usize) -> Result<Carried> {
+	let carried = match node.op {
+		// Softmax statistics per query and head, then the indexer's block
+		// representatives, both written as the positions settle.
+		Primitive::Attention => {
+			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
+			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
+			let representatives = checked_mul(checked_mul(rows, attention_blocks(node), "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
+			Carried { history: History::Sequence, values: checked_add(statistics, representatives, "attention state")? }
+		}
+		Primitive::Scan => {
+			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
+			Carried { history: History::Positions(1), values: checked_mul(2 * gates + 1, state_count, "scan states")? }
+		}
+		// One thread owns one row and head: the chunk entry states, the live state
+		// and the chunk the reverse pass replays.
+		Primitive::Delta => {
+			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
+			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(key_width, width, "delta state")?);
+			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")?;
+			let states = checked_mul(checked_mul(rows, heads, "delta pairs")?, checked_mul(spans, state, "delta state span")?, "delta states")?;
+			Carried { history: History::Positions(1), values: states }
+		}
+		// Tap `j` of a `kernel`-wide depthwise convolution reads the position
+		// `(kernel - 1 - j) * dilation` behind, so its tail is that many positions.
+		Primitive::Dconv => {
+			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
+			Carried { history: History::Positions(checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?), values: 0 }
+		}
+		Primitive::Contraction if node.argument[0] > 1.0 => Carried { history: History::Positions(integer_argument(node.argument[0], "contraction kernel")? as usize - 1), values: 0 },
+		Primitive::Pool => Carried { history: History::Sequence, values: checked_mul(rows, node.output.elements(), "pool context")? },
+		// The rows the host gathers for every position, staged as [row][position][channel].
+		Primitive::Lookup => Carried { history: History::Sequence, values: checked_mul(rows, node.output.elements(), "lookup staging")? },
+		// A batch normalization keeps the mean and variance its training saved at
+		// the head of its statistics span, so they cross into inference rather than
+		// across the positions of a sequence.
+		Primitive::Normalize if normalize_mode(node.argument[0])? == program_ir::NormalizeMode::Batch => {
+			Carried { history: History::None, values: checked_mul(2, node.output.channels, "normalization statistics")? }
+		}
+		_ => Carried::NONE,
+	};
+	Ok(carried)
+}
+/// The nodes that carry state across the positions of a sequence, with what each
+/// one declares. The placement counts it, a step reads it, and a tape restores
+/// the statistics an evaluation normalization saved out of it.
+fn carried_state(nodes: &[Node], rows: usize) -> Result<Vec<(usize, Carried)>> {
+	let mut declared = Vec::new();
+	for (index, node) in nodes.iter().enumerate() {
+		let state = carried(node, rows)?;
+		if state.any() {
+			declared.push((index, state));
+		}
+	}
+	Ok(declared)
+}
 fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
+	let state = carried(node, rows)?.values;
+	// Beyond the state the node carries, the context holds what one pass needs.
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
@@ -12739,41 +12854,34 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// Softmax statistics, then the indexer block representatives, then one
 		// row of block scores and one admission flag per block per query.
 		Primitive::Attention => {
-			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
-			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
-			let blocks = attention_blocks(node);
-			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
+			let (queries, blocks) = (checked_mul(rows, node.output.length, "attention statistics rows")?, attention_blocks(node));
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
-			checked_add(statistics, checked_add(representatives, scores, "indexer context")?, "attention context")?
+			checked_add(state, scores, "attention context")?
 		}
 		Primitive::Scan => {
-			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
-			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
-			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
+			checked_add(state, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
-		// One thread owns one row and head: the chunk entry states, the live state,
-		// the chunk the reverse pass replays, the state adjoint, the readout error
-		// and key weight vectors, and one decay partial.
+		// The state adjoint, the readout error and key weight vectors, and one
+		// decay partial ride beside the states one thread owns.
 		Primitive::Delta => {
-			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
-			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(key_width, width, "delta state")?);
-			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")?;
-			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
-			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
+			let (_, _, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
+			let vectors = checked_mul(checked_mul(rows, heads, "delta pairs")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta scratch")?;
+			checked_add(state, vectors, "delta context")?
 		}
-		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		Primitive::Pool => return checked_mul(state, size_of::<u64>(), "pool context bytes"),
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
 		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
-		// The rows the host gathers for every position, staged as [row][position][channel].
-		Primitive::Lookup => checked_mul(rows, node.output.elements(), "lookup staging")?,
+		Primitive::Lookup => state,
 		// One count per expert, then every routed position of every expert in
 		// ascending expert and position order.
 		Primitive::ExpertIn | Primitive::ExpertOut => {
 			let entries = checked_mul(checked_mul(rows, node.output.length, "routed positions")?, node.argument[1] as usize, "routed slots")?;
 			return checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes");
 		}
+		// Four statistics per group; for an evaluation mode that span is the saved
+		// mean and variance the node declares, so it is counted once.
 		Primitive::Normalize => {
 			let statistics = checked_mul(4, normalize_groups(node, rows)?, "normalization context")?;
 			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
