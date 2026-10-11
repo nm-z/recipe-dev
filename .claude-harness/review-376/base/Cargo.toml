@@ -1,0 +1,91 @@
+[package]
+name = "recipe"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+path = "recipe.rs"
+
+[[bin]]
+name = "recipe"
+path = "cli.rs"
+
+[dependencies]
+
+[package.metadata.recipe]
+dependency-allowlist = []
+contraction-cpu-shared-values = 65536
+contraction-register-m = 8
+contraction-register-n = 8
+contraction-fragment-k = 16
+contraction-chunk-k = 64
+contraction-local-chunks = 3
+contraction-k-partitions = 32
+contraction-split-span = 128
+contraction-matrix-split-span = 64
+contraction-swizzle-m-tiles = 4
+contraction-resident-waves-per-workgroup = 2
+contraction-matrix-max-waves-per-workgroup = 4
+attention-query-tile = 24
+cpu-compiler = "/usr/bin/clang"
+hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
+hsa-runtime = "libhsa-runtime64.so.1"
+hsa-device-library = "/opt/rocm/amdgcn/bitcode/ocml.bc"
+hsa-clock-library = "/opt/rocm/amdgcn/bitcode/ockl.bc"
+hsa-abi-library = "/opt/rocm/amdgcn/bitcode/oclc_abi_version_600.bc"
+hsa-device-library-directory = "/opt/rocm/amdgcn/bitcode"
+hsa-finite-library = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc"
+hsa-math-library = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc"
+nvidia-ptx = "ptx71"
+nvidia-compiler = "/usr/bin/clang"
+nvidia-runtime = "libcuda.so.1"
+nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
+nvidia-ptx-generator = "/usr/bin/llc"
+
+[package.metadata.train]
+epochs = 210
+learning-rate = 0.0092
+initial-weight = 0.01
+adamw-beta1 = 0.9
+adamw-beta2 = 0.999
+adamw-epsilon = 0.00000001
+adamw-weight-decay = 0.01
+kmeans-iterations = 8
+svm-iterations = 128
+svm-learning-rate = 0.1
+svm-regularization = 0.001
+svm-epsilon = 0.1
+tree-depth = 5
+tree-min-rows = 4
+forest-feature-fraction = 0.7
+bayes-prior-precision = 0.001
+bayes-noise-variance = 1.0
+bayes-variance-epsilon = 0.000001
+boost-iterations = 8
+boost-learning-rate = 0.1
+catboost-ordered-prior = 1.0
+catboost-border-count = 32
+xgboost-l2-regularization = 1.0
+xgboost-minimum-gain = 0.000001
+lightgbm-histogram-bins = 16
+lightgbm-leaves = 8
+quantization-block-weights = 64
+surrogate-epochs = 8
+surrogate-rate = 0.01
+surrogate-width = 8
+random-seed = 17
+progress-refresh-hz = 240
+normalization-epsilon = 0.00001
+categorical-ratio = 0.5
+leak-slope = 0.01
+prelu-slope = 0.25
+elu-alpha = 1.0
+selu-alpha = 1.6732632423543772
+selu-scale = 1.0507009873554805
+gelu-scale = 0.7978845608028654
+gelu-cubic = 0.044715
+huber-threshold = 1.0
+output-tolerance = 0.00000001
+gradient-tolerance = 0.00001
+backend-tolerance = 0.00001

@@ -1,0 +1,1051 @@
+s-16/recipe.rs:7546:
+ 	for _ in 0..config.boost_iterations {
+ 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
+ 		let mut permutation = (0..rows).collect::<Vec<_>>();
+-		for index in (1..permutation.len()).rev() { permutation.swap(index, next_random(&mut state) as usize % (index + 1)) }
++		for index in (1..permutation.len()).rev() {
++			permutation.swap(index, next_random(&mut state) as usize % (index + 1))
++		}
+ 		let mut codes = vec![0_usize; rows];
+ 		let mut splits = Vec::with_capacity(config.tree_depth);
+ 		for level in 0..config.tree_depth {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7553:
+ 			let Some(split) = ordered_split(&borders, &residuals, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows) else { break };
+-			for row in 0..rows { codes[row] |= usize::from(data.samples[row * data.features + split.0] < split.1) << level }
++			for row in 0..rows {
++				codes[row] |= usize::from(data.samples[row * data.features + split.0] < split.1) << level
++			}
+ 			splits.push(split);
+ 		}
+ 		let leaf_count = 1_usize << splits.len();
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7558:
+ 		let mut sums = vec![0.0; leaf_count];
+ 		let mut counts = vec![0_usize; leaf_count];
+-		for &row in &permutation { sums[codes[row]] += residuals[row]; counts[codes[row]] += 1 }
++		for &row in &permutation {
++			sums[codes[row]] += residuals[row];
++			counts[codes[row]] += 1
++		}
+ 		let leaves = sums.into_iter().zip(counts).map(|(sum, count)| sum / (count as f64 + config.catboost_prior)).collect::<Vec<_>>();
+ 		let tree = oblivious_tree(&splits, &leaves, 0, 0);
+-		for (row, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() { predictions[row] += config.boost_rate * tree_predict(&tree, sample) }
++		for (row, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
++			predictions[row] += config.boost_rate * tree_predict(&tree, sample)
++		}
+ 		trees.push(tree);
+ 	}
+ 	boosted_predictor(base, &trees, config.boost_rate)
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7608:
+ 	let span = count.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
+ 	let mut results = Vec::with_capacity(count);
+ 	std::thread::scope(|scope| {
+-		let handles = (0..count).step_by(span).map(|start| { let work = &work; scope.spawn(move || (start..(start + span).min(count)).map(work).collect::<Vec<_>>()) }).collect::<Vec<_>>();
+-		for handle in handles { results.extend(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))) }
++		let handles = (0..count)
++			.step_by(span)
++			.map(|start| {
++				let work = &work;
++				scope.spawn(move || (start..(start + span).min(count)).map(work).collect::<Vec<_>>())
++			})
++			.collect::<Vec<_>>();
++		for handle in handles {
++			results.extend(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
++		}
+ 	});
+ 	results
+ }
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7628:
+ 	Ok(Predictor::new(program.finish()?))
+ }
+ impl Estimator {
+-	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { (self.fit)(self.param, data, rows, config, exclude) }
++	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> {
++		(self.fit)(self.param, data, rows, config, exclude)
++	}
+ }
+ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<NativeContractionShapes>>> {
+-	graph.nodes.iter().map(|node| {
+-		let dimensions = match node.op {
+-			Primitive::Contraction => {
+-				let span = integer_argument(node.argument[0], "native contraction kernel")?.max(1) as usize;
+-				let window = checked_mul(node.input.channels, span, "native contraction window")?;
+-				let output_rows = checked_mul(rows, node.output.length, "native contraction output rows")?;
+-				let input_rows = checked_mul(rows, node.input.length, "native contraction input rows")?;
+-				let previous_terms = checked_mul(node.output.channels, span, "native contraction previous terms")?;
+-				Some(((output_rows, node.output.channels, window), (window, node.output.channels, output_rows), (input_rows, node.input.channels, previous_terms), node.parameters))
+-			}
+-			Primitive::Scan => {
+-				let rows = checked_mul(rows, node.input.length, "native scan projection rows")?;
+-				let parameters = checked_mul(node.input.channels, node.output.channels, "native scan projection parameters")?;
+-				Some(((rows, node.output.channels, node.input.channels), (node.input.channels, node.output.channels, rows), (rows, node.input.channels, node.output.channels), parameters))
+-			}
+-			_ => None,
+-		};
+-		dimensions.map(|(forward, gradient, previous, parameters)| {
+-			let extent = |(m, n, k), role| Ok(Tile { m: narrow(m, &format!("{role} M"))? as u32, n: narrow(n, &format!("{role} N"))? as u32, k: narrow(k, &format!("{role} K"))? as u32 });
+-			Ok(NativeContractionShapes { forward: extent(forward, "native forward contraction")?, gradient: extent(gradient, "native gradient contraction")?, previous: extent(previous, "native previous contraction")?, parameters })
+-		}).transpose()
+-	}).collect()
++	graph.nodes
++		.iter()
++		.map(|node| {
++			let dimensions = match node.op {
++				Primitive::Contraction => {
++					let span = integer_argument(node.argument[0], "native contraction kernel")?.max(1) as usize;
++					let window = checked_mul(node.input.channels, span, "native contraction window")?;
++					let output_rows = checked_mul(rows, node.output.length, "native contraction output rows")?;
++					let input_rows = checked_mul(rows, node.input.length, "native contraction input rows")?;
++					let previous_terms = checked_mul(node.output.channels, span, "native contraction previous terms")?;
++					Some(((output_rows, node.output.channels, window), (window, node.output.channels, output_rows), (input_rows, node.input.channels, previous_terms), node.parameters))
++				}
++				Primitive::Scan => {
++					let rows = checked_mul(rows, node.input.length, "native scan projection rows")?;
++					let parameters = checked_mul(node.input.channels, node.output.channels, "native scan projection parameters")?;
++					Some(((rows, node.output.channels, node.input.channels), (node.input.channels, node.output.channels, rows), (rows, node.input.channels, node.output.channels), parameters))
++				}
++				_ => None,
++			};
++			dimensions
++				.map(|(forward, gradient, previous, parameters)| {
++					let extent = |(m, n, k), role| Ok(Tile { m: narrow(m, &format!("{role} M"))? as u32, n: narrow(n, &format!("{role} N"))? as u32, k: narrow(k, &format!("{role} K"))? as u32 });
++					Ok(NativeContractionShapes { forward: extent(forward, "native forward contraction")?, gradient: extent(gradient, "native gradient contraction")?, previous: extent(previous, "native previous contraction")?, parameters })
++				})
++				.transpose()
++		})
++		.collect()
+ }
+ fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
+ 	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7659:
+ 	let keys = extent.n.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
+ 	let pairs = extent.m.checked_mul(extent.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
+-	let forward = queries.checked_mul(2)
+-		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
+-		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+-		.and_then(|values| extent.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
+-	let query_gradient = queries.checked_mul(3)
+-		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
+-		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+-		.and_then(|values| values.checked_add(extent.m));
+-	let key_value_gradient = queries.checked_mul(2)
+-		.and_then(|values| keys.checked_mul(4).and_then(|keys| values.checked_add(keys)))
+-		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+-		.and_then(|values| values.checked_add(extent.m));
++	let forward = queries.checked_mul(2).and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys))).and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs))).and_then(|values| extent.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
++	let query_gradient = queries.checked_mul(3).and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys))).and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs))).and_then(|values| values.checked_add(extent.m));
++	let key_value_gradient = queries.checked_mul(2).and_then(|values| keys.checked_mul(4).and_then(|keys| values.checked_add(keys))).and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs))).and_then(|values| values.checked_add(extent.m));
+ 	let matrix_pairs = extent.m.checked_mul(extent.m);
+-	let matrix = queries.checked_mul(4)
+-		.and_then(|values| matrix_pairs.and_then(|pairs| pairs.checked_mul(2)).and_then(|pairs| values.checked_add(pairs)))
+-		.and_then(|values| values.checked_add(extent.m));
+-	forward.zip(query_gradient).zip(key_value_gradient).zip(matrix)
+-		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 }))
+-		.ok_or_else(|| RecipeError::new("native attention shared values overflow"))
++	let matrix = queries.checked_mul(4).and_then(|values| matrix_pairs.and_then(|pairs| pairs.checked_mul(2)).and_then(|pairs| values.checked_add(pairs))).and_then(|values| values.checked_add(extent.m));
++	forward.zip(query_gradient).zip(key_value_gradient).zip(matrix).map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 })).ok_or_else(|| RecipeError::new("native attention shared values overflow"))
+ }
+ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32) -> Result<Tile> {
+ 	require(length != 0 && width != 0 && shared_values != 0 && query_tile != 0, "native attention tile inputs are empty")?;
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7689:
+ 		let query_gradient_per_key = width.checked_mul(2).and_then(|values| queries.checked_mul(2).and_then(|queries| values.checked_add(queries))).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+ 		let key_value_gradient_fixed = query_values.checked_mul(2).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+ 		let key_value_gradient_per_key = width.checked_mul(4).and_then(|values| queries.checked_mul(2).and_then(|queries| values.checked_add(queries))).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+-		let keys = (shared_values.saturating_sub(forward_fixed) / forward_per_key)
+-			.min(shared_values.saturating_sub(query_gradient_fixed) / query_gradient_per_key)
+-			.min(shared_values.saturating_sub(key_value_gradient_fixed) / key_value_gradient_per_key);
++		let keys = (shared_values.saturating_sub(forward_fixed) / forward_per_key).min(shared_values.saturating_sub(query_gradient_fixed) / query_gradient_per_key).min(shared_values.saturating_sub(key_value_gradient_fixed) / key_value_gradient_per_key);
+ 		let pairs = queries.checked_mul(queries).ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
+-		let matrix = query_values.checked_mul(4)
+-			.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+-			.and_then(|values| values.checked_add(queries))
+-			.ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
++		let matrix = query_values.checked_mul(4).and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs))).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
+ 		if keys != 0 && (queries != length || matrix <= shared_values) {
+-			return Ok(Tile { m: queries, n: keys.min(length), k: width })
++			return Ok(Tile { m: queries, n: keys.min(length), k: width });
+ 		}
+ 		queries = queries.checked_sub(1).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("native attention tile does not fit the device"))?;
+ 	}
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7705:
+ }
+ fn native_attention_tiles(graph: &Graph, shared_values: u32, query_tile: u32) -> Result<Vec<Option<Tile>>> {
+-	graph.nodes.iter().map(|node| {
+-		if node.op != Primitive::Attention {
+-			return Ok(None)
+-		}
+-		let heads = integer_argument(node.argument[0], "native attention heads")? as u32;
+-		let channels = narrow(node.output.channels, "native attention channels")? as u32;
+-		let length = narrow(node.output.length, "native attention length")? as u32;
+-		require(channels % heads == 0, "native attention head partition is invalid")?;
+-		native_attention_tile(length, channels / heads, shared_values, query_tile).map(Some)
+-	}).collect()
++	graph.nodes
++		.iter()
++		.map(|node| {
++			if node.op != Primitive::Attention {
++				return Ok(None);
++			}
++			let heads = integer_argument(node.argument[0], "native attention heads")? as u32;
++			let channels = narrow(node.output.channels, "native attention channels")? as u32;
++			let length = narrow(node.output.length, "native attention length")? as u32;
++			require(channels % heads == 0, "native attention head partition is invalid")?;
++			native_attention_tile(length, channels / heads, shared_values, query_tile).map(Some)
++		})
++		.collect()
+ }
+ fn native_tiles(total: usize, width: u32, role: &str) -> Result<usize> {
+ 	let width = width as usize;
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7752:
+ 		let required = limits.k.div_ceil(fragment).checked_mul(fragment).ok_or_else(|| RecipeError::new("native matrix contraction K tile overflows"))?;
+ 		let k = required.min(capacity);
+ 		require(k != 0, "native matrix contraction tile does not fit the device")?;
+-		return Ok(Tile { m, n, k })
++		return Ok(Tile { m, n, k });
+ 	}
+ 	let mut lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
+ 	let widest_m = limits.m.div_ceil(register_m);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7779:
+ 		// fills the budget by itself. The N lanes narrow once the M lanes are spent.
+ 		match lane_m.checked_sub(1).filter(|lanes| *lanes != 0) {
+ 			Some(lanes) => lane_m = lanes,
+-			None => { lane_n = lane_n.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?; lane_m = widest_m.min(block / lane_n) }
++			None => {
++				lane_n = lane_n.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
++				lane_m = widest_m.min(block / lane_n)
++			}
+ 		}
+ 	}
+ }
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7786:
+ fn native_contraction_shared_values(extent: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<u32> {
+ 	let staging = extent.m.checked_add(extent.n).and_then(|width| width.checked_mul(extent.k)).ok_or_else(|| RecipeError::new("native contraction shared values overflow"))?;
+ 	if matrix {
+-		return Ok(staging)
++		return Ok(staging);
+ 	}
+ 	let partials = extent.k.div_ceil(fragment).checked_mul(native_contraction_partial_per_chunk(extent.m, extent.n, register_m, register_n, block, ratio)?).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+ 	Ok(staging.max(partials))
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7823:
+ 		// using the larger span leaves the extra rows untouched.
+ 		let extent = contraction.gradient_shape.k as usize;
+ 		let splits = extent.div_ceil(NATIVE_SPLIT_SPAN.min(NATIVE_MATRIX_SPLIT_SPAN)).min(NATIVE_K_PARTITIONS).max(1);
+-		let jobs = checked_mul(
+-			native_tiles(contraction.gradient_shape.m as usize, contraction.gradient.m, "native split-K M tiles")?,
+-			native_tiles(contraction.gradient_shape.n as usize, contraction.gradient.n, "native split-K N tiles")?,
+-			"native split-K jobs",
+-		)?;
++		let jobs = checked_mul(native_tiles(contraction.gradient_shape.m as usize, contraction.gradient.m, "native split-K M tiles")?, native_tiles(contraction.gradient_shape.n as usize, contraction.gradient.n, "native split-K N tiles")?, "native split-K jobs")?;
+ 		narrow(checked_mul(jobs, splits, "native split-K tasks")?, "native split-K tasks")?;
+ 		if splits > 1 {
+ 			scratch = scratch.max(checked_mul(splits, contraction.parameters.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native split-K scratch")?);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7853:
+ 	pub block: u32,
+ }
+ impl Geometry {
+-	pub fn threads(self) -> Result<u32> { self.groups.checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows")) }
++	pub fn threads(self) -> Result<u32> {
++		self.groups.checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows"))
++	}
+ }
+ #[cfg(any(amd, nvidia))]
+ fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, resources: Resources) -> Result<Geometry> {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7882:
+ }
+ impl IntoDataSources for Auto {
+ 	const AUTO: bool = true;
+-	fn into_data_sources(self) -> Vec<String> { Vec::new() }
++	fn into_data_sources(self) -> Vec<String> {
++		Vec::new()
++	}
+ }
+ impl IntoDataSources for &str {
+-	fn into_data_sources(self) -> Vec<String> { vec![self.to_owned()] }
++	fn into_data_sources(self) -> Vec<String> {
++		vec![self.to_owned()]
++	}
+ }
+ impl IntoDataSources for String {
+-	fn into_data_sources(self) -> Vec<String> { vec![self] }
++	fn into_data_sources(self) -> Vec<String> {
++		vec![self]
++	}
+ }
+ impl<T: Into<String>, const N: usize> IntoDataSources for [T; N] {
+-	fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
++	fn into_data_sources(self) -> Vec<String> {
++		self.into_iter().map(Into::into).collect()
++	}
+ }
+ impl<T: Into<String>> IntoDataSources for Vec<T> {
+-	fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
++	fn into_data_sources(self) -> Vec<String> {
++		self.into_iter().map(Into::into).collect()
++	}
+ }
+ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
+-	fn into_data_sources(self) -> Vec<String> { self.iter().cloned().map(Into::into).collect() }
++	fn into_data_sources(self) -> Vec<String> {
++		self.iter().cloned().map(Into::into).collect()
++	}
+ }
+ impl Data {
+ 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7916:
+ 		self.sources.push(source.into());
+ 		self
+ 	}
+-	pub const fn broadcast(mut self) -> Self { self.broadcast = true; self }
++	pub const fn broadcast(mut self) -> Self {
++		self.broadcast = true;
++		self
++	}
+ 	pub const fn norm(mut self, _: ZScore) -> Self {
+ 		self.normalize = true;
+ 		self
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7959:
+ 		Err(error) => Err(error.clone()),
+ 	}
+ }
+-fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool { name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')))) }
++fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool {
++	name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))))
++}
+ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
+ 	let mut paths = Vec::new();
+ 	for source in sources {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:7966:
+ 		collect_files(&resolve_path(source)?, &mut paths)?;
+ 	}
+-	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
+-	paths.sort(); paths.dedup();
++	for path in &mut paths {
++		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
++	}
++	paths.sort();
++	paths.dedup();
+ 	// A ZIP source contributes its entries, not itself: the container is not a
+ 	// table or a sample, and its entries take virtual paths anchored at the
+ 	// archive's own path, so the directory-layout rules that already interpret
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8003:
+ 		let aligned = rows != 0 && tables.iter().all(|table| table.rows.len() == rows);
+ 		require(aligned || data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
+ 		if data.broadcast {
+-			for table in &mut tables { let count = table.rows.len(); require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
+-				if count != rows { table.rows = table.rows.iter().cloned().cycle().take(rows).collect() }
++			for table in &mut tables {
++				let count = table.rows.len();
++				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
++				if count != rows {
++					table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
++				}
+ 			}
+ 		}
+ 	}
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8112:
+ 		for (column, ordered) in &columns {
+ 			let mut width = None;
+ 			for (row, (path, bytes)) in ordered.iter().enumerate() {
+-				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+-					image_values(path, bytes)?
+-				} else {
+-					vec![sample_text(path, bytes)?]
+-				};
++				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) { image_values(path, bytes)? } else { vec![sample_text(path, bytes)?] };
+ 				require(*width.get_or_insert(values.len()) == values.len(), format!("paired sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+ 				rows[row].extend(values);
+ 			}
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8146:
+ 	rows: Vec<Vec<String>>,
+ }
+ impl SampleTableBuilder {
+-	fn new(target: String) -> Self { Self { target, headers: Vec::new(), rows: Vec::new() } }
++	fn new(target: String) -> Self {
++		Self { target, headers: Vec::new(), rows: Vec::new() }
++	}
+ 	fn push(&mut self, path: &Path, bytes: &[u8], target: String) -> Result<()> {
+-		let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+-			image_values(path, bytes)?
+-		} else {
+-			vec![sample_text(path, bytes)?]
+-		};
++		let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) { image_values(path, bytes)? } else { vec![sample_text(path, bytes)?] };
+ 		if self.headers.is_empty() {
+ 			self.headers = match values.len() {
+ 				1 => vec!["content".to_owned()],
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8179:
+ 	let (_, _, _, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+ 	Ok(pixels.iter().map(|value| value.to_string()).collect())
+ }
+-fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg") }
++fn is_image(extension: &str) -> bool {
++	matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
++}
+ /// Document formats that carry sample text but never decode as tables, so they only
+ /// count as samples inside a recognized directory layout.
+-fn is_document(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "md" | "html" | "htm") }
++fn is_document(extension: &str) -> bool {
++	matches!(extension.to_ascii_lowercase().as_str(), "md" | "html" | "htm")
++}
+ /// Decoded baseline JFIF pixels: 8-bit precision, Huffman entropy coding, and the
+ /// libjpeg fixed-point inverse DCT and color conversion so pixels match its output.
+ fn jpeg_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8465:
+ 				let (depth, color, interlace) = (body[8], body[9], body[12]);
+ 				require(depth == 8, format!("PNG bit depth {depth} is unsupported"))?;
+ 				require(interlace == 0, "PNG interlacing is unsupported")?;
+-				let channels = match color { 0 => 1, 2 => 3, color => return Err(RecipeError::new(format!("PNG color type {color} is unsupported"))) };
++				let channels = match color {
++					0 => 1,
++					2 => 3,
++					color => return Err(RecipeError::new(format!("PNG color type {color} is unsupported"))),
++				};
+ 				header = Some((width, height, channels));
+ 			}
+ 			b"IDAT" => compressed.extend_from_slice(body),
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8494:
+ 				4 => {
+ 					let estimate = i32::from(left) + i32::from(above) - i32::from(corner);
+ 					let (da, db, dc) = ((estimate - i32::from(left)).abs(), (estimate - i32::from(above)).abs(), (estimate - i32::from(corner)).abs());
+-					if da <= db && da <= dc { left } else if db <= dc { above } else { corner }
++					if da <= db && da <= dc {
++						left
++					} else if db <= dc {
++						above
++					} else {
++						corner
++					}
+ 				}
+ 				filter => return Err(RecipeError::new(format!("PNG filter {filter} is unsupported"))),
+ 			};
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8507:
+ 	let (mut tables, sources) = load_tables(data, &data.sources)?;
+ 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
+ 	if !data.tests.is_empty() {
+-		let (tests, test_sources) = load_tables(data, &data.tests)?; require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
++		let (tests, test_sources) = load_tables(data, &data.tests)?;
++		require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
+ 		require(tables.len() == tests.len(), "test data table count differs from training data")?;
+ 		for (table, test) in tables.iter_mut().zip(tests) {
+ 			require(table.headers == test.headers, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8538:
+ 	}
+ 	let table_index = selected.first().map_or(0, |target| target.0);
+ 	let row_count = tables[table_index].rows.len();
+-	for table in &tables { require(table.rows.len() == row_count, format!("table {:?} expected {row_count} positionally aligned rows, received {}", table.name, table.rows.len()))? }
++	for table in &tables {
++		require(table.rows.len() == row_count, format!("table {:?} expected {row_count} positionally aligned rows, received {}", table.name, table.rows.len()))?
++	}
+ 	let mut columns = Vec::new();
+ 	for (table, value) in tables.iter().enumerate() {
+ 		for (column, header) in value.headers.iter().enumerate() {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8561:
+ 	let mut source_rows = 0;
+ 	let mut missing = vec![0_usize; columns.len()];
+ 	for row in 0..row_count {
+-		if row == source_table_rows { source_rows = targets.len() / target_width }
++		if row == source_table_rows {
++			source_rows = targets.len() / target_width
++		}
+ 		let mut encoded = Vec::with_capacity(features);
+ 		let valid = columns.iter().all(|column| tables[column.0].rows[row].get(column.1).is_some_and(|value| encode(value, &column.2, &mut encoded)));
+ 		if valid {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8584:
+ 		} else if valid {
+ 			// One row is one sample whose target is the vector of its selected columns. A row
+ 			// missing any of them contributes nothing, exactly as a missing scalar target did.
+-			let row_targets = selected.iter().zip(&target_categories).map(|(target, categories)| {
+-				let value = tables[target.0].rows[row].get(target.1);
+-				value.and_then(|value| value.parse::<f64>().ok()).or_else(|| value.and_then(|value| categories.iter().position(|category| category == value)).map(|value| value as f64)).filter(|target| target.is_finite())
+-			}).collect::<Option<Vec<_>>>();
++			let row_targets = selected
++				.iter()
++				.zip(&target_categories)
++				.map(|(target, categories)| {
++					let value = tables[target.0].rows[row].get(target.1);
++					value.and_then(|value| value.parse::<f64>().ok()).or_else(|| value.and_then(|value| categories.iter().position(|category| category == value)).map(|value| value as f64)).filter(|target| target.is_finite())
++				})
++				.collect::<Option<Vec<_>>>();
+ 			if let Some(row_targets) = row_targets {
+ 				samples.extend_from_slice(&encoded);
+ 				targets.extend(row_targets);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8597:
+ 			}
+ 		}
+ 	}
+-	if source_table_rows == row_count { source_rows = targets.len() / target_width }
++	if source_table_rows == row_count {
++		source_rows = targets.len() / target_width
++	}
+ 	for (column, count) in columns.iter().zip(missing).filter(|value| value.1 != 0) {
+ 		let percentage = count as f64 * 100.0 / row_count as f64;
+ 		let precision = 4_usize.max((-percentage.log10()).ceil().max(0.0) as usize);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8648:
+ 	// Sources may repeat a row verbatim; each copy is its own sample, so its identity mixes
+ 	// in how many identical rows precede it in source order, which the seed never changes.
+ 	let mut occurrences = BTreeMap::new();
+-	let mut identities = samples.chunks_exact(features).zip(targets.chunks_exact(target_width)).map(|(sample, target)| {
+-		let content = target[1..].iter().fold(sample_identity(sample, target[0]), |hash, value| (hash ^ value.to_bits()).wrapping_mul(1099511628211));
+-		let occurrence = occurrences.entry(content).and_modify(|count| *count += 1_u64).or_insert(0);
+-		occurrence.to_le_bytes().iter().fold(content, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(1099511628211))
+-	}).collect();
++	let mut identities = samples
++		.chunks_exact(features)
++		.zip(targets.chunks_exact(target_width))
++		.map(|(sample, target)| {
++			let content = target[1..].iter().fold(sample_identity(sample, target[0]), |hash, value| (hash ^ value.to_bits()).wrapping_mul(1099511628211));
++			let occurrence = occurrences.entry(content).and_modify(|count| *count += 1_u64).or_insert(0);
++			occurrence.to_le_bytes().iter().fold(content, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(1099511628211))
++		})
++		.collect();
+ 	shuffle(&mut samples, &mut targets, &mut identities, features, source_rows, target_width)?;
+ 	let (norm_mean, norm_scale) = if data.normalize {
+ 		normalize_samples(&mut samples, features, ((source_rows as f64) * data.split).floor() as usize)?
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8695:
+ 	// all-zero low mantissa bits of small integer values, collapsing the identity space.
+ 	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+ }
+-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
+-fn is_archive(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "zip") }
++fn is_table(extension: &str) -> bool {
++	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml")
++}
++fn is_archive(extension: &str) -> bool {
++	matches!(extension.to_ascii_lowercase().as_str(), "zip")
++}
+ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+ 	let path = path.as_ref();
+ 	let mut components = path.components();
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8719:
+ 	}
+ 	Ok(())
+ }
+-fn target_column(table: &Table, name: &str) -> Option<usize> { table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column)) }
++fn target_column(table: &Table, name: &str) -> Option<usize> {
++	table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column))
++}
+ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<Vec<Table>> {
+ 	let mut groups = BTreeMap::<PathBuf, Vec<Table>>::new();
+ 	for (directory, table) in tables {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8732:
+ 			// Tables in one directory align onto each other only when they contribute different columns. Same columns means more rows of one table, and broadcasting those duplicates records instead of widening them.
+ 			if group.iter().any(|table| table.headers != group[0].headers) {
+ 				let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
+-				for table in &mut group { let count = table.rows.len();
++				for table in &mut group {
++					let count = table.rows.len();
+ 					require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
+-					if count != rows { table.rows = table.rows.iter().cloned().cycle().take(rows).collect() }
++					if count != rows {
++						table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
++					}
+ 				}
+ 			}
+ 			tables.extend(group);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8749:
+ 		capture.sort_by_key(&key);
+ 	}
+ 	let schemas = captures[0].iter().map(|table| (table.headers.clone(), table.rows.len())).collect::<Vec<_>>();
+-	for (capture_index, capture) in captures.iter().enumerate() { require(capture.len() == schemas.len(), format!("capture {capture_index} expected {} tables, received {}", schemas.len(), capture.len()))?;
+-		for (table_index, (table, schema)) in capture.iter().zip(&schemas).enumerate() { require(table.headers == schema.0 && table.rows.len() == schema.1, format!("capture {capture_index} table {table_index} expected {} columns and {} rows, received {} columns and {} rows", schema.0.len(), schema.1, table.headers.len(), table.rows.len()))? }
++	for (capture_index, capture) in captures.iter().enumerate() {
++		require(capture.len() == schemas.len(), format!("capture {capture_index} expected {} tables, received {}", schemas.len(), capture.len()))?;
++		for (table_index, (table, schema)) in capture.iter().zip(&schemas).enumerate() {
++			require(table.headers == schema.0 && table.rows.len() == schema.1, format!("capture {capture_index} table {table_index} expected {} columns and {} rows, received {} columns and {} rows", schema.0.len(), schema.1, table.headers.len(), table.rows.len()))?
++		}
+ 	}
+ 	let names = (0..schemas.len())
+ 		.map(|index| {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8823:
+ 	match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
+ 		Some("jsonl") => {
+ 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+-			let records = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| {
+-				let (value, rest) = json_value(line)?;
+-				require(rest.trim().is_empty(), format!("JSONL record has trailing content {:?}", rest.trim()))?;
+-				Ok(value)
+-			}).collect::<Result<Vec<_>>>().map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
++			let records = text
++				.lines()
++				.map(str::trim)
++				.filter(|line| !line.is_empty())
++				.map(|line| {
++					let (value, rest) = json_value(line)?;
++					require(rest.trim().is_empty(), format!("JSONL record has trailing content {:?}", rest.trim()))?;
++					Ok(value)
++				})
++				.collect::<Result<Vec<_>>>()
++				.map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+ 			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+ 		}
+ 		Some("json") => {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:8859:
+ /// Every user table of a SQLite database, walked from its rowid b-trees.
+ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
+ 	require(bytes.get(..16) == Some(b"SQLite format 3\0"), "SQLite header is absent")?;
+-	let page_size = match u16::from_be_bytes(bytes[16..18].try_into().unwrap()) as usize { 1 => 65536, size => size };
++	let page_size = match u16::from_be_bytes(bytes[16..18].try_into().unwrap()) as usize {
++		1 => 65536,
++		size => size,
++	};
+ 	let mut schema = Vec::new();
+ 	sqlite_rows(bytes, page_size, 1, &mut schema)?;
+ 	let mut tables = Vec::new();
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9618:
+ }
+ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
+ 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
+-	let (_, mut rows, blank) = [b'\t', b';', b','].into_iter().try_fold((0, Vec::new(), 0), |widest, delimiter| { let (rows, blank) = records(bytes, delimiter)?; let width = rows.first().map_or(0, Vec::len); let rectangle = if rows.iter().all(|row| row.len() == width) { width } else { 0 }; Ok(if rectangle >= widest.0 { (rectangle, rows, blank) } else { widest }) })?;
++	let (_, mut rows, blank) = [b'\t', b';', b','].into_iter().try_fold((0, Vec::new(), 0), |widest, delimiter| {
++		let (rows, blank) = records(bytes, delimiter)?;
++		let width = rows.first().map_or(0, Vec::len);
++		let rectangle = if rows.iter().all(|row| row.len() == width) { width } else { 0 };
++		Ok(if rectangle >= widest.0 { (rectangle, rows, blank) } else { widest })
++	})?;
+ 	require(!rows.is_empty(), format!("dataset {} is empty", path.display()))?;
+ 	let first = rows.remove(0);
+ 	let numeric = |value: &String| value.parse::<f64>().is_ok();
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9657:
+ 			field = Vec::new();
+ 			if row.iter().any(|value| !value.is_empty()) {
+ 				rows.push(row);
+-			} else { blank += 1 }
++			} else {
++				blank += 1
++			}
+ 			row = Vec::new();
+ 		} else {
+ 			field.push(byte);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9671:
+ 	}
+ 	Ok((rows, blank))
+ }
+-fn categories(table: &Table, column: usize, rows: usize) -> Vec<String> { table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|value| !value.is_empty()).cloned().collect::<BTreeSet<_>>().into_iter().collect() }
++fn categories(table: &Table, column: usize, rows: usize) -> Vec<String> {
++	table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|value| !value.is_empty()).cloned().collect::<BTreeSet<_>>().into_iter().collect()
++}
+ fn infer_feature(table: &Table, column: usize, rows: usize) -> FeatureType {
+ 	let values = table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|value| !value.is_empty()).collect::<Vec<_>>();
+ 	if !values.is_empty() && values.iter().all(|value| value.parse::<f64>().is_ok()) {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9868:
+ 		self.stop = if value == 0.0 { None } else { Some(value) };
+ 		self
+ 	}
+-	pub const fn optimizer(self, _: Adamw) -> Self { self }
++	pub const fn optimizer(self, _: Adamw) -> Self {
++		self
++	}
+ 	pub const fn epochs(mut self, value: usize) -> Self {
+ 		self.epochs = value;
+ 		self
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9896:
+ 		if INTERRUPTED.load(Ordering::Acquire) {
+ 			std::process::exit(INTERRUPTED_EXIT);
+ 		}
+-		self.try_run(model, data, evaluation).unwrap_or_else(|error| { if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) } panic!("{error}") })
++		self.try_run(model, data, evaluation).unwrap_or_else(|error| {
++			if INTERRUPTED.load(Ordering::Acquire) {
++				std::process::exit(INTERRUPTED_EXIT)
++			}
++			panic!("{error}")
++		})
+ 	}
+ 	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport {
+ 		let evaluation = data.split < 1.0 || !data.tests.is_empty();
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9903:
+ 		let report = self.execute(model, data, evaluation);
+-		if evaluation { self.print_evaluation(model, &report) }
++		if evaluation {
++			self.print_evaluation(model, &report)
++		}
+ 		report
+ 	}
+ 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9961:
+ 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
+ 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
+ 				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+-				if saved { stored.bn_stats = tape.extract_bn_stats()? }
++				if saved {
++					stored.bn_stats = tape.extract_bn_stats()?
++				}
+ 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(()))?;
+ 				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
+ 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:9968:
+ 				Ok((loss, saved, predictions))
+ 			})?;
+ 			epoch_seconds += seconds;
+-			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &schedule)?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
++			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &schedule)?;
++			if INTERRUPTED.load(Ordering::Acquire) {
++				std::process::exit(INTERRUPTED_EXIT)
++			}
+ 		}
+ 		stored.bn_stats = tape.extract_bn_stats()?;
+ 		tape.inject_bn_stats(&stored.bn_stats)?;
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10013:
+ 			let raw = validation.predictions()?;
+ 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
+ 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
+-			}
++		}
+ 		let r2 = if training_rows == prepared.rows {
+ 			coefficient(&prepared.targets, &predictions)
+ 		} else if evaluation && data.autoregressive {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10021:
+ 		} else {
+ 			coefficient(&prepared.targets[training_values..], &evaluated)
+ 		};
+-		if !evaluated.is_empty() { predictions = evaluated }
++		if !evaluated.is_empty() {
++			predictions = evaluated
++		}
+ 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
+ 		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
+ 	}
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10035:
+ 		result
+ 	}
+ 	fn print(&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool, schedule: &str) -> Result<()> {
+-		if self.log_metrics.is_empty() { return Ok(()) }
++		if self.log_metrics.is_empty() {
++			return Ok(());
++		}
+ 		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then(|| coefficient(targets, predictions));
+ 		Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, schedule, Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false }), live, true)
+ 	}
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10042:
+-	fn print_evaluation(&self, model: &Model, report: &TrainingReport) { let defaults = [Loss, R2]; let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics }; Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), metrics, self.epochs, &report.schedule, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false, evaluation: true }), false, true).unwrap_or_else(|error| panic!("{error}")) }
++	fn print_evaluation(&self, model: &Model, report: &TrainingReport) {
++		let defaults = [Loss, R2];
++		let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics };
++		Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), metrics, self.epochs, &report.schedule, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false, evaluation: true }), false, true).unwrap_or_else(|error| panic!("{error}"))
++	}
+ 	fn metric_line(loss: &str, topology: &str, metrics: &[Metric], epochs: usize, schedule: &str, measurement: Metrics) -> String {
+-		let time = measurement.seconds * 1000.0; let mut values = Vec::new(); let mut topology_printed = false;
++		let time = measurement.seconds * 1000.0;
++		let mut values = Vec::new();
++		let mut topology_printed = false;
+ 		for metric in metrics {
+ 			let value = match metric.0 {
+ 				0 => format!("{} \x1b[38\x3b2\x3b242\x3b40\x3b60m{}\x1b[0m", if measurement.evaluation { "eval" } else { "run" }, measurement.run),
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10048:
+ 				1 => format!("{loss} \x1b[38\x3b2\x3b0\x3b174\x3b107m{}\x1b[0m", measurement.loss.map_or_else(|| format!("{:>6}", "..."), |value| format!("{value:.4}"))),
+ 				2 => format!("r2 \x1b[38\x3b2\x3b39\x3b125\x3b255m{}\x1b[0m", measurement.r2.map_or_else(|| format!("{:>7}", "..."), |value| format!("{value:>7.4}"))),
+-				3 => if measurement.seconds < 1.0 { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>7.3} ms\x1b[0m") } else { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{:>8.4} s\x1b[0m", measurement.seconds) },
++				3 => {
++					if measurement.seconds < 1.0 {
++						format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>7.3} ms\x1b[0m")
++					} else {
++						format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{:>8.4} s\x1b[0m", measurement.seconds)
++					}
++				}
+ 				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{:>width$}\x1b[0m", measurement.epoch, width = epochs.max(1).ilog10() as usize + 1),
+-				5..=7 | 9 if !topology_printed && !topology.is_empty() => { topology_printed = true; topology.to_owned() }
++				5..=7 | 9 if !topology_printed && !topology.is_empty() => {
++					topology_printed = true;
++					topology.to_owned()
++				}
+ 				5..=7 | 9 => continue,
+ 				8 => continue,
+ 				10 if schedule.is_empty() => continue,
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10056:
+ 				10 => format!("tile \x1b[38\x3b2\x3b135\x3b90\x3b251m{schedule}\x1b[0m"),
+ 				_ => unreachable!(),
+-			}; values.push(value);
++			};
++			values.push(value);
+ 		}
+-		if measurement.checkpoint { values.push("\x1b[1\x3b32m← checkpoint\x1b[0m".to_owned()) }
++		if measurement.checkpoint {
++			values.push("\x1b[1\x3b32m← checkpoint\x1b[0m".to_owned())
++		}
+ 		values.join("  ")
+ 	}
+ 	fn write_progress(line: &str, replace: bool, complete: bool) -> Result<()> {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10064:
+-		if line.is_empty() && !replace { return Ok(()) }
+-		let mut frame = if line.is_empty() { "\r\x1b[2K\x1b[?7h".to_owned() } else if replace { format!("\r\x1b[2K{}", if complete { "\x1b[?7h" } else { "" }) } else if complete { String::new() } else { "\x1b[?7l\r\x1b[2K".to_owned() };
+-		frame.push_str(line); if complete { frame.push('\n') }
++		if line.is_empty() && !replace {
++			return Ok(());
++		}
++		let mut frame = if line.is_empty() {
++			"\r\x1b[2K\x1b[?7h".to_owned()
++		} else if replace {
++			format!("\r\x1b[2K{}", if complete { "\x1b[?7h" } else { "" })
++		} else if complete {
++			String::new()
++		} else {
++			"\x1b[?7l\r\x1b[2K".to_owned()
++		};
++		frame.push_str(line);
++		if complete {
++			frame.push('\n')
++		}
+ 		let mut output = std::io::stderr().lock();
+ 		output.write_all(frame.as_bytes()).and_then(|_| output.flush()).map_err(|error| RecipeError::new(format!("cannot write epoch progress: {error}")))
+ 	}
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10070:
+ 	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, schedule: &str, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
+-		let started = Instant::now(); let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: false, evaluation: false };
++		let started = Instant::now();
++		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: false, evaluation: false };
+ 		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, schedule, partial);
+ 		let live = !line.is_empty() && std::io::stderr().is_terminal();
+-		if !live { return action().map(|value| (value, started.elapsed().as_secs_f64(), false)) }
++		if !live {
++			return action().map(|value| (value, started.elapsed().as_secs_f64(), false));
++		}
+ 		Self::write_progress(&line, false, false)?;
+-		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology, schedule) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics), schedule.to_owned());
+-		let updates = std::thread::spawn(move || -> Result<bool> { let mut row = false; loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
+-			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { if INTERRUPTED.load(Ordering::Acquire) && !row { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, &schedule, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)? }; return Ok(row || INTERRUPTED.load(Ordering::Acquire)) },
+-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { let interrupted = INTERRUPTED.load(Ordering::Acquire); Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, &schedule, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?; row |= interrupted },
+-		} } });
+-		let result = action(); let _ = stop.send(()); updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))??;
+-		let value = match result { Ok(value) => value, Err(error) => { let _ = Self::write_progress("", true, false); return Err(error) } };
++		let (stop, wait) = std::sync::mpsc::channel();
++		let (metrics, loss, topology, schedule) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics), schedule.to_owned());
++		let updates = std::thread::spawn(move || -> Result<bool> {
++			let mut row = false;
++			loop {
++				match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
++					Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
++						if INTERRUPTED.load(Ordering::Acquire) && !row {
++							Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, &schedule, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)?
++						};
++						return Ok(row || INTERRUPTED.load(Ordering::Acquire));
++					}
++					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
++						let interrupted = INTERRUPTED.load(Ordering::Acquire);
++						Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, &schedule, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?;
++						row |= interrupted
++					}
++				}
++			}
++		});
++		let result = action();
++		let _ = stop.send(());
++		updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))??;
++		let value = match result {
++			Ok(value) => value,
++			Err(error) => {
++				let _ = Self::write_progress("", true, false);
++				return Err(error);
++			}
++		};
+ 		Ok((value, started.elapsed().as_secs_f64(), true))
+ 	}
+ }
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10086:
+-#[derive(Clone, Copy)] struct Metrics { run: u64, epoch: usize, loss: Option<f64>, r2: Option<f64>, seconds: f64, checkpoint: bool, evaluation: bool }
++#[derive(Clone, Copy)]
++struct Metrics {
++	run: u64,
++	epoch: usize,
++	loss: Option<f64>,
++	r2: Option<f64>,
++	seconds: f64,
++	checkpoint: bool,
++	evaluation: bool,
++}
+ pub struct TrainingReport {
+ 	initial_loss: f64,
+ 	final_loss: f64,
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10098:
+ 	epoch_seconds: f64,
+ }
+ impl TrainingReport {
+-	pub const fn initial_loss(&self) -> f64 { self.initial_loss }
+-	pub const fn final_loss(&self) -> f64 { self.final_loss }
+-	pub fn initial_predictions(&self) -> &[f64] { &self.initial_predictions }
+-	pub fn predictions(&self) -> &[f64] { &self.predictions }
+-	pub const fn r2(&self) -> f64 { self.r2 }
+-	pub const fn tile(&self) -> [u32; 3] { [self.tile.m, self.tile.n, self.tile.k] }
+-	pub const fn epoch_seconds(&self) -> f64 { self.epoch_seconds }
++	pub const fn initial_loss(&self) -> f64 {
++		self.initial_loss
++	}
++	pub const fn final_loss(&self) -> f64 {
++		self.final_loss
++	}
++	pub fn initial_predictions(&self) -> &[f64] {
++		&self.initial_predictions
++	}
++	pub fn predictions(&self) -> &[f64] {
++		&self.predictions
++	}
++	pub const fn r2(&self) -> f64 {
++		self.r2
++	}
++	pub const fn tile(&self) -> [u32; 3] {
++		[self.tile.m, self.tile.n, self.tile.k]
++	}
++	pub const fn epoch_seconds(&self) -> f64 {
++		self.epoch_seconds
++	}
+ }
+ #[derive(Clone, Copy)]
+ struct TargetScale {
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/recipe.rs:10118:
+ 		// A constant target spans nothing; encode it as the minimum of a unit span so scaling stays finite.
+ 		Self { minimum, span: if maximum == minimum { 1.0 } else { maximum - minimum } }
+ 	}
+-	fn encode(self, value: f64) -> f64 { (value - self.minimum) / self.span }
+-	fn decode(self, value: f64) -> f64 { self.minimum + self.span * logistic(value) }
++	fn encode(self, value: f64) -> f64 {
++		(value - self.minimum) / self.span
++	}
++	fn decode(self, value: f64) -> f64 {
++		self.minimum + self.span * logistic(value)
++	}
+ 	fn logit(self, value: f64) -> f64 {
+ 		let value = value.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
+ 		(value / (1.0 - value)).ln()
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/FA.rs:42:
+ fn run(width: usize, bits: u8) -> (Evidence, f64) {
+ 	let bundle = std::env::temp_dir().join(format!("recipe-fa-{width}-{}.ogdl", std::process::id()));
+ 
+-	let data = recipe
+-		.data(auto)
+-		.set("data/temporal/window_subfolders/window-0000");
+-	let model = recipe
+-		.model()
+-		.conv(width, 1);
++	let data = recipe.data(auto).set("data/temporal/window_subfolders/window-0000");
++	let model = recipe.model().conv(width, 1);
+ 	let model = model.attn(1);
+-	let model = model
+-		.layer(1)
+-		.loss(mse);
+-	let report = recipe
+-		.train()
+-		.seed(17)
+-		.epochs(1)
+-		.fp(std::env::var("RECIPE_FA_REFERENCE_BITS").map_or(bits, |bits| bits.parse().unwrap_or_else(|error| panic!("FA reference precision is malformed: {error}"))))
+-		.save(&bundle)
+-		.run(&model, &data);
++	let model = model.layer(1).loss(mse);
++	let report = recipe.train().seed(17).epochs(1).fp(std::env::var("RECIPE_FA_REFERENCE_BITS").map_or(bits, |bits| bits.parse().unwrap_or_else(|error| panic!("FA reference precision is malformed: {error}")))).save(&bundle).run(&model, &data);
+ 
+ 	assert!(report.final_loss().is_finite(), "attention produced a nonfinite loss");
+ 	assert!(!report.predictions().is_empty(), "attention produced no predictions");
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/FA.rs:72:
+ 
+ fn reference(test: &str, bits: u8) -> Evidence {
+ 	let executable = std::env::current_exe().unwrap_or_else(|error| panic!("cannot locate the FA test binary: {error}"));
+-	let output = std::process::Command::new(executable)
+-		.env("RECIPE_FA_CPU_REFERENCE", "1")
+-		.env("RECIPE_FA_REFERENCE_BITS", bits.to_string())
+-		.env("RECIPE_FORCE_CPU", "1")
+-		.arg("--exact")
+-		.arg(test)
+-		.arg("--nocapture")
+-		.output()
+-		.unwrap_or_else(|error| panic!("cannot run the CPU FA reference: {error}"));
++	let output = std::process::Command::new(executable).env("RECIPE_FA_CPU_REFERENCE", "1").env("RECIPE_FA_REFERENCE_BITS", bits.to_string()).env("RECIPE_FORCE_CPU", "1").arg("--exact").arg(test).arg("--nocapture").output().unwrap_or_else(|error| panic!("cannot run the CPU FA reference: {error}"));
+ 	assert!(output.status.success(), "CPU FA reference failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+ 	let text = String::from_utf8_lossy(&output.stdout);
+ 	let line = text.lines().find_map(|line| line.strip_prefix("FA_EVIDENCE ")).unwrap_or_else(|| panic!("CPU FA reference produced no evidence:\n{text}"));
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/FA.rs:107:
+ 			let reference = reference.parse::<f64>().unwrap_or_else(|error| panic!("upstream FA seconds are malformed: {error}"));
+ 			assert!(seconds >= reference * 0.7 && seconds <= reference * 1.3, "FA time {seconds} is outside 30% of the upstream {reference} seconds");
+ 		}
+-		return
++		return;
+ 	}
+ 	if std::env::var_os("RECIPE_FA_CPU_REFERENCE").is_some() {
+ 		println!("FA_EVIDENCE {}", evidence.encode());
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/FA.rs:114:
+-		return
++		return;
+ 	}
+ 
+ 	let baseline = reference(test, bits);
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/determinism.rs:242:
+ 
+ fn child(case: &Case) -> Evidence {
+ 	let executable = std::env::current_exe().unwrap_or_else(|error| panic!("cannot locate the test binary: {error}"));
+-	let output = std::process::Command::new(&executable)
+-		.env("RECIPE_DETERMINISM_CASE", case.name)
+-		.env("RECIPE_FORCE_CPU", "1")
+-		.arg("--exact")
+-		.arg("--nocapture")
+-		.arg("cross_backend_byte_identity")
+-		.output()
+-		.unwrap_or_else(|error| panic!("cannot run the CPU side of {}: {error}", case.name));
++	let output = std::process::Command::new(&executable).env("RECIPE_DETERMINISM_CASE", case.name).env("RECIPE_FORCE_CPU", "1").arg("--exact").arg("--nocapture").arg("cross_backend_byte_identity").output().unwrap_or_else(|error| panic!("cannot run the CPU side of {}: {error}", case.name));
+ 	let text = String::from_utf8_lossy(&output.stdout);
+ 	let line = text.lines().find_map(|line| line.strip_prefix("EVIDENCE ")).unwrap_or_else(|| panic!("the CPU side of {} produced no evidence:\n{}\n{}", case.name, text, String::from_utf8_lossy(&output.stderr)));
+ 	Evidence::decode(line)
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/throughput.rs:16:
+ 	std::mem::forget(stderr);
+ }
+ 
+-fn natural(name: &str, fallback: usize) -> usize { std::env::var(name).ok().map(|value| value.parse().unwrap_or_else(|_| panic!("{name} must be a positive integer"))).unwrap_or(fallback) }
++fn natural(name: &str, fallback: usize) -> usize {
++	std::env::var(name).ok().map(|value| value.parse().unwrap_or_else(|_| panic!("{name} must be a positive integer"))).unwrap_or(fallback)
++}
+ 
+ fn dataset(rows: usize, columns: usize) -> std::path::PathBuf {
+ 	let path = std::env::temp_dir().join(format!("recipe-throughput-{rows}x{columns}.csv"));
+Diff in /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/tests/throughput.rs:76:
+ 	let peaks = std::env::var("BENCH_PEAKS").unwrap_or_else(|_| "fp16=70.34,bf16=70.34,int8=70.34,int4=140.7,fp32=35.17,fp64=1.1".to_owned());
+ 	let peak = |precision: &str| peaks.split(',').filter_map(|entry| entry.trim().split_once('=')).find(|(name, _)| *name == precision).and_then(|(_, value)| value.parse::<f64>().ok());
+ 	let data = recipe.data(dataset(rows, width).to_string_lossy().as_ref()).target("y");
+-		let model = stack(width, layers);
++	let model = stack(width, layers);
+ 	let flops_per_epoch = (rows * layers * 6 * width * width) as f64;
+-		let mut results = Vec::new();
+-		for precision in precisions.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+-			let first = train(precision, epochs_a).run(&model, &data);
+-			let second = train(precision, epochs_b).run(&model, &data);
+-			let seconds_a = first.epoch_seconds();
+-			let seconds_b = second.epoch_seconds();
+-			let per_epoch = seconds_b / epochs_b as f64;
+-			if per_epoch <= 0.0 {
+-				report(format!("throughput {precision}: measured epoch time {per_epoch:.3}s is invalid\n"));
+-				continue;
+-			}
+-			let tflops = flops_per_epoch / per_epoch / 1e12;
+-			report(format!("throughput {precision}: {tflops:.3} tflops ({per_epoch:.3}s/epoch, epoch totals {seconds_a:.2}s/{seconds_b:.2}s, tiles {:?}/{:?}, loss {:.5})\n", first.tile(), second.tile(), second.final_loss()));
++	let mut results = Vec::new();
++	for precision in precisions.split(',').map(str::trim).filter(|value| !value.is_empty()) {
++		let first = train(precision, epochs_a).run(&model, &data);
++		let second = train(precision, epochs_b).run(&model, &data);
++		let seconds_a = first.epoch_seconds();
++		let seconds_b = second.epoch_seconds();
++		let per_epoch = seconds_b / epochs_b as f64;
++		if per_epoch <= 0.0 {
++			report(format!("throughput {precision}: measured epoch time {per_epoch:.3}s is invalid\n"));
++			continue;
++		}
++		let tflops = flops_per_epoch / per_epoch / 1e12;
++		report(format!("throughput {precision}: {tflops:.3} tflops ({per_epoch:.3}s/epoch, epoch totals {seconds_a:.2}s/{seconds_b:.2}s, tiles {:?}/{:?}, loss {:.5})\n", first.tile(), second.tile(), second.final_loss()));
+ 		results.push((precision.to_owned(), tflops, per_epoch, second.tile()));
+ 	}
+ 	let mut table = format!("\n{:<9} {:>10} {:>10} {:>12} {:>10}  {}\n", "precision", "tflops", "s/epoch", "peak", "of peak", "tile");
+[fmt exit: 1]
+?? .claude-harness/
+
+[output truncated; full output: /home/nate/.local/share/claude-harness/worktrees/claude-harness-16/.claude-harness/dsh-subprocess-M7RwVO/dsh-subprocess-298374-1-44a0ea9d8e73-stdout.log]
+[stderr]
+Warning: can't set `struct_lit_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `fn_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `where_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `struct_lit_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `fn_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `where_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `struct_lit_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `fn_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `where_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `struct_lit_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `fn_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `where_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `struct_lit_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `fn_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `where_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `struct_lit_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `fn_single_line = true`, unstable features are only available in nightly channel.
+Warning: can't set `where_single_line = true`, unstable features are only available in nightly channel.

@@ -1,0 +1,109 @@
+f: (compute precision)
+	fp	float  point
+	int	integer
+	bf	brain float
+	tf	tensor float
+q: (data storage)
+	qi	quantized integer
+		nf	normal float
+	iq	importance quantized
+
+recipe.train
+	.f(exp, mantissa)
+	.fp(8|16|32|64)
+	.int(1|4|8)
+	.bf(16)
+	.tf(32)
+blck.atvn.norm.
+	.qi(4|5|8).(0|1)
+	.qi(2|6|8).k
+	.qi(3).k[.s|m|l]
+	.qi(4|5).k[.s|m]
+	.qi(4).nf
+	.iq(1).(s|m)
+	.iq(2|3).(xxs|xs|s|m)
+	.iq(4).(xs|nl)
+
+sign
+exp
+man
+
+bias
+mbits
+
+Uniform
+Scale
+KMeans
+Normal
+
+
+
+fp: (-1)^sign × 2^(exp-bias) × (1 + man/2^mbits)
+	8
+		bin[s eeeee mm]
+			sign 1
+			exp 5
+			man 2
+		dec[-57344, 57344]
+			bias 15
+			mbits 2
+	16
+		bin[s eeeee mmmmmmmmmm]
+			sign 1
+			exp 5
+			man 10
+		dec[-65504, 65504]
+			bias 15
+			mbits 10
+	32
+		bin[s eeeeeeee mmmmmmmmmmmmmmmmmmmmmmm]
+			sign 1
+			exp 8
+			man 23
+		dec[-3.4028234663852886e38, 3.4028234663852886e38]
+			bias 127
+			mbits 23
+	64
+		bin[s eeeeeeeeeee mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm]
+			sign 1
+			exp 11
+			man 52
+		dec[-1.7976931348623157e308, 1.7976931348623157e308]
+			bias 1023
+			mbits 52
+int: -sign×2^(bits-1) + Σ(bit_i×2^i)
+	1
+		bin[s]
+			sign 1
+			value 0
+		dec[-1, 0]
+	4
+		bin[s vvv]
+			sign 1
+			value 3
+		dec[-8, 7]
+	8
+		bin[s vvvvvvv]
+			sign 1
+			value 7
+		dec[-128, 127]
+bf: (-1)^sign × 2^(exp-bias) × (1 + man/2^mbits)
+
+	16
+		bin[s eeeeeeee mmmmmmm]
+			sign 1
+			exp 8
+			man 7
+		dec[-3.3895313892515355e38, 3.3895313892515355e38]
+			bias 127
+			mbits 7
+tf: (-1)^sign × 2^(exp-bias) × (1 + man/2^mbits)
+	32
+		bin[s eeeeeeee mmmmmmmmmm xxxxxxxxxxxxx]
+			sign 1
+			exp 8
+			man 10
+			ignored storage bits 13
+		dec[-3.4011621342146535e38, 3.4011621342146535e38]
+			bias 127
+			mbits 10
