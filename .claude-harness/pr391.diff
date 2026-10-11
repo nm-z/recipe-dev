@@ -1,0 +1,196 @@
+diff --git a/recipe.rs b/recipe.rs
+index b092d1f0..e9d66905 100644
+--- a/recipe.rs
++++ b/recipe.rs
+@@ -3164,7 +3164,7 @@ mod bundle {
+ 		for node in &graph.nodes {
+ 			if node.op != Primitive::Predictor { continue }
+ 			let code = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 2).ok_or_else(|| RecipeError::new("fitted estimator program span is invalid"))?.to_vec();
+-			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize, table: vec![0.0; node.parameters] });
++			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize, table: vec![0.0; node.parameters], nearest: None });
+ 		}
+ 		Ok(SemanticGraph { model: stored.model.clone(), precision: stored.precision, input: graph.input, output: graph.output, inputs: stored.inputs.clone(), outputs: stored.outputs.clone(), tensors, predictors, frozen: graph.frozen.clone(), state: graph.state.clone(), norm_mean: stored.norm_mean.clone(), norm_scale: stored.norm_scale.clone(), target_min: stored.target_min, target_span: stored.target_span, bn_stats: stored.bn_stats.clone(), artifact: stored.artifact.clone() })
+ 	}
+@@ -3287,7 +3287,7 @@ mod bundle {
+ 					let fields = values::<f64>(value, "fitted estimator program")?;
+ 					require(fields.len() >= 3 && (fields.len() - 3) % 2 == 0, "fitted estimator program has the wrong width")?;
+ 					let slot = |value: f64, role| usize::try_from(value as i64).ok().filter(|_| value.fract() == 0.0).ok_or_else(|| RecipeError::new(format!("invalid fitted estimator {role}")));
+-					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, table: vec![0.0; slot(fields[2], "table width")?], code: fields[3..].to_vec() });
++					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, table: vec![0.0; slot(fields[2], "table width")?], code: fields[3..].to_vec(), nearest: None });
+ 				}
+ 				"frozen" => builder.frozen = values(value, "frozen weight")?,
+ 				"moments" => builder.state.moments = values(value, "Adam moment")?,
+@@ -7016,11 +7016,88 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize,
+ 	Ok(graph)
+ }
+ #[derive(Clone)]
++struct NearestNode {
++	minimum: u32,
++	start: u32,
++	end: u32,
++	split: Option<(usize, f64, Box<NearestNode>, Box<NearestNode>)>,
++}
++#[derive(Clone)]
++struct NearestIndex {
++	features: usize,
++	permutation: Vec<u32>,
++	root: NearestNode,
++}
++impl NearestIndex {
++	fn build(samples: &[f64], features: usize, rows: usize) -> Self {
++		let mut permutation = (0..rows as u32).collect::<Vec<_>>();
++		let root = Self::partition(samples, features, &mut permutation, 0);
++		Self { features, permutation, root }
++	}
++	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32) -> NearestNode {
++		let minimum = permutation.iter().copied().min().unwrap_or(0);
++		let end = start + permutation.len() as u32;
++		if permutation.len() <= 16 {
++			return NearestNode { minimum, start, end, split: None };
++		}
++		let mut widest = (f64::NEG_INFINITY, 0);
++		for feature in 0..features {
++			let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
++			for &row in permutation.iter() {
++				let value = samples[row as usize * features + feature];
++				(low, high) = (low.min(value), high.max(value));
++			}
++			widest = if high - low > widest.0 { (high - low, feature) } else { widest };
++		}
++		let (dimension, middle) = (widest.1, permutation.len() / 2);
++		permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
++		let threshold = samples[permutation[middle] as usize * features + dimension];
++		let (left, right) = permutation.split_at_mut(middle);
++		let left = Box::new(Self::partition(samples, features, left, start));
++		let right = Box::new(Self::partition(samples, features, right, start + middle as u32));
++		NearestNode { minimum, start, end, split: Some((dimension, threshold, left, right)) }
++	}
++	fn nearest(&self, node: &NearestNode, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
++		let Some((dimension, threshold, left, right)) = &node.split else {
++			for &candidate in &self.permutation[node.start as usize..node.end as usize] {
++				if exclude && candidate as usize == row {
++					continue;
++				}
++				let base = candidate as usize * self.features;
++				let measured = distance(query, &samples[base..base + self.features]);
++				let keeps = best.len() < count || best.last().is_some_and(|&(kept, index)| measured < kept || (measured == kept && candidate < index));
++				if measured < f64::MAX && keeps {
++					let position = best.iter().position(|&(kept, index)| kept > measured || (kept == measured && index > candidate)).unwrap_or(best.len());
++					best.insert(position, (measured, candidate));
++					best.truncate(count);
++				}
++			}
++			return;
++		};
++		// On an equal coordinate the left child holds the lower row indices, so it is
++		// searched first to settle tie-breaks before the far bound is consulted.
++		let (near, far) = if query[*dimension] <= *threshold { (left, right) } else { (right, left) };
++		self.nearest(near, samples, query, row, count, exclude, best);
++		// The squared split coordinate gap lower-bounds every far-side distance, so the
++		// far subtree is skipped only when no far row can displace or tie a kept one.
++		if best.len() == count {
++			if let Some(&(kept, index)) = best.last() {
++				let gap = (query[*dimension] - threshold).powi(2);
++				if gap > kept || (gap == kept && far.minimum > index) {
++					return;
++				}
++			}
++		}
++		self.nearest(far, samples, query, row, count, exclude, best);
++	}
++}
++#[derive(Clone)]
+ struct PredictorProgram {
+ 	code: Vec<f64>,
+ 	locals: usize,
+ 	stack: usize,
+ 	table: Vec<f64>,
++	nearest: Option<NearestIndex>,
+ }
+ impl PredictorProgram {
+ 	fn evaluate(&self, row: usize, query: &[f64]) -> Result<f64> {
+@@ -7049,17 +7126,14 @@ impl PredictorProgram {
+ 					let features = query.len();
+ 					let rows = self.table.len().checked_div(features + 1).filter(|rows| rows * (features + 1) == self.table.len()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+ 					let (samples, targets) = self.table.split_at(rows * features);
+-					let mut best = vec![(f64::MAX, 0.0); count];
+-					for (candidate, sample) in samples.chunks_exact(features).enumerate() {
+-						let (mut carry_distance, mut carry_target) = (if exclude && candidate == row { f64::MAX } else { distance(query, sample) }, targets[candidate]);
+-						for slot in &mut best {
+-							if slot.0 > carry_distance {
+-								std::mem::swap(&mut slot.0, &mut carry_distance);
+-								std::mem::swap(&mut slot.1, &mut carry_target);
+-							}
+-						}
+-					}
+-					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
++					// An index is built beside the table it searches and neither is replaced afterwards, so a
++					// program that carries an absent or differently shaped index rebuilds from the table it holds
++					// now rather than answering from one that never saw these values.
++					let rebuilt = self.nearest.as_ref().filter(|index| index.features == features && index.permutation.len() == rows).is_none().then(|| NearestIndex::build(samples, features, rows));
++					let index = rebuilt.as_ref().or(self.nearest.as_ref()).ok_or_else(|| RecipeError::new("nearest index is absent"))?;
++					let mut best = Vec::with_capacity(count);
++					index.nearest(&index.root, samples, query, row, count, exclude, &mut best);
++					stack.push((0..count).map(|slot| best.get(slot).map_or(0.0, |&(_, candidate)| targets[candidate as usize])).sum::<f64>() / count as f64)
+ 				},
+ 				value if value == PredictorOpcode::Affine as i32 => {
+ 					require(self.table.len() == 3 * query.len() && !query.is_empty(), "affine table width is invalid")?;
+@@ -7081,15 +7155,16 @@ struct PredictorBuilder {
+ 	depth: usize,
+ 	stack: usize,
+ 	table: Vec<f64>,
++	index: Option<NearestIndex>,
+ }
+ impl PredictorBuilder {
+-	fn new() -> Self { Self { code: Vec::new(), locals: 0, depth: 0, stack: 0, table: Vec::new() } }
+-	fn nearest(&mut self, count: usize, exclude: bool, table: Vec<f64>) {
+-		self.table = table;
++	fn new() -> Self { Self { code: Vec::new(), locals: 0, depth: 0, stack: 0, table: Vec::new(), index: None } }
++	fn nearest(&mut self, count: usize, exclude: bool, features: usize, table: Vec<f64>) {
++		(self.index, self.table) = (Some(NearestIndex::build(&table, features, table.len() / (features + 1))), table);
+ 		self.push(PredictorOpcode::Nearest, if exclude { -(count as f64) } else { count as f64 });
+ 	}
+ 	fn affine(&mut self, table: Vec<f64>) {
+-		self.table = table;
++		(self.index, self.table) = (None, table);
+ 		self.push(PredictorOpcode::Affine, 0.0);
+ 	}
+ 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
+@@ -7105,7 +7180,7 @@ impl PredictorBuilder {
+ 	fn finish(self) -> Result<PredictorProgram> {
+ 		require(self.depth == 1 && self.stack != 0 && self.code.len() % 2 == 0, "predictor program is invalid")?;
+ 		require(self.code.chunks_exact(2).all(|instruction| instruction[0].is_finite() && instruction[1].is_finite()), "predictor program contains a nonfinite value")?;
+-		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack, table: self.table })
++		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack, table: self.table, nearest: self.index })
+ 	}
+ }
+ struct Predictor {
+@@ -7113,8 +7188,8 @@ struct Predictor {
+ 	predict: Box<dyn Fn(usize, &[f64]) -> Result<f64> + Send + Sync>,
+ }
+ impl Predictor {
+-	fn new(program: PredictorProgram) -> Self {
+-		let evaluator = program.clone();
++	fn new(mut program: PredictorProgram) -> Self {
++		let evaluator = PredictorProgram { nearest: program.nearest.take(), code: program.code.clone(), locals: program.locals, stack: program.stack, table: program.table.clone() };
+ 		Self { program, predict: Box::new(move |row, query| evaluator.evaluate(row, query)) }
+ 	}
+ }
+@@ -7598,7 +7673,7 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _:
+ 	let groups = table.len() / data.features.max(1);
+ 	table.extend((0..groups).map(|group| group as f64));
+ 	let mut program = PredictorBuilder::new();
+-	program.nearest(1, false, table);
++	program.nearest(1, false, data.features, table);
+ 	Ok(Predictor::new(program.finish()?))
+ }
+ /// Evaluates the immutable teacher once for each prepared sample. Worker threads process
+@@ -7626,7 +7701,7 @@ fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool)
+ 	let mut table = data.samples[..rows * data.features].to_vec();
+ 	table.extend_from_slice(&data.targets[..rows]);
+ 	let mut program = PredictorBuilder::new();
+-	program.nearest(count, exclude, table);
++	program.nearest(count, exclude, data.features, table);
+ 	Ok(Predictor::new(program.finish()?))
+ }
+ impl Estimator {
