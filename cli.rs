@@ -115,6 +115,7 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	for (key, value) in settings { unsafe { std::env::set_var(key, value); } }
 	#[cfg(unix)]
 	recipe::runtime_started().unwrap_or_else(|error| { fs::remove_file(&output).ok(); invalid(&error.to_string()); });
+	if let Ok(parent) = std::env::var("RECIPE_RUNTIME_JOB") { unsafe { std::env::set_var("RECIPE_RUNTIME_PARENT", parent); } }
 	let inherited_device = std::env::var("RECIPE_DEVICE").ok();
 	if let Some(selection) = device.or(inherited_device.as_deref()) {
 		match recipe::run_remote_script(&output, selection, config, arguments) {

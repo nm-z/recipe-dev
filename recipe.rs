@@ -37591,7 +37591,7 @@ const RUNTIME_RESIZE: u8 = 14;
 
 #[cfg(unix)]
 fn runtime_setting(name: &str) -> bool {
-	!matches!(name, "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_RUNTIME_JOB" | "RECIPE_RUNTIME_PARENT" | "RECIPE_RUNTIME_TTY" | "RECIPE_RUNTIME_SIZE")
+	!matches!(name, "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_RUNTIME_JOB" | "RECIPE_RUNTIME_PARENT" | "RECIPE_RUNTIME_NODE" | "RECIPE_RUNTIME_TTY" | "RECIPE_RUNTIME_SIZE")
 }
 
 #[cfg(unix)]
@@ -37854,6 +37854,7 @@ fn runtime_run_job(
 		.envs(settings.iter().map(|(key, value)| (key, value)))
 		.env("RECIPE_RUNTIME_SOCKET", runtime_socket_path())
 		.env("RECIPE_RUNTIME_JOB", job_id.to_string())
+		.env("RECIPE_RUNTIME_NODE", local_host().map_err(|error| error.to_string())?)
 		.spawn()
 		.map_err(|e| format!("cannot start recipe run: {e}"))?;
 	let mut stdin: Box<dyn Write + Send> = if terminal & 1 == 0 { Box::new(child.stdin.take().ok_or("cannot capture job stdin")?) }
@@ -38328,6 +38329,10 @@ pub fn runtime_daemon() -> ! {
 #[cfg(unix)]
 fn runtime_connect() -> Result<UnixStream> {
 	let socket_path = runtime_socket_path();
+	let nested = std::env::var_os("RECIPE_RUNTIME_PARENT").is_some();
+	if nested && let Ok(node) = std::env::var("RECIPE_RUNTIME_NODE") {
+		require(node == local_host()?, format!("nested run requires its parent's runtime on node {node}"))?;
+	}
 	let deadline = Instant::now() + Duration::from_secs(env!("RECIPE_RUNTIME_CONNECT_SECONDS").parse().expect("validated runtime connection deadline"));
 	let mut spawned = false;
 	loop {
@@ -38338,6 +38343,7 @@ fn runtime_connect() -> Result<UnixStream> {
 			require(verb == RUNTIME_HELLO && identity == runtime_identity()?, "Recipe runtime uses another executable; select a separate runtime socket and lock")?;
 			return Ok(stream);
 		}
+		require(!nested, format!("nested run cannot reach its parent's runtime at {}", socket_path.display()))?;
 		require(Instant::now() < deadline, format!("cannot reach the Recipe runtime at {}", socket_path.display()))?;
 		if !spawned {
 			if let Some(binary) = std::env::current_exe().ok().filter(|p| p.exists()) {
