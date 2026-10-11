@@ -1,0 +1,260 @@
+diff --git a/recipe.rs b/recipe.rs
+index b092d1f0..b6fe7bf5 100644
+--- a/recipe.rs
++++ b/recipe.rs
+@@ -72,6 +72,7 @@ pub enum PredictorOpcode {
+ 	Choose = 11,
+ 	Nearest = 12,
+ 	Affine = 13,
++	Gauss = 14,
+ }
+ 
+ impl PredictorOpcode {
+@@ -91,6 +92,7 @@ impl PredictorOpcode {
+ 			11 => Ok(Self::Choose),
+ 			12 => Ok(Self::Nearest),
+ 			13 => Ok(Self::Affine),
++			14 => Ok(Self::Gauss),
+ 			_ => Err(EmitError::InvalidOpcode { kind: "predictor", value }),
+ 		}
+ 	}
+@@ -596,7 +598,8 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
+ 				stack.push(format!("%{p}.result"));
+ 			}
+ 			PredictorOpcode::Affine => {
+-				if context.features == 0 || context.parameters != 3 * context.features {
++				let stride = context.parameters / 3;
++				if context.features == 0 || context.parameters % 3 != 0 || stride < context.features {
+ 					return Err(EmitError::InvalidOperand { kind: "affine table width", value: context.parameters as f64 });
+ 				}
+ 				let ty = context.value_type;
+@@ -609,19 +612,72 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
+ 				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.j.next, %{p}.body ]");
+ 				let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.acc.next, %{p}.body ]");
+ 				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.more, label %{p}.body, label %{p}.done", features = context.features);
+-				// The table is three feature-length planes (means, scales, weights),
++				// The table is three stride-length planes (means, scales, weights),
+ 				// accumulated per feature as (x - mean) * scale * weight. The
+ 				// weights pointer is already advanced to this node's parameter
+ 				// span, so the plane indices are node-relative.
+ 				let _ = writeln!(output, "{p}.body:");
+ 				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
+ 				let _ = writeln!(output, "%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.j\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", weights = context.weights);
+-				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {features}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", features = context.features, weights = context.weights);
+-				let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {features}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", features = context.features, weights = context.weights);
++				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {stride}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", weights = context.weights);
++				let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {stride}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", weights = context.weights);
+ 				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.scaled = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.scale)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.scaled, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+ 				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.head\n{p}.done:");
+ 				stack.push(format!("%{p}.acc"));
+ 			}
++			PredictorOpcode::Gauss => {
++				let classes = integer(argument, "gauss classes")?;
++				if classes <= 0 {
++					return Err(EmitError::InvalidOperand { kind: "gauss classes", value: argument });
++				}
++				let classes = classes as usize;
++				let width = 2 * classes + 2;
++				if context.features == 0 || context.parameters % width != 0 {
++					return Err(EmitError::InvalidOperand { kind: "gauss table width", value: context.parameters as f64 });
++				}
++				let stride = context.parameters / width;
++				if stride < context.features || stride < classes {
++					return Err(EmitError::InvalidOperand { kind: "gauss table stride", value: stride as f64 });
++				}
++				let ty = context.value_type;
++				let (ptr, align) = (context.pointer_type, context.alignment);
++				let p = format!("{}.gauss.{sequence}", context.prefix);
++				sequence += 1;
++				let (zero, minimum) = ((context.literal)(0.0, ty), (context.literal)(-f64::MAX, ty));
++				// Class loop head: induction variable plus the best score and its
++				// class label as phis. The table is one label plane, one base
++				// plane, then one mean plane and one scale plane per class, each
++				// padded to the stride so no storage block mixes magnitude
++				// families. The weights pointer is already advanced to this node's
++				// parameter span, so the plane indices are node-relative.
++				let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
++				let _ = writeln!(output, "%{p}.c = phi i32 [ 0, %{p}.entry ], [ %{p}.c.next, %{p}.latch ]");
++				let _ = writeln!(output, "%{p}.best = phi {ty} [ {minimum}, %{p}.entry ], [ %{p}.best.new, %{p}.latch ]");
++				let _ = writeln!(output, "%{p}.label = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.label.new, %{p}.latch ]");
++				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.c, {classes}\nbr i1 %{p}.more, label %{p}.score, label %{p}.done");
++				// Class score: the base seeds the accumulator, then each feature
++				// adds (x - mean)^2 * scale, matching the float association of the
++				// straight-line score this loop replaces.
++				let _ = writeln!(output, "{p}.score:");
++				let _ = writeln!(output, "%{p}.base.index = add i32 %{p}.c, {stride}\n%{p}.base.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.base.index\n%{p}.base = load {ty}, {ptr} %{p}.base.ptr, align {align}", weights = context.weights);
++				let _ = writeln!(output, "br label %{p}.f.head\n{p}.f.head:");
++				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.score ], [ %{p}.j.next, %{p}.f.body ]");
++				let _ = writeln!(output, "%{p}.acc = phi {ty} [ %{p}.base, %{p}.score ], [ %{p}.acc.next, %{p}.f.body ]");
++				let _ = writeln!(output, "%{p}.f.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.f.more, label %{p}.f.body, label %{p}.f.done", features = context.features);
++				let _ = writeln!(output, "{p}.f.body:");
++				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
++				let _ = writeln!(output, "%{p}.mean.plane = mul i32 %{p}.c, {stride}\n%{p}.mean.relative = add i32 %{p}.mean.plane, %{p}.j\n%{p}.mean.index = add i32 %{p}.mean.relative, {base}\n%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.mean.index\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", base = 2 * stride, weights = context.weights);
++				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.mean.index, {planes}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", planes = classes * stride, weights = context.weights);
++				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.centered)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.square, {ty} %{p}.scale)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
++				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.f.head\n{p}.f.done:");
++				// Keep the strictly better score, so ties resolve to the earlier class.
++				let _ = writeln!(output, "%{p}.this.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.c\n%{p}.this = load {ty}, {ptr} %{p}.this.ptr, align {align}", weights = context.weights);
++				let _ = writeln!(output, "%{p}.swap = call i1 @recipe.ogt({ty} %{p}.acc, {ty} %{p}.best)");
++				let _ = writeln!(output, "%{p}.best.new = select i1 %{p}.swap, {ty} %{p}.acc, {ty} %{p}.best");
++				let _ = writeln!(output, "%{p}.label.new = select i1 %{p}.swap, {ty} %{p}.this, {ty} %{p}.label");
++				let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.c.next = add i32 %{p}.c, 1\nbr label %{p}.head\n{p}.done:");
++				stack.push(format!("%{p}.label"));
++			}
+ 		}
+ 	}
+ 	if stack.len() != 1 {
+@@ -7062,11 +7118,30 @@ impl PredictorProgram {
+ 					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
+ 				},
+ 				value if value == PredictorOpcode::Affine as i32 => {
+-					require(self.table.len() == 3 * query.len() && !query.is_empty(), "affine table width is invalid")?;
+-					let (means, rest) = self.table.split_at(query.len());
+-					let (scales, weights) = rest.split_at(query.len());
++					let stride = self.table.len() / 3;
++					require(self.table.len() % 3 == 0 && !query.is_empty() && stride >= query.len(), "affine table width is invalid")?;
++					let (means, rest) = self.table.split_at(stride);
++					let (scales, weights) = rest.split_at(stride);
+ 					stack.push(query.iter().zip(means).zip(scales).zip(weights).map(|(((value, mean), scale), weight)| (value - mean) * scale * weight).sum())
+ 				},
++				value if value == PredictorOpcode::Gauss as i32 => {
++					let features = query.len();
++					let classes = slot()?;
++					let width = 2 * classes + 2;
++					require(features != 0 && classes != 0 && self.table.len() % width == 0, "gauss table width is invalid")?;
++					let stride = self.table.len() / width;
++					require(stride >= features && stride >= classes, "gauss table stride is invalid")?;
++					let mut best = (-f64::MAX, 0.0);
++					for class in 0..classes {
++						let means = &self.table[(2 + class) * stride..];
++						let scales = &self.table[(2 + classes + class) * stride..];
++						let score = query.iter().zip(means).zip(scales).fold(self.table[stride + class], |score, ((value, mean), scale)| score + (value - mean) * (value - mean) * scale);
++						if score > best.0 {
++							best = (score, self.table[class]);
++						}
++					}
++					stack.push(best.1)
++				},
+ 				_ => return Err(RecipeError::new(format!("invalid predictor opcode {opcode}"))),
+ 			}
+ 		}
+@@ -7092,16 +7167,16 @@ impl PredictorBuilder {
+ 		self.table = table;
+ 		self.push(PredictorOpcode::Affine, 0.0);
+ 	}
++	fn gauss(&mut self, classes: usize, table: Vec<f64>) {
++		self.table = table;
++		self.push(PredictorOpcode::Gauss, classes as f64);
++	}
+ 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
+ 	fn push(&mut self, opcode: PredictorOpcode, argument: f64) { self.emit(opcode, argument); self.depth += 1; self.stack = self.stack.max(self.depth) }
+ 	fn feature(&mut self, index: usize) { self.push(PredictorOpcode::Feature, index as f64) }
+ 	fn constant(&mut self, value: f64) { self.push(PredictorOpcode::Constant, value) }
+-	fn load(&mut self, slot: usize) { self.push(PredictorOpcode::Load, slot as f64) }
+-	fn store(&mut self, slot: usize) { self.emit(PredictorOpcode::Store, slot as f64); self.depth -= 1 }
+-	fn duplicate(&mut self) { self.push(PredictorOpcode::Duplicate, 0.0) }
+ 	fn binary(&mut self, opcode: PredictorOpcode) { self.emit(opcode, 0.0); self.depth -= 1 }
+ 	fn choose(&mut self) { self.emit(PredictorOpcode::Choose, 0.0); self.depth -= 2 }
+-	fn local(&mut self) -> usize { let slot = self.locals; self.locals += 1; slot }
+ 	fn finish(self) -> Result<PredictorProgram> {
+ 		require(self.depth == 1 && self.stack != 0 && self.code.len() % 2 == 0, "predictor program is invalid")?;
+ 		require(self.code.chunks_exact(2).all(|instruction| instruction[0].is_finite() && instruction[1].is_finite()), "predictor program contains a nonfinite value")?;
+@@ -7269,19 +7344,6 @@ fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Res
+ 	}
+ 	require(values.iter().all(|value| value.is_finite()), "linear system produced a nonfinite solution").map(|_| values)
+ }
+-fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse: &[f64]) {
+-	program.constant(base);
+-	for (feature, (&mean, &scale)) in means.iter().zip(inverse).enumerate() {
+-		program.feature(feature);
+-		program.constant(mean);
+-		program.binary(PredictorOpcode::Subtract);
+-		program.duplicate();
+-		program.binary(PredictorOpcode::Multiply);
+-		program.constant(-0.5 * scale);
+-		program.binary(PredictorOpcode::Multiply);
+-		program.binary(PredictorOpcode::Add);
+-	}
+-}
+ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+ 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
+ 	if !data.target_categorical {
+@@ -7301,15 +7363,20 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
+ 		}
+ 		for feature in 0..data.features { matrix[feature * data.features + feature] += config.bayes_prior_precision }
+ 		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
+-		let bias = target_mean - weights.iter().zip(&means).map(|(weight, mean)| weight * mean).sum::<f64>();
++		// The fitted model lives in the predictor table as three planes like
++		// fit_svm, so the emitted program is a fixed-size feature loop instead
++		// of straight-line code that grows with the feature count. Every plane
++		// is padded to the widest storage block, so no quantization block mixes
++		// magnitude families.
++		let stride = data.features.next_multiple_of(256);
++		let mut table = vec![0.0; 3 * stride];
++		table[..data.features].copy_from_slice(&means);
++		table[stride..stride + data.features].fill(1.0);
++		table[2 * stride..2 * stride + data.features].copy_from_slice(&weights);
+ 		let mut program = PredictorBuilder::new();
+-		program.constant(bias);
+-		for (feature, weight) in weights.into_iter().enumerate() {
+-			program.feature(feature);
+-			program.constant(weight);
+-			program.binary(PredictorOpcode::Multiply);
+-			program.binary(PredictorOpcode::Add);
+-		}
++		program.constant(target_mean);
++		program.affine(table);
++		program.binary(PredictorOpcode::Add);
+ 		return Ok(Predictor::new(program.finish()?));
+ 	}
+ 	let mut classes = data.targets[..rows].to_vec();
+@@ -7326,34 +7393,23 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
+ 		let base = (members.len() as f64 / rows as f64).ln() - 0.5 * variance.iter().map(|value| value.ln()).sum::<f64>();
+ 		statistics.push((class, base, means, variance.into_iter().map(f64::recip).collect::<Vec<_>>()));
+ 	}
+-	let mut program = PredictorBuilder::new();
+-	let (best_score, best_class, score, condition) = (program.local(), program.local(), program.local(), program.local());
++	// The class statistics live in the predictor table as one label plane, one
++	// base plane, and one mean and one scale plane per class, so the emitted
++	// program is one fixed-size class and feature loop instead of straight-line
++	// code that grows with the feature count. Every plane is padded to the
++	// widest storage block, so no quantization block mixes magnitude families.
++	let stride = data.features.max(statistics.len()).next_multiple_of(256);
++	let mut table = vec![0.0; (2 * statistics.len() + 2) * stride];
+ 	for (index, (class, base, means, inverse)) in statistics.iter().enumerate() {
+-		bayes_score(&mut program, *base, means, inverse);
+-		program.store(score);
+-		if index == 0 {
+-			program.load(score);
+-			program.store(best_score);
+-			program.constant(*class);
+-			program.store(best_class);
+-			continue;
++		table[index] = *class;
++		table[stride + index] = *base;
++		table[(2 + index) * stride..(2 + index) * stride + data.features].copy_from_slice(means);
++		for (slot, scale) in table[(2 + statistics.len() + index) * stride..].iter_mut().zip(inverse) {
++			*slot = -0.5 * scale;
+ 		}
+-		program.load(score);
+-		program.load(best_score);
+-		program.binary(PredictorOpcode::Greater);
+-		program.store(condition);
+-		program.load(condition);
+-		program.load(score);
+-		program.load(best_score);
+-		program.choose();
+-		program.store(best_score);
+-		program.load(condition);
+-		program.constant(*class);
+-		program.load(best_class);
+-		program.choose();
+-		program.store(best_class);
+-	}
+-	program.load(best_class);
++	}
++	let mut program = PredictorBuilder::new();
++	program.gauss(statistics.len(), table);
+ 	Ok(Predictor::new(program.finish()?))
+ }
+ fn tree_predict(tree: &TreeNode, sample: &[f64]) -> f64 {
