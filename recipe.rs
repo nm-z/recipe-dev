@@ -10246,10 +10246,11 @@ mod gguf {
 							let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
 							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments })
 						}
-						false if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
+						false if plan.tables.contains(&entry) => {
+							require(planes.len() == 1, format!("table entry {entry} requires one mapped tensor"))?;
 							let tensor = match first {
 								Plane::Mapped(tensor) => tensor,
-								Plane::Owned { .. } => unreachable!(),
+								Plane::Owned { .. } => return Err(RecipeError::new(format!("table entry {entry} requires a mapped tensor"))),
 							};
 							BoundWeight::Stored(self.embedding_stored(tensor)?)
 						}
@@ -17205,6 +17206,8 @@ impl Gguf {
 #[derive(Clone, Default)]
 pub struct Binding {
 	tensors: BTreeSet<String>,
+	/// Entries that read mapped table rows, including raw F32 and F16 embeddings.
+	tables: BTreeSet<usize>,
 	/// Tensors of the file that no node reads.
 	unread: Vec<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
@@ -17272,6 +17275,12 @@ impl Binding {
 		self.tensors.extend(planes.iter().map(|tensor| tensor.name.clone()));
 		self.nodes.push(planes.iter().cloned().map(Plane::Mapped).collect());
 		self
+	}
+	/// The next weighted node reads rows of this mapped table, regardless of its tensor name.
+	#[must_use]
+	pub fn table(mut self, tensor: &GgufTensor) -> Self {
+		self.tables.insert(self.nodes.len());
+		self.node(std::slice::from_ref(tensor))
 	}
 	/// Appends values derived from `source` to the preceding node, for example a stored delta decay rewritten as `ln(-a)`.
 	/// Start an empty node with `node(&[])` when every plane is transformed. Compilation checks the node's complete element count.
@@ -17836,7 +17845,7 @@ impl<'a> Builder<'a> {
 			let block = model.blocks.last_mut().unwrap();
 			(block.quantization, block.profile) = (format.0, false);
 		});
-		builder.mapped(vec![embedding.clone()]);
+		builder.plan = builder.plan.table(&embedding);
 		let ple = if builder.present("ple.ngram_size") { Some(Ngram::new(file)?) } else { None };
 		for layer in 0..blocks {
 			if let Some(ple) = ple.as_ref().filter(|ple| ple.layer() == layer) {
@@ -19206,7 +19215,7 @@ impl Builder<'_> {
 			match &block.operation {
 				Operation::Embed(rows, columns) => {
 					require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
-					self.mapped(vec![embedding.clone()]);
+					self.plan = std::mem::take(&mut self.plan).table(&embedding);
 				}
 				Operation::Ple(formula) => {
 					let table = Ngram::new(self.file)?;
