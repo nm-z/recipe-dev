@@ -46,11 +46,12 @@ if [ "${1:-}" = "--existing" ]; then
 		RECIPE_SUITE_WORK="$existing_work" \
 		RECIPE_EVIDENCE="$existing_work/suite.json" \
 		"$existing_target/release/recipe" run "$existing_source/.github/runtime/suite.rs" --device "$RECIPE_EXISTING_DEVICE" 2>&1 | tee "$existing_work/run.log"
-	jq -e '.executed == 8 and .failed == 0 and (.checks | length) == 8 and all(.checks[]; .passed == true)' "$existing_work/suite.json" >/dev/null
+	jq -e '.executed >= 40 and .failed == 0 and .executed == (.checks | length) and all(.checks[]; .passed == true)' "$existing_work/suite.json" >/dev/null
 	existing_route="$(awk '/^suite device / {print $3; exit}' "$existing_work/run.log")"
 	case "$existing_route" in "$RECIPE_EXISTING_DEVICE"|*:"$RECIPE_EXISTING_DEVICE") ;; *) echo 'the suite did not execute on the selected NVIDIA backend' >&2; exit 1 ;; esac
 	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] && git diff --quiet && git diff --cached --quiet || { echo 'the candidate changed during execution' >&2; exit 1; }
-	printf 'EXISTING NVIDIA PASS candidate=%s device=%s uuid=%s executed=8 failed=0\n' "$CANDIDATE_SHA" "$RECIPE_EXISTING_DEVICE" "$existing_uuid"
+	existing_executed="$(jq .executed "$existing_work/suite.json")"
+	printf 'EXISTING NVIDIA PASS candidate=%s device=%s uuid=%s executed=%s failed=0\n' "$CANDIDATE_SHA" "$RECIPE_EXISTING_DEVICE" "$existing_uuid" "$existing_executed"
 	exit 0
 fi
 

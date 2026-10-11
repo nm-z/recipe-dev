@@ -501,3 +501,42 @@ ple-convolution = "silu"
 ple-gate = "signed-root-sigmoid"
 ple-floor = "0.000001"
 ple-width-scaled = "true"
+
+[precision.e5m2]
+sum = "int8"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp16"
+norm = "fp16"
+res = "fp16"
+acc = "fp32"
+train = "fp32"
+fp8 = "e5m2"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.05
+step = 32
+
+[precision.inference]
+sum = "int8"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp16"
+norm = "fp16"
+res = "fp16"
+acc = "fp32"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.05
+step = 32
