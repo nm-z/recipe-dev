@@ -114,8 +114,12 @@ int main(int argc, char **argv)
 		rcpref_read_record(fb, V, &ib, &wb, b);
 		if (ia != k || ib != k)
 			rcpref_die("step index out of order");
+		if (!isfinite(a[0]) || !isfinite(b[0]))
+			rcpref_die("nonfinite logit");
 		uint32_t ar = 0, br = 0;
 		for (uint32_t j = 1; j < V; j++) {
+			if (!isfinite(a[j]) || !isfinite(b[j]))
+				rcpref_die("nonfinite logit");
 			if (a[j] > a[ar])
 				ar = j;
 			if (b[j] > b[br])
