@@ -1541,7 +1541,8 @@ impl ScheduleRat {
 			let mut best: Option<(usize, f64)> = None;
 			for (position, candidate) in value.unmeasured.iter().enumerate() {
 				let features = schedule_candidate_features(&value.candidates[*candidate]);
-				let favor = self.repeat.favor(&features, 1.0 / (1.0 + distance(proposal, &features)));
+				let favor = self.repeat.candidate_favor(&features, 1.0 / (1.0 + distance(proposal, &features)), value.candidates.len());
+				if favor == 0.0 { continue; }
 				if best.is_none_or(|(_, score)| favor > score) {
 					best = Some((position, favor));
 				}
@@ -13322,6 +13323,7 @@ struct LaneTuner {
 	random: u64,
 	window: usize,
 	temperature: f64,
+	repeat: Vec<RepeatPenalty>,
 }
 impl LaneTuner {
 	fn new(graph: &Graph) -> Result<Self> {
@@ -13340,15 +13342,27 @@ impl LaneTuner {
 		}
 		let window = natural("lane tuning window", env!("RECIPE_LANE_TUNING_WINDOW"))?.max(1);
 		let temperature = env!("RECIPE_LANE_TUNING_TEMPERATURE").parse::<f64>().map_err(|_| RecipeError::new("lane tuning temperature is not a number"))?;
-		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature })
+		let config = Config::load()?;
+		let repeat = vec![RepeatPenalty::new(config.rat_repeat_penalty, config.rat_repeat_window)?; keys.len()];
+		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature, repeat })
 	}
 	/// The width each class runs next, and the table of one i32 per node slot.
 	fn choose(&mut self) -> Vec<u8> {
 		for (class, runs) in self.history.iter().enumerate() {
 			let means = runs.iter().map(|window| (!window.is_empty()).then(|| window.iter().sum::<f64>() / window.len() as f64)).collect::<Vec<_>>();
 			let best = means.iter().flatten().copied().fold(f64::INFINITY, f64::min);
-			let weights = means.iter().map(|mean| if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 }).collect::<Vec<_>>();
+			let weights = means.iter().enumerate().map(|(candidate, mean)| {
+				let weight = if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 };
+				self.repeat[class].candidate_favor(&[candidate as f64], weight, LANE_TEAMS.len())
+			}).collect::<Vec<_>>();
 			let total = weights.iter().sum::<f64>();
+			if total == 0.0 {
+				// Every width is already measured. Keep the best without proposing it again.
+				if let Some((candidate, _)) = means.iter().enumerate().filter_map(|(index, mean)| mean.map(|mean| (index, mean))).min_by(|left, right| left.1.total_cmp(&right.1)) {
+					self.chosen[class] = candidate;
+				}
+				continue;
+			}
 			let mut draw = (next_random(&mut self.random) >> 11) as f64 / (1_u64 << 53) as f64 * total;
 			let mut pick = weights.len() - 1;
 			for (candidate, weight) in weights.iter().enumerate() {
@@ -13359,6 +13373,7 @@ impl LaneTuner {
 				draw -= weight;
 			}
 			self.chosen[class] = pick;
+			self.repeat[class].push(&[pick as f64]);
 		}
 		// Slot n + 1 holds node n's knob: the kernels number nodes from one.
 		let mut table = vec![0_u8; (self.classes.len() + 2) * 4];
@@ -19452,6 +19467,11 @@ impl RepeatPenalty {
 	fn favor(&self, key: &[f64], favorability: f64) -> f64 {
 		if self.repeats(key) { if favorability > 0.0 { favorability / self.penalty } else { favorability * self.penalty } } else { favorability }
 	}
+	/// A window covering a finite choice set retains every proposal, so a
+	/// recent choice is excluded until the proposer exhausts that set.
+	fn candidate_favor(&self, key: &[f64], favorability: f64, choices: usize) -> f64 {
+		if self.window >= choices && self.repeats(key) { 0.0 } else { self.favor(key, favorability) }
+	}
 	/// A command score is better the closer it is to `target`, so the favorability
 	/// is the negated distance and a repeat moves the score away from the target.
 	fn score(&self, key: &[f64], score: f64, target: f64) -> f64 {
@@ -19462,7 +19482,7 @@ impl RepeatPenalty {
 		target - self.favor(key, -offset.abs()) * offset.signum()
 	}
 	fn push(&mut self, key: &[f64]) {
-		if self.window == 0 {
+		if self.window == 0 || self.penalty == 1.0 {
 			return;
 		}
 		if self.recent.len() == self.window {
@@ -36939,6 +36959,9 @@ impl Train {
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
 		let width = names.len() + outputs.len();
 		let mut replay = RatReplay::new(width, usize::MAX)?;
+		let target = self.rat_target.unwrap_or(0.0);
+		let (penalty, window) = self.repeat.unwrap_or((config.rat_repeat_penalty, config.rat_repeat_window));
+		let mut repeat = RepeatPenalty::new(penalty, window)?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
 		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
 		let initial_predictions = episode.action.clone();
@@ -36965,7 +36988,9 @@ impl Train {
 				replay.raw.pop_front();
 			}
 			for observation in &episode.observations {
-				replay.observe(observation, episode.score)?;
+				let scored = repeat.score(observation, episode.score, target);
+				repeat.push(observation);
+				replay.observe(observation, scored)?;
 			}
 			let (samples, targets) = replay.snapshot();
 			let fitted_rows = if let Some(selector) = &mut selector {
