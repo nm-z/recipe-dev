@@ -253,10 +253,10 @@ fn main() {
 		assert!(rescale_worst < 1e-6, "fp16 KV storage rounded the attention value rescale: {rescale_worst}");
 		return;
 	}
-	let online = std::process::Command::new(std::env::current_exe().expect("cannot locate the suite"))
+	let online_check = std::process::Command::new(std::env::current_exe().expect("cannot locate the suite"))
 		.arg("--attention").env("RECIPE_CONFIG", "llamacpp").output().expect("cannot execute online attention check");
-	report.record("attention_online_fp16_kv_wide_sum", online.status.success(), String::from_utf8_lossy(&online.stdout).trim().to_owned());
-	assert!(online.status.success(), "online attention check failed: {}", String::from_utf8_lossy(&online.stderr));
+	report.record("attention_online_fp16_kv_wide_sum", online_check.status.success(), String::from_utf8_lossy(&online_check.stdout).trim().to_owned());
+	assert!(online_check.status.success(), "online attention check failed: {}", String::from_utf8_lossy(&online_check.stderr));
 
 	// 1. A linear model recovers an exact linear relationship, checked against
 	//    the closed form rather than against a recorded value.
