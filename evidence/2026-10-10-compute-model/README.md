@@ -44,18 +44,19 @@ installed disassembler that supports `sm_52`. Benji's CUDA 13.4 `cuobjdump`
 invocation rejects that architecture. Saved `.sass.txt` dumps let the same
 evaluator run on a CPU machine without disassembling again.
 
-## CPU verification on Benji
+## CPU verification on Archy
 
-Build with `CARGO_BUILD_JOBS=3` and
+Build with `CARGO_BUILD_JOBS=4`, `CUDA_VISIBLE_DEVICES=` (empty),
+`RECIPE_FORCE_CPU=1`, and
 `CARGO_TARGET_DIR=/home/nate/work/target-cx-recipe979`, using the release profile.
 Delete that target directory after the PR is merged or closed. Evidence
 directories contain logs and small outputs.
 
-Wrap each build or test command on Benji with
-`flock --close /home/nate/work/.build-slot-$((RANDOM%4+1)).lock`, and run it with
+Wrap each build or test command on Archy with
+`flock --close /home/nate/work/.build-slot-1.lock`, and run it with
 `nice -n 19`. Run one command at a time for this worker.
 
-The evaluator's syntax check and historical-trace rejection run on Benji.
+The evaluator's syntax check and historical-trace rejection run on the CPU.
 The original Flash Next capture fails with `no captured per-device compute
 nodes` before SASS processing. CPU execution does not establish the held-out
 GPU error result.
