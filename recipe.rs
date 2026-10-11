@@ -10003,19 +10003,30 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 				*mean += value / rows as f64
 			}
 		}
+		// The covariance is symmetric and the noise variance is invariant, so only
+		// the upper triangle accumulates and the noise divides each sum once.
 		let mut matrix = vec![0.0; data.features * data.features];
 		let mut values = vec![0.0; data.features];
+		let mut centered = vec![0.0; data.features];
 		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
+			for (centered, (value, mean)) in centered.iter_mut().zip(sample.iter().zip(&means)) {
+				*centered = value - mean
+			}
 			for left in 0..data.features {
-				let centered = sample[left] - means[left];
-				values[left] += centered * (target - target_mean) / config.bayes_noise_variance;
-				for right in 0..data.features {
-					matrix[left * data.features + right] += centered * (sample[right] - means[right]) / config.bayes_noise_variance
+				values[left] += centered[left] * (target - target_mean);
+				for right in left..data.features {
+					matrix[left * data.features + right] += centered[left] * centered[right]
 				}
 			}
 		}
-		for feature in 0..data.features {
-			matrix[feature * data.features + feature] += config.bayes_prior_precision
+		for left in 0..data.features {
+			values[left] /= config.bayes_noise_variance;
+			for right in left..data.features {
+				let entry = matrix[left * data.features + right] / config.bayes_noise_variance;
+				matrix[left * data.features + right] = entry;
+				matrix[right * data.features + left] = entry;
+			}
+			matrix[left * data.features + left] += config.bayes_prior_precision
 		}
 		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
 		let mut table = vec![1.0; 2 * data.features];

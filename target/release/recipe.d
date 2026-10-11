@@ -1,0 +1,1 @@
+/home/nate/Developer/recipe-506-head/target/release/recipe: /home/nate/Developer/recipe-506-head/Cargo.toml /home/nate/Developer/recipe-506-head/amd-nv-cpu.ll /home/nate/Developer/recipe-506-head/build.rs /home/nate/Developer/recipe-506-head/cli.rs /home/nate/Developer/recipe-506-head/recipe.rs
