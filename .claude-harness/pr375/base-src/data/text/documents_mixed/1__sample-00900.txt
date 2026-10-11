@@ -1,0 +1,1 @@
+Sample 00900: the model works under load.

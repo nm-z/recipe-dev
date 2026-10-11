@@ -1,0 +1,1 @@
+Sample 01778: the compiler converges with new data.

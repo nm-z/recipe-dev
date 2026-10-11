@@ -1,0 +1,1 @@
+Sample 00008: the engine responds on device.

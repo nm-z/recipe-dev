@@ -1,0 +1,1 @@
+Sample 01640: the engine responds under load.

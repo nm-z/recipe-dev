@@ -1,0 +1,1 @@
+Sample 00782: the device converges on device. It says, "check input, then retry."

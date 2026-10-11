@@ -1,0 +1,1200 @@
+{"input":"Sample 01200: the engine works with new data.","target":1}
+{"input":"Sample 01201: the sensor fails with new data.","target":0}
+{"input":"Sample 01202: the compiler converges with new data.","target":1}
+{"input":"Sample 01203: the kernel drifts at night.","target":0}
+{"input":"Sample 01204: the model improves at night.","target":1}
+{"input":"Sample 01205: the dataset stalls at night.","target":0}
+{"input":"Sample 01206: the device passes under load.","target":1}
+{"input":"Sample 01207: the signal breaks under load. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01208: the engine responds under load.","target":1}
+{"input":"Sample 01209: the sensor diverges after training.","target":0}
+{"input":"Sample 01210: the compiler learns after training.","target":1}
+{"input":"Sample 01211: the kernel lags after training.","target":0}
+{"input":"Sample 01212: the model works on device.","target":1}
+{"input":"Sample 01213: the dataset fails on device.","target":0}
+{"input":"Sample 01214: the device converges on device.","target":1}
+{"input":"Sample 01215: the signal drifts during testing.","target":0}
+{"input":"Sample 01216: the engine improves during testing.","target":1}
+{"input":"Sample 01217: the sensor stalls during testing.","target":0}
+{"input":"Sample 01218: the compiler passes with new data.","target":1}
+{"input":"Sample 01219: the kernel breaks with new data.","target":0}
+{"input":"Sample 01220: the model responds with new data.","target":1}
+{"input":"Sample 01221: the dataset diverges at night.","target":0}
+{"input":"Sample 01222: the device learns at night.","target":1}
+{"input":"Sample 01223: the signal lags at night.","target":0}
+{"input":"Sample 01224: the engine works under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01225: the sensor fails under load.","target":0}
+{"input":"Sample 01226: the compiler converges under load.","target":1}
+{"input":"Sample 01227: the kernel drifts after training.","target":0}
+{"input":"Sample 01228: the model improves after training.","target":1}
+{"input":"Sample 01229: the dataset stalls after training.","target":0}
+{"input":"Sample 01230: the device passes on device.","target":1}
+{"input":"Sample 01231: the signal breaks on device.","target":0}
+{"input":"Sample 01232: the engine responds on device.","target":1}
+{"input":"Sample 01233: the sensor diverges during testing.","target":0}
+{"input":"Sample 01234: the compiler learns during testing.","target":1}
+{"input":"Sample 01235: the kernel lags during testing.","target":0}
+{"input":"Sample 01236: the model works with new data.","target":1}
+{"input":"Sample 01237: the dataset fails with new data.","target":0}
+{"input":"Sample 01238: the device converges with new data.","target":1}
+{"input":"Sample 01239: the signal drifts at night.","target":0}
+{"input":"Sample 01240: the engine improves at night.","target":1}
+{"input":"Sample 01241: the sensor stalls at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01242: the compiler passes under load.","target":1}
+{"input":"Sample 01243: the kernel breaks under load.","target":0}
+{"input":"Sample 01244: the model responds under load.","target":1}
+{"input":"Sample 01245: the dataset diverges after training.","target":0}
+{"input":"Sample 01246: the device learns after training.","target":1}
+{"input":"Sample 01247: the signal lags after training.","target":0}
+{"input":"Sample 01248: the engine works on device.","target":1}
+{"input":"Sample 01249: the sensor fails on device.","target":0}
+{"input":"Sample 01250: the compiler converges on device.","target":1}
+{"input":"Sample 01251: the kernel drifts during testing.","target":0}
+{"input":"Sample 01252: the model improves during testing.","target":1}
+{"input":"Sample 01253: the dataset stalls during testing.","target":0}
+{"input":"Sample 01254: the device passes with new data.","target":1}
+{"input":"Sample 01255: the signal breaks with new data.","target":0}
+{"input":"Sample 01256: the engine responds with new data.","target":1}
+{"input":"Sample 01257: the sensor diverges at night.","target":0}
+{"input":"Sample 01258: the compiler learns at night. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01259: the kernel lags at night.","target":0}
+{"input":"Sample 01260: the model works under load.","target":1}
+{"input":"Sample 01261: the dataset fails under load.","target":0}
+{"input":"Sample 01262: the device converges under load.","target":1}
+{"input":"Sample 01263: the signal drifts after training.","target":0}
+{"input":"Sample 01264: the engine improves after training.","target":1}
+{"input":"Sample 01265: the sensor stalls after training.","target":0}
+{"input":"Sample 01266: the compiler passes on device.","target":1}
+{"input":"Sample 01267: the kernel breaks on device.","target":0}
+{"input":"Sample 01268: the model responds on device.","target":1}
+{"input":"Sample 01269: the dataset diverges during testing.","target":0}
+{"input":"Sample 01270: the device learns during testing.","target":1}
+{"input":"Sample 01271: the signal lags during testing.","target":0}
+{"input":"Sample 01272: the engine works with new data.","target":1}
+{"input":"Sample 01273: the sensor fails with new data.","target":0}
+{"input":"Sample 01274: the compiler converges with new data.","target":1}
+{"input":"Sample 01275: the kernel drifts at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01276: the model improves at night.","target":1}
+{"input":"Sample 01277: the dataset stalls at night.","target":0}
+{"input":"Sample 01278: the device passes under load.","target":1}
+{"input":"Sample 01279: the signal breaks under load.","target":0}
+{"input":"Sample 01280: the engine responds under load.","target":1}
+{"input":"Sample 01281: the sensor diverges after training.","target":0}
+{"input":"Sample 01282: the compiler learns after training.","target":1}
+{"input":"Sample 01283: the kernel lags after training.","target":0}
+{"input":"Sample 01284: the model works on device.","target":1}
+{"input":"Sample 01285: the dataset fails on device.","target":0}
+{"input":"Sample 01286: the device converges on device.","target":1}
+{"input":"Sample 01287: the signal drifts during testing.","target":0}
+{"input":"Sample 01288: the engine improves during testing.","target":1}
+{"input":"Sample 01289: the sensor stalls during testing.","target":0}
+{"input":"Sample 01290: the compiler passes with new data.","target":1}
+{"input":"Sample 01291: the kernel breaks with new data.","target":0}
+{"input":"Sample 01292: the model responds with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01293: the dataset diverges at night.","target":0}
+{"input":"Sample 01294: the device learns at night.","target":1}
+{"input":"Sample 01295: the signal lags at night.","target":0}
+{"input":"Sample 01296: the engine works under load.","target":1}
+{"input":"Sample 01297: the sensor fails under load.","target":0}
+{"input":"Sample 01298: the compiler converges under load.","target":1}
+{"input":"Sample 01299: the kernel drifts after training.","target":0}
+{"input":"Sample 01300: the model improves after training.","target":1}
+{"input":"Sample 01301: the dataset stalls after training.","target":0}
+{"input":"Sample 01302: the device passes on device.","target":1}
+{"input":"Sample 01303: the signal breaks on device.","target":0}
+{"input":"Sample 01304: the engine responds on device.","target":1}
+{"input":"Sample 01305: the sensor diverges during testing.","target":0}
+{"input":"Sample 01306: the compiler learns during testing.","target":1}
+{"input":"Sample 01307: the kernel lags during testing.","target":0}
+{"input":"Sample 01308: the model works with new data.","target":1}
+{"input":"Sample 01309: the dataset fails with new data. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01310: the device converges with new data.","target":1}
+{"input":"Sample 01311: the signal drifts at night.","target":0}
+{"input":"Sample 01312: the engine improves at night.","target":1}
+{"input":"Sample 01313: the sensor stalls at night.","target":0}
+{"input":"Sample 01314: the compiler passes under load.","target":1}
+{"input":"Sample 01315: the kernel breaks under load.","target":0}
+{"input":"Sample 01316: the model responds under load.","target":1}
+{"input":"Sample 01317: the dataset diverges after training.","target":0}
+{"input":"Sample 01318: the device learns after training.","target":1}
+{"input":"Sample 01319: the signal lags after training.","target":0}
+{"input":"Sample 01320: the engine works on device.","target":1}
+{"input":"Sample 01321: the sensor fails on device.","target":0}
+{"input":"Sample 01322: the compiler converges on device.","target":1}
+{"input":"Sample 01323: the kernel drifts during testing.","target":0}
+{"input":"Sample 01324: the model improves during testing.","target":1}
+{"input":"Sample 01325: the dataset stalls during testing.","target":0}
+{"input":"Sample 01326: the device passes with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01327: the signal breaks with new data.","target":0}
+{"input":"Sample 01328: the engine responds with new data.","target":1}
+{"input":"Sample 01329: the sensor diverges at night.","target":0}
+{"input":"Sample 01330: the compiler learns at night.","target":1}
+{"input":"Sample 01331: the kernel lags at night.","target":0}
+{"input":"Sample 01332: the model works under load.","target":1}
+{"input":"Sample 01333: the dataset fails under load.","target":0}
+{"input":"Sample 01334: the device converges under load.","target":1}
+{"input":"Sample 01335: the signal drifts after training.","target":0}
+{"input":"Sample 01336: the engine improves after training.","target":1}
+{"input":"Sample 01337: the sensor stalls after training.","target":0}
+{"input":"Sample 01338: the compiler passes on device.","target":1}
+{"input":"Sample 01339: the kernel breaks on device.","target":0}
+{"input":"Sample 01340: the model responds on device.","target":1}
+{"input":"Sample 01341: the dataset diverges during testing.","target":0}
+{"input":"Sample 01342: the device learns during testing.","target":1}
+{"input":"Sample 01343: the signal lags during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01344: the engine works with new data.","target":1}
+{"input":"Sample 01345: the sensor fails with new data.","target":0}
+{"input":"Sample 01346: the compiler converges with new data.","target":1}
+{"input":"Sample 01347: the kernel drifts at night.","target":0}
+{"input":"Sample 01348: the model improves at night.","target":1}
+{"input":"Sample 01349: the dataset stalls at night.","target":0}
+{"input":"Sample 01350: the device passes under load.","target":1}
+{"input":"Sample 01351: the signal breaks under load.","target":0}
+{"input":"Sample 01352: the engine responds under load.","target":1}
+{"input":"Sample 01353: the sensor diverges after training.","target":0}
+{"input":"Sample 01354: the compiler learns after training.","target":1}
+{"input":"Sample 01355: the kernel lags after training.","target":0}
+{"input":"Sample 01356: the model works on device.","target":1}
+{"input":"Sample 01357: the dataset fails on device.","target":0}
+{"input":"Sample 01358: the device converges on device.","target":1}
+{"input":"Sample 01359: the signal drifts during testing.","target":0}
+{"input":"Sample 01360: the engine improves during testing. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01361: the sensor stalls during testing.","target":0}
+{"input":"Sample 01362: the compiler passes with new data.","target":1}
+{"input":"Sample 01363: the kernel breaks with new data.","target":0}
+{"input":"Sample 01364: the model responds with new data.","target":1}
+{"input":"Sample 01365: the dataset diverges at night.","target":0}
+{"input":"Sample 01366: the device learns at night.","target":1}
+{"input":"Sample 01367: the signal lags at night.","target":0}
+{"input":"Sample 01368: the engine works under load.","target":1}
+{"input":"Sample 01369: the sensor fails under load.","target":0}
+{"input":"Sample 01370: the compiler converges under load.","target":1}
+{"input":"Sample 01371: the kernel drifts after training.","target":0}
+{"input":"Sample 01372: the model improves after training.","target":1}
+{"input":"Sample 01373: the dataset stalls after training.","target":0}
+{"input":"Sample 01374: the device passes on device.","target":1}
+{"input":"Sample 01375: the signal breaks on device.","target":0}
+{"input":"Sample 01376: the engine responds on device.","target":1}
+{"input":"Sample 01377: the sensor diverges during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01378: the compiler learns during testing.","target":1}
+{"input":"Sample 01379: the kernel lags during testing.","target":0}
+{"input":"Sample 01380: the model works with new data.","target":1}
+{"input":"Sample 01381: the dataset fails with new data.","target":0}
+{"input":"Sample 01382: the device converges with new data.","target":1}
+{"input":"Sample 01383: the signal drifts at night.","target":0}
+{"input":"Sample 01384: the engine improves at night.","target":1}
+{"input":"Sample 01385: the sensor stalls at night.","target":0}
+{"input":"Sample 01386: the compiler passes under load.","target":1}
+{"input":"Sample 01387: the kernel breaks under load.","target":0}
+{"input":"Sample 01388: the model responds under load.","target":1}
+{"input":"Sample 01389: the dataset diverges after training.","target":0}
+{"input":"Sample 01390: the device learns after training.","target":1}
+{"input":"Sample 01391: the signal lags after training.","target":0}
+{"input":"Sample 01392: the engine works on device.","target":1}
+{"input":"Sample 01393: the sensor fails on device.","target":0}
+{"input":"Sample 01394: the compiler converges on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01395: the kernel drifts during testing.","target":0}
+{"input":"Sample 01396: the model improves during testing.","target":1}
+{"input":"Sample 01397: the dataset stalls during testing.","target":0}
+{"input":"Sample 01398: the device passes with new data.","target":1}
+{"input":"Sample 01399: the signal breaks with new data.","target":0}
+{"input":"Sample 01400: the engine responds with new data.","target":1}
+{"input":"Sample 01401: the sensor diverges at night.","target":0}
+{"input":"Sample 01402: the compiler learns at night.","target":1}
+{"input":"Sample 01403: the kernel lags at night.","target":0}
+{"input":"Sample 01404: the model works under load.","target":1}
+{"input":"Sample 01405: the dataset fails under load.","target":0}
+{"input":"Sample 01406: the device converges under load.","target":1}
+{"input":"Sample 01407: the signal drifts after training.","target":0}
+{"input":"Sample 01408: the engine improves after training.","target":1}
+{"input":"Sample 01409: the sensor stalls after training.","target":0}
+{"input":"Sample 01410: the compiler passes on device.","target":1}
+{"input":"Sample 01411: the kernel breaks on device. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01412: the model responds on device.","target":1}
+{"input":"Sample 01413: the dataset diverges during testing.","target":0}
+{"input":"Sample 01414: the device learns during testing.","target":1}
+{"input":"Sample 01415: the signal lags during testing.","target":0}
+{"input":"Sample 01416: the engine works with new data.","target":1}
+{"input":"Sample 01417: the sensor fails with new data.","target":0}
+{"input":"Sample 01418: the compiler converges with new data.","target":1}
+{"input":"Sample 01419: the kernel drifts at night.","target":0}
+{"input":"Sample 01420: the model improves at night.","target":1}
+{"input":"Sample 01421: the dataset stalls at night.","target":0}
+{"input":"Sample 01422: the device passes under load.","target":1}
+{"input":"Sample 01423: the signal breaks under load.","target":0}
+{"input":"Sample 01424: the engine responds under load.","target":1}
+{"input":"Sample 01425: the sensor diverges after training.","target":0}
+{"input":"Sample 01426: the compiler learns after training.","target":1}
+{"input":"Sample 01427: the kernel lags after training.","target":0}
+{"input":"Sample 01428: the model works on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01429: the dataset fails on device.","target":0}
+{"input":"Sample 01430: the device converges on device.","target":1}
+{"input":"Sample 01431: the signal drifts during testing.","target":0}
+{"input":"Sample 01432: the engine improves during testing.","target":1}
+{"input":"Sample 01433: the sensor stalls during testing.","target":0}
+{"input":"Sample 01434: the compiler passes with new data.","target":1}
+{"input":"Sample 01435: the kernel breaks with new data.","target":0}
+{"input":"Sample 01436: the model responds with new data.","target":1}
+{"input":"Sample 01437: the dataset diverges at night.","target":0}
+{"input":"Sample 01438: the device learns at night.","target":1}
+{"input":"Sample 01439: the signal lags at night.","target":0}
+{"input":"Sample 01440: the engine works under load.","target":1}
+{"input":"Sample 01441: the sensor fails under load.","target":0}
+{"input":"Sample 01442: the compiler converges under load.","target":1}
+{"input":"Sample 01443: the kernel drifts after training.","target":0}
+{"input":"Sample 01444: the model improves after training.","target":1}
+{"input":"Sample 01445: the dataset stalls after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01446: the device passes on device.","target":1}
+{"input":"Sample 01447: the signal breaks on device.","target":0}
+{"input":"Sample 01448: the engine responds on device.","target":1}
+{"input":"Sample 01449: the sensor diverges during testing.","target":0}
+{"input":"Sample 01450: the compiler learns during testing.","target":1}
+{"input":"Sample 01451: the kernel lags during testing.","target":0}
+{"input":"Sample 01452: the model works with new data.","target":1}
+{"input":"Sample 01453: the dataset fails with new data.","target":0}
+{"input":"Sample 01454: the device converges with new data.","target":1}
+{"input":"Sample 01455: the signal drifts at night.","target":0}
+{"input":"Sample 01456: the engine improves at night.","target":1}
+{"input":"Sample 01457: the sensor stalls at night.","target":0}
+{"input":"Sample 01458: the compiler passes under load.","target":1}
+{"input":"Sample 01459: the kernel breaks under load.","target":0}
+{"input":"Sample 01460: the model responds under load.","target":1}
+{"input":"Sample 01461: the dataset diverges after training.","target":0}
+{"input":"Sample 01462: the device learns after training. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01463: the signal lags after training.","target":0}
+{"input":"Sample 01464: the engine works on device.","target":1}
+{"input":"Sample 01465: the sensor fails on device.","target":0}
+{"input":"Sample 01466: the compiler converges on device.","target":1}
+{"input":"Sample 01467: the kernel drifts during testing.","target":0}
+{"input":"Sample 01468: the model improves during testing.","target":1}
+{"input":"Sample 01469: the dataset stalls during testing.","target":0}
+{"input":"Sample 01470: the device passes with new data.","target":1}
+{"input":"Sample 01471: the signal breaks with new data.","target":0}
+{"input":"Sample 01472: the engine responds with new data.","target":1}
+{"input":"Sample 01473: the sensor diverges at night.","target":0}
+{"input":"Sample 01474: the compiler learns at night.","target":1}
+{"input":"Sample 01475: the kernel lags at night.","target":0}
+{"input":"Sample 01476: the model works under load.","target":1}
+{"input":"Sample 01477: the dataset fails under load.","target":0}
+{"input":"Sample 01478: the device converges under load.","target":1}
+{"input":"Sample 01479: the signal drifts after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01480: the engine improves after training.","target":1}
+{"input":"Sample 01481: the sensor stalls after training.","target":0}
+{"input":"Sample 01482: the compiler passes on device.","target":1}
+{"input":"Sample 01483: the kernel breaks on device.","target":0}
+{"input":"Sample 01484: the model responds on device.","target":1}
+{"input":"Sample 01485: the dataset diverges during testing.","target":0}
+{"input":"Sample 01486: the device learns during testing.","target":1}
+{"input":"Sample 01487: the signal lags during testing.","target":0}
+{"input":"Sample 01488: the engine works with new data.","target":1}
+{"input":"Sample 01489: the sensor fails with new data.","target":0}
+{"input":"Sample 01490: the compiler converges with new data.","target":1}
+{"input":"Sample 01491: the kernel drifts at night.","target":0}
+{"input":"Sample 01492: the model improves at night.","target":1}
+{"input":"Sample 01493: the dataset stalls at night.","target":0}
+{"input":"Sample 01494: the device passes under load.","target":1}
+{"input":"Sample 01495: the signal breaks under load.","target":0}
+{"input":"Sample 01496: the engine responds under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01497: the sensor diverges after training.","target":0}
+{"input":"Sample 01498: the compiler learns after training.","target":1}
+{"input":"Sample 01499: the kernel lags after training.","target":0}
+{"input":"Sample 01500: the model works on device.","target":1}
+{"input":"Sample 01501: the dataset fails on device.","target":0}
+{"input":"Sample 01502: the device converges on device.","target":1}
+{"input":"Sample 01503: the signal drifts during testing.","target":0}
+{"input":"Sample 01504: the engine improves during testing.","target":1}
+{"input":"Sample 01505: the sensor stalls during testing.","target":0}
+{"input":"Sample 01506: the compiler passes with new data.","target":1}
+{"input":"Sample 01507: the kernel breaks with new data.","target":0}
+{"input":"Sample 01508: the model responds with new data.","target":1}
+{"input":"Sample 01509: the dataset diverges at night.","target":0}
+{"input":"Sample 01510: the device learns at night.","target":1}
+{"input":"Sample 01511: the signal lags at night.","target":0}
+{"input":"Sample 01512: the engine works under load.","target":1}
+{"input":"Sample 01513: the sensor fails under load. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01514: the compiler converges under load.","target":1}
+{"input":"Sample 01515: the kernel drifts after training.","target":0}
+{"input":"Sample 01516: the model improves after training.","target":1}
+{"input":"Sample 01517: the dataset stalls after training.","target":0}
+{"input":"Sample 01518: the device passes on device.","target":1}
+{"input":"Sample 01519: the signal breaks on device.","target":0}
+{"input":"Sample 01520: the engine responds on device.","target":1}
+{"input":"Sample 01521: the sensor diverges during testing.","target":0}
+{"input":"Sample 01522: the compiler learns during testing.","target":1}
+{"input":"Sample 01523: the kernel lags during testing.","target":0}
+{"input":"Sample 01524: the model works with new data.","target":1}
+{"input":"Sample 01525: the dataset fails with new data.","target":0}
+{"input":"Sample 01526: the device converges with new data.","target":1}
+{"input":"Sample 01527: the signal drifts at night.","target":0}
+{"input":"Sample 01528: the engine improves at night.","target":1}
+{"input":"Sample 01529: the sensor stalls at night.","target":0}
+{"input":"Sample 01530: the compiler passes under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01531: the kernel breaks under load.","target":0}
+{"input":"Sample 01532: the model responds under load.","target":1}
+{"input":"Sample 01533: the dataset diverges after training.","target":0}
+{"input":"Sample 01534: the device learns after training.","target":1}
+{"input":"Sample 01535: the signal lags after training.","target":0}
+{"input":"Sample 01536: the engine works on device.","target":1}
+{"input":"Sample 01537: the sensor fails on device.","target":0}
+{"input":"Sample 01538: the compiler converges on device.","target":1}
+{"input":"Sample 01539: the kernel drifts during testing.","target":0}
+{"input":"Sample 01540: the model improves during testing.","target":1}
+{"input":"Sample 01541: the dataset stalls during testing.","target":0}
+{"input":"Sample 01542: the device passes with new data.","target":1}
+{"input":"Sample 01543: the signal breaks with new data.","target":0}
+{"input":"Sample 01544: the engine responds with new data.","target":1}
+{"input":"Sample 01545: the sensor diverges at night.","target":0}
+{"input":"Sample 01546: the compiler learns at night.","target":1}
+{"input":"Sample 01547: the kernel lags at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01548: the model works under load.","target":1}
+{"input":"Sample 01549: the dataset fails under load.","target":0}
+{"input":"Sample 01550: the device converges under load.","target":1}
+{"input":"Sample 01551: the signal drifts after training.","target":0}
+{"input":"Sample 01552: the engine improves after training.","target":1}
+{"input":"Sample 01553: the sensor stalls after training.","target":0}
+{"input":"Sample 01554: the compiler passes on device.","target":1}
+{"input":"Sample 01555: the kernel breaks on device.","target":0}
+{"input":"Sample 01556: the model responds on device.","target":1}
+{"input":"Sample 01557: the dataset diverges during testing.","target":0}
+{"input":"Sample 01558: the device learns during testing.","target":1}
+{"input":"Sample 01559: the signal lags during testing.","target":0}
+{"input":"Sample 01560: the engine works with new data.","target":1}
+{"input":"Sample 01561: the sensor fails with new data.","target":0}
+{"input":"Sample 01562: the compiler converges with new data.","target":1}
+{"input":"Sample 01563: the kernel drifts at night.","target":0}
+{"input":"Sample 01564: the model improves at night. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01565: the dataset stalls at night.","target":0}
+{"input":"Sample 01566: the device passes under load.","target":1}
+{"input":"Sample 01567: the signal breaks under load.","target":0}
+{"input":"Sample 01568: the engine responds under load.","target":1}
+{"input":"Sample 01569: the sensor diverges after training.","target":0}
+{"input":"Sample 01570: the compiler learns after training.","target":1}
+{"input":"Sample 01571: the kernel lags after training.","target":0}
+{"input":"Sample 01572: the model works on device.","target":1}
+{"input":"Sample 01573: the dataset fails on device.","target":0}
+{"input":"Sample 01574: the device converges on device.","target":1}
+{"input":"Sample 01575: the signal drifts during testing.","target":0}
+{"input":"Sample 01576: the engine improves during testing.","target":1}
+{"input":"Sample 01577: the sensor stalls during testing.","target":0}
+{"input":"Sample 01578: the compiler passes with new data.","target":1}
+{"input":"Sample 01579: the kernel breaks with new data.","target":0}
+{"input":"Sample 01580: the model responds with new data.","target":1}
+{"input":"Sample 01581: the dataset diverges at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01582: the device learns at night.","target":1}
+{"input":"Sample 01583: the signal lags at night.","target":0}
+{"input":"Sample 01584: the engine works under load.","target":1}
+{"input":"Sample 01585: the sensor fails under load.","target":0}
+{"input":"Sample 01586: the compiler converges under load.","target":1}
+{"input":"Sample 01587: the kernel drifts after training.","target":0}
+{"input":"Sample 01588: the model improves after training.","target":1}
+{"input":"Sample 01589: the dataset stalls after training.","target":0}
+{"input":"Sample 01590: the device passes on device.","target":1}
+{"input":"Sample 01591: the signal breaks on device.","target":0}
+{"input":"Sample 01592: the engine responds on device.","target":1}
+{"input":"Sample 01593: the sensor diverges during testing.","target":0}
+{"input":"Sample 01594: the compiler learns during testing.","target":1}
+{"input":"Sample 01595: the kernel lags during testing.","target":0}
+{"input":"Sample 01596: the model works with new data.","target":1}
+{"input":"Sample 01597: the dataset fails with new data.","target":0}
+{"input":"Sample 01598: the device converges with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01599: the signal drifts at night.","target":0}
+{"input":"Sample 01600: the engine improves at night.","target":1}
+{"input":"Sample 01601: the sensor stalls at night.","target":0}
+{"input":"Sample 01602: the compiler passes under load.","target":1}
+{"input":"Sample 01603: the kernel breaks under load.","target":0}
+{"input":"Sample 01604: the model responds under load.","target":1}
+{"input":"Sample 01605: the dataset diverges after training.","target":0}
+{"input":"Sample 01606: the device learns after training.","target":1}
+{"input":"Sample 01607: the signal lags after training.","target":0}
+{"input":"Sample 01608: the engine works on device.","target":1}
+{"input":"Sample 01609: the sensor fails on device.","target":0}
+{"input":"Sample 01610: the compiler converges on device.","target":1}
+{"input":"Sample 01611: the kernel drifts during testing.","target":0}
+{"input":"Sample 01612: the model improves during testing.","target":1}
+{"input":"Sample 01613: the dataset stalls during testing.","target":0}
+{"input":"Sample 01614: the device passes with new data.","target":1}
+{"input":"Sample 01615: the signal breaks with new data. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01616: the engine responds with new data.","target":1}
+{"input":"Sample 01617: the sensor diverges at night.","target":0}
+{"input":"Sample 01618: the compiler learns at night.","target":1}
+{"input":"Sample 01619: the kernel lags at night.","target":0}
+{"input":"Sample 01620: the model works under load.","target":1}
+{"input":"Sample 01621: the dataset fails under load.","target":0}
+{"input":"Sample 01622: the device converges under load.","target":1}
+{"input":"Sample 01623: the signal drifts after training.","target":0}
+{"input":"Sample 01624: the engine improves after training.","target":1}
+{"input":"Sample 01625: the sensor stalls after training.","target":0}
+{"input":"Sample 01626: the compiler passes on device.","target":1}
+{"input":"Sample 01627: the kernel breaks on device.","target":0}
+{"input":"Sample 01628: the model responds on device.","target":1}
+{"input":"Sample 01629: the dataset diverges during testing.","target":0}
+{"input":"Sample 01630: the device learns during testing.","target":1}
+{"input":"Sample 01631: the signal lags during testing.","target":0}
+{"input":"Sample 01632: the engine works with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01633: the sensor fails with new data.","target":0}
+{"input":"Sample 01634: the compiler converges with new data.","target":1}
+{"input":"Sample 01635: the kernel drifts at night.","target":0}
+{"input":"Sample 01636: the model improves at night.","target":1}
+{"input":"Sample 01637: the dataset stalls at night.","target":0}
+{"input":"Sample 01638: the device passes under load.","target":1}
+{"input":"Sample 01639: the signal breaks under load.","target":0}
+{"input":"Sample 01640: the engine responds under load.","target":1}
+{"input":"Sample 01641: the sensor diverges after training.","target":0}
+{"input":"Sample 01642: the compiler learns after training.","target":1}
+{"input":"Sample 01643: the kernel lags after training.","target":0}
+{"input":"Sample 01644: the model works on device.","target":1}
+{"input":"Sample 01645: the dataset fails on device.","target":0}
+{"input":"Sample 01646: the device converges on device.","target":1}
+{"input":"Sample 01647: the signal drifts during testing.","target":0}
+{"input":"Sample 01648: the engine improves during testing.","target":1}
+{"input":"Sample 01649: the sensor stalls during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01650: the compiler passes with new data.","target":1}
+{"input":"Sample 01651: the kernel breaks with new data.","target":0}
+{"input":"Sample 01652: the model responds with new data.","target":1}
+{"input":"Sample 01653: the dataset diverges at night.","target":0}
+{"input":"Sample 01654: the device learns at night.","target":1}
+{"input":"Sample 01655: the signal lags at night.","target":0}
+{"input":"Sample 01656: the engine works under load.","target":1}
+{"input":"Sample 01657: the sensor fails under load.","target":0}
+{"input":"Sample 01658: the compiler converges under load.","target":1}
+{"input":"Sample 01659: the kernel drifts after training.","target":0}
+{"input":"Sample 01660: the model improves after training.","target":1}
+{"input":"Sample 01661: the dataset stalls after training.","target":0}
+{"input":"Sample 01662: the device passes on device.","target":1}
+{"input":"Sample 01663: the signal breaks on device.","target":0}
+{"input":"Sample 01664: the engine responds on device.","target":1}
+{"input":"Sample 01665: the sensor diverges during testing.","target":0}
+{"input":"Sample 01666: the compiler learns during testing. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01667: the kernel lags during testing.","target":0}
+{"input":"Sample 01668: the model works with new data.","target":1}
+{"input":"Sample 01669: the dataset fails with new data.","target":0}
+{"input":"Sample 01670: the device converges with new data.","target":1}
+{"input":"Sample 01671: the signal drifts at night.","target":0}
+{"input":"Sample 01672: the engine improves at night.","target":1}
+{"input":"Sample 01673: the sensor stalls at night.","target":0}
+{"input":"Sample 01674: the compiler passes under load.","target":1}
+{"input":"Sample 01675: the kernel breaks under load.","target":0}
+{"input":"Sample 01676: the model responds under load.","target":1}
+{"input":"Sample 01677: the dataset diverges after training.","target":0}
+{"input":"Sample 01678: the device learns after training.","target":1}
+{"input":"Sample 01679: the signal lags after training.","target":0}
+{"input":"Sample 01680: the engine works on device.","target":1}
+{"input":"Sample 01681: the sensor fails on device.","target":0}
+{"input":"Sample 01682: the compiler converges on device.","target":1}
+{"input":"Sample 01683: the kernel drifts during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01684: the model improves during testing.","target":1}
+{"input":"Sample 01685: the dataset stalls during testing.","target":0}
+{"input":"Sample 01686: the device passes with new data.","target":1}
+{"input":"Sample 01687: the signal breaks with new data.","target":0}
+{"input":"Sample 01688: the engine responds with new data.","target":1}
+{"input":"Sample 01689: the sensor diverges at night.","target":0}
+{"input":"Sample 01690: the compiler learns at night.","target":1}
+{"input":"Sample 01691: the kernel lags at night.","target":0}
+{"input":"Sample 01692: the model works under load.","target":1}
+{"input":"Sample 01693: the dataset fails under load.","target":0}
+{"input":"Sample 01694: the device converges under load.","target":1}
+{"input":"Sample 01695: the signal drifts after training.","target":0}
+{"input":"Sample 01696: the engine improves after training.","target":1}
+{"input":"Sample 01697: the sensor stalls after training.","target":0}
+{"input":"Sample 01698: the compiler passes on device.","target":1}
+{"input":"Sample 01699: the kernel breaks on device.","target":0}
+{"input":"Sample 01700: the model responds on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01701: the dataset diverges during testing.","target":0}
+{"input":"Sample 01702: the device learns during testing.","target":1}
+{"input":"Sample 01703: the signal lags during testing.","target":0}
+{"input":"Sample 01704: the engine works with new data.","target":1}
+{"input":"Sample 01705: the sensor fails with new data.","target":0}
+{"input":"Sample 01706: the compiler converges with new data.","target":1}
+{"input":"Sample 01707: the kernel drifts at night.","target":0}
+{"input":"Sample 01708: the model improves at night.","target":1}
+{"input":"Sample 01709: the dataset stalls at night.","target":0}
+{"input":"Sample 01710: the device passes under load.","target":1}
+{"input":"Sample 01711: the signal breaks under load.","target":0}
+{"input":"Sample 01712: the engine responds under load.","target":1}
+{"input":"Sample 01713: the sensor diverges after training.","target":0}
+{"input":"Sample 01714: the compiler learns after training.","target":1}
+{"input":"Sample 01715: the kernel lags after training.","target":0}
+{"input":"Sample 01716: the model works on device.","target":1}
+{"input":"Sample 01717: the dataset fails on device. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01718: the device converges on device.","target":1}
+{"input":"Sample 01719: the signal drifts during testing.","target":0}
+{"input":"Sample 01720: the engine improves during testing.","target":1}
+{"input":"Sample 01721: the sensor stalls during testing.","target":0}
+{"input":"Sample 01722: the compiler passes with new data.","target":1}
+{"input":"Sample 01723: the kernel breaks with new data.","target":0}
+{"input":"Sample 01724: the model responds with new data.","target":1}
+{"input":"Sample 01725: the dataset diverges at night.","target":0}
+{"input":"Sample 01726: the device learns at night.","target":1}
+{"input":"Sample 01727: the signal lags at night.","target":0}
+{"input":"Sample 01728: the engine works under load.","target":1}
+{"input":"Sample 01729: the sensor fails under load.","target":0}
+{"input":"Sample 01730: the compiler converges under load.","target":1}
+{"input":"Sample 01731: the kernel drifts after training.","target":0}
+{"input":"Sample 01732: the model improves after training.","target":1}
+{"input":"Sample 01733: the dataset stalls after training.","target":0}
+{"input":"Sample 01734: the device passes on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01735: the signal breaks on device.","target":0}
+{"input":"Sample 01736: the engine responds on device.","target":1}
+{"input":"Sample 01737: the sensor diverges during testing.","target":0}
+{"input":"Sample 01738: the compiler learns during testing.","target":1}
+{"input":"Sample 01739: the kernel lags during testing.","target":0}
+{"input":"Sample 01740: the model works with new data.","target":1}
+{"input":"Sample 01741: the dataset fails with new data.","target":0}
+{"input":"Sample 01742: the device converges with new data.","target":1}
+{"input":"Sample 01743: the signal drifts at night.","target":0}
+{"input":"Sample 01744: the engine improves at night.","target":1}
+{"input":"Sample 01745: the sensor stalls at night.","target":0}
+{"input":"Sample 01746: the compiler passes under load.","target":1}
+{"input":"Sample 01747: the kernel breaks under load.","target":0}
+{"input":"Sample 01748: the model responds under load.","target":1}
+{"input":"Sample 01749: the dataset diverges after training.","target":0}
+{"input":"Sample 01750: the device learns after training.","target":1}
+{"input":"Sample 01751: the signal lags after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01752: the engine works on device.","target":1}
+{"input":"Sample 01753: the sensor fails on device.","target":0}
+{"input":"Sample 01754: the compiler converges on device.","target":1}
+{"input":"Sample 01755: the kernel drifts during testing.","target":0}
+{"input":"Sample 01756: the model improves during testing.","target":1}
+{"input":"Sample 01757: the dataset stalls during testing.","target":0}
+{"input":"Sample 01758: the device passes with new data.","target":1}
+{"input":"Sample 01759: the signal breaks with new data.","target":0}
+{"input":"Sample 01760: the engine responds with new data.","target":1}
+{"input":"Sample 01761: the sensor diverges at night.","target":0}
+{"input":"Sample 01762: the compiler learns at night.","target":1}
+{"input":"Sample 01763: the kernel lags at night.","target":0}
+{"input":"Sample 01764: the model works under load.","target":1}
+{"input":"Sample 01765: the dataset fails under load.","target":0}
+{"input":"Sample 01766: the device converges under load.","target":1}
+{"input":"Sample 01767: the signal drifts after training.","target":0}
+{"input":"Sample 01768: the engine improves after training. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01769: the sensor stalls after training.","target":0}
+{"input":"Sample 01770: the compiler passes on device.","target":1}
+{"input":"Sample 01771: the kernel breaks on device.","target":0}
+{"input":"Sample 01772: the model responds on device.","target":1}
+{"input":"Sample 01773: the dataset diverges during testing.","target":0}
+{"input":"Sample 01774: the device learns during testing.","target":1}
+{"input":"Sample 01775: the signal lags during testing.","target":0}
+{"input":"Sample 01776: the engine works with new data.","target":1}
+{"input":"Sample 01777: the sensor fails with new data.","target":0}
+{"input":"Sample 01778: the compiler converges with new data.","target":1}
+{"input":"Sample 01779: the kernel drifts at night.","target":0}
+{"input":"Sample 01780: the model improves at night.","target":1}
+{"input":"Sample 01781: the dataset stalls at night.","target":0}
+{"input":"Sample 01782: the device passes under load.","target":1}
+{"input":"Sample 01783: the signal breaks under load.","target":0}
+{"input":"Sample 01784: the engine responds under load.","target":1}
+{"input":"Sample 01785: the sensor diverges after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01786: the compiler learns after training.","target":1}
+{"input":"Sample 01787: the kernel lags after training.","target":0}
+{"input":"Sample 01788: the model works on device.","target":1}
+{"input":"Sample 01789: the dataset fails on device.","target":0}
+{"input":"Sample 01790: the device converges on device.","target":1}
+{"input":"Sample 01791: the signal drifts during testing.","target":0}
+{"input":"Sample 01792: the engine improves during testing.","target":1}
+{"input":"Sample 01793: the sensor stalls during testing.","target":0}
+{"input":"Sample 01794: the compiler passes with new data.","target":1}
+{"input":"Sample 01795: the kernel breaks with new data.","target":0}
+{"input":"Sample 01796: the model responds with new data.","target":1}
+{"input":"Sample 01797: the dataset diverges at night.","target":0}
+{"input":"Sample 01798: the device learns at night.","target":1}
+{"input":"Sample 01799: the signal lags at night.","target":0}
+{"input":"Sample 01800: the engine works under load.","target":1}
+{"input":"Sample 01801: the sensor fails under load.","target":0}
+{"input":"Sample 01802: the compiler converges under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01803: the kernel drifts after training.","target":0}
+{"input":"Sample 01804: the model improves after training.","target":1}
+{"input":"Sample 01805: the dataset stalls after training.","target":0}
+{"input":"Sample 01806: the device passes on device.","target":1}
+{"input":"Sample 01807: the signal breaks on device.","target":0}
+{"input":"Sample 01808: the engine responds on device.","target":1}
+{"input":"Sample 01809: the sensor diverges during testing.","target":0}
+{"input":"Sample 01810: the compiler learns during testing.","target":1}
+{"input":"Sample 01811: the kernel lags during testing.","target":0}
+{"input":"Sample 01812: the model works with new data.","target":1}
+{"input":"Sample 01813: the dataset fails with new data.","target":0}
+{"input":"Sample 01814: the device converges with new data.","target":1}
+{"input":"Sample 01815: the signal drifts at night.","target":0}
+{"input":"Sample 01816: the engine improves at night.","target":1}
+{"input":"Sample 01817: the sensor stalls at night.","target":0}
+{"input":"Sample 01818: the compiler passes under load.","target":1}
+{"input":"Sample 01819: the kernel breaks under load. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01820: the model responds under load.","target":1}
+{"input":"Sample 01821: the dataset diverges after training.","target":0}
+{"input":"Sample 01822: the device learns after training.","target":1}
+{"input":"Sample 01823: the signal lags after training.","target":0}
+{"input":"Sample 01824: the engine works on device.","target":1}
+{"input":"Sample 01825: the sensor fails on device.","target":0}
+{"input":"Sample 01826: the compiler converges on device.","target":1}
+{"input":"Sample 01827: the kernel drifts during testing.","target":0}
+{"input":"Sample 01828: the model improves during testing.","target":1}
+{"input":"Sample 01829: the dataset stalls during testing.","target":0}
+{"input":"Sample 01830: the device passes with new data.","target":1}
+{"input":"Sample 01831: the signal breaks with new data.","target":0}
+{"input":"Sample 01832: the engine responds with new data.","target":1}
+{"input":"Sample 01833: the sensor diverges at night.","target":0}
+{"input":"Sample 01834: the compiler learns at night.","target":1}
+{"input":"Sample 01835: the kernel lags at night.","target":0}
+{"input":"Sample 01836: the model works under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01837: the dataset fails under load.","target":0}
+{"input":"Sample 01838: the device converges under load.","target":1}
+{"input":"Sample 01839: the signal drifts after training.","target":0}
+{"input":"Sample 01840: the engine improves after training.","target":1}
+{"input":"Sample 01841: the sensor stalls after training.","target":0}
+{"input":"Sample 01842: the compiler passes on device.","target":1}
+{"input":"Sample 01843: the kernel breaks on device.","target":0}
+{"input":"Sample 01844: the model responds on device.","target":1}
+{"input":"Sample 01845: the dataset diverges during testing.","target":0}
+{"input":"Sample 01846: the device learns during testing.","target":1}
+{"input":"Sample 01847: the signal lags during testing.","target":0}
+{"input":"Sample 01848: the engine works with new data.","target":1}
+{"input":"Sample 01849: the sensor fails with new data.","target":0}
+{"input":"Sample 01850: the compiler converges with new data.","target":1}
+{"input":"Sample 01851: the kernel drifts at night.","target":0}
+{"input":"Sample 01852: the model improves at night.","target":1}
+{"input":"Sample 01853: the dataset stalls at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01854: the device passes under load.","target":1}
+{"input":"Sample 01855: the signal breaks under load.","target":0}
+{"input":"Sample 01856: the engine responds under load.","target":1}
+{"input":"Sample 01857: the sensor diverges after training.","target":0}
+{"input":"Sample 01858: the compiler learns after training.","target":1}
+{"input":"Sample 01859: the kernel lags after training.","target":0}
+{"input":"Sample 01860: the model works on device.","target":1}
+{"input":"Sample 01861: the dataset fails on device.","target":0}
+{"input":"Sample 01862: the device converges on device.","target":1}
+{"input":"Sample 01863: the signal drifts during testing.","target":0}
+{"input":"Sample 01864: the engine improves during testing.","target":1}
+{"input":"Sample 01865: the sensor stalls during testing.","target":0}
+{"input":"Sample 01866: the compiler passes with new data.","target":1}
+{"input":"Sample 01867: the kernel breaks with new data.","target":0}
+{"input":"Sample 01868: the model responds with new data.","target":1}
+{"input":"Sample 01869: the dataset diverges at night.","target":0}
+{"input":"Sample 01870: the device learns at night. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01871: the signal lags at night.","target":0}
+{"input":"Sample 01872: the engine works under load.","target":1}
+{"input":"Sample 01873: the sensor fails under load.","target":0}
+{"input":"Sample 01874: the compiler converges under load.","target":1}
+{"input":"Sample 01875: the kernel drifts after training.","target":0}
+{"input":"Sample 01876: the model improves after training.","target":1}
+{"input":"Sample 01877: the dataset stalls after training.","target":0}
+{"input":"Sample 01878: the device passes on device.","target":1}
+{"input":"Sample 01879: the signal breaks on device.","target":0}
+{"input":"Sample 01880: the engine responds on device.","target":1}
+{"input":"Sample 01881: the sensor diverges during testing.","target":0}
+{"input":"Sample 01882: the compiler learns during testing.","target":1}
+{"input":"Sample 01883: the kernel lags during testing.","target":0}
+{"input":"Sample 01884: the model works with new data.","target":1}
+{"input":"Sample 01885: the dataset fails with new data.","target":0}
+{"input":"Sample 01886: the device converges with new data.","target":1}
+{"input":"Sample 01887: the signal drifts at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01888: the engine improves at night.","target":1}
+{"input":"Sample 01889: the sensor stalls at night.","target":0}
+{"input":"Sample 01890: the compiler passes under load.","target":1}
+{"input":"Sample 01891: the kernel breaks under load.","target":0}
+{"input":"Sample 01892: the model responds under load.","target":1}
+{"input":"Sample 01893: the dataset diverges after training.","target":0}
+{"input":"Sample 01894: the device learns after training.","target":1}
+{"input":"Sample 01895: the signal lags after training.","target":0}
+{"input":"Sample 01896: the engine works on device.","target":1}
+{"input":"Sample 01897: the sensor fails on device.","target":0}
+{"input":"Sample 01898: the compiler converges on device.","target":1}
+{"input":"Sample 01899: the kernel drifts during testing.","target":0}
+{"input":"Sample 01900: the model improves during testing.","target":1}
+{"input":"Sample 01901: the dataset stalls during testing.","target":0}
+{"input":"Sample 01902: the device passes with new data.","target":1}
+{"input":"Sample 01903: the signal breaks with new data.","target":0}
+{"input":"Sample 01904: the engine responds with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01905: the sensor diverges at night.","target":0}
+{"input":"Sample 01906: the compiler learns at night.","target":1}
+{"input":"Sample 01907: the kernel lags at night.","target":0}
+{"input":"Sample 01908: the model works under load.","target":1}
+{"input":"Sample 01909: the dataset fails under load.","target":0}
+{"input":"Sample 01910: the device converges under load.","target":1}
+{"input":"Sample 01911: the signal drifts after training.","target":0}
+{"input":"Sample 01912: the engine improves after training.","target":1}
+{"input":"Sample 01913: the sensor stalls after training.","target":0}
+{"input":"Sample 01914: the compiler passes on device.","target":1}
+{"input":"Sample 01915: the kernel breaks on device.","target":0}
+{"input":"Sample 01916: the model responds on device.","target":1}
+{"input":"Sample 01917: the dataset diverges during testing.","target":0}
+{"input":"Sample 01918: the device learns during testing.","target":1}
+{"input":"Sample 01919: the signal lags during testing.","target":0}
+{"input":"Sample 01920: the engine works with new data.","target":1}
+{"input":"Sample 01921: the sensor fails with new data. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01922: the compiler converges with new data.","target":1}
+{"input":"Sample 01923: the kernel drifts at night.","target":0}
+{"input":"Sample 01924: the model improves at night.","target":1}
+{"input":"Sample 01925: the dataset stalls at night.","target":0}
+{"input":"Sample 01926: the device passes under load.","target":1}
+{"input":"Sample 01927: the signal breaks under load.","target":0}
+{"input":"Sample 01928: the engine responds under load.","target":1}
+{"input":"Sample 01929: the sensor diverges after training.","target":0}
+{"input":"Sample 01930: the compiler learns after training.","target":1}
+{"input":"Sample 01931: the kernel lags after training.","target":0}
+{"input":"Sample 01932: the model works on device.","target":1}
+{"input":"Sample 01933: the dataset fails on device.","target":0}
+{"input":"Sample 01934: the device converges on device.","target":1}
+{"input":"Sample 01935: the signal drifts during testing.","target":0}
+{"input":"Sample 01936: the engine improves during testing.","target":1}
+{"input":"Sample 01937: the sensor stalls during testing.","target":0}
+{"input":"Sample 01938: the compiler passes with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01939: the kernel breaks with new data.","target":0}
+{"input":"Sample 01940: the model responds with new data.","target":1}
+{"input":"Sample 01941: the dataset diverges at night.","target":0}
+{"input":"Sample 01942: the device learns at night.","target":1}
+{"input":"Sample 01943: the signal lags at night.","target":0}
+{"input":"Sample 01944: the engine works under load.","target":1}
+{"input":"Sample 01945: the sensor fails under load.","target":0}
+{"input":"Sample 01946: the compiler converges under load.","target":1}
+{"input":"Sample 01947: the kernel drifts after training.","target":0}
+{"input":"Sample 01948: the model improves after training.","target":1}
+{"input":"Sample 01949: the dataset stalls after training.","target":0}
+{"input":"Sample 01950: the device passes on device.","target":1}
+{"input":"Sample 01951: the signal breaks on device.","target":0}
+{"input":"Sample 01952: the engine responds on device.","target":1}
+{"input":"Sample 01953: the sensor diverges during testing.","target":0}
+{"input":"Sample 01954: the compiler learns during testing.","target":1}
+{"input":"Sample 01955: the kernel lags during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01956: the model works with new data.","target":1}
+{"input":"Sample 01957: the dataset fails with new data.","target":0}
+{"input":"Sample 01958: the device converges with new data.","target":1}
+{"input":"Sample 01959: the signal drifts at night.","target":0}
+{"input":"Sample 01960: the engine improves at night.","target":1}
+{"input":"Sample 01961: the sensor stalls at night.","target":0}
+{"input":"Sample 01962: the compiler passes under load.","target":1}
+{"input":"Sample 01963: the kernel breaks under load.","target":0}
+{"input":"Sample 01964: the model responds under load.","target":1}
+{"input":"Sample 01965: the dataset diverges after training.","target":0}
+{"input":"Sample 01966: the device learns after training.","target":1}
+{"input":"Sample 01967: the signal lags after training.","target":0}
+{"input":"Sample 01968: the engine works on device.","target":1}
+{"input":"Sample 01969: the sensor fails on device.","target":0}
+{"input":"Sample 01970: the compiler converges on device.","target":1}
+{"input":"Sample 01971: the kernel drifts during testing.","target":0}
+{"input":"Sample 01972: the model improves during testing. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 01973: the dataset stalls during testing.","target":0}
+{"input":"Sample 01974: the device passes with new data.","target":1}
+{"input":"Sample 01975: the signal breaks with new data.","target":0}
+{"input":"Sample 01976: the engine responds with new data.","target":1}
+{"input":"Sample 01977: the sensor diverges at night.","target":0}
+{"input":"Sample 01978: the compiler learns at night.","target":1}
+{"input":"Sample 01979: the kernel lags at night.","target":0}
+{"input":"Sample 01980: the model works under load.","target":1}
+{"input":"Sample 01981: the dataset fails under load.","target":0}
+{"input":"Sample 01982: the device converges under load.","target":1}
+{"input":"Sample 01983: the signal drifts after training.","target":0}
+{"input":"Sample 01984: the engine improves after training.","target":1}
+{"input":"Sample 01985: the sensor stalls after training.","target":0}
+{"input":"Sample 01986: the compiler passes on device.","target":1}
+{"input":"Sample 01987: the kernel breaks on device.","target":0}
+{"input":"Sample 01988: the model responds on device.","target":1}
+{"input":"Sample 01989: the dataset diverges during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 01990: the device learns during testing.","target":1}
+{"input":"Sample 01991: the signal lags during testing.","target":0}
+{"input":"Sample 01992: the engine works with new data.","target":1}
+{"input":"Sample 01993: the sensor fails with new data.","target":0}
+{"input":"Sample 01994: the compiler converges with new data.","target":1}
+{"input":"Sample 01995: the kernel drifts at night.","target":0}
+{"input":"Sample 01996: the model improves at night.","target":1}
+{"input":"Sample 01997: the dataset stalls at night.","target":0}
+{"input":"Sample 01998: the device passes under load.","target":1}
+{"input":"Sample 01999: the signal breaks under load.","target":0}
+{"input":"Sample 02000: the engine responds under load.","target":1}
+{"input":"Sample 02001: the sensor diverges after training.","target":0}
+{"input":"Sample 02002: the compiler learns after training.","target":1}
+{"input":"Sample 02003: the kernel lags after training.","target":0}
+{"input":"Sample 02004: the model works on device.","target":1}
+{"input":"Sample 02005: the dataset fails on device.","target":0}
+{"input":"Sample 02006: the device converges on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02007: the signal drifts during testing.","target":0}
+{"input":"Sample 02008: the engine improves during testing.","target":1}
+{"input":"Sample 02009: the sensor stalls during testing.","target":0}
+{"input":"Sample 02010: the compiler passes with new data.","target":1}
+{"input":"Sample 02011: the kernel breaks with new data.","target":0}
+{"input":"Sample 02012: the model responds with new data.","target":1}
+{"input":"Sample 02013: the dataset diverges at night.","target":0}
+{"input":"Sample 02014: the device learns at night.","target":1}
+{"input":"Sample 02015: the signal lags at night.","target":0}
+{"input":"Sample 02016: the engine works under load.","target":1}
+{"input":"Sample 02017: the sensor fails under load.","target":0}
+{"input":"Sample 02018: the compiler converges under load.","target":1}
+{"input":"Sample 02019: the kernel drifts after training.","target":0}
+{"input":"Sample 02020: the model improves after training.","target":1}
+{"input":"Sample 02021: the dataset stalls after training.","target":0}
+{"input":"Sample 02022: the device passes on device.","target":1}
+{"input":"Sample 02023: the signal breaks on device. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02024: the engine responds on device.","target":1}
+{"input":"Sample 02025: the sensor diverges during testing.","target":0}
+{"input":"Sample 02026: the compiler learns during testing.","target":1}
+{"input":"Sample 02027: the kernel lags during testing.","target":0}
+{"input":"Sample 02028: the model works with new data.","target":1}
+{"input":"Sample 02029: the dataset fails with new data.","target":0}
+{"input":"Sample 02030: the device converges with new data.","target":1}
+{"input":"Sample 02031: the signal drifts at night.","target":0}
+{"input":"Sample 02032: the engine improves at night.","target":1}
+{"input":"Sample 02033: the sensor stalls at night.","target":0}
+{"input":"Sample 02034: the compiler passes under load.","target":1}
+{"input":"Sample 02035: the kernel breaks under load.","target":0}
+{"input":"Sample 02036: the model responds under load.","target":1}
+{"input":"Sample 02037: the dataset diverges after training.","target":0}
+{"input":"Sample 02038: the device learns after training.","target":1}
+{"input":"Sample 02039: the signal lags after training.","target":0}
+{"input":"Sample 02040: the engine works on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02041: the sensor fails on device.","target":0}
+{"input":"Sample 02042: the compiler converges on device.","target":1}
+{"input":"Sample 02043: the kernel drifts during testing.","target":0}
+{"input":"Sample 02044: the model improves during testing.","target":1}
+{"input":"Sample 02045: the dataset stalls during testing.","target":0}
+{"input":"Sample 02046: the device passes with new data.","target":1}
+{"input":"Sample 02047: the signal breaks with new data.","target":0}
+{"input":"Sample 02048: the engine responds with new data.","target":1}
+{"input":"Sample 02049: the sensor diverges at night.","target":0}
+{"input":"Sample 02050: the compiler learns at night.","target":1}
+{"input":"Sample 02051: the kernel lags at night.","target":0}
+{"input":"Sample 02052: the model works under load.","target":1}
+{"input":"Sample 02053: the dataset fails under load.","target":0}
+{"input":"Sample 02054: the device converges under load.","target":1}
+{"input":"Sample 02055: the signal drifts after training.","target":0}
+{"input":"Sample 02056: the engine improves after training.","target":1}
+{"input":"Sample 02057: the sensor stalls after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02058: the compiler passes on device.","target":1}
+{"input":"Sample 02059: the kernel breaks on device.","target":0}
+{"input":"Sample 02060: the model responds on device.","target":1}
+{"input":"Sample 02061: the dataset diverges during testing.","target":0}
+{"input":"Sample 02062: the device learns during testing.","target":1}
+{"input":"Sample 02063: the signal lags during testing.","target":0}
+{"input":"Sample 02064: the engine works with new data.","target":1}
+{"input":"Sample 02065: the sensor fails with new data.","target":0}
+{"input":"Sample 02066: the compiler converges with new data.","target":1}
+{"input":"Sample 02067: the kernel drifts at night.","target":0}
+{"input":"Sample 02068: the model improves at night.","target":1}
+{"input":"Sample 02069: the dataset stalls at night.","target":0}
+{"input":"Sample 02070: the device passes under load.","target":1}
+{"input":"Sample 02071: the signal breaks under load.","target":0}
+{"input":"Sample 02072: the engine responds under load.","target":1}
+{"input":"Sample 02073: the sensor diverges after training.","target":0}
+{"input":"Sample 02074: the compiler learns after training. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02075: the kernel lags after training.","target":0}
+{"input":"Sample 02076: the model works on device.","target":1}
+{"input":"Sample 02077: the dataset fails on device.","target":0}
+{"input":"Sample 02078: the device converges on device.","target":1}
+{"input":"Sample 02079: the signal drifts during testing.","target":0}
+{"input":"Sample 02080: the engine improves during testing.","target":1}
+{"input":"Sample 02081: the sensor stalls during testing.","target":0}
+{"input":"Sample 02082: the compiler passes with new data.","target":1}
+{"input":"Sample 02083: the kernel breaks with new data.","target":0}
+{"input":"Sample 02084: the model responds with new data.","target":1}
+{"input":"Sample 02085: the dataset diverges at night.","target":0}
+{"input":"Sample 02086: the device learns at night.","target":1}
+{"input":"Sample 02087: the signal lags at night.","target":0}
+{"input":"Sample 02088: the engine works under load.","target":1}
+{"input":"Sample 02089: the sensor fails under load.","target":0}
+{"input":"Sample 02090: the compiler converges under load.","target":1}
+{"input":"Sample 02091: the kernel drifts after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02092: the model improves after training.","target":1}
+{"input":"Sample 02093: the dataset stalls after training.","target":0}
+{"input":"Sample 02094: the device passes on device.","target":1}
+{"input":"Sample 02095: the signal breaks on device.","target":0}
+{"input":"Sample 02096: the engine responds on device.","target":1}
+{"input":"Sample 02097: the sensor diverges during testing.","target":0}
+{"input":"Sample 02098: the compiler learns during testing.","target":1}
+{"input":"Sample 02099: the kernel lags during testing.","target":0}
+{"input":"Sample 02100: the model works with new data.","target":1}
+{"input":"Sample 02101: the dataset fails with new data.","target":0}
+{"input":"Sample 02102: the device converges with new data.","target":1}
+{"input":"Sample 02103: the signal drifts at night.","target":0}
+{"input":"Sample 02104: the engine improves at night.","target":1}
+{"input":"Sample 02105: the sensor stalls at night.","target":0}
+{"input":"Sample 02106: the compiler passes under load.","target":1}
+{"input":"Sample 02107: the kernel breaks under load.","target":0}
+{"input":"Sample 02108: the model responds under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02109: the dataset diverges after training.","target":0}
+{"input":"Sample 02110: the device learns after training.","target":1}
+{"input":"Sample 02111: the signal lags after training.","target":0}
+{"input":"Sample 02112: the engine works on device.","target":1}
+{"input":"Sample 02113: the sensor fails on device.","target":0}
+{"input":"Sample 02114: the compiler converges on device.","target":1}
+{"input":"Sample 02115: the kernel drifts during testing.","target":0}
+{"input":"Sample 02116: the model improves during testing.","target":1}
+{"input":"Sample 02117: the dataset stalls during testing.","target":0}
+{"input":"Sample 02118: the device passes with new data.","target":1}
+{"input":"Sample 02119: the signal breaks with new data.","target":0}
+{"input":"Sample 02120: the engine responds with new data.","target":1}
+{"input":"Sample 02121: the sensor diverges at night.","target":0}
+{"input":"Sample 02122: the compiler learns at night.","target":1}
+{"input":"Sample 02123: the kernel lags at night.","target":0}
+{"input":"Sample 02124: the model works under load.","target":1}
+{"input":"Sample 02125: the dataset fails under load. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02126: the device converges under load.","target":1}
+{"input":"Sample 02127: the signal drifts after training.","target":0}
+{"input":"Sample 02128: the engine improves after training.","target":1}
+{"input":"Sample 02129: the sensor stalls after training.","target":0}
+{"input":"Sample 02130: the compiler passes on device.","target":1}
+{"input":"Sample 02131: the kernel breaks on device.","target":0}
+{"input":"Sample 02132: the model responds on device.","target":1}
+{"input":"Sample 02133: the dataset diverges during testing.","target":0}
+{"input":"Sample 02134: the device learns during testing.","target":1}
+{"input":"Sample 02135: the signal lags during testing.","target":0}
+{"input":"Sample 02136: the engine works with new data.","target":1}
+{"input":"Sample 02137: the sensor fails with new data.","target":0}
+{"input":"Sample 02138: the compiler converges with new data.","target":1}
+{"input":"Sample 02139: the kernel drifts at night.","target":0}
+{"input":"Sample 02140: the model improves at night.","target":1}
+{"input":"Sample 02141: the dataset stalls at night.","target":0}
+{"input":"Sample 02142: the device passes under load. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02143: the signal breaks under load.","target":0}
+{"input":"Sample 02144: the engine responds under load.","target":1}
+{"input":"Sample 02145: the sensor diverges after training.","target":0}
+{"input":"Sample 02146: the compiler learns after training.","target":1}
+{"input":"Sample 02147: the kernel lags after training.","target":0}
+{"input":"Sample 02148: the model works on device.","target":1}
+{"input":"Sample 02149: the dataset fails on device.","target":0}
+{"input":"Sample 02150: the device converges on device.","target":1}
+{"input":"Sample 02151: the signal drifts during testing.","target":0}
+{"input":"Sample 02152: the engine improves during testing.","target":1}
+{"input":"Sample 02153: the sensor stalls during testing.","target":0}
+{"input":"Sample 02154: the compiler passes with new data.","target":1}
+{"input":"Sample 02155: the kernel breaks with new data.","target":0}
+{"input":"Sample 02156: the model responds with new data.","target":1}
+{"input":"Sample 02157: the dataset diverges at night.","target":0}
+{"input":"Sample 02158: the device learns at night.","target":1}
+{"input":"Sample 02159: the signal lags at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02160: the engine works under load.","target":1}
+{"input":"Sample 02161: the sensor fails under load.","target":0}
+{"input":"Sample 02162: the compiler converges under load.","target":1}
+{"input":"Sample 02163: the kernel drifts after training.","target":0}
+{"input":"Sample 02164: the model improves after training.","target":1}
+{"input":"Sample 02165: the dataset stalls after training.","target":0}
+{"input":"Sample 02166: the device passes on device.","target":1}
+{"input":"Sample 02167: the signal breaks on device.","target":0}
+{"input":"Sample 02168: the engine responds on device.","target":1}
+{"input":"Sample 02169: the sensor diverges during testing.","target":0}
+{"input":"Sample 02170: the compiler learns during testing.","target":1}
+{"input":"Sample 02171: the kernel lags during testing.","target":0}
+{"input":"Sample 02172: the model works with new data.","target":1}
+{"input":"Sample 02173: the dataset fails with new data.","target":0}
+{"input":"Sample 02174: the device converges with new data.","target":1}
+{"input":"Sample 02175: the signal drifts at night.","target":0}
+{"input":"Sample 02176: the engine improves at night. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02177: the sensor stalls at night.","target":0}
+{"input":"Sample 02178: the compiler passes under load.","target":1}
+{"input":"Sample 02179: the kernel breaks under load.","target":0}
+{"input":"Sample 02180: the model responds under load.","target":1}
+{"input":"Sample 02181: the dataset diverges after training.","target":0}
+{"input":"Sample 02182: the device learns after training.","target":1}
+{"input":"Sample 02183: the signal lags after training.","target":0}
+{"input":"Sample 02184: the engine works on device.","target":1}
+{"input":"Sample 02185: the sensor fails on device.","target":0}
+{"input":"Sample 02186: the compiler converges on device.","target":1}
+{"input":"Sample 02187: the kernel drifts during testing.","target":0}
+{"input":"Sample 02188: the model improves during testing.","target":1}
+{"input":"Sample 02189: the dataset stalls during testing.","target":0}
+{"input":"Sample 02190: the device passes with new data.","target":1}
+{"input":"Sample 02191: the signal breaks with new data.","target":0}
+{"input":"Sample 02192: the engine responds with new data.","target":1}
+{"input":"Sample 02193: the sensor diverges at night. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02194: the compiler learns at night.","target":1}
+{"input":"Sample 02195: the kernel lags at night.","target":0}
+{"input":"Sample 02196: the model works under load.","target":1}
+{"input":"Sample 02197: the dataset fails under load.","target":0}
+{"input":"Sample 02198: the device converges under load.","target":1}
+{"input":"Sample 02199: the signal drifts after training.","target":0}
+{"input":"Sample 02200: the engine improves after training.","target":1}
+{"input":"Sample 02201: the sensor stalls after training.","target":0}
+{"input":"Sample 02202: the compiler passes on device.","target":1}
+{"input":"Sample 02203: the kernel breaks on device.","target":0}
+{"input":"Sample 02204: the model responds on device.","target":1}
+{"input":"Sample 02205: the dataset diverges during testing.","target":0}
+{"input":"Sample 02206: the device learns during testing.","target":1}
+{"input":"Sample 02207: the signal lags during testing.","target":0}
+{"input":"Sample 02208: the engine works with new data.","target":1}
+{"input":"Sample 02209: the sensor fails with new data.","target":0}
+{"input":"Sample 02210: the compiler converges with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02211: the kernel drifts at night.","target":0}
+{"input":"Sample 02212: the model improves at night.","target":1}
+{"input":"Sample 02213: the dataset stalls at night.","target":0}
+{"input":"Sample 02214: the device passes under load.","target":1}
+{"input":"Sample 02215: the signal breaks under load.","target":0}
+{"input":"Sample 02216: the engine responds under load.","target":1}
+{"input":"Sample 02217: the sensor diverges after training.","target":0}
+{"input":"Sample 02218: the compiler learns after training.","target":1}
+{"input":"Sample 02219: the kernel lags after training.","target":0}
+{"input":"Sample 02220: the model works on device.","target":1}
+{"input":"Sample 02221: the dataset fails on device.","target":0}
+{"input":"Sample 02222: the device converges on device.","target":1}
+{"input":"Sample 02223: the signal drifts during testing.","target":0}
+{"input":"Sample 02224: the engine improves during testing.","target":1}
+{"input":"Sample 02225: the sensor stalls during testing.","target":0}
+{"input":"Sample 02226: the compiler passes with new data.","target":1}
+{"input":"Sample 02227: the kernel breaks with new data. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02228: the model responds with new data.","target":1}
+{"input":"Sample 02229: the dataset diverges at night.","target":0}
+{"input":"Sample 02230: the device learns at night.","target":1}
+{"input":"Sample 02231: the signal lags at night.","target":0}
+{"input":"Sample 02232: the engine works under load.","target":1}
+{"input":"Sample 02233: the sensor fails under load.","target":0}
+{"input":"Sample 02234: the compiler converges under load.","target":1}
+{"input":"Sample 02235: the kernel drifts after training.","target":0}
+{"input":"Sample 02236: the model improves after training.","target":1}
+{"input":"Sample 02237: the dataset stalls after training.","target":0}
+{"input":"Sample 02238: the device passes on device.","target":1}
+{"input":"Sample 02239: the signal breaks on device.","target":0}
+{"input":"Sample 02240: the engine responds on device.","target":1}
+{"input":"Sample 02241: the sensor diverges during testing.","target":0}
+{"input":"Sample 02242: the compiler learns during testing.","target":1}
+{"input":"Sample 02243: the kernel lags during testing.","target":0}
+{"input":"Sample 02244: the model works with new data. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02245: the dataset fails with new data.","target":0}
+{"input":"Sample 02246: the device converges with new data.","target":1}
+{"input":"Sample 02247: the signal drifts at night.","target":0}
+{"input":"Sample 02248: the engine improves at night.","target":1}
+{"input":"Sample 02249: the sensor stalls at night.","target":0}
+{"input":"Sample 02250: the compiler passes under load.","target":1}
+{"input":"Sample 02251: the kernel breaks under load.","target":0}
+{"input":"Sample 02252: the model responds under load.","target":1}
+{"input":"Sample 02253: the dataset diverges after training.","target":0}
+{"input":"Sample 02254: the device learns after training.","target":1}
+{"input":"Sample 02255: the signal lags after training.","target":0}
+{"input":"Sample 02256: the engine works on device.","target":1}
+{"input":"Sample 02257: the sensor fails on device.","target":0}
+{"input":"Sample 02258: the compiler converges on device.","target":1}
+{"input":"Sample 02259: the kernel drifts during testing.","target":0}
+{"input":"Sample 02260: the model improves during testing.","target":1}
+{"input":"Sample 02261: the dataset stalls during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02262: the device passes with new data.","target":1}
+{"input":"Sample 02263: the signal breaks with new data.","target":0}
+{"input":"Sample 02264: the engine responds with new data.","target":1}
+{"input":"Sample 02265: the sensor diverges at night.","target":0}
+{"input":"Sample 02266: the compiler learns at night.","target":1}
+{"input":"Sample 02267: the kernel lags at night.","target":0}
+{"input":"Sample 02268: the model works under load.","target":1}
+{"input":"Sample 02269: the dataset fails under load.","target":0}
+{"input":"Sample 02270: the device converges under load.","target":1}
+{"input":"Sample 02271: the signal drifts after training.","target":0}
+{"input":"Sample 02272: the engine improves after training.","target":1}
+{"input":"Sample 02273: the sensor stalls after training.","target":0}
+{"input":"Sample 02274: the compiler passes on device.","target":1}
+{"input":"Sample 02275: the kernel breaks on device.","target":0}
+{"input":"Sample 02276: the model responds on device.","target":1}
+{"input":"Sample 02277: the dataset diverges during testing.","target":0}
+{"input":"Sample 02278: the device learns during testing. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02279: the signal lags during testing.","target":0}
+{"input":"Sample 02280: the engine works with new data.","target":1}
+{"input":"Sample 02281: the sensor fails with new data.","target":0}
+{"input":"Sample 02282: the compiler converges with new data.","target":1}
+{"input":"Sample 02283: the kernel drifts at night.","target":0}
+{"input":"Sample 02284: the model improves at night.","target":1}
+{"input":"Sample 02285: the dataset stalls at night.","target":0}
+{"input":"Sample 02286: the device passes under load.","target":1}
+{"input":"Sample 02287: the signal breaks under load.","target":0}
+{"input":"Sample 02288: the engine responds under load.","target":1}
+{"input":"Sample 02289: the sensor diverges after training.","target":0}
+{"input":"Sample 02290: the compiler learns after training.","target":1}
+{"input":"Sample 02291: the kernel lags after training.","target":0}
+{"input":"Sample 02292: the model works on device.","target":1}
+{"input":"Sample 02293: the dataset fails on device.","target":0}
+{"input":"Sample 02294: the device converges on device.","target":1}
+{"input":"Sample 02295: the signal drifts during testing. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02296: the engine improves during testing.","target":1}
+{"input":"Sample 02297: the sensor stalls during testing.","target":0}
+{"input":"Sample 02298: the compiler passes with new data.","target":1}
+{"input":"Sample 02299: the kernel breaks with new data.","target":0}
+{"input":"Sample 02300: the model responds with new data.","target":1}
+{"input":"Sample 02301: the dataset diverges at night.","target":0}
+{"input":"Sample 02302: the device learns at night.","target":1}
+{"input":"Sample 02303: the signal lags at night.","target":0}
+{"input":"Sample 02304: the engine works under load.","target":1}
+{"input":"Sample 02305: the sensor fails under load.","target":0}
+{"input":"Sample 02306: the compiler converges under load.","target":1}
+{"input":"Sample 02307: the kernel drifts after training.","target":0}
+{"input":"Sample 02308: the model improves after training.","target":1}
+{"input":"Sample 02309: the dataset stalls after training.","target":0}
+{"input":"Sample 02310: the device passes on device.","target":1}
+{"input":"Sample 02311: the signal breaks on device.","target":0}
+{"input":"Sample 02312: the engine responds on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02313: the sensor diverges during testing.","target":0}
+{"input":"Sample 02314: the compiler learns during testing.","target":1}
+{"input":"Sample 02315: the kernel lags during testing.","target":0}
+{"input":"Sample 02316: the model works with new data.","target":1}
+{"input":"Sample 02317: the dataset fails with new data.","target":0}
+{"input":"Sample 02318: the device converges with new data.","target":1}
+{"input":"Sample 02319: the signal drifts at night.","target":0}
+{"input":"Sample 02320: the engine improves at night.","target":1}
+{"input":"Sample 02321: the sensor stalls at night.","target":0}
+{"input":"Sample 02322: the compiler passes under load.","target":1}
+{"input":"Sample 02323: the kernel breaks under load.","target":0}
+{"input":"Sample 02324: the model responds under load.","target":1}
+{"input":"Sample 02325: the dataset diverges after training.","target":0}
+{"input":"Sample 02326: the device learns after training.","target":1}
+{"input":"Sample 02327: the signal lags after training.","target":0}
+{"input":"Sample 02328: the engine works on device.","target":1}
+{"input":"Sample 02329: the sensor fails on device. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02330: the compiler converges on device.","target":1}
+{"input":"Sample 02331: the kernel drifts during testing.","target":0}
+{"input":"Sample 02332: the model improves during testing.","target":1}
+{"input":"Sample 02333: the dataset stalls during testing.","target":0}
+{"input":"Sample 02334: the device passes with new data.","target":1}
+{"input":"Sample 02335: the signal breaks with new data.","target":0}
+{"input":"Sample 02336: the engine responds with new data.","target":1}
+{"input":"Sample 02337: the sensor diverges at night.","target":0}
+{"input":"Sample 02338: the compiler learns at night.","target":1}
+{"input":"Sample 02339: the kernel lags at night.","target":0}
+{"input":"Sample 02340: the model works under load.","target":1}
+{"input":"Sample 02341: the dataset fails under load.","target":0}
+{"input":"Sample 02342: the device converges under load.","target":1}
+{"input":"Sample 02343: the signal drifts after training.","target":0}
+{"input":"Sample 02344: the engine improves after training.","target":1}
+{"input":"Sample 02345: the sensor stalls after training.","target":0}
+{"input":"Sample 02346: the compiler passes on device. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02347: the kernel breaks on device.","target":0}
+{"input":"Sample 02348: the model responds on device.","target":1}
+{"input":"Sample 02349: the dataset diverges during testing.","target":0}
+{"input":"Sample 02350: the device learns during testing.","target":1}
+{"input":"Sample 02351: the signal lags during testing.","target":0}
+{"input":"Sample 02352: the engine works with new data.","target":1}
+{"input":"Sample 02353: the sensor fails with new data.","target":0}
+{"input":"Sample 02354: the compiler converges with new data.","target":1}
+{"input":"Sample 02355: the kernel drifts at night.","target":0}
+{"input":"Sample 02356: the model improves at night.","target":1}
+{"input":"Sample 02357: the dataset stalls at night.","target":0}
+{"input":"Sample 02358: the device passes under load.","target":1}
+{"input":"Sample 02359: the signal breaks under load.","target":0}
+{"input":"Sample 02360: the engine responds under load.","target":1}
+{"input":"Sample 02361: the sensor diverges after training.","target":0}
+{"input":"Sample 02362: the compiler learns after training.","target":1}
+{"input":"Sample 02363: the kernel lags after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02364: the model works on device.","target":1}
+{"input":"Sample 02365: the dataset fails on device.","target":0}
+{"input":"Sample 02366: the device converges on device.","target":1}
+{"input":"Sample 02367: the signal drifts during testing.","target":0}
+{"input":"Sample 02368: the engine improves during testing.","target":1}
+{"input":"Sample 02369: the sensor stalls during testing.","target":0}
+{"input":"Sample 02370: the compiler passes with new data.","target":1}
+{"input":"Sample 02371: the kernel breaks with new data.","target":0}
+{"input":"Sample 02372: the model responds with new data.","target":1}
+{"input":"Sample 02373: the dataset diverges at night.","target":0}
+{"input":"Sample 02374: the device learns at night.","target":1}
+{"input":"Sample 02375: the signal lags at night.","target":0}
+{"input":"Sample 02376: the engine works under load.","target":1}
+{"input":"Sample 02377: the sensor fails under load.","target":0}
+{"input":"Sample 02378: the compiler converges under load.","target":1}
+{"input":"Sample 02379: the kernel drifts after training.","target":0}
+{"input":"Sample 02380: the model improves after training. It says, \"check input, then retry.\"","target":1}
+{"input":"Sample 02381: the dataset stalls after training.","target":0}
+{"input":"Sample 02382: the device passes on device.","target":1}
+{"input":"Sample 02383: the signal breaks on device.","target":0}
+{"input":"Sample 02384: the engine responds on device.","target":1}
+{"input":"Sample 02385: the sensor diverges during testing.","target":0}
+{"input":"Sample 02386: the compiler learns during testing.","target":1}
+{"input":"Sample 02387: the kernel lags during testing.","target":0}
+{"input":"Sample 02388: the model works with new data.","target":1}
+{"input":"Sample 02389: the dataset fails with new data.","target":0}
+{"input":"Sample 02390: the device converges with new data.","target":1}
+{"input":"Sample 02391: the signal drifts at night.","target":0}
+{"input":"Sample 02392: the engine improves at night.","target":1}
+{"input":"Sample 02393: the sensor stalls at night.","target":0}
+{"input":"Sample 02394: the compiler passes under load.","target":1}
+{"input":"Sample 02395: the kernel breaks under load.","target":0}
+{"input":"Sample 02396: the model responds under load.","target":1}
+{"input":"Sample 02397: the dataset diverges after training. It says, \"check input, then retry.\"","target":0}
+{"input":"Sample 02398: the device learns after training.","target":1}
+{"input":"Sample 02399: the signal lags after training.","target":0}

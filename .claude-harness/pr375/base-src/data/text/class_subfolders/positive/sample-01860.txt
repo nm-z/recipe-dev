@@ -1,0 +1,1 @@
+Sample 01860: the model works on device.

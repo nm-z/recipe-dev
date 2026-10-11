@@ -1,0 +1,1 @@
+Sample 01207: the signal breaks under load. It says, "check input, then retry."

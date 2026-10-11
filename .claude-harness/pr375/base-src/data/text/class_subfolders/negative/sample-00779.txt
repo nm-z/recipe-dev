@@ -1,0 +1,1 @@
+Sample 00779: the kernel lags after training.

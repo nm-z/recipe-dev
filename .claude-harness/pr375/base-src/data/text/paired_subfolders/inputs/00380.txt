@@ -1,0 +1,1 @@
+Sample 00380: the model responds under load.

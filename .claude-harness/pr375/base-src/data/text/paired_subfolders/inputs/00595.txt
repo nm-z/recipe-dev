@@ -1,0 +1,1 @@
+Sample 00595: the kernel breaks under load. It says, "check input, then retry."

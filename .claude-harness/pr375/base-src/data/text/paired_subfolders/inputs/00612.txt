@@ -1,0 +1,1 @@
+Sample 00612: the model works under load. It says, "check input, then retry."

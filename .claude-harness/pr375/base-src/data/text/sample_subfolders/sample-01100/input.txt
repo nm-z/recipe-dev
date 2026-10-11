@@ -1,0 +1,1 @@
+Sample 01100: the model responds under load.

@@ -1,0 +1,1 @@
+Sample 01938: the compiler passes with new data. It says, "check input, then retry."

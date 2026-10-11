@@ -1,0 +1,1 @@
+Sample 02010: the compiler passes with new data.

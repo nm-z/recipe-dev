@@ -1,0 +1,1 @@
+Sample 01122: the compiler passes on device. It says, "check input, then retry."

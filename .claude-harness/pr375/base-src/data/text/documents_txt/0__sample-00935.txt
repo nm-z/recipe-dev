@@ -1,0 +1,1 @@
+Sample 00935: the signal lags at night. It says, "check input, then retry."

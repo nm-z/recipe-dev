@@ -1,0 +1,1 @@
+Sample 00378: the compiler passes under load.

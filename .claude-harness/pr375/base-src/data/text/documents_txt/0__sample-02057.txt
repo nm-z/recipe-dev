@@ -1,0 +1,1 @@
+Sample 02057: the sensor stalls after training. It says, "check input, then retry."

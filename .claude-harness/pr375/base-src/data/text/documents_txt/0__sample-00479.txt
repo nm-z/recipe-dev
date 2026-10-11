@@ -1,0 +1,1 @@
+Sample 00479: the signal lags during testing.

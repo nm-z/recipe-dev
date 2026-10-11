@@ -1,0 +1,1 @@
+Sample 01724: the model responds with new data.

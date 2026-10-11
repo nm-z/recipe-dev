@@ -1,0 +1,1 @@
+Sample 01921: the sensor fails with new data. It says, "check input, then retry."

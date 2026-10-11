@@ -1,0 +1,1 @@
+Sample 00969: the sensor diverges at night. It says, "check input, then retry."

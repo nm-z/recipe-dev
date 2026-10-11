@@ -1,0 +1,1 @@
+Sample 01118: the device converges under load.

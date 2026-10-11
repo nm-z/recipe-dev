@@ -1,0 +1,1 @@
+Sample 00646: the device learns at night. It says, "check input, then retry."

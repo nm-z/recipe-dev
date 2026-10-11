@@ -1,0 +1,1 @@
+Sample 00017: the sensor stalls at night. It says, "check input, then retry."

@@ -1,0 +1,1 @@
+Sample 01020: the model works with new data. It says, "check input, then retry."

@@ -1,0 +1,1 @@
+Sample 00522: the compiler passes under load.

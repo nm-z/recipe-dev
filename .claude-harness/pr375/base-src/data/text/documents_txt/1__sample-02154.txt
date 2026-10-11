@@ -1,0 +1,1 @@
+Sample 02154: the compiler passes with new data.

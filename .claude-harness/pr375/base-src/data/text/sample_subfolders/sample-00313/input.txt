@@ -1,0 +1,1 @@
+Sample 00313: the sensor fails on device.

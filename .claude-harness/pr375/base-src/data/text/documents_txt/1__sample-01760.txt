@@ -1,0 +1,1 @@
+Sample 01760: the engine responds with new data.

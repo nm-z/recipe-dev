@@ -1,0 +1,1 @@
+Sample 00681: the sensor diverges at night.

@@ -1,0 +1,1 @@
+Sample 01225: the sensor fails under load.

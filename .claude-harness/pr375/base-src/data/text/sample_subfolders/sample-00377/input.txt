@@ -1,0 +1,1 @@
+Sample 00377: the sensor stalls at night.

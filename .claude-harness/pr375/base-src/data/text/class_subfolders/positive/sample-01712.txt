@@ -1,0 +1,1 @@
+Sample 01712: the engine responds under load.

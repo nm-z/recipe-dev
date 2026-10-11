@@ -1,0 +1,1 @@
+Sample 01530: the compiler passes under load. It says, "check input, then retry."

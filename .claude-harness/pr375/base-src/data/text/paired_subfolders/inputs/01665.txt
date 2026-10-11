@@ -1,0 +1,1 @@
+Sample 01665: the sensor diverges during testing.

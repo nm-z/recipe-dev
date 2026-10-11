@@ -1,0 +1,1 @@
+Sample 00187: the kernel breaks on device. It says, "check input, then retry."

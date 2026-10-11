@@ -1,0 +1,1 @@
+Sample 01649: the sensor stalls during testing. It says, "check input, then retry."

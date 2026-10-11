@@ -1,0 +1,1 @@
+Sample 01844: the model responds on device.

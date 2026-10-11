@@ -1,0 +1,1 @@
+Sample 01730: the compiler converges under load.
