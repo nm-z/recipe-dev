@@ -18,6 +18,19 @@ use recipe::*;
 use recipe::log::{epoch, loss};
 use std::io::Write;
 
+fn match_row(row: usize, distances: &[Vec<f64>], seen: &mut [bool], owner: &mut [Option<usize>], tolerance: f64) -> bool {
+	for (reference, distance) in distances[row].iter().enumerate() {
+		if *distance >= tolerance || seen[reference] { continue; }
+		seen[reference] = true;
+		let previous = owner[reference];
+		if previous.is_none_or(|previous| match_row(previous, distances, seen, owner, tolerance)) {
+			owner[reference] = Some(row);
+			return true;
+		}
+	}
+	false
+}
+
 fn main() {
 	let path = std::env::var("RECIPE_TRAIN_GGUF").unwrap();
 	let work = std::env::var("RECIPE_TRAIN_WORK").unwrap();
@@ -58,9 +71,7 @@ fn main() {
 	for line in model.binding(&data).unwrap().listing() {
 		println!("binding {line}");
 	}
-	let mut reference = reference.chunks_exact(vocabulary).collect::<Vec<_>>();
-	let order = |left: &&[f64], right: &&[f64]| left.iter().zip(*right).map(|(a, b)| a.total_cmp(b)).find(|value| !value.is_eq()).unwrap_or(std::cmp::Ordering::Equal);
-	reference.sort_by(order);
+	let reference = reference.chunks_exact(vocabulary).collect::<Vec<_>>();
 	let minimum = reference.iter().flat_map(|row| row.iter()).copied().fold(f64::INFINITY, f64::min);
 	let maximum = reference.iter().flat_map(|row| row.iter()).copied().fold(f64::NEG_INFINITY, f64::max);
 	for (label, definition, tolerance) in [("canonical", model.clone(), 0.001), ("integer fp32 fallback", model.int(8), 0.05 * (maximum - minimum))] {
@@ -68,13 +79,17 @@ fn main() {
 		assert_eq!(trained.rows, pairs.len());
 		assert_eq!(trained.loss.len(), 4);
 		assert_eq!(trained.initial_predictions().len(), pairs.len() * vocabulary, "training must retain the vocabulary head");
-		let mut initial = trained.initial_predictions().chunks_exact(vocabulary).collect::<Vec<_>>();
-		initial.sort_by(order);
-		let error = initial.iter().flat_map(|row| row.iter()).zip(reference.iter().flat_map(|row| row.iter()))
-			.map(|(left, right)| (left - right).abs()).fold(0.0_f64, f64::max);
-		assert!(error < tolerance, "{label}: pretrained logit mismatch {error}, tolerance {tolerance}");
+		let distances = trained.initial_predictions().chunks_exact(vocabulary).map(|initial| reference.iter().map(|expected| {
+			initial.iter().zip(*expected).map(|(left, right)| (left - right).abs()).fold(0.0_f64, f64::max)
+		}).collect::<Vec<_>>()).collect::<Vec<_>>();
+		let mut owner = vec![None; pairs.len()];
+		for row in 0..pairs.len() {
+			assert!(match_row(row, &distances, &mut vec![false; pairs.len()], &mut owner, tolerance),
+				"{label}: no one-to-one pretrained logit match for row {row}, tolerance {tolerance}");
+		}
+		let error = owner.iter().enumerate().map(|(reference, row)| distances[row.unwrap()][reference]).fold(0.0_f64, f64::max);
 		let loss_tolerance = if label == "canonical" { 0.001 } else { 0.05 };
-		assert!((trained.itl.loss - expected_loss).abs() < loss_tolerance * expected_loss.max(1.0), "initial loss differs from inference");
+		assert!((trained.itl.loss - expected_loss).abs() < loss_tolerance * expected_loss, "initial loss differs from inference");
 		assert!(trained.fnl.loss.is_finite() && trained.fnl.loss < trained.itl.loss);
 		assert!(trained.fnl.loss < trained.loss[0][0], "loss must fall after the first epoch");
 		assert!(trained.initial_predictions().iter().zip(trained.predictions()).any(|(left, right)| left.to_bits() != right.to_bits()),
