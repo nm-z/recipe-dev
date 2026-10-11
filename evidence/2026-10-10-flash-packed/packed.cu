@@ -287,7 +287,59 @@ template<int T,int N,int NW,int LW,bool MAGIC,bool DICT>static __device__ __forc
 		if(l==0&&row<m&&c<active)out[c*m+row]=acc[c];
 	}
 }
+#ifdef PACKED_WORKER
+// The resident worker requires 256 threads. Retain each decoded group across columns.
+template<int T,int N,int LW,bool DICT>static __device__ __forceinline__ void group32_thin(const uint8_t *W,const u32 *x,const float2 *ds,float *out,int k,int m,int row_base,int active,u32 mask,u32 count,u32 *scratch){
+	constexpr int NT=256,TU=LW,YS=20,ACC=4096,WEIGHTS=6144,SOURCES=3072;
+	u32 (*ys)[TU*YS]=(u32 (*)[TU*YS])scratch;float2 (*scales)[TU]=(float2 (*)[TU])(scratch+N*TU*YS);int *table=(int*)(scales+N);
+	int tid=threadIdx.x,l=tid&(LW-1),row=row_base+(tid/LW)*count,nb=k/32,tiles=(nb+TU-1)/TU;
+	for(int c=0;c<N;c++)scratch[ACC+tid*N+c]=0;
+	const uint8_t *rp=W+size_t(row<m?row:0)*(k/Format<T>::block)*Format<T>::bytes;
+	for(int tile=0;tile<tiles;tile++){
+		for(int c=0;c<N;c++){
+			int source=int(scratch[SOURCES+c]);
+			for(int j=tid;j<TU*4;j+=NT){uint4 value=make_uint4(0,0,0,0);int offset=tile*TU*4+j;
+				if(source>=0&&offset<nb*4)value=__ldg((const uint4*)x+source*nb*4+offset);store_shared4(&ys[c][(j/4)*YS+(j%4)*4],value);}
+			for(int j=tid;j<TU;j+=NT){float2 value=make_float2(0,0);if(source>=0&&tile*TU+j<nb)value=__ldg(ds+source*nb+tile*TU+j);store_shared2(&scales[c][j],value);}
+		}
+		__syncthreads();int b=tile*TU+l;u32 weights[16];float d,s0,s1,mn;
+		decode32<T,(DICT&&T!=20)>(rp,b<nb?b:0,weights,d,s0,s1,mn,table);
+		u32 *cached=scratch+WEIGHTS+tid*16;
+		store_shared4(cached,make_uint4(weights[0],weights[1],weights[2],weights[3]));
+		store_shared4(cached+4,make_uint4(weights[4],weights[5],weights[6],weights[7]));
+		store_shared4(cached+8,make_uint4(weights[8],weights[9],weights[10],weights[11]));
+		store_shared4(cached+12,make_uint4(weights[12],weights[13],weights[14],weights[15]));
+		for(int c=0;c<active;c++){
+			if(row>=m||b>=nb)continue;int a0=0,a1=0;
+			#pragma unroll
+			for(int sub=0;sub<4;sub++){
+				uint4 values=load_shared4(&ys[c][l*YS+sub*4]),w=load_shared4(cached+sub*4);int sum=0;
+				sum=mad2(w.x,values.x,sum);sum=mad2(w.y,values.y,sum);sum=mad2(w.z,values.z,sum);sum=mad2(w.w,values.w,sum);
+				if(sub<2)a0+=sum;else a1+=sum;
+			}
+			float2 scale=load_shared2(&scales[c][l]);u32 *at=scratch+ACC+tid*N+c;
+			float sum=__uint_as_float(*at)+fmaf(d*scale.x,fmaf(s0,float(a0),s1*float(a1)),-mn*scale.y);*at=__float_as_uint(sum);
+		}
+		__syncthreads();
+	}
+	for(int c=0;c<active;c++){
+		float sum=__uint_as_float(scratch[ACC+tid*N+c]);
+		#pragma unroll
+		for(int step=LW/2;step;step>>=1)sum+=__shfl_xor_sync(0xffffffff,sum,step);
+		if(l==0&&row<m)out[c*m+row]=sum;
+	}
+}
+template<int T,int N,int LW>static __device__ __forceinline__ void prepare_thin_table(u32 *scratch,int active,u32 mask){
+	if constexpr(T==20){int *table=(int*)(scratch+N*LW*22);if(threadIdx.x<16)table[threadIdx.x]=kvalues_iq4nl[threadIdx.x];}
+	if(threadIdx.x==0){u32 bits=mask;for(int c=0;c<N;c++){scratch[3072+c]=u32(c>=active?-1:mask?__ffs(bits)-1:c);bits&=bits-1;}}
+	__syncthreads();
+}
+#endif
+#ifdef PACKED_WORKER
+#define G(T,N,W,L,K) extern "C" __device__ __noinline__ void packed_g_##T##_##N##_##W##_##K##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){prepare_thin_table<T,N,L>(scratch,active,mask);for(int base=cta_index;base<m;base+=cta_count*(256/L))group32_thin<T,N,L,(K==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#else
 #define G(T,N,W,L,K) extern "C" __device__ __noinline__ void packed_g_##T##_##N##_##W##_##K##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){if constexpr(T==20&&K==2&&N<=2&&L==8&&(W==8||W==16)){int lut=__ldg(kvalues_iq4nl+(threadIdx.x&15));for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32_fast<T,N,W,L,false,true>(a,b,c,d,k,m,base,active,mask,cta_count,scratch,lut);return;}for(int base=cta_index;base<m;base+=cta_count*(W*32/L))group32<T,N,W,L,(K==1),(K==2)>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#endif
 #define GK(T,N,W,L) G(T,N,W,L,0) G(T,N,W,L,1)
 #define GW(T,N,L) GK(T,N,2,L) GK(T,N,4,L) GK(T,N,8,L) GK(T,N,16,L)
 #define GN(T,N) GW(T,N,8) GW(T,N,16)
@@ -404,7 +456,11 @@ template<int T,int NW,int N,int LW>static __device__ __forceinline__ void k_widt
 		if(lane==0&&row<m&&c<active)out[c*m+row]=acc[c];
 	}
 }
+#ifdef PACKED_WORKER
+#define WIDTH(T,N,W,L) extern "C" __device__ __noinline__ void packed_h_##T##_##N##_##W##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){prepare_thin_table<T,N,L>(scratch,active,mask);for(int base=cta_index;base<m;base+=cta_count*(256/L))group32_thin<T,N,L,false>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#else
 #define WIDTH(T,N,W,L) extern "C" __device__ __noinline__ void packed_h_##T##_##N##_##W##_##L(const uint8_t *a,const u32 *b,const float2 *c,float *d,int k,int m,int active,u32 mask,u32 cta_index,u32 cta_count,u32 *scratch){for(int base=cta_index;base<m;base+=cta_count*(W*32/L))k_width<T,W,N,L>(a,b,c,d,k,m,base,active,mask,cta_count,scratch);}
+#endif
 #define WIDTHW(T,N,L) WIDTH(T,N,2,L) WIDTH(T,N,4,L) WIDTH(T,N,8,L) WIDTH(T,N,16,L)
 #define WIDTHN(T,N) WIDTHW(T,N,8) WIDTHW(T,N,16)
 #define WIDTHT(T) WIDTHN(T,1) WIDTHN(T,2) WIDTHN(T,4) WIDTHN(T,8)

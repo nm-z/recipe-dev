@@ -1,0 +1,2 @@
+uuid, driver_version, power.limit [W], clocks.current.sm [MHz], clocks.current.memory [MHz]
+GPU-ccb8b3a3-f45d-8962-215b-c2b140e4bb28, 470.256.02, 113.00 W, 1177 MHz, 2505 MHz

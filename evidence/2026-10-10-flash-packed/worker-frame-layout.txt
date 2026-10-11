@@ -1,0 +1,1 @@
+layouts=8 mask_positions=3216 row_partitions=2785280 mismatches=0
