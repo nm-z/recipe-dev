@@ -117,10 +117,10 @@ static int weighted_return_check(void) {
 	static float compact[5 * 2560], old_return[5 * 4096], fused_return[5 * 4096];
 	uint32_t counts[5];
 	uint64_t comparisons = 0;
-	for (uint32_t test = 0; test < 55; test++) {
-		uint32_t positions = test / 11 + 1;
+	for (uint32_t case_id = 0; case_id < 55; case_id++) {
+		uint32_t positions = case_id / 11 + 1;
 		for (uint32_t position = 0; position < positions; position++) {
-			counts[position] = (test + position) % 11;
+			counts[position] = (case_id + position) % 11;
 			for (uint32_t slot = 0; slot < 10; slot++) {
 				coefficients[position * 10 + slot] = (float)(random_word() & 0xffffu) / 65536.0f;
 				for (uint32_t row = 0; row < 2560; row++)
@@ -143,7 +143,7 @@ static int weighted_return_check(void) {
 		}
 		for (uint32_t linear = 0; linear < positions * 4096; linear++) {
 			comparisons++;
-			if (word(old_return[linear]) != word(fused_return[linear])) { fprintf(stderr, "Weighted return differs at case %u, index %u.\n", test, linear); return 1; }
+			if (word(old_return[linear]) != word(fused_return[linear])) { fprintf(stderr, "Weighted return differs at case %u, index %u.\n", case_id, linear); return 1; }
 		}
 	}
 	printf("Weighted-return CPU comparisons: %llu output words across active counts 0..10 and positions 1..5; zero mismatches.\n", (unsigned long long)comparisons);
@@ -153,10 +153,10 @@ int main(void) {
 	float scores[512];
 	Routing reference, candidate;
 	uint64_t comparisons = 0;
-	for (uint32_t test = 0; test < 4108; test++) {
+	for (uint32_t case_id = 0; case_id < 4108; case_id++) {
 		for (uint32_t id = 0; id < 512; id++) {
 			uint32_t random = random_word();
-			switch (test) {
+			switch (case_id) {
 				case 0: scores[id] = 1.0f; break;
 				case 1: scores[id] = (float)id; break;
 				case 2: scores[id] = -(float)id; break;
@@ -175,10 +175,10 @@ int main(void) {
 		scalar(scores, &reference);
 		for (uint32_t width = 256; width <= 512; width *= 2) {
 			if (!cta(scores, width, &candidate)) return 1;
-			if (memcmp(reference.selected, candidate.selected, sizeof(reference.selected))) { fprintf(stderr, "Selected IDs differ at case %u, width %u.\n", test, width); return 1; }
+			if (memcmp(reference.selected, candidate.selected, sizeof(reference.selected))) { fprintf(stderr, "Selected IDs differ at case %u, width %u.\n", case_id, width); return 1; }
 			for (uint32_t id = 0; id < 512; id++) {
 				comparisons++;
-				if (word(reference.weights[id]) != word(candidate.weights[id])) { fprintf(stderr, "Coefficient differs at case %u, width %u, expert %u.\n", test, width, id); return 1; }
+				if (word(reference.weights[id]) != word(candidate.weights[id])) { fprintf(stderr, "Coefficient differs at case %u, width %u, expert %u.\n", case_id, width, id); return 1; }
 			}
 		}
 	}

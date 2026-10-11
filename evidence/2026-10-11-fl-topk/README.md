@@ -51,7 +51,7 @@ Publication retains the existing `p2p_publish_tagged` call with tag `sequence * 
 
 `check-router.c` compares the scalar algorithm and a modeled 256/512-lane reduction across ties, signed zeros, finite extremes, underflow, and randomized finite inputs. It also checks nonfinite fallback and compares compact-combine/return against direct weighted return for active counts 0 through 10 and one through five positions. This CPU model check does not execute PTX or prove GPU publication.
 
-Build and test through the repository Makefile on Benji or Archy only. When Benji is available, wrap each command in one CEO build slot, use nice 19 and three jobs, and write artifacts only under the worker's owned target directory. Archy builds and Benji SSH are currently paused by the owners.
+Build and check through the repository Makefile on Benji or Archy only. When Benji is available, wrap each command in one CEO build slot, use nice 19 and three jobs, and write artifacts only under the worker's owned target directory. Archy builds and Benji SSH are currently paused by the owners.
 
 ```bash
 flock --close /home/nate/work/.build-slot-$((RANDOM%4+1)).lock nice -n 19 env CARGO_BUILD_JOBS=3 CARGO_TARGET_DIR=/home/nate/work/target-fl-topk make -j3 router-check ROUTER_CHECK=/home/nate/work/target-fl-topk/check-router

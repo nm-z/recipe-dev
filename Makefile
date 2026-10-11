@@ -21,12 +21,12 @@ target/%.o: %.ptx
 
 native-module:
 	case "$$(hostname)" in archy|benji) ;; *) echo 'Assemble on archy or benji.' >&2; exit 1 ;; esac
-	test -n "$(NATIVE_PTX)" && test -n "$(NATIVE_CUBIN)"
+	[[ -n "$(NATIVE_PTX)" && -n "$(NATIVE_CUBIN)" ]]
 	$(PTXAS) -arch=$(ARCH) -O1 -c --disable-optimizer-constants -v "$(NATIVE_PTX)" -o "$(NATIVE_CUBIN).device.cubin"
 	$(dir $(PTXAS))nvlink -arch=$(ARCH) --kernels-used $(NATIVE_ENTRIES) "$(NATIVE_CUBIN).device.cubin" -o "$(NATIVE_CUBIN)"
 
 router-check:
 	case "$$(hostname)" in archy|benji) ;; *) echo 'Check on archy or benji.' >&2; exit 1 ;; esac
-	test -n "$(ROUTER_CHECK)"
+	[[ -n "$(ROUTER_CHECK)" ]]
 	$(CC) -O2 -std=c11 -Wall -Wextra -Werror -fno-fast-math -ffp-contract=off evidence/2026-10-11-fl-topk/check-router.c -lm -o "$(ROUTER_CHECK)"
 	"$(ROUTER_CHECK)"
