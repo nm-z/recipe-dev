@@ -1,0 +1,10 @@
+data/categoric/multi_input_class_files | NOTARGET | native artifact /home/nate/.cache/recipe/native/recipe-native-9d930c9bd01b7eeb/artifact.so is empty note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace 
+data/categoric/multi_input_csv.csv | NOTARGET | native artifact /home/nate/.cache/recipe/native/recipe-native-9d930c9bd01b7eeb/artifact.so is empty note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace 
+data/categoric/multi_input_json.json | NOTARGET | native artifact /home/nate/.cache/recipe/native/recipe-native-a66540a76ad8800a/artifact.so is empty note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace 
+data/categoric/multi_input_jsonl.jsonl | OK | feats=3 | multi_input_jsonl.material multi_input_jsonl.finish multi_input_jsonl.region 
+data/categoric/multi_input_lookup_tables | OK | feats=5 | categories.material categories.kind samples.material samples.finish samples.region 
+data/categoric/multi_input_multi_target_class_files | OK | feats=4 | data.material data.finish data.region data.defect_flag 
+data/categoric/multi_input_multi_target_csv.csv | OK | feats=4 | multi_input_multi_target_csv.material multi_input_multi_target_csv.finish multi_input_multi_target_csv.region multi_input_multi_target_csv.defect_flag 
+data/categoric/multi_input_multi_target_json.json | OK | feats=4 | multi_input_multi_target_json.material multi_input_multi_target_json.finish multi_input_multi_target_json.region multi_input_multi_target_json.defect_flag 
+data/categoric/multi_input_multi_target_jsonl.jsonl | OK | feats=4 | multi_input_multi_target_jsonl.material multi_input_multi_target_jsonl.finish multi_input_multi_target_jsonl.region multi_input_multi_target_jsonl.defect_flag 
+data/categoric/multi_input_multi_target_lookup_tables | OK | feats=6 | categories.material categories.kind samples.material samples.finish samples.region samples.defect_flag 
