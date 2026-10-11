@@ -1538,19 +1538,20 @@ impl ScheduleRat {
 		let mut picks = Vec::with_capacity(groups.len());
 		for (group, value) in groups.iter().enumerate() {
 			let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
-			let mut best: Option<(usize, f64)> = None;
+			let mut best: Option<(usize, f64, f64)> = None;
 			for (position, candidate) in value.unmeasured.iter().enumerate() {
 				let features = schedule_candidate_features(&value.candidates[*candidate]);
-				let favor = self.repeat.candidate_favor(&features, 1.0 / (1.0 + distance(proposal, &features)), value.candidates.len());
+				let distance = distance(proposal, &features);
+				let favor = self.repeat.candidate_favor(&features, 1.0 / (1.0 + distance), value.candidates.len());
 				if favor == 0.0 { continue; }
-				if best.is_none_or(|(_, score)| favor > score) {
-					best = Some((position, favor));
+				if best.is_none_or(|(_, score, previous)| favor > score || (favor == score && distance < previous)) {
+					best = Some((position, favor, distance));
 				}
 			}
-			if let Some((position, _)) = best {
+			if let Some((position, _, _)) = best {
 				self.repeat.push(&schedule_candidate_features(&value.candidates[value.unmeasured[position]]));
 			}
-			picks.push(best.map(|(position, _)| position));
+			picks.push(best.map(|(position, _, _)| position));
 		}
 		Ok(picks)
 	}
@@ -36081,6 +36082,9 @@ impl RatState {
 				best = Some((favor, choice));
 			}
 		}
+		if repeat.penalty == 1.0 || repeat.window == 0 {
+			return Ok(nearest.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone());
+		}
 		if let Some((_, choice)) = best {
 			repeat.push(&self.values.iter().chain(choice).copied().collect::<Vec<_>>());
 			Ok(choice.clone())
@@ -36970,7 +36974,6 @@ impl Train {
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
 		let width = names.len() + outputs.len();
 		let mut replay = RatReplay::new(width, usize::MAX)?;
-		let target = self.rat_target.unwrap_or(0.0);
 		let (penalty, window) = self.repeat.unwrap_or((config.rat_repeat_penalty, config.rat_repeat_window));
 		let mut repeat = RepeatPenalty::new(penalty, window)?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
