@@ -24116,8 +24116,8 @@ pub(crate) struct Precisions {
 	chain_angle: bool,
 	/// How attention takes its softmax: `full`, the scores of every key at
 	/// once; or `online`, llama.cpp's CPU order, one thread per query walking
-	/// the keys in position order with a running maximum, the query and the
-	/// value accumulator in the cache type, the exponentials from the CPU's
+	/// the keys in position order with a running maximum, the query in the
+	/// cache type, the value accumulator in the state type, the exponentials from the CPU's
 	/// libm, and the key dot in four 16-lane fused accumulators folded by halves.
 	online_softmax: bool,
 	/// Where the transcendental steps of the elementwise programs come from:

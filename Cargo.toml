@@ -142,23 +142,23 @@ fp8-e5m2-special = [123, 126, 124]
 default-config = "recipe"
 
 [precision.recipe]
-sum = "int8"
-embed = "fp16"
-attn = "fp16"
-rope = "fp16"
+sum = "fp32"
+embed = "fp32"
+attn = "fp32"
+rope = "fp32"
 kv = "fp16"
-atvn = "fp16"
-norm = "fp16"
-res = "fp16"
+atvn = "fp32"
+norm = "fp32"
+res = "fp32"
 acc = "fp32"
 train = "fp32"
 fp8 = "e4m3"
-rope-angle = "direct"
+rope-angle = "chain"
 attn-softmax = "full"
 math = "portable"
 gelu-table = "none"
 exact-cpu = false
-tolerance = 0.05
+tolerance = 0.001
 step = 32
 
 [precision.check64]
