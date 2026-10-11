@@ -16518,11 +16518,10 @@ fn retain_mtp_hidden(graph: &mut Graph) -> Result<()> {
 	let projection = graph.nodes.last().ok_or_else(|| RecipeError::new("MTP model has no output projection"))?;
 	require(projection.op == Primitive::Contraction && projection.output.length == graph.input.length, "MTP requires a vocabulary projection at every input position")?;
 	let mut source = usize::try_from(projection.source).map_err(|_| RecipeError::new("MTP output projection has no hidden state"))?;
-	while matches!(graph.nodes[source].op, Primitive::Last | Primitive::Normalize) {
+	// Retain the residual stream before the head's normalization and lane read.
+	while matches!(graph.nodes[source].op, Primitive::Last | Primitive::Normalize)
+		|| graph.nodes[source].op == Primitive::Read && graph.nodes[source].argument[1] == 0.0 {
 		source = usize::try_from(graph.nodes[source].source).map_err(|_| RecipeError::new("MTP hidden stream is absent"))?;
-	}
-	if graph.nodes[source].op == Primitive::Read && graph.nodes[source].argument[1] == 0.0 {
-		source = usize::try_from(graph.nodes[source].source).map_err(|_| RecipeError::new("MTP lane stream is absent"))?;
 	}
 	graph.nodes[source].retain_output = true;
 	Ok(())
@@ -16797,10 +16796,14 @@ impl MtpRuntime {
 		if begin >= end { return Ok(()); }
 		let positions = end - begin;
 		self.samples.resize(checked_mul(self.head.width * self.head.lanes + 1, positions, "MTP request input")?, 0.0);
-		for position in begin..end { self.input(position - begin, positions, ids[position + 1], &self.hidden[position].clone())?; }
+		// The first token has no preceding hidden state. Other tokens use the preceding target row.
+		for position in begin..end {
+			let hidden = if position == 0 { vec![0.0; self.head.width * self.head.lanes] } else { self.hidden[position - 1].clone() };
+			self.input(position - begin, positions, ids[position], &hidden)?;
+		}
 		self.placed.run_state_window(&self.samples, begin as u32, end as u32)?;
 		self.head_valid = end;
-		self.release_hidden(end)?;
+		self.release_hidden(end - 1)?;
 		Ok(())
 	}
 	fn decode(&mut self, main: &Placed, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
@@ -16844,6 +16847,9 @@ impl MtpRuntime {
 		}
 		self.ids = prompt.to_vec();
 		if self.lookup_enabled { self.lookup.observe(prompt, stop); }
+		if self.head.tokens > 0 && !self.lookup_enabled {
+			self.refresh(prompt, self.head_valid, prompt.len())?;
+		}
 		let boundary = Instant::now();
 		if let Some(progress) = progress { progress.prefilled(prompt.len()); progress.phase(if budget > 0 { "tg" } else { "done" }, boundary); }
 		let mut generation = Generation { ids: prompt.to_vec(), logits: self.logits.clone(), cached, prefill_seconds: boundary.duration_since(started).as_secs_f64(), generation_seconds: 0.0, mtp: MtpReport::default(), reference: ReferenceReport::default() };
@@ -16866,19 +16872,19 @@ impl MtpRuntime {
 			let draft_started = Instant::now();
 			let lookup = if self.lookup_enabled { self.lookup.propose(&generation.ids, limit, stop, &sampler.suppressed) } else { Vec::new() };
 			let from_lookup = !lookup.is_empty();
-			if !from_lookup && limit > 0 { self.refresh(&generation.ids, self.head_valid, base - 1)?; }
+			if !from_lookup && limit > 0 { self.refresh(&generation.ids, self.head_valid, base)?; }
 			let mut proposed = vec![next];
 			proposed.extend(lookup);
 			let mut hidden = if !from_lookup && limit > 0 { self.hidden[base - 1].clone() } else { Vec::new() };
 			let mut head_prefix = None;
 			for offset in 0..if from_lookup { 0 } else { limit } {
-				let position = base + offset - 1;
+				let position = base + offset;
 				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
 				self.input(0, 1, proposed[offset], &hidden)?;
 				let output = self.placed.run_window(&self.samples, position as u32, position as u32 + 1)?;
 				if offset == 0 {
 					self.head_valid = position + 1;
-					self.release_hidden(self.head_valid)?;
+					self.release_hidden(self.head_valid - 1)?;
 					head_prefix = Some(self.head_valid as u32);
 				}
 				let logits = self.placed.last_logits(&output, position as u32, position as u32 + 1)?;
@@ -16934,7 +16940,7 @@ impl MtpRuntime {
 				self.logits = output_tape.logits_at(&predictions, committed - 1)?;
 			} else if ran_head {
 				// Replace speculative head inputs with the verified main-model states.
-				self.refresh(&generation.ids, base, base + accepted - 1)?;
+				self.refresh(&generation.ids, base + 1, base + accepted)?;
 			}
 			let drafts = proposed.len() - 1;
 			let accepted_drafts = accepted - 1;
