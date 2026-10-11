@@ -6,6 +6,497 @@
 #[path = "build.rs"]
 mod native_build;
 use native_build::{encoding, fp8};
+/// Hand-written decode bodies for the resident Flash shapes. Prefill keeps the
+/// tiled bodies. Rewriting preserves entries, arguments, and allocated buffers.
+pub struct FlashDecode;
+impl FlashDecode {
+	fn delta() -> String {
+		let mut ptx = String::from(r#"// One checkpointed decode position. Keep each column's state in registers
+// between its key prediction and query readout. Shared Q/K values replace
+// duplicate global loads by every value column.
+.func flash_delta_step_48x128(
+	.param .b64 fd_0,
+	.param .b64 fd_1,
+	.param .b64 fd_2,
+	.param .b64 fd_3,
+	.param .b64 fd_4,
+	.param .b64 fd_5,
+	.param .b32 fd_6,
+	.param .b32 fd_7,
+	.param .b32 fd_8,
+	.param .b64 fd_9
+)
+{
+	.reg .b64 input, output, context, prepared, pair, row, head, keyhead;
+	.reg .b64 qbase, kbase, vbase, obase, prior, next, live, vectors, qvec, kvec, a, b, off;
+	.reg .b32 position, column, slot, tid, localhead, base;
+	.reg .f32 cell<128>, prediction, readout, decay, beta, scale, key, query, value, term, error;
+	.reg .pred fresh;
+	ld.param.u64 input, [fd_0];
+	ld.param.u64 output, [fd_3];
+	ld.param.u64 context, [fd_4];
+	ld.param.u64 pair, [fd_5];
+	ld.param.u32 position, [fd_7];
+	ld.param.u32 column, [fd_8];
+	ld.param.u64 prepared, [fd_9];
+	div.u64 row, pair, 48;
+	rem.u64 head, pair, 48;
+	and.b64 keyhead, head, 15;
+	mul.lo.u64 qbase, row, 51200;
+	mad.lo.u64 qbase, keyhead, 640, qbase;
+	add.u64 kbase, qbase, 10240;
+	mul.lo.u64 vbase, row, 51200;
+	mad.lo.u64 vbase, head, 640, vbase;
+	add.u64 vbase, vbase, 20480;
+	mul.lo.u64 obase, row, 30720;
+	mad.lo.u64 obase, head, 640, obase;
+	mul.lo.u64 live, pair, 65536;
+	add.u64 live, live, context;
+	sub.u32 slot, position, 1;
+	rem.u32 slot, slot, 5;
+	mul.wide.u32 prior, slot, 65536;
+	mad.lo.u64 prior, pair, 327680, prior;
+	add.u64 prior, prior, 3145728;
+	add.u64 prior, prior, context;
+	rem.u32 slot, position, 5;
+	mul.wide.u32 next, slot, 65536;
+	mad.lo.u64 next, pair, 327680, next;
+	add.u64 next, next, 3145728;
+	add.u64 next, next, context;
+	mul.wide.u32 off, column, 4;
+	add.u64 prior, prior, off;
+	add.u64 next, next, off;
+	add.u64 live, live, off;
+	ld.global.f32 scale, [prepared];
+	ld.global.f32 decay, [prepared+4];
+	ld.global.f32 beta, [prepared+8];
+	mov.u32 tid, %tid.x;
+	shr.u32 localhead, tid, 7;
+	shl.b32 base, localhead, 10;
+	mov.u64 vectors, contraction_tile_f32;
+	cvt.u64.u32 off, base;
+	add.u64 qvec, vectors, off;
+	add.u64 kvec, qvec, 512;
+	mul.wide.u32 off, column, 20;
+	shl.b64 qbase, qbase, 2;
+	shl.b64 kbase, kbase, 2;
+	add.u64 qbase, qbase, input;
+	add.u64 kbase, kbase, input;
+	add.u64 a, qbase, off;
+	add.u64 b, kbase, off;
+	ld.global.f32 query, [a];
+	ld.global.f32 key, [b];
+	mul.rn.f32 query, query, scale;
+	mul.wide.u32 off, column, 4;
+	add.u64 a, qvec, off;
+	add.u64 b, kvec, off;
+	st.shared.f32 [a], query;
+	st.shared.f32 [b], key;
+	bar.sync 0;
+	setp.eq.u32 fresh, position, 0;
+	mov.f32 prediction, 0f00000000;
+"#);
+		for i in 0..128 {
+			ptx.push_str(&format!("\tmov.f32 cell{i}, 0f00000000;\n\t@!fresh ld.global.f32 cell{i}, [prior+{state}];\n\tmul.rn.f32 cell{i}, cell{i}, decay;\n\tld.shared.f32 key, [kvec+{vector}];\n\tmul.rn.f32 term, cell{i}, key;\n\tadd.rn.f32 prediction, prediction, term;\n", state=i*512, vector=i*4));
+		}
+		ptx.push_str(r#"	mul.wide.u32 off, column, 20;
+	shl.b64 vbase, vbase, 2;
+	add.u64 a, vbase, off;
+	add.u64 a, a, input;
+	ld.global.f32 value, [a];
+	sub.rn.f32 error, value, prediction;
+	mul.rn.f32 error, error, beta;
+	mov.f32 readout, 0f00000000;
+"#);
+		for i in 0..128 {
+			ptx.push_str(&format!("\tld.shared.f32 key, [kvec+{vector}];\n\tmul.rn.f32 term, error, key;\n\tadd.rn.f32 cell{i}, cell{i}, term;\n\tst.global.f32 [live+{state}], cell{i};\n\tst.global.f32 [next+{state}], cell{i};\n\tld.shared.f32 query, [qvec+{vector}];\n\tmul.rn.f32 term, cell{i}, query;\n\tadd.rn.f32 readout, readout, term;\n", state=i*512, vector=i*4));
+		}
+		ptx.push_str(r#"	shl.b64 obase, obase, 2;
+	add.u64 a, obase, off;
+	add.u64 a, a, output;
+	st.global.f32 [a], readout;
+	bar.sync 0;
+	ret;
+}
+"#);
+		ptx
+	}
+	fn attention() -> String { String::from(r#"// One decode position per CTA/head. Key lanes read contiguous cache positions;
+// dots and softmax run in parallel. The caller retains the grid barriers.
+.func flash_attention_step_24x256(
+	.param .b64 fa_0,
+	.param .b64 fa_1,
+	.param .b64 fa_2,
+	.param .b64 fa_3,
+	.param .b32 fa_4,
+	.param .b32 fa_5,
+	.param .b32 fa_6,
+	.param .b32 fa_7,
+	.param .b32 fa_8,
+	.param .b32 fa_9
+)
+{
+	.reg .b64 input, output, context, cache, tile, address, address2, query, scores, probabilities, reductions;
+	.reg .b64 offset, rowinput, rowcache, keycache, valuecache, selectbase, stats, outputbase, gatebase;
+	.reg .b32 rows, position, span, threads, origin, tid, block, group, groups, job, jobs, row, head, kvhead;
+	.reg .b32 localposition, keyposition, channel, lane, warp, index, keylimit, bits, magnitude, remainder, sign;
+	.reg .b32 parity, increment, encoded, small;
+	.reg .b16 half;
+	.reg .f32 value, qvalue, product, score, maximum, denominator, probability, partner, accumulator, gate;
+	.reg .pred p, q, r, active;
+	ld.param.u64 input, [fa_0];
+	ld.param.u64 output, [fa_1];
+	ld.param.u64 context, [fa_2];
+	ld.param.u64 cache, [fa_3];
+	ld.param.u32 rows, [fa_4];
+	ld.param.u32 position, [fa_5];
+	ld.param.u32 threads, [fa_8];
+	ld.param.u32 origin, [fa_9];
+	mov.u32 tid, %tid.x;
+	mov.u32 group, %ctaid.x;
+	mov.u32 block, %ntid.x;
+	div.u32 groups, threads, block;
+	mul.lo.u32 jobs, rows, 24;
+	mov.u32 job, group;
+	mov.u64 tile, contraction_tile_f16_f16_kvf8;
+	mov.u64 query, tile;
+	add.u64 scores, tile, 1024;
+	add.u64 probabilities, tile, 1536;
+	add.u64 reductions, tile, 2048;
+	and.b32 lane, tid, 31;
+	shr.u32 warp, tid, 5;
+	and.b32 localposition, position, 127;
+	sub.u32 localposition, localposition, origin;
+	add.u32 keylimit, position, 1;
+flash_attention_job:
+	setp.ge.u32 p, job, jobs;
+	@p bra flash_attention_done;
+	div.u32 row, job, 24;
+	rem.u32 head, job, 24;
+	div.u32 kvhead, head, 12;
+	mul.wide.u32 rowinput, row, 133120;
+	add.u64 rowinput, rowinput, input;
+	mul.wide.u32 rowcache, row, 131072;
+	add.u64 rowcache, rowcache, cache;
+	mul.wide.u32 offset, kvhead, 32768;
+	add.u64 keycache, rowcache, offset;
+	add.u64 valuecache, keycache, 65536;
+	mul.wide.u32 selectbase, rows, 20480;
+	mul.wide.u32 offset, row, 16384;
+	add.u64 selectbase, selectbase, offset;
+	mul.wide.u32 offset, position, 128;
+	add.u64 selectbase, selectbase, offset;
+	add.u64 selectbase, selectbase, context;
+	add.u64 selectbase, selectbase, 64;
+	mad.lo.u32 index, head, 256, tid;
+	mul.wide.u32 offset, index, 10;
+	add.u64 address, rowinput, offset;
+	mul.wide.u32 offset, localposition, 2;
+	add.u64 address, address, offset;
+	ld.global.b16 half, [address];
+	cvt.f32.f16 qvalue, half;
+	mul.wide.u32 offset, tid, 4;
+	add.u64 address2, query, offset;
+	st.shared.f32 [address2], qvalue;
+	mad.lo.u32 index, kvhead, 256, tid;
+	mul.wide.u32 offset, index, 10;
+	add.u64 address, rowinput, offset;
+	mul.wide.u32 offset, localposition, 2;
+	add.u64 address, address, offset;
+	ld.global.b16 half, [address+61440];
+	cvt.u32.u16 bits, half;
+	and.b32 magnitude, bits, 32767;
+	shr.u32 sign, bits, 8;
+	and.b32 sign, sign, 128;
+	and.b32 remainder, magnitude, 127;
+	shr.u32 encoded, magnitude, 7;
+	and.b32 parity, encoded, 1;
+	setp.gt.u32 p, remainder, 64;
+	setp.eq.u32 q, remainder, 64;
+	setp.ne.u32 r, parity, 0;
+	and.pred q, q, r;
+	or.pred p, p, q;
+	selp.u32 increment, 1, 0, p;
+	add.u32 encoded, encoded, increment;
+	sub.u32 encoded, encoded, 64;
+	min.u32 encoded, encoded, 126;
+	cvt.f32.f16 value, half;
+	abs.f32 value, value;
+	mul.rn.f32 value, value, 0f44000000;
+	cvt.rni.u32.f32 small, value;
+	setp.lt.u32 p, magnitude, 9216;
+	selp.u32 encoded, small, encoded, p;
+	setp.gt.u32 p, magnitude, 31744;
+	selp.u32 encoded, 127, encoded, p;
+	or.b32 encoded, encoded, sign;
+
+	mad.lo.u32 index, tid, 128, position;
+	cvt.u64.u32 offset, index;
+	add.u64 address2, keycache, offset;
+	st.global.u8 [address2], encoded;
+	ld.global.b16 half, [address+66560];
+	cvt.u32.u16 bits, half;
+	and.b32 magnitude, bits, 32767;
+	shr.u32 sign, bits, 8;
+	and.b32 sign, sign, 128;
+	and.b32 remainder, magnitude, 127;
+	shr.u32 encoded, magnitude, 7;
+	and.b32 parity, encoded, 1;
+	setp.gt.u32 p, remainder, 64;
+	setp.eq.u32 q, remainder, 64;
+	setp.ne.u32 r, parity, 0;
+	and.pred q, q, r;
+	or.pred p, p, q;
+	selp.u32 increment, 1, 0, p;
+	add.u32 encoded, encoded, increment;
+	sub.u32 encoded, encoded, 64;
+	min.u32 encoded, encoded, 126;
+	cvt.f32.f16 value, half;
+	abs.f32 value, value;
+	mul.rn.f32 value, value, 0f44000000;
+	cvt.rni.u32.f32 small, value;
+	setp.lt.u32 p, magnitude, 9216;
+	selp.u32 encoded, small, encoded, p;
+	setp.gt.u32 p, magnitude, 31744;
+	selp.u32 encoded, 127, encoded, p;
+	or.b32 encoded, encoded, sign;
+
+	add.u64 address2, valuecache, offset;
+	st.global.u8 [address2], encoded;
+	bar.sync 0;
+	mov.f32 score, 0fFF800000;
+	setp.lt.u32 active, tid, keylimit;
+	@!active bra flash_attention_score_ready;
+	shr.u32 index, tid, 2;
+	mul.wide.u32 offset, index, 2;
+	add.u64 address, selectbase, offset;
+	ld.global.b16 half, [address];
+	cvt.f32.f16 value, half;
+	setp.gt.f32 active, value, 0f3F000000;
+	@!active bra flash_attention_score_ready;
+	mov.f32 score, 0f00000000;
+	mov.u32 channel, 0;
+	cvt.u64.u32 offset, tid;
+	add.u64 address, keycache, offset;
+	mov.u64 address2, query;
+flash_attention_dot:
+	ld.global.u8 encoded, [address];
+	and.b32 magnitude, encoded, 127;
+	shl.b32 bits, magnitude, 20;
+	add.u32 bits, bits, 1006632960;
+	and.b32 small, magnitude, 7;
+	cvt.rn.f32.u32 value, small;
+	mul.rn.f32 value, value, 0f3B000000;
+	setp.lt.u32 p, magnitude, 8;
+	selp.b32 bits, value, bits, p;
+	setp.eq.u32 p, magnitude, 127;
+	selp.b32 bits, 2143289344, bits, p;
+	shl.b32 sign, encoded, 24;
+	and.b32 sign, sign, 2147483648;
+	or.b32 bits, bits, sign;
+	mov.b32 value, bits;
+
+	ld.shared.f32 qvalue, [address2];
+	mul.rn.f32 product, qvalue, value;
+	add.rn.f32 score, score, product;
+	add.u64 address, address, 128;
+	add.u64 address2, address2, 4;
+	add.u32 channel, channel, 1;
+	setp.lt.u32 p, channel, 256;
+	@p bra flash_attention_dot;
+	mul.rn.f32 score, score, 0f3D800000;
+	cvt.rn.f16.f32 half, score;
+	cvt.f32.f16 score, half;
+flash_attention_score_ready:
+	mov.f32 maximum, score;
+	shfl.bfly.b32 partner, maximum, 16, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 8, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 4, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 2, 31;
+	max.f32 maximum, maximum, partner;
+	shfl.bfly.b32 partner, maximum, 1, 31;
+	max.f32 maximum, maximum, partner;
+	mul.wide.u32 offset, warp, 4;
+	add.u64 address, reductions, offset;
+	setp.eq.u32 p, lane, 0;
+	@p st.shared.f32 [address], maximum;
+	bar.sync 0;
+	ld.shared.f32 maximum, [reductions];
+	ld.shared.f32 partner, [reductions+4];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+8];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+12];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+16];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+20];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+24];
+	max.f32 maximum, maximum, partner;
+	ld.shared.f32 partner, [reductions+28];
+	max.f32 maximum, maximum, partner;
+	mov.f32 probability, 0f00000000;
+	@!active bra flash_attention_probability_ready;
+	sub.rn.f32 probability, score, maximum;
+	mul.rn.f32 probability, probability, 0f3FB8AA3B;
+	ex2.approx.f32 probability, probability;
+flash_attention_probability_ready:
+	setp.lt.u32 p, tid, 128;
+	mul.wide.u32 offset, tid, 4;
+	add.u64 address, probabilities, offset;
+	@p st.shared.f32 [address], probability;
+	mov.f32 denominator, probability;
+	shfl.bfly.b32 partner, denominator, 16, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 8, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 4, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 2, 31;
+	add.rn.f32 denominator, denominator, partner;
+	shfl.bfly.b32 partner, denominator, 1, 31;
+	add.rn.f32 denominator, denominator, partner;
+	mul.wide.u32 offset, warp, 4;
+	add.u64 address, reductions, offset;
+	setp.eq.u32 p, lane, 0;
+	@p st.shared.f32 [address], denominator;
+	bar.sync 0;
+	ld.shared.f32 denominator, [reductions];
+	ld.shared.f32 partner, [reductions+4];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+8];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+12];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+16];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+20];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+24];
+	add.rn.f32 denominator, denominator, partner;
+	ld.shared.f32 partner, [reductions+28];
+	add.rn.f32 denominator, denominator, partner;
+	mov.f32 accumulator, 0f00000000;
+	mov.u32 keyposition, 0;
+	mul.wide.u32 offset, tid, 128;
+	add.u64 address, valuecache, offset;
+	mov.u64 address2, probabilities;
+flash_attention_values:
+	ld.global.u8 encoded, [address];
+	and.b32 magnitude, encoded, 127;
+	shl.b32 bits, magnitude, 20;
+	add.u32 bits, bits, 1006632960;
+	and.b32 small, magnitude, 7;
+	cvt.rn.f32.u32 value, small;
+	mul.rn.f32 value, value, 0f3B000000;
+	setp.lt.u32 p, magnitude, 8;
+	selp.b32 bits, value, bits, p;
+	setp.eq.u32 p, magnitude, 127;
+	selp.b32 bits, 2143289344, bits, p;
+	shl.b32 sign, encoded, 24;
+	and.b32 sign, sign, 2147483648;
+	or.b32 bits, bits, sign;
+	mov.b32 value, bits;
+
+	ld.shared.f32 probability, [address2];
+	mul.rn.f32 product, value, probability;
+	add.rn.f32 accumulator, accumulator, product;
+	add.u64 address, address, 1;
+	add.u64 address2, address2, 4;
+	add.u32 keyposition, keyposition, 1;
+	setp.lt.u32 p, keyposition, keylimit;
+	@p bra flash_attention_values;
+	setp.gt.f32 p, denominator, 0f00000000;
+	@p div.rn.f32 accumulator, accumulator, denominator;
+	@!p mov.f32 accumulator, 0f00000000;
+	mad.lo.u32 index, head, 256, tid;
+	mad.lo.u32 index, row, 6144, index;
+	mul.wide.u32 outputbase, index, 10;
+	add.u64 outputbase, outputbase, output;
+	mul.wide.u32 offset, localposition, 2;
+	add.u64 outputbase, outputbase, offset;
+	mad.lo.u32 index, head, 256, tid;
+	mul.wide.u32 gatebase, index, 10;
+	add.u64 gatebase, gatebase, rowinput;
+	add.u64 gatebase, gatebase, offset;
+	ld.global.b16 half, [gatebase+71680];
+	cvt.f32.f16 gate, half;
+	mul.rn.f32 gate, gate, 0fBFB8AA3B;
+	ex2.approx.f32 gate, gate;
+	add.rn.f32 gate, gate, 0f3F800000;
+	div.rn.f32 accumulator, accumulator, gate;
+	cvt.rn.f16.f32 half, accumulator;
+	st.global.b16 [outputbase], half;
+	setp.eq.u32 p, tid, 0;
+	mad.lo.u32 index, job, 128, position;
+	mul.wide.u32 stats, index, 2;
+	add.u64 stats, stats, context;
+	cvt.rn.f16.f32 half, maximum;
+	@p st.global.b16 [stats], half;
+	mul.wide.u32 offset, rows, 6144;
+	add.u64 stats, stats, offset;
+	cvt.rn.f16.f32 half, denominator;
+	@p st.global.b16 [stats], half;
+	bar.sync 0;
+	add.u32 job, job, groups;
+	bra.uni flash_attention_job;
+flash_attention_done:
+	ret;
+}
+"#) }
+	/// Replace only the checked decode ABI and shape in an existing PTX module.
+	/// A different precision, shape, or checkpoint contract retains its body.
+	pub fn ptx(mut source: String) -> String {
+		let mut declarations = String::new();
+		for (name, helper, shapes, widths, prepared) in [
+			("delta_forward_body", Self::delta(), &["51200", "3147264", "327680", "15872"][..], &[64,64,64,64,64,64,32,32,32,64][..], true),
+			("attention_forward_body_f16_kvf8", Self::attention(), &["1703936", "917504", "65536", "20480"][..], &[64,64,64,64,32,32,32,32,32,32][..], false),
+		] {
+			let Some(start) = source.find(&format!(".func {name}(\n")) else { continue };
+			let Some(close) = source[start..].find("\n}\n") else { continue };
+			let end = start + close + 3;
+			let original = source[start..end].to_owned();
+			let Some(body) = original.find("\n{\n") else { continue };
+			let parameters = original[..body].lines().filter_map(|line| {
+				let words = line.split_whitespace().collect::<Vec<_>>();
+				(words.first() == Some(&".param")).then(|| (words[1].to_owned(), words[2].trim_end_matches(',').to_owned()))
+			}).collect::<Vec<_>>();
+			if parameters.len() != widths.len() || parameters.iter().zip(widths).any(|((ty,_),width)| *ty != format!(".b{width}")) || shapes.iter().any(|shape| !original.contains(shape)) { continue; }
+			let helper_start = helper.find(".func ").expect("Flash decode function");
+			let helper_body = helper[helper_start..].find("\n{").expect("Flash decode body") + helper_start;
+			let helper_name = helper[helper_start+6..].split('(').next().expect("Flash decode symbol").trim();
+			declarations.push_str(&helper[helper_start..helper_body]); declarations.push_str(";\n");
+			let general = format!("{helper_name}_general");
+			let mut wrapper = format!("{}\n{{\n\t.reg .b64 d<10>;\n\t.reg .b32 r<10>, block;\n\t.reg .pred p;\n", &original[..body]);
+			for (i,((_,parameter),width)) in parameters.iter().zip(widths).enumerate() {
+				wrapper.push_str(&format!("\tld.param.u{width} {register}{i}, [{parameter}];\n", register=if *width == 64 {"d"} else {"r"}));
+			}
+			wrapper.push_str("\tmov.u32 block, %ntid.x;\n\tsetp.ne.u32 p, block, 256;\n\t@p bra flash_decode_general;\n\tsetp.ne.u32 p, r6, 1;\n\t@p bra flash_decode_general;\n");
+			if prepared { wrapper.push_str("\tsetp.eq.u64 p, d9, 0;\n\t@p bra flash_decode_general;\n"); }
+			for (case,callee) in [helper_name,general.as_str()].into_iter().enumerate() {
+				if case == 1 { wrapper.push_str("flash_decode_general:\n"); }
+				wrapper.push_str("\t{\n");
+				for (i,width) in widths.iter().enumerate() { wrapper.push_str(&format!("\t.param .b{width} a{i};\n")); }
+				for (i,width) in widths.iter().enumerate() { wrapper.push_str(&format!("\tst.param.b{width} [a{i}], {register}{i};\n", register=if *width == 64 {"d"} else {"r"})); }
+				let arguments = (0..widths.len()).map(|i|format!("a{i}")).collect::<Vec<_>>().join(", ");
+				wrapper.push_str(&format!("\tcall.uni {callee}, ({arguments});\n\t}}\n"));
+				if case == 0 { wrapper.push_str("\tbra.uni flash_decode_done;\n"); }
+			}
+			wrapper.push_str("flash_decode_done:\n\tret;\n}\n");
+			source.replace_range(start..end,&format!("{}\n{wrapper}",original.replace(name,&general)));
+			source.push_str(&helper);
+		}
+		if !declarations.is_empty() {
+			if let Some(at) = source.find(".address_size 64") { source.insert_str(at+".address_size 64".len(), &format!("\n{declarations}")); }
+		}
+		source
+	}
+}
+
 /// Packed GGUF matvec functions for Maxwell, callable inside the native step.
 pub struct PackedMatvec;
 impl PackedMatvec {
@@ -9030,6 +9521,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(PackedMatvec::ptx());
 			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
+			ptx_source = FlashDecode::ptx(ptx_source);
 			let entries = ptx_source.lines().filter_map(|line| {
 				let words = line.split_whitespace().collect::<Vec<_>>();
 				let at = words.iter().position(|word| *word == ".entry")?;
