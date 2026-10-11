@@ -1,0 +1,1 @@
+/home/nate/Developer/wt-497d/target/release/librecipe.rlib: /home/nate/Developer/wt-497d/Cargo.toml /home/nate/Developer/wt-497d/amd-nv-cpu.ll /home/nate/Developer/wt-497d/build.rs /home/nate/Developer/wt-497d/recipe.rs
