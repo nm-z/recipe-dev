@@ -22350,15 +22350,14 @@ fn finish_int_sums(graph: &mut Graph, index: usize, config: Config) -> Result<()
 		_ => None,
 	}
 	.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-	// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
-	// nodes remain together until the load kernel can emit multiple target
-	// layouts for one node; every single noncanonical plane converts at load.
+	// Native Q4_K and Q6_K planes already have an int8 dot layout, including
+	// mixed nodes. Keep their checkpoint weights.
 	let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
 		if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
 		let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
-		let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
+		let native_k = format.bits == 8 && codecs.len() == weight.segments.len() && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
 		let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
-		canonical || mixed_k
+		canonical || native_k
 	});
 	let kept = kept.map(|weight| weight.format);
 	let node = &mut graph.nodes[index];
