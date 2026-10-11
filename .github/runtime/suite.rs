@@ -710,14 +710,14 @@ fn rope_contract(work: &Path) {
 		("rope_freqs.weight", vec![2], 0, factors),
 	]);
 	let file = recipe.gguf(path.to_str().unwrap());
-	let model = recipe.model().no(bias).attn(1).fp(32).rope(neox, 4, 10000.0).fp(32).last();
+	let model = recipe.model().no(bias).attn(1).fp(32).rope(neox, 4, 4.0).fp(32).last();
 	let plan = file.plan().node(&[file.tensor("blk.0.attn_q.weight").unwrap().clone(), file.tensor("blk.0.attn_k.weight").unwrap().clone(), file.tensor("blk.0.attn_v.weight").unwrap().clone()])
 		.named(&file, "rope_freqs.weight").named(&file, "blk.0.attn_output.weight");
 	let got = file.infer(&model, &plan, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], 4);
 	let first = [0.1, 0.3, 0.5, 0.7];
 	let last = [0.2, 0.4, 0.6, 0.8];
 	let mut query = last;
-	for (pair, angle) in [1.0_f64, 0.005].into_iter().enumerate() {
+	for (pair, angle) in [1.0_f64, 0.25].into_iter().enumerate() {
 		query[pair] = last[pair] * angle.cos() - last[pair + 2] * angle.sin();
 		query[pair + 2] = last[pair + 2] * angle.cos() + last[pair] * angle.sin();
 	}
