@@ -213,6 +213,9 @@ fn main() {
 	let work = PathBuf::from(environment("RECIPE_SUITE_WORK"));
 	let evidence = PathBuf::from(environment("RECIPE_EVIDENCE"));
 	std::fs::create_dir_all(&work).expect("cannot create the suite work directory");
+	let trace_path = std::env::var_os("RECIPE_TRACE_PATH").map(PathBuf::from).unwrap_or_else(|| work.join("phases.log"));
+	// Set the log destination before Recipe starts any workers.
+	unsafe { std::env::set_var("RECIPE_TRACE_PATH", &trace_path); }
 	let linear_source = root.join("data/linear.csv");
 	let multi_source = root.join("data/multi.csv");
 	let mut report = Report { checks: Vec::new() };
@@ -378,6 +381,23 @@ fn main() {
 		let repeats = first.initial_loss().to_bits() == second.initial_loss().to_bits() && first.final_loss().to_bits() == second.final_loss().to_bits() && prediction_bits(first.predictions()) == prediction_bits(second.predictions());
 		report.record(name, falls && repeats, format!("initial_loss={:.9} final_loss={:.9} final_bits={:016x} repeats={repeats}", first.initial_loss(), first.final_loss(), first.final_loss().to_bits()));
 	}
+
+	// The shared device-clock writer must preserve full-window and step outputs.
+	let _ = recipe.infer().log([debug]);
+	let traced = file.place(&stepped_model, 160, &[]);
+	let traced_whole = traced.infer(&ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>());
+	traced.prefill(&ids[..159]);
+	let traced_step = traced.step(ids[159]);
+	let unchanged = prediction_bits(&traced_whole) == prediction_bits(&whole) && prediction_bits(&traced_step) == prediction_bits(&whole);
+	let trace = std::fs::read_to_string(&trace_path).expect("traced placement did not write its log");
+	let window = trace.lines().rev().find(|line| line.starts_with("range window ") && line.contains("positions=159..160"));
+	let seconds = window.and_then(|line| line.split_whitespace().find_map(|field| field.strip_prefix("window_seconds=")?.parse::<f64>().ok()));
+	let clocks = trace.lines().rev().find(|line| line.starts_with("clocks window 159..160 "));
+	let stamps = clocks.map(|line| line.split_whitespace().filter(|field| field.starts_with('n') && field.contains(':')).collect::<Vec<_>>()).unwrap_or_default();
+	let measured = !stamps.is_empty() && stamps.iter().all(|field| field.split_once(':').is_some_and(|(_, ticks)| ticks.parse::<u64>().is_ok()))
+		&& seconds.is_some_and(|seconds| seconds.is_finite() && seconds > 0.0) && window.is_some_and(|line| line.contains("device=")) && clocks.is_some_and(|line| line.contains("device="));
+	report.record("traced_window_and_step", unchanged && measured, format!("output_bits_equal={unchanged} node_clocks={} window_seconds={seconds:?}", stamps.len()));
+	report.record("single_device_has_no_exchange", !trace.lines().any(|line| line.starts_with("exchange phase ")), "ordinary placement has no exchange phase records".to_owned());
 
 	let failed: Vec<&str> = report.checks.iter().filter(|check| !check.passed).map(|check| check.name).collect();
 	let body = report
