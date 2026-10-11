@@ -20591,11 +20591,16 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 /// the dies' consecutive shares make whole, else the last die's whole output.
 fn die_output(tapes: &[NativeTape], read: impl Fn(&NativeTape, std::ops::Range<usize>) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 	let last = tapes.last().ok_or_else(|| RecipeError::new("placement has no die"))?;
-	let shares = if last.output_rows() == (0..last.output.channels) { std::slice::from_ref(last) } else { tapes };
+	let shares = if last.output_rows()? == (0..last.output.channels) { std::slice::from_ref(last) } else { tapes };
 	let mut values = Vec::new();
+	let mut end = 0;
 	for tape in shares {
-		values.extend(read(tape, tape.output_rows())?);
+		let rows = tape.output_rows()?;
+		require(rows.start == end, format!("output row shares are not consecutive: expected row {end}, received {}", rows.start))?;
+		end = rows.end;
+		values.extend(read(tape, rows)?);
 	}
+	require(end == last.output.channels, format!("output row shares cover {end} channels, expected {}", last.output.channels))?;
 	Ok(values)
 }
 /// The saved statistics a batch normalization carries into inference, as the
@@ -21101,8 +21106,10 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 		for region in &regions {
 			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;
 		}
-		let last = graph.nodes.len() - 1;
-		if lone_split(graph, last, dies).is_some() && plan.contains_key(&last) {
+		if let Some(last) = graph.nodes.len().checked_sub(1)
+			&& graph.nodes[last].op == Primitive::Contraction
+			&& lone_split(graph, last, dies).is_some() && plan.contains_key(&last)
+		{
 			trace(&format!("split output node {last} rows per die {:?}", plan[&last]))?;
 		}
 	}
@@ -21138,7 +21145,8 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 			}
 			None => None,
 		};
-		let gather = (index + 1 != graph.nodes.len()).then_some(0.0);
+		let output_head = index + 1 == graph.nodes.len() && node.op == Primitive::Contraction;
+		let gather = (!output_head).then_some(0.0);
 		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, gather)));
 		let Some((shard, exchange)) = plan else {
 			nodes.push(node);
@@ -25367,10 +25375,16 @@ impl NativeTape {
 	}
 	/// The output channels this tape computes: all of them, or the rows a tensor
 	/// split gave this die of an output node it splits without an exchange.
-	fn output_rows(&self) -> std::ops::Range<usize> {
+	fn output_rows(&self) -> Result<std::ops::Range<usize>> {
 		match self.nodes.last() {
-			Some(node) if node.op == Primitive::Contraction && node.shard.rows.count != 0 => node.shard.rows.first..node.shard.rows.first + node.shard.rows.count,
-			_ => 0..self.output.channels,
+			Some(node) if node.op == Primitive::Contraction && node.shard.rows.count != 0 => {
+				let rows = node.shard.rows;
+				require(rows.period == 0, format!("output row share has period {}; a head split requires contiguous rows", rows.period))?;
+				let end = checked_add(rows.first, rows.count, "output row share")?;
+				require(end <= self.output.channels, format!("output row share {}..{end} exceeds {} channels", rows.first, self.output.channels))?;
+				Ok(rows.first..end)
+			}
+			_ => Ok(0..self.output.channels),
 		}
 	}
 	/// Positions `begin..end` of every output channel, channel by channel.
