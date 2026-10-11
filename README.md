@@ -36,6 +36,25 @@ recipe --device amd0 model.rs
 recipe --device amd0 --device archy:nv0 model.rs
 ```
 
+## decode
+
+```rust
+let mut sampler = recipe.sampler().temperature(0.8).top_k(40).top_p(0.95).repeat(1.1, 64).seed(7);
+let generation = recipe.decode("model.ogdl", &prompt_ids, &mut sampler, &[eos], 64);
+generation.ids;
+generation.logits;
+generation.prefill_seconds;
+generation.step_seconds;
+```
+
+The model reads a sequence of ids and returns one logit per id. The prefill runs the prompt and the decode then holds that state: a step adds one id, extends the attention keys and values, the recurrent state, and the convolution tail by the one position the id reaches, and samples from the new logits (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy). A step therefore reads what earlier calls left rather than running the sequence again, and the result is the result of one forward of the same ids. The decode stops at a stop id, after the budget, or when the ids fill the model's sequence.
+
+```rust
+recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
+```
+
+`serve` answers that many decode requests over HTTP and returns. A request names its prompt in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&top_k=40&top_p=0.95&min_p=0.05&penalty=1.1&seed=7`, and each field it leaves out keeps the sampler's default. The answer is chunked and carries one id per chunk as the decode reaches it.
+
 ## files
 
 ```bash
