@@ -1,0 +1,9 @@
+index, uuid, power.limit [W], clocks.applications.graphics [MHz], clocks.applications.memory [MHz], utilization.gpu [%], memory.used [MiB]
+0, GPU-1783441e-9a1a-684e-82bb-14d24e6e0c8f, 113.00 W, 1177 MHz, 2505 MHz, 0 %, 0 MiB
+1, GPU-ccb8b3a3-f45d-8962-215b-c2b140e4bb28, 113.00 W, 1177 MHz, 2505 MHz, 0 %, 1600 MiB
+2, GPU-c767d250-4454-d181-d648-8706b5f2fb64, 113.00 W, 1177 MHz, 2505 MHz, 0 %, 0 MiB
+3, GPU-5f06269e-5fe2-ff52-1a0d-b0d0c0c763a6, 113.00 W, 1177 MHz, 2505 MHz, 7 %, 5658 MiB
+4, GPU-906e6ede-6cde-d0dd-5110-d1bb8bf2458d, 113.00 W, 1177 MHz, 2505 MHz, 32 %, 5658 MiB
+5, GPU-1d9dc086-8739-66c2-fa98-f5bf3ef2b2d4, 113.00 W, 1177 MHz, 2505 MHz, 0 %, 7822 MiB
+6, GPU-431371bd-b482-96b2-4b70-04f83c6d075b, 150.00 W, 873 MHz, 2505 MHz, 0 %, 0 MiB
+7, GPU-7ed9f65b-0233-0113-dfc1-05f4039decb4, 150.00 W, 873 MHz, 2505 MHz, 0 %, 1478 MiB

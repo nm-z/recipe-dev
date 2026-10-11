@@ -238,7 +238,7 @@ jobs:
       - name: Install the Arch toolchain
         run: |
           set -euo pipefail
-          pacman -Syu --noconfirm --needed git rust clang llvm lld tar gzip
+          pacman -Syu --noconfirm --needed git rust clang llvm lld tar gzip ruby
           echo "pacman toolchain installed"
 
       - name: Check out the controller
@@ -282,6 +282,13 @@ jobs:
           cd "$GITHUB_WORKSPACE/candidate"
           cargo build --release --lib --bin recipe
           file target/release/recipe
+
+      - name: Parse and compile every kernel module
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          out="$(dirname "$(ls -t target/release/build/recipe-*/out/recipe-amd-f32.ll | head -1)")"
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/kernel-ir.sh" "$out" recipe.rs Cargo.toml
 
       - name: Execute the runtime suite on the CPU backend
         run: |
