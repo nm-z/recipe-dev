@@ -4407,15 +4407,41 @@ impl NativeModelIr {
 			.collect())
 	}
 
+	fn emit_expert_completion(&self, index: usize, consumer: usize, ir: &mut String) -> Result<()> {
+		let prefix = format!("expert.complete.{index}.{consumer}");
+		let pointer = pointer_type(Backend::Nvidia);
+		ir.push_str(&ptr_gep(Backend::Nvidia, "weights", self.plans[index].weight_offset, &format!("{prefix}.weights")));
+		ir.push_str(&ptr_gep(Backend::Nvidia, "values", self.plans[index].value, &format!("{prefix}.output")));
+		ir.push_str(&format!("%{prefix}.desc = load i64, {pointer} %{prefix}.weights, align 8\n"));
+		if let Some(clocks) = self.layout.clocks {
+			ir.push_str(&format!("%{prefix}.clock = getelementptr i8, {pointer} %contexts, i64 {at}\ncall void asm sideeffect \"{{ .reg .pred p; .reg .b64 t; setp.eq.u32 p,$1,0; mov.u64 t,%globaltimer; @p st.u64 [$0],t; }}\",\"l,r,~{{memory}}\"({pointer} %{prefix}.clock,i32 %tid)\n", at = clocks + index * 24));
+		}
+		ir.push_str(&format!("call void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,phase,r; .reg .b64 z; mov.u64 z,0; st.param.u64 [d],$0; st.param.u64 [x],z; st.param.u64 [c],z; st.param.u64 [s],z; st.param.u64 [o],$1; st.param.u64 [h],z; st.param.u32 [l],$2; st.param.u32 [b],$3; st.param.u32 [p],$4; st.param.u32 [t],$5; st.param.u32 [phase],$6; call.uni (r),split_main_exchange,(d,x,c,s,o,l,b,p,t,h,phase); }}\",\"l,l,r,r,r,r,r,~{{memory}}\"(i64 %{prefix}.desc,{pointer} %{prefix}.output,i32 {length},i32 %n{index}.begin,i32 %n{index}.span,i32 %begin,i32 2)\n", length = self.plans[index].node.output.length));
+		ir.push_str(barrier(Backend::Nvidia));
+		if self.layout.clocks.is_some() {
+			// Account only for dispatch and completion; the intervening operations keep their own clocks.
+			ir.push_str(&format!("call void asm sideeffect \"{{ .reg .pred p; .reg .b64 t,start,sum; setp.eq.u32 p,$1,0; mov.u64 t,%globaltimer; @p ld.u64 start,[$0]; @p ld.u64 sum,[$0+8]; sub.u64 t,t,start; add.u64 sum,sum,t; @p st.u64 [$0+8],sum; }}\",\"l,r,~{{memory}}\"({pointer} %{prefix}.clock,i32 %tid)\n"));
+		}
+		Ok(())
+	}
+
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool, functions: &mut String) -> Result<String> {
 		let mut ir = String::new();
 		let outlined = self.inference && backend == Backend::Nvidia && !reverse && !training;
+		let mut pending_expert = None;
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
 		} else {
 			self.plans.iter().enumerate().collect::<Vec<_>>()
 		};
 		for (index, plan) in order {
+			if let Some(prior) = pending_expert {
+				if plan.node.source == prior as i32 || plan.node.second == prior as i32 || external_expert(&plan.node)
+					|| plan.node.block_kind == "recur_body" || index + 1 == self.plans.len() {
+					self.emit_expert_completion(prior, index, &mut ir)?;
+					pending_expert = None;
+				}
+			}
 			// Recurrent body nodes are emitted by the scan's uniform position loop.
 			// They are still plans so their parameters, storage, and adjoints remain
 			// part of the graph, but executing them here would run the body once
@@ -4792,8 +4818,11 @@ impl NativeModelIr {
 				(false, Primitive::ExpertOut) => {
 					if external_expert(node) {
 						require(backend == Backend::Nvidia && node.precision == Compute::FP32, "expert dispatch requires NVIDIA FP32 expert boundaries")?;
+						let overlap = outlined && self.layout.fingerprints.is_none() && node.observation.is_none()
+							&& self.plans.get(index + 1).is_some_and(|next| next.node.source != index as i32 && next.node.second != index as i32 && !external_expert(&next.node));
 						let routing = self.emit_expert_selection(backend, index, node, &mut ir)?;
-						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; call.uni (r), split_main_forward, (d,x,c,s,o,l,b,p,t,h); }}\", \"l,l,l,l,l,r,r,r,r,l,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0)\n", weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
+						ir.push_str(&format!("%n{index}.split.desc = load i64, ptr addrspace(1) {weights}, align 8\ncall void asm sideeffect \"{{ .param .u64 d,x,c,s,o,h; .param .u32 l,b,p,t,phase,r; st.param.u64 [d], $0; st.param.u64 [x], $1; st.param.u64 [c], $2; st.param.u64 [s], $3; st.param.u64 [o], $4; st.param.u64 [h], $9; st.param.u32 [l], $5; st.param.u32 [b], $6; st.param.u32 [p], $7; st.param.u32 [t], $8; st.param.u32 [phase], $10; call.uni (r), split_main_exchange, (d,x,c,s,o,l,b,p,t,h,phase); }}\", \"l,l,l,l,l,r,r,r,r,l,r,~{{memory}}\"(i64 %n{index}.split.desc, ptr addrspace(1) {source}, ptr addrspace(1) {coeff}, ptr addrspace(1) {routing}, ptr addrspace(1) {out}, i32 {length}, i32 {begin}, i32 {span}, i32 %begin, i64 0,i32 {phase})\n", phase = u32::from(overlap), weights = pointers.weights, source = pointers.source, coeff = pointers.second, out = pointers.value, length = node.output.length));
+						if overlap { pending_expert = Some(index); }
 						ir.push_str(barrier(backend));
 					} else {
 					let selected = self.emit_expert_selection(backend, index, node, &mut ir)?;
@@ -8642,7 +8671,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
 	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
 	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]); }
-	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
+	if ir.contains("split_main_forward") || ir.contains("split_main_exchange") {parts.push(b"expert-device-link-O1-v1");}
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
@@ -9012,7 +9041,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
 			}
 			let mut ptx_source = fs::read_to_string(output).map_err(|error| RecipeError::new(format!("cannot read native PTX: {error}")))?;
-			let expert_calls=ptx_source.contains("split_main_forward");
+			let expert_calls=ptx_source.contains("split_main_forward") || ptx_source.contains("split_main_exchange");
 			let packed_calls = ptx_source.contains("packed_prepare") || ptx_source.contains("packed_matvec");
 			if packed_calls {
 				let at = ptx_source.find(".address_size 64").ok_or_else(|| RecipeError::new("native packed PTX has no address-size declaration"))? + ".address_size 64".len();
@@ -9021,6 +9050,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if expert_calls {
 				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
 				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
+				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_exchange(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h,.param .u32 phase);\n");
 			}
 
 			ptx_source.push_str(MtpBatch::ptx());
@@ -35628,9 +35658,20 @@ entry_result:
 }
 .func (.param .u32 result) split_main_forward(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
 	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
-	.reg .b64 a<36>; .reg .b32 r<32>; .reg .pred p<8>; .reg .f32 f;
+	.reg .b64 d,x,c,s,o,h; .reg .b32 l,b,p,t,phase,r;
+	ld.param.u64 d,[desc0]; ld.param.u64 x,[source0]; ld.param.u64 c,[coef0]; ld.param.u64 s,[selected0]; ld.param.u64 o,[output0]; ld.param.u64 h,[sh0];
+	ld.param.u32 l,[length0]; ld.param.u32 b,[begin0]; ld.param.u32 p,[cols0]; ld.param.u32 t,[absolute0]; mov.u32 phase,0;
+	{ .param .u64 dd,xx,cc,ss,oo,hh; .param .u32 ll,bb,pp,tt,ph,rr;
+	st.param.u64 [dd],d; st.param.u64 [xx],x; st.param.u64 [cc],c; st.param.u64 [ss],s; st.param.u64 [oo],o; st.param.u64 [hh],h;
+	st.param.u32 [ll],l; st.param.u32 [bb],b; st.param.u32 [pp],p; st.param.u32 [tt],t; st.param.u32 [ph],phase;
+	call.uni (rr),split_main_exchange,(dd,xx,cc,ss,oo,ll,bb,pp,tt,hh,ph); ld.param.u32 r,[rr]; }
+	st.param.u32 [result],r; ret;
+}
+.func (.param .u32 result) split_main_exchange(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
+	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0,.param .u32 phase0) {
+	.reg .b64 a<36>; .reg .b32 r<33>; .reg .pred p<8>; .reg .f32 f;
 	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[coef0]; ld.param.u64 a3,[selected0]; ld.param.u64 a4,[output0];
-	ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a5,[sh0];
+	ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a5,[sh0]; ld.param.u32 r32,[phase0];
 	ld.global.u32 r30,[a0+104]; setp.ne.u32 p1,r30,0; @!p1 bra main_expert;
 	{ .param .u64 d,x,o,h; .param .u32 l,b,c,t,ok; st.param.u64 [d],a0; st.param.u64 [x],a1; st.param.u64 [o],a4; st.param.u64 [h],a5; st.param.u32 [l],r0; st.param.u32 [b],r1; st.param.u32 [c],r2; st.param.u32 [t],r3;
 	call.uni (ok),split_dense_forward,(d,x,o,l,b,c,t,h); ld.param.u32 r30,[ok]; }
@@ -35646,6 +35687,7 @@ main_expert:
 	sub.u32 r14,r3,r10; div.u32 r14,r14,r11; mul.lo.u32 r14,r14,r12; sub.u32 r15,r4,r13; add.u32 r14,r14,r15; add.u32 r15,r9,r14; add.u32 r15,r15,1;
 	mov.u32 r16,%tid.x; mov.u32 r17,%ctaid.x; mov.u32 r18,%ntid.x; mov.u32 r19,%nctaid.x; mad.lo.u32 r20,r17,r18,r16; mul.lo.u32 r21,r18,r19;
 	setp.eq.u32 p0,r20,0; mov.u64 a17,%globaltimer; add.u64 a18,a17,5000000000;
+	setp.eq.u32 p1,r32,2; @p1 bra main_local;
 	mov.u32 r22,0;
 main_validate_position:
 	setp.ge.u32 p1,r22,r2; @p1 bra main_validated;
@@ -35695,6 +35737,7 @@ main_send:
 	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,302; @p1 bra main_failed;
 	add.u32 r22,r22,1; bra main_send;
 main_local:
+	setp.eq.u32 p1,r32,1; @p1 bra main_success;
 	ld.global.u64 a28,[a14+120]; mul.wide.u32 a19,r14,128; add.u64 a28,a28,a19;
 	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a14; st.param.u64 [sh],a5; st.param.u64 [report],a28; st.param.u32 [seq],r15; st.param.u32 [cols],r2;
 	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r30,[ok]; }
