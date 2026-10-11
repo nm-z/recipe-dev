@@ -1,0 +1,1 @@
+/home/nate/Developer/wt-576/target/release/librecipe.rlib: /home/nate/Developer/wt-576/Cargo.toml /home/nate/Developer/wt-576/amd-nv-cpu.ll /home/nate/Developer/wt-576/build.rs /home/nate/Developer/wt-576/recipe.rs
