@@ -35529,9 +35529,10 @@ dl_computed:
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
 	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,405; @p1 bra dl_done;
 	// Terminal compact rows have no later consumers of inactive positions.
-	// Writing the complete row coalesces peer traffic while retaining its active logit.
-	ld.global.u32 r31,[a0+184]; setp.ne.u32 p1,r31,0; setp.eq.u32 p2,r1,1; and.pred p1,p1,p2;
+	// Writing each complete row coalesces peer traffic and retains every active logit.
+	ld.global.u32 r31,[a0+184]; setp.ne.u32 p1,r31,0;
 	setp.gt.u32 p2,r13,1; and.pred p1,p1,p2; setp.le.u32 p2,r13,8; and.pred p1,p1,p2;
+	add.u32 r31,r14,r1; setp.le.u32 p2,r31,r13; and.pred p1,p1,p2;
 	@p1 bra dl_padded_begin;
 	 mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
 dl_scatter:
@@ -35544,7 +35545,9 @@ dl_padded_begin:
 dl_padded:
 	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r13; rem.u32 r26,r15,r13;
 	mul.wide.u32 a17,r17,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_padded_next;
-	mad.lo.u32 r19,r18,r13,r26; mov.f32 f,0f00000000; setp.eq.u32 p2,r26,r14;
+	mad.lo.u32 r19,r18,r13,r26; mov.f32 f,0f00000000;
+	setp.ge.u32 p2,r26,r14; setp.lt.u32 p3,r26,r31; and.pred p2,p2,p3;
+	sub.u32 r26,r26,r14; mad.lo.u32 r17,r26,r25,r17;
 	mul.wide.u32 a17,r17,4; add.u64 a18,a10,a17; @p2 ld.global.f32 f,[a18];
 	mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
 dl_padded_next:
