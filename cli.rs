@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe weight-holder <socket>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -148,6 +148,12 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
+	#[cfg(unix)] if std::env::args().nth(1).as_deref()==Some("weight-holder") {
+		arguments.next();let socket=arguments.next().unwrap_or_else(||invalid("weight-holder requires a socket path"));
+		if arguments.next().is_some() {invalid("weight-holder takes one socket path");}
+		unsafe {std::env::set_var("RECIPE_DEVICE","nv0.nv1.nv3.nv4.nv5.nv7");}
+		recipe::weight_holder_serve(Path::new(&socket)).unwrap_or_else(|error|invalid(&error.to_string()));return;
+	}
 	let (mut source, mut device, mut config) = (None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
 	let mut export_seen = false;

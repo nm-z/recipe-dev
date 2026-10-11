@@ -9403,6 +9403,9 @@ mod gguf {
 	/// memory elsewhere. A stored weight holds a shard's mapping alive for as long
 	/// as the tape reads its bytes.
 	pub(super) struct Mapping {
+		pub(super) identity: String,
+		#[cfg(unix)]
+		resident: std::sync::Mutex<Vec<(usize,usize,super::ResidentRamBuffer)>>,
 		pointer: *const u8,
 		length: usize,
 		owned: Option<Vec<u8>>,
@@ -9413,22 +9416,43 @@ mod gguf {
 		#[cfg(unix)]
 		fn open(path: &Path) -> Result<Self> {
 			use std::os::unix::io::AsRawFd;
+			use std::os::unix::fs::MetadataExt;
 			let file = std::fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+			let metadata=file.metadata().map_err(|error|RecipeError::new(format!("GGUF identity: {error}")))?;
+			let identity=format!("{}:{}:{}:{}:{}:{}:{}:{}",path.display(),metadata.dev(),metadata.ino(),metadata.len(),metadata.mtime(),metadata.mtime_nsec(),metadata.ctime(),metadata.ctime_nsec());
 			let length = usize::try_from(file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len())
 				.map_err(|_| RecipeError::new("GGUF file exceeds the address space"))?;
 			require(length != 0, format!("{} is empty", path.display()))?;
 			let pointer = unsafe { super::mmap(std::ptr::null_mut(), length, 1, 2, file.as_raw_fd(), 0) };
 			require(pointer as isize != -1, format!("cannot map {}: {}", path.display(), std::io::Error::last_os_error()))?;
-			Ok(Self { pointer: pointer.cast(), length, owned: None })
+			Ok(Self { identity,resident:std::sync::Mutex::new(Vec::new()),pointer: pointer.cast(), length, owned: None })
 		}
 		#[cfg(not(unix))]
 		fn open(path: &Path) -> Result<Self> {
 			let owned = std::fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 			require(!owned.is_empty(), format!("{} is empty", path.display()))?;
-			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned) })
+			Ok(Self { identity:format!("{}:{}",path.display(),owned.len()),pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned) })
 		}
 		pub(super) fn bytes(&self) -> &[u8] {
 			unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+		}
+		pub(super) fn hold_lookup(&self,at:usize,count:usize)->Result<()> {
+			#[cfg(unix)] if let Some(client)=super::resident_weight_client()? {
+				use std::os::unix::io::AsRawFd;
+				let mut mappings=self.resident.lock().map_err(|_|RecipeError::new("resident lookup mappings are poisoned"))?;
+				let start=at&!4095;
+				let end=at.checked_add(count).ok_or_else(||RecipeError::new("resident lookup extent overflows"))?.div_ceil(4096).checked_mul(4096).ok_or_else(||RecipeError::new("resident lookup page extent overflows"))?.min(self.length);
+				if mappings.iter().any(|(first,last,_)|*first==start && *last==end) {return Ok(());}
+				let bytes=end-start;let identity=format!("lookup-map-abi-1:{}:{start}:{end}:{at}:{count}",self.identity);
+					let gpu=super::resident_device("nv4")?;
+					let mut resident=client.reserve_ram_kind(&super::resident_weight_key(gpu,bytes,&identity)?,bytes,super::resident_weight_seed()?,false)?;
+					if !resident.ready() {resident.write(0,&self.bytes()[start..end])?;resident.commit()?;}
+					let address=unsafe {self.pointer.add(start)} as *mut std::ffi::c_void;
+					let mapped=unsafe {super::mmap(address,bytes,1,17,resident.mapping._file.as_raw_fd(),0)};
+					require(mapped==address,format!("cannot map resident lookup: {}",std::io::Error::last_os_error()))?;
+					mappings.push((start,end,resident));
+			}
+			Ok(())
 		}
 	}
 	impl Drop for Mapping {
@@ -9504,6 +9528,9 @@ mod gguf {
 		tensors: Vec<GgufTensor>,
 	}
 	impl Gguf {
+		pub(super) fn resident_identity(&self)->String {
+			format!("{:?}:{:?}",self.shards.iter().map(|shard|(&shard.mapping.identity,shard.data)).collect::<Vec<_>>(),self.tensors)
+		}
 		/// Open one GGUF file or the complete split model it names.
 		pub fn open(path: &Path) -> Result<Self> {
 			let first = Self::shard(path, 0)?;
@@ -14873,6 +14900,10 @@ impl std::ops::Deref for StoredSegment {
 #[derive(Clone)]
 pub(crate) struct StoredBytes(Arc<Vec<StoredSegment>>);
 impl StoredBytes {
+	fn hold_lookup(&self)->Result<()> {
+		for run in self.0.iter() {if let StoredSegment::Mapped(mapping,at,count)=run {mapping.hold_lookup(*at,*count)?;}}
+		Ok(())
+	}
 	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Mapped(mapping.clone(), at, length)]))
 	}
@@ -19506,7 +19537,7 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:split_working_reserve(&target_graph,head_graph.as_ref())};8];
 	for gpu in selected_gpus()? {
 		let die=gpu.name.strip_prefix("nv").and_then(|value|value.parse::<usize>().ok()).ok_or_else(||RecipeError::new("expert startup requires physical local NVIDIA names"))?;
-		require(die<8 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
+		require(die<8 && die!=2 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=(gpu.free_bytes()? as usize).saturating_add(resident_weight_credit(gpu)?);
 		#[cfg(nvidia)] if die==2 && let Driver::Cuda(driver)=&gpu.driver {
 			gpu.activate()?; let (mut free,mut total)=(0,0); unsafe {gpu.status((driver.memory_info)(&mut free,&mut total),"capped expert memory")?;}
 			budgets[die].free_bytes=budgets[die].free_bytes.min(free.saturating_sub(total.saturating_sub(5_798_205_440)));
@@ -19753,7 +19784,7 @@ impl ExpertExecution {
 			fs::write(directory.join("assembly.txt"),diagnostic).map_err(|error| RecipeError::new(format!("expert assembly receipt: {error}")))?;
 		}
 		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
-		let weights = ExpertSplitWeights::prepare(plan, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
+		let weights = ExpertSplitWeights::prepare(plan, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"],&format!("{}:{}",target.resident_identity(),head.map_or_else(String::new,Gguf::resident_identity)))?;
 		let control = Buffer::zeroed(main, 128)?;
 		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
 		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
@@ -20071,14 +20102,19 @@ impl ExpertSplitPlan {
 /// Retain this object in cx-flash's holder. Creation is transactional: capacity
 /// failure returns before weight allocation; upload failure drops new buffers.
 /// Module replacement leaves these allocations and peer sequences unchanged.
-struct ExpertPinned { gpu: &'static Gpu, pointer: usize, mapped: [u64;8] }
+struct ExpertPinned { #[cfg(unix)] resident:Option<ResidentRamBuffer>,gpu: &'static Gpu, pointer: usize, mapped: [u64;8] }
 impl ExpertPinned {
-	fn new(gpu: &'static Gpu, bytes: usize, devices: &[Option<&'static Gpu>]) -> Result<Self> {
+	fn new(gpu: &'static Gpu, bytes: usize, devices: &[Option<&'static Gpu>],identity:&str) -> Result<Self> {
+		#[cfg(unix)] if let Some(client)=resident_weight_client()? {
+			let resident=client.reserve_ram(&resident_weight_key(gpu,bytes,identity)?,bytes,resident_weight_seed()?)?;
+			let pointer=resident.address();let mapped=resident.mapping.mapped;
+			return Ok(Self {resident:Some(resident),gpu,pointer,mapped});
+		}
 		#[cfg(nvidia)] {
 			let Driver::Cuda(driver)=&gpu.driver else {return Err(RecipeError::new("expert spill requires CUDA mapped RAM"));};
 			gpu.activate()?; let mut pointer=ptr::null_mut();
 			unsafe {gpu.status((driver.host_alloc)(&mut pointer,bytes,3),"expert pinned RAM allocation")?;}
-			let mut value=Self {gpu,pointer:pointer as usize,mapped:[0;8]};
+			let mut value=Self {#[cfg(unix)] resident:None,gpu,pointer:pointer as usize,mapped:[0;8]};
 			for (die,device) in devices.iter().enumerate().filter_map(|(die,gpu)|gpu.map(|gpu|(die,gpu))) {
 				let Driver::Cuda(driver)=&device.driver else {return Err(RecipeError::new("expert spill compute die is not CUDA"));};
 				device.activate()?;
@@ -20090,7 +20126,7 @@ impl ExpertPinned {
 	}
 }
 impl Drop for ExpertPinned {
-	fn drop(&mut self) { #[cfg(nvidia)] if let Driver::Cuda(driver)=&self.gpu.driver {let _=self.gpu.activate(); unsafe {(driver.host_free)(self.pointer as Ptr);}} }
+	fn drop(&mut self) { #[cfg(unix)] if self.resident.is_some() {return;} #[cfg(nvidia)] if let Driver::Cuda(driver)=&self.gpu.driver {let _=self.gpu.activate(); unsafe {(driver.host_free)(self.pointer as Ptr);}} }
 }
 
 pub struct ExpertSplitWeights {
@@ -20109,11 +20145,11 @@ impl ExpertSplitWeights {
 	/// Names use physical Archy ordinal order. Dies 2 and 6 have no context or buffer.
 	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
 	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str;8]) -> Result<Self> {
-		let value=Self::prepare(plan,names)?;
+		let mut value=Self::prepare(plan,names,&format!("{}:{}",target.resident_identity(),head.map_or_else(String::new,Gguf::resident_identity)))?;
 		value.upload(target,head)?;
 		Ok(value)
 	}
-	fn prepare(mut plan: ExpertSplitPlan, names: [&str; 8]) -> Result<Self> {
+	fn prepare(mut plan: ExpertSplitPlan, names: [&str; 8],source_identity:&str) -> Result<Self> {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
 		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
 		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
@@ -20125,7 +20161,7 @@ impl ExpertSplitWeights {
 			#[cfg(not(nvidia))]
 			return Err(RecipeError::new("expert split requires the NVIDIA backend"));
 			#[allow(unreachable_code)]
-			require(gpu.free_bytes()? >= checked_add(plan.weights[die], plan.budgets[die].reserve_bytes, "expert split reserve")? as u64,
+			require(gpu.free_bytes()?.saturating_add(resident_weight_credit(gpu)? as u64) >= checked_add(plan.weights[die], plan.budgets[die].reserve_bytes, "expert split reserve")? as u64,
 				format!("physical die {die} free VRAM changed before resident loading"))?;
 		}
 		let main = devices[plan.main_die].expect("main die is permitted");
@@ -20136,8 +20172,12 @@ impl ExpertSplitWeights {
 		for item in plan.placements.iter_mut().filter(|item| (item.expert.is_some() || item.row_start.is_some()) && !item.spilled) {
 			let (offset,end)=ExpertSplitPlan::end(expert_bytes[item.die],item.tensor.bytes)?; item.offset=offset; expert_bytes[item.die]=end;
 		}
-		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
-		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
+		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| {
+			let identity=format!("expert-pool-abi-1:{source_identity}:{:?}",plan.placements.iter().filter(|item|item.die==die && !item.spilled && (item.expert.is_some() || item.row_start.is_some())).collect::<Vec<_>>());
+			Buffer::resident_reserve(gpu,expert_bytes[die],&identity)
+		}).transpose()).collect::<Result<Vec<_>>>()?;
+		let spill_identity=format!("expert-spill-abi-1:{source_identity}:{:?}",plan.placements.iter().filter(|item|item.spilled).collect::<Vec<_>>());
+		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices,&spill_identity)?)} else {None};
 		let response_table = Buffer::reserve(main, 6 * 16)?;
 		let mut bindings=std::collections::HashMap::new();
 		for item in plan.placements.iter().filter(|item|item.expert.is_some()) {
@@ -20178,12 +20218,15 @@ impl ExpertSplitWeights {
 		value.response_table.write_bytes(0, &table)?;
 		Ok(value)
 	}
-	fn upload(&self,target:&Gguf,head:Option<&Gguf>)->Result<()> {
+	fn upload(&mut self,target:&Gguf,head:Option<&Gguf>)->Result<()> {
 		// Read each shard in file order while preserving every assigned destination.
 		let mut uploads=self.plan.placements.iter().filter(|item|item.expert.is_some() || item.row_start.is_some()).collect::<Vec<_>>();
 		uploads.sort_by_key(|item|(item.mtp,item.tensor.shard,item.tensor.offset,item.die));
 		let upload_started=Instant::now(); let mut upload_reported=upload_started; let mut uploaded=0usize;
 		for item in uploads {
+			if item.spilled {
+				#[cfg(unix)] if self.spill.as_ref().and_then(|spill|spill.resident.as_ref()).is_some_and(ResidentRamBuffer::ready) {continue;}
+			} else if self.buffers[item.die].as_ref().is_some_and(Buffer::resident_ready) {continue;}
 			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
 			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
 			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
@@ -20200,6 +20243,8 @@ impl ExpertSplitWeights {
 			}
 		}
 		println!("resident weights {} bytes  average rate {:.4} GB/s",uploaded,uploaded as f64/upload_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
+		for buffer in self.buffers.iter_mut().flatten() {buffer.resident_commit()?;}
+		#[cfg(unix)] if let Some(resident)=self.spill.as_mut().and_then(|spill|spill.resident.as_mut()) && !resident.ready {resident.commit()?;}
 		Ok(())
 	}
 	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
@@ -24730,13 +24775,13 @@ impl NativeTape {
 			(TapeInput::Values(values), true) => Buffer::upload(gpu, &values.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?,
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
-		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
+		let mut weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
 		if let Some(execution) = &graph.expert_execution {
 			let execution = execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))?;
 			let (offsets, _) = native_weight_arena(graph, precision.model, true)?;
 			for layer in &graph.expert_layers { weights.write_bytes(offsets[layer.node], &execution.main_descriptors[layer.global].pointer.to_ne_bytes())?; }
 		}
-		if program.model_load.is_some() {
+		if program.model_load.is_some() && !weights.resident_ready() {
 			let image = &program.artifact.storage;
 			require(!image.is_empty(), "native model-load storage is empty")?;
 			// One node at a time through one scratch the size of the largest
@@ -24772,9 +24817,10 @@ impl NativeTape {
 					trace(&format!("load node {node} {} wrote {written:?} machine {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
 				}
 			}
-		} else {
+		} else if program.model_load.is_none() {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
 		}
+		weights.resident_commit()?;
 		// The arenas are cleared on the device rather than staged whole on the
 		// host: a later position reads the zeros the earlier windows left.
 		// RECIPE_ARENA_GUARD=bytes pads every arena on both sides by that many
@@ -24789,6 +24835,7 @@ impl NativeTape {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if inference && node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?.clone();
+				table.bytes.hold_lookup()?;
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: None, table, width: node.argument[1] as usize, length: node.output.length });
 			} else if node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
@@ -24800,6 +24847,7 @@ impl NativeTape {
 			}
 			if node.op == Primitive::Lookup {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				table.bytes.hold_lookup()?;
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
@@ -24852,12 +24900,12 @@ impl NativeTape {
 			lookups,
 			lookup_rows: (inference && graph.expert_execution.is_some()).then(|| Mutex::new(LookupRows::default())),
 			tokens,
-			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
+			adjoints: Buffer { #[cfg(unix)] resident:None,runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
 			samples,
 			request: Mutex::new(None),
 			saved_output: Mutex::new(Vec::new()),
-			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
+			input_adjoint: Buffer { #[cfg(unix)] resident:None,runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
 			targets: Buffer::upload_float(gpu, &target_buffer, layout.output_precision)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen_mask)?,
@@ -26581,6 +26629,8 @@ fn narrow(value: usize, role: &str) -> Result<i32> {
 	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))
 }
 struct Buffer {
+	#[cfg(unix)]
+	resident: Option<ResidentWeightBuffer>,
 	runtime: &'static Gpu,
 	pointer: u64,
 	bytes: usize,
@@ -26629,7 +26679,7 @@ impl Buffer {
 	}
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let bytes = size_of_val(values);
-		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
+		Ok(Self { #[cfg(unix)] resident:None,runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
 	}
 	/// A device buffer of `bytes` zeros, filled one bounded host block at a time.
 	/// A zeroed buffer with `guard` zeroed bytes on both sides of it; the
@@ -26639,13 +26689,13 @@ impl Buffer {
 			return Self::zeroed(runtime, bytes);
 		}
 		let whole = Self::zeroed(runtime, bytes.max(1) + 2 * guard)?;
-		let inner = Self { runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1) };
+		let inner = Self { #[cfg(unix)] resident:None,runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1) };
 		std::mem::forget(whole);
 		Ok(inner)
 	}
 	fn zeroed(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let buffer = Self { #[cfg(unix)] resident:None,runtime, pointer: runtime.allocate(bytes)?, bytes };
 		let zeros = vec![0_u8; bytes.min(ZERO_FILL_BYTES)];
 		for offset in (0..bytes).step_by(zeros.len()) {
 			buffer.write_bytes(offset, &zeros[..zeros.len().min(bytes - offset)])?;
@@ -26666,15 +26716,49 @@ impl Buffer {
 	/// A device buffer of `bytes` left as allocated, for a scratch every write fills before a read.
 	fn reserve(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
-		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes })
+		Ok(Self { #[cfg(unix)] resident:None,runtime, pointer: runtime.allocate(bytes)?, bytes })
+	}
+	fn resident_reserve(runtime:&'static Gpu,bytes:usize,identity:&str)->Result<Self> {
+		#[cfg(unix)] if let Some(client)=resident_weight_client()? {
+			let key=resident_weight_key(runtime,bytes,identity)?;
+			let resident=client.reserve(&runtime.name,&key,bytes.max(1),resident_weight_seed()?)?;
+			return Ok(Self {runtime,pointer:resident.pointer,bytes:bytes.max(1),resident:Some(resident)});
+		}
+		Self::reserve(runtime,bytes)
+	}
+	fn resident_ready(&self)->bool {
+		#[cfg(unix)] {return self.resident.as_ref().is_some_and(ResidentWeightBuffer::ready);}
+		#[cfg(not(unix))] false
+	}
+	fn resident_commit(&mut self)->Result<()> {
+		#[cfg(unix)] if let Some(resident)=&mut self.resident && !resident.ready {resident.commit()?;}
+		Ok(())
 	}
 	/// The weight arena. A packed weight is written from where it is mapped, a
 	/// stored weight the model-load kernel expands is left to that kernel, and
 	/// every other node's parameters are encoded and written in place.
 	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<Self> {
+		use std::fmt::Write as _;
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
 		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let mut identity=String::new();
+		#[cfg(unix)] if resident_weight_client()?.is_some() {
+		write!(&mut identity,"native-weight-abi-1:{precision:?}:{inference}:{offsets:?}")?;
+		for (index,node) in graph.nodes.iter().enumerate() {
+			write!(&mut identity,"{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}",node.identity(index),node.source,node.second,node.input.channels,node.input.length,node.output.channels,node.output.length,node.offset,node.parameters,node.storage,node.packed,node.argument.map(f64::to_bits))?;
+			if let Some(weight)=graph.stored.get(index).and_then(Option::as_ref) {
+				write!(&mut identity,"{}:{}:{:?}",weight.format.0,weight.count,weight.segments.iter().map(|(format,count)|(format.0,*count)).collect::<Vec<_>>())?;
+				for run in weight.bytes.0.iter() {match run {
+					StoredSegment::Mapped(mapping,at,count)=>write!(&mut identity,"{}:{at}:{count}",mapping.identity)?,
+					StoredSegment::Owned(data)=>{for byte in data {write!(&mut identity,"{byte:02x}")?;}},
+					StoredSegment::Absent(count)=>write!(&mut identity,"absent:{count}")?,
+				}}
+			}
+			for value in &graph.parameters[node.offset..node.offset+node.parameters] {write!(&mut identity,"{:016x}",value.to_bits())?;}
+		}
+		}
+		let buffer=Self::resident_reserve(runtime,bytes,&identity)?;
+		if buffer.resident_ready() {return Ok(buffer);}
 		let mut written = std::collections::BTreeSet::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if inference && external_expert(node) { continue; }
@@ -26745,6 +26829,7 @@ impl Buffer {
 }
 impl Drop for Buffer {
 	fn drop(&mut self) {
+		#[cfg(unix)] if self.resident.is_some() {return;}
 		self.runtime.free(self.pointer);
 	}
 }
@@ -26939,7 +27024,17 @@ impl Kernel {
 	}
 }
 #[cfg(nvidia)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CudaIpcHandle { reserved: [u8;64] }
+#[cfg(nvidia)]
 struct Cuda {
+	host_register: unsafe extern "C" fn(Ptr,usize,u32)->i32,
+	host_unregister: unsafe extern "C" fn(Ptr)->i32,
+	ipc_export: unsafe extern "C" fn(*mut CudaIpcHandle,u64)->i32,
+	ipc_open: unsafe extern "C" fn(*mut u64,CudaIpcHandle,u32)->i32,
+	ipc_close: unsafe extern "C" fn(u64)->i32,
+	copy_peer: unsafe extern "C" fn(u64,Ptr,u64,Ptr,usize)->i32,
 	copy_device: unsafe extern "C" fn(u64, u64, usize) -> i32,
 	host_alloc: unsafe extern "C" fn(*mut Ptr,usize,u32)->i32,
 	host_device_pointer: unsafe extern "C" fn(*mut u64,Ptr,u32)->i32,
@@ -27103,6 +27198,377 @@ impl<R: Read, W: Write> Wire<R, W> {
 	}
 }
 type RemoteChannel = Wire<std::process::ChildStdout, std::process::ChildStdin>;
+#[cfg(unix)]
+type HolderChannel = Wire<std::os::unix::net::UnixStream,std::os::unix::net::UnixStream>;
+#[cfg(unix)]
+fn holder_text(wire: &mut HolderChannel) -> Result<String> {
+	let length=wire.read_u32()? as usize;
+	require(length>0 && length<=65536,"resident weight key must contain 1..65536 bytes")?;
+	let mut bytes=vec![0;length]; wire.read_into(&mut bytes)?;
+	String::from_utf8(bytes).map_err(|_|RecipeError::new("resident weight key is not UTF-8"))
+}
+#[cfg(unix)]
+fn holder_write_text(wire: &mut HolderChannel,text: &str) -> Result<()> {
+	require(!text.is_empty() && text.len()<=65536,"resident weight key must contain 1..65536 bytes")?;
+	wire.write_u32(text.len() as u32)?; wire.write_bytes(text.as_bytes())
+}
+#[cfg(unix)]
+fn holder_channel(stream: std::os::unix::net::UnixStream) -> Result<HolderChannel> {
+	let input=stream.try_clone().map_err(|error|RecipeError::new(format!("resident weight connection: {error}")))?;
+	Ok(Wire {input:std::io::BufReader::new(input),output:std::io::BufWriter::new(stream),role:"resident weights"})
+}
+fn resident_device(name:&str)->Result<&'static Gpu> {
+	require(local_host()?=="archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(),"resident weights require physical Archy device names")?;
+	require(matches!(name,"nv0"|"nv1"|"nv3"|"nv4"|"nv5"|"nv7"),"resident weights exclude physical dies 2 and 6")?;
+	let selected=device_selection()?.ok_or_else(||RecipeError::new("resident weights require an explicit RECIPE_DEVICE selection"))?;
+	require(selected.iter().all(|name|matches!(name.as_str(),"nv0"|"nv1"|"nv3"|"nv4"|"nv5"|"nv7")),"resident selection must exclude physical dies 2 and 6")?;
+	let gpu=device(Some(name))?;
+	#[cfg(nvidia)] if matches!(gpu.driver,Driver::Cuda(_)) {return Ok(gpu);}
+	let _=gpu; Err(RecipeError::new("resident weights require the NVIDIA backend"))
+}
+
+/// A resident-to-resident byte copy. Offsets refer to the allocation keys, not
+/// process-local CUDA pointers. Submit the complete relocation before copying.
+#[derive(Clone,Debug)]
+pub struct ResidentWeightCopy {
+	pub source: String,
+	pub source_offset: usize,
+	pub destination: String,
+	pub destination_offset: usize,
+	pub bytes: usize,
+}
+#[cfg(unix)]
+struct HeldWeight {buffer:Buffer,ready:bool,seed:u64}
+#[cfg(unix)]
+struct HeldRam {mapping:SharedResidentRam,ready:bool,seed:u64}
+#[cfg(unix)]
+struct SharedResidentRam {pointer:usize,bytes:usize,path:PathBuf,_file:fs::File,gpu:Option<&'static Gpu>,mapped:[u64;8]}
+#[cfg(unix)]
+impl SharedResidentRam {
+	fn open(path:&Path,bytes:usize,owner:bool,pinned:bool)->Result<Self> {
+		use std::os::unix::io::{AsRawFd,FromRawFd};
+		require(bytes>0,"shared resident RAM is empty")?;
+		let file=if owner {
+			#[cfg(target_os="linux")] {
+				let descriptor=unsafe {memfd_create(c"recipe-resident-weights".as_ptr(),3)};
+				require(descriptor>=0,format!("resident RAM memfd: {}",std::io::Error::last_os_error()))?;
+				unsafe {fs::File::from_raw_fd(descriptor)}
+			}
+			#[cfg(not(target_os="linux"))] return Err(RecipeError::new("shared resident RAM requires Linux memfd"));
+		} else {fs::OpenOptions::new().read(true).write(true).open(path).map_err(|error|RecipeError::new(format!("resident RAM {}: {error}",path.display())))?};
+		if owner {file.set_len(bytes as u64).map_err(|error|RecipeError::new(format!("resident RAM size: {error}")))?;}
+		#[cfg(target_os="linux")] if owner {
+			require(unsafe {fcntl(file.as_raw_fd(),1033,6)}==0,"cannot seal resident RAM size")?;
+		}
+		let path=if owner {PathBuf::from(format!("/proc/{}/fd/{}",std::process::id(),file.as_raw_fd()))} else {path.to_path_buf()};
+		require(file.metadata().map_err(|error|RecipeError::new(format!("resident RAM identity: {error}")))?.len()==bytes as u64,"resident RAM file size differs")?;
+		let pointer=unsafe {mmap(ptr::null_mut(),bytes,3,1,file.as_raw_fd(),0)};
+		require(pointer as isize != -1,"cannot map shared resident RAM")?;
+		let mut value=Self {pointer:pointer as usize,bytes,path,_file:file,gpu:None,mapped:[0;8]};
+		if !pinned {return Ok(value);}
+		let gpu=resident_device("nv4")?;
+		#[cfg(nvidia)] if let Driver::Cuda(driver)=&gpu.driver {
+			gpu.activate()?;let status=unsafe {(driver.host_register)(pointer,bytes,3)};
+			if let Err(error)=gpu.status(status,"shared resident RAM registration") {unsafe {munmap(pointer,bytes);};value.pointer=0;return Err(error);}
+			value.gpu=Some(gpu);
+			for die in [0,1,3,4,5,7] {
+				let device=resident_device(&format!("nv{die}"))?;let Driver::Cuda(driver)=&device.driver else {unreachable!()};device.activate()?;
+				unsafe {device.status((driver.host_device_pointer)(&mut value.mapped[die],pointer,0),"shared resident RAM device address")?;}
+			}
+			return Ok(value);
+		}
+		Err(RecipeError::new("shared resident RAM requires CUDA"))
+	}
+}
+#[cfg(unix)]
+impl Drop for SharedResidentRam {
+	fn drop(&mut self) {
+		if self.pointer==0 {return;}
+		#[cfg(nvidia)] if let Some(gpu)=self.gpu && let Driver::Cuda(driver)=&gpu.driver {
+			if gpu.activate().is_ok() {unsafe {(driver.host_unregister)(self.pointer as Ptr);}}
+		}
+		unsafe {munmap(self.pointer as Ptr,self.bytes);}
+	}
+}
+
+/// Serve durable CUDA allocations independently of any compute client. A client
+/// connection is an exclusive lease; disconnecting closes that lease, not weights.
+/// Run this CLI directly under the owner's supervisor, never as a compute child.
+#[cfg(unix)]
+pub fn weight_holder_serve(path:&Path)->Result<()> {
+	use std::os::unix::{fs::PermissionsExt,net::UnixListener};
+	require(local_host()?=="archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(),"weight holder requires unmapped Archy ordinals")?;
+	let listener=UnixListener::bind(path).map_err(|error|RecipeError::new(format!("cannot bind weight holder {}: {error}",path.display())))?;
+	fs::set_permissions(path,fs::Permissions::from_mode(0o600)).map_err(|error|RecipeError::new(format!("weight holder permissions: {error}")))?;
+	let mut held=std::collections::BTreeMap::<String,HeldWeight>::new();
+	let mut ram=std::collections::BTreeMap::<String,HeldRam>::new();
+	let mut lease=0u64;
+	println!("weight holder pid {} socket {}",std::process::id(),path.display());
+	loop {
+		let (stream,_)=listener.accept().map_err(|error|RecipeError::new(format!("weight holder accept: {error}")))?;
+		lease=lease.checked_add(1).ok_or_else(||RecipeError::new("weight holder lease counter exhausted"))?;
+		let mut wire=holder_channel(stream)?;
+		// Malformed/disconnected clients cannot unwind the allocation owner.
+		if let Err(error)=weight_holder_client(&mut wire,&mut held,&mut ram,lease) {eprintln!("weight holder client: {error}");}
+	}
+}
+#[cfg(unix)]
+fn weight_holder_client(wire:&mut HolderChannel,held:&mut std::collections::BTreeMap<String,HeldWeight>,ram:&mut std::collections::BTreeMap<String,HeldRam>,lease:u64)->Result<()> {
+	wire.write_u32(1)?; wire.write_u64(std::process::id() as u64)?; wire.flush()?;
+	while let Ok(command)=wire.read_u8() {
+		match command {
+			0=> {
+				wire.status(&Ok(()))?; wire.write_u32((held.len()+ram.len()) as u32)?;
+				for (key,weight) in held.iter() {holder_write_text(wire,key)?;holder_write_text(wire,&weight.buffer.runtime.name)?;wire.write_u64(weight.buffer.bytes as u64)?;wire.write_u8(weight.ready as u8)?;}
+				for (key,weight) in ram.iter() {holder_write_text(wire,key)?;holder_write_text(wire,"ram")?;wire.write_u64(weight.mapping.bytes as u64)?;wire.write_u8(weight.ready as u8)?;}
+			}
+			1=> {
+				let seed=wire.read_u8()?; require(seed<=1,"invalid resident seed flag")?;
+				let name=holder_text(wire)?;let key=holder_text(wire)?;
+				let bytes=usize::try_from(wire.read_u64()?).map_err(|_|RecipeError::new("resident size exceeds machine address space"))?;
+				let result=(||->Result<([u8;64],bool)> {
+					require(bytes>0,"resident allocation is empty")?;
+					require(!ram.contains_key(&key),"resident key already names RAM")?;
+					if !held.contains_key(&key) {
+						require(seed==1,"resident allocation is absent; attach never reads weights from disk")?;
+						let gpu=resident_device(&name)?;
+						held.insert(key.clone(),HeldWeight {buffer:Buffer::reserve(gpu,bytes)?,ready:false,seed:lease});
+					}
+					let weight=&held[&key];
+					require(weight.buffer.runtime.name==name && weight.buffer.bytes==bytes,"resident allocation identity or size differs")?;
+					require(weight.ready || (seed==1 && weight.seed==lease),"resident allocation is incomplete; disk reload is forbidden")?;
+					#[cfg(nvidia)] if let Driver::Cuda(driver)=&weight.buffer.runtime.driver {
+						weight.buffer.runtime.activate()?;let mut handle=CudaIpcHandle {reserved:[0;64]};
+						unsafe {weight.buffer.runtime.status((driver.ipc_export)(&mut handle,weight.buffer.pointer),"resident IPC export")?;}
+						return Ok((handle.reserved,weight.ready));
+					}
+					Err(RecipeError::new("resident IPC export requires CUDA"))
+				})();
+				wire.status(&result.as_ref().map(|_|()).map_err(Clone::clone))?;
+				if let Ok((handle,ready))=result {wire.write_bytes(&handle)?;wire.write_u8(ready as u8)?;}
+			}
+			2=> {
+				let key=holder_text(wire)?;
+				let result=(||->Result<()> {
+					if let Some(weight)=ram.get_mut(&key) {
+						require(weight.seed==lease && !weight.ready,"resident RAM commit requires its initial seed lease")?;weight.ready=true;return Ok(());
+					}
+					let weight=held.get_mut(&key).ok_or_else(||RecipeError::new("resident commit names an absent allocation"))?;
+					require(weight.seed==lease && !weight.ready,"resident commit requires its initial seed lease")?;
+					weight.ready=true;Ok(())
+				})();wire.status(&result)?;
+			}
+			3=> {
+				let count=wire.read_u32()? as usize;require(count>0 && count<=65536,"resident relocation needs 1..65536 spans")?;
+				let mut copies=Vec::with_capacity(count);
+				for _ in 0..count {copies.push(ResidentWeightCopy {source:holder_text(wire)?,source_offset:wire.read_u64()? as usize,destination:holder_text(wire)?,destination_offset:wire.read_u64()? as usize,bytes:wire.read_u64()? as usize});}
+				wire.status(&resident_copy_weights(held,&copies))?;
+			}
+			4=> {
+				let seed=wire.read_u8()?;require(seed<=1,"invalid resident RAM seed flag")?;
+				let pinned=wire.read_u8()?;require(pinned<=1,"invalid resident RAM mapping flag")?;
+				let key=holder_text(wire)?;let bytes=wire.read_u64()? as usize;
+				let result=(||->Result<(String,bool)> {
+					require(!held.contains_key(&key),"resident key already names device memory")?;
+					if !ram.contains_key(&key) {
+						require(seed==1,"resident RAM is absent; attach never reads weights from disk")?;
+						ram.insert(key.clone(),HeldRam {mapping:SharedResidentRam::open(Path::new(""),bytes,true,pinned!=0)?,ready:false,seed:lease});
+					}
+					let weight=&ram[&key];require(weight.mapping.bytes==bytes,"resident RAM size differs")?;
+					require(weight.mapping.gpu.is_some()==(pinned!=0),"resident RAM mapping kind differs")?;
+					require(weight.ready || (seed==1 && weight.seed==lease),"resident RAM is incomplete; disk reload is forbidden")?;
+					Ok((weight.mapping.path.to_string_lossy().into_owned(),weight.ready))
+				})();wire.status(&result.as_ref().map(|_|()).map_err(Clone::clone))?;
+				if let Ok((path,ready))=result {holder_write_text(wire,&path)?;wire.write_u8(ready as u8)?;}
+			}
+			5=> {
+				let result=(||->Result<()> {for name in ["nv0","nv1","nv3","nv4","nv5","nv7"] {resident_device(name)?;}Ok(())})();wire.status(&result)?;
+			}
+			_=>return Err(RecipeError::new("unknown weight holder command")),
+		}
+		wire.flush()?;
+	}
+	Ok(())
+}
+#[cfg(unix)]
+fn resident_copy_weights(held:&std::collections::BTreeMap<String,HeldWeight>,copies:&[ResidentWeightCopy])->Result<()> {
+	// Preserve unread resident sources: reject a destructive ordering before
+	// writing anything. The planner can order acyclic moves or use spare storage.
+	for (index,copy) in copies.iter().enumerate() {
+		let source=held.get(&copy.source).ok_or_else(||RecipeError::new("resident copy source is absent"))?;
+		let destination=held.get(&copy.destination).ok_or_else(||RecipeError::new("resident copy destination is absent"))?;
+		require(source.ready && copy.bytes>0,"resident copy needs a ready nonempty source")?;
+		require(copy.source_offset.checked_add(copy.bytes).is_some_and(|end|end<=source.buffer.bytes) && copy.destination_offset.checked_add(copy.bytes).is_some_and(|end|end<=destination.buffer.bytes),"resident copy exceeds an allocation")?;
+		for later in &copies[index+1..] {
+			require(copy.destination!=later.source || copy.destination_offset+copy.bytes<=later.source_offset || later.source_offset.checked_add(later.bytes).is_some_and(|end|end<=copy.destination_offset),"resident relocation overwrites an unread source; order moves or use resident scratch")?;
+		}
+		if copy.source==copy.destination {
+			require(copy.source_offset==copy.destination_offset || copy.source_offset+copy.bytes<=copy.destination_offset || copy.destination_offset+copy.bytes<=copy.source_offset,"overlapping resident move needs an explicit scratch span")?;
+		}
+	}
+	for copy in copies {
+		if copy.source==copy.destination && copy.source_offset==copy.destination_offset {continue;}
+		let source=&held[&copy.source].buffer;let destination=&held[&copy.destination].buffer;
+		let (from,to)=(source.pointer+copy.source_offset as u64,destination.pointer+copy.destination_offset as u64);
+		if ptr::eq(source.runtime,destination.runtime) {destination.runtime.copy_device(to,from,copy.bytes)?;}
+		else {
+			#[cfg(nvidia)] if let (Driver::Cuda(origin),Driver::Cuda(target))=(&source.runtime.driver,&destination.runtime.driver) {
+				require(destination.runtime.reaches(&[source.runtime,destination.runtime]),"resident relocation needs direct peer access")?;
+				destination.runtime.activate()?;
+				unsafe {destination.runtime.status((target.copy_peer)(to,target.context,from,origin.context,copy.bytes),"resident peer copy")?;}
+			} else {return Err(RecipeError::new("resident relocation requires CUDA"));}
+			#[cfg(not(nvidia))] return Err(RecipeError::new("resident relocation requires CUDA"));
+		}
+		destination.runtime.synchronize()?;
+	}
+	Ok(())
+}
+
+/// Connect once per compute process and retain the connection until all imported
+/// buffers are closed. The allocation owner survives client exit or failure.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct ResidentWeightClient {channel:Arc<Mutex<HolderChannel>>,pub owner_pid:u64}
+#[cfg(unix)]
+impl ResidentWeightClient {
+	pub fn connect(path:&Path)->Result<Self> {
+		let stream=std::os::unix::net::UnixStream::connect(path).map_err(|error|RecipeError::new(format!("weight holder {}: {error}",path.display())))?;
+		let mut channel=holder_channel(stream)?;require(channel.read_u32()?==1,"weight holder protocol differs")?;
+		let owner_pid=channel.read_u64()?;Ok(Self {channel:Arc::new(Mutex::new(channel)),owner_pid})
+	}
+	fn initialize(&self)->Result<()> {
+		let mut wire=self.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(5)?;wire.flush()?;wire.read_status("resident owner contexts")
+	}
+	pub fn allocations(&self)->Result<Vec<(String,String,usize,bool)>> {
+		let mut wire=self.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(0)?;wire.flush()?;wire.read_status("resident inventory")?;
+		let count=wire.read_u32()? as usize;let mut values=Vec::with_capacity(count);
+		for _ in 0..count {values.push((holder_text(&mut wire)?,holder_text(&mut wire)?,wire.read_u64()? as usize,wire.read_u8()?!=0));}
+		Ok(values)
+	}
+	/// Seed is only for the CEO-authorized initial load. An ordinary attachment
+	/// requires committed existing weights and cannot allocate or read model data.
+	pub fn reserve(&self,name:&str,key:&str,bytes:usize,seed:bool)->Result<ResidentWeightBuffer> {
+		let mut wire=self.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(1)?;wire.write_u8(seed as u8)?;holder_write_text(&mut wire,name)?;holder_write_text(&mut wire,key)?;wire.write_u64(bytes as u64)?;wire.flush()?;wire.read_status("resident attach")?;
+		let mut handle=[0;64];wire.read_into(&mut handle)?;let ready=wire.read_u8()?!=0;
+		let gpu=resident_device(name)?;
+		#[cfg(nvidia)] if let Driver::Cuda(driver)=&gpu.driver {
+			gpu.activate()?;let mut pointer=0;
+			unsafe {gpu.status((driver.ipc_open)(&mut pointer,CudaIpcHandle {reserved:handle},1),"resident IPC attach")?;}
+			return Ok(ResidentWeightBuffer {gpu,pointer,bytes,key:key.to_owned(),client:self.clone(),ready});
+		}
+		Err(RecipeError::new("resident IPC attach requires CUDA"))
+	}
+	pub fn reserve_ram(&self,key:&str,bytes:usize,seed:bool)->Result<ResidentRamBuffer> {
+		self.reserve_ram_kind(key,bytes,seed,true)
+	}
+	fn reserve_ram_kind(&self,key:&str,bytes:usize,seed:bool,pinned:bool)->Result<ResidentRamBuffer> {
+		let mut wire=self.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(4)?;wire.write_u8(seed as u8)?;wire.write_u8(pinned as u8)?;holder_write_text(&mut wire,key)?;wire.write_u64(bytes as u64)?;wire.flush()?;wire.read_status("resident RAM attach")?;
+		let path=holder_text(&mut wire)?;let ready=wire.read_u8()?!=0;drop(wire);
+		Ok(ResidentRamBuffer {mapping:SharedResidentRam::open(Path::new(&path),bytes,false,pinned)?,key:key.to_owned(),client:self.clone(),ready})
+	}
+	/// Synchronize the compute lease before sending relocation. No model bytes
+	/// travel through this connection or machine RAM.
+	pub fn copy(&self,copies:&[ResidentWeightCopy])->Result<()> {
+		require(!copies.is_empty() && copies.len()<=65536,"resident relocation needs 1..65536 spans")?;
+		for gpu in selected_gpus()? {gpu.synchronize()?;}
+		let mut wire=self.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(3)?;wire.write_u32(copies.len() as u32)?;
+		for copy in copies {holder_write_text(&mut wire,&copy.source)?;wire.write_u64(copy.source_offset as u64)?;holder_write_text(&mut wire,&copy.destination)?;wire.write_u64(copy.destination_offset as u64)?;wire.write_u64(copy.bytes as u64)?;}
+		wire.flush()?;wire.read_status("resident relocation")
+	}
+}
+#[cfg(unix)]
+pub struct ResidentWeightBuffer {gpu:&'static Gpu,pointer:u64,bytes:usize,key:String,client:ResidentWeightClient,ready:bool}
+#[cfg(unix)]
+impl ResidentWeightBuffer {
+	pub fn address(&self)->u64 {self.pointer}
+	pub fn bytes(&self)->usize {self.bytes}
+	pub fn ready(&self)->bool {self.ready}
+	pub fn write(&self,offset:usize,bytes:&[u8])->Result<()> {
+		require(!self.ready,"committed resident weights cannot be seeded again")?;
+		require(offset.checked_add(bytes.len()).is_some_and(|end|end<=self.bytes),"resident write exceeds allocation")?;
+		self.gpu.upload(self.pointer+offset as u64,bytes.as_ptr().cast(),bytes.len()).map(|_|())
+	}
+	pub fn read(&self,offset:usize,count:usize)->Result<Vec<u8>> {
+		require(offset.checked_add(count).is_some_and(|end|end<=self.bytes),"resident read exceeds allocation")?;
+		self.gpu.synchronize()?;let mut bytes=vec![0;count];self.gpu.download(bytes.as_mut_ptr().cast(),self.pointer+offset as u64,count)?;Ok(bytes)
+	}
+	pub fn commit(&mut self)->Result<()> {
+		require(!self.ready,"resident allocation is already committed")?;self.gpu.synchronize()?;
+		let mut wire=self.client.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(2)?;holder_write_text(&mut wire,&self.key)?;wire.flush()?;wire.read_status("resident commit")?;self.ready=true;Ok(())
+	}
+}
+#[cfg(unix)]
+impl Drop for ResidentWeightBuffer {
+	fn drop(&mut self) {
+		#[cfg(nvidia)] if let Driver::Cuda(driver)=&self.gpu.driver {
+			if self.gpu.activate().is_ok() {let status=unsafe {(driver.ipc_close)(self.pointer)};if status!=0 {eprintln!("resident IPC close failed: {status}");}}
+		}
+	}
+}
+#[cfg(unix)]
+pub struct ResidentRamBuffer {mapping:SharedResidentRam,key:String,client:ResidentWeightClient,ready:bool}
+#[cfg(unix)]
+impl ResidentRamBuffer {
+	pub fn address(&self)->usize {self.mapping.pointer}
+	pub fn bytes(&self)->usize {self.mapping.bytes}
+	pub fn device_address(&self,die:usize)->Result<u64> {
+		self.mapping.mapped.get(die).copied().filter(|pointer|*pointer!=0).ok_or_else(||RecipeError::new("resident RAM die is unavailable"))
+	}
+	pub fn ready(&self)->bool {self.ready}
+	pub fn write(&self,offset:usize,bytes:&[u8])->Result<()> {
+		require(!self.ready,"committed resident RAM cannot be seeded again")?;
+		require(offset.checked_add(bytes.len()).is_some_and(|end|end<=self.mapping.bytes),"resident RAM write exceeds allocation")?;
+		unsafe {ptr::copy_nonoverlapping(bytes.as_ptr(),(self.mapping.pointer as *mut u8).add(offset),bytes.len());}Ok(())
+	}
+	pub fn commit(&mut self)->Result<()> {
+		require(!self.ready,"resident RAM is already committed")?;
+		let mut wire=self.client.channel.lock().map_err(|_|RecipeError::new("resident weight connection is poisoned"))?;
+		wire.write_u8(2)?;holder_write_text(&mut wire,&self.key)?;wire.flush()?;wire.read_status("resident RAM commit")?;self.ready=true;Ok(())
+	}
+}
+#[cfg(unix)]
+fn resident_weight_seed()->Result<bool> {
+	match std::env::var("RECIPE_WEIGHT_HOLDER_MODE").as_deref() {Err(_)|Ok("attach")=>Ok(false),Ok("seed")=>Ok(true),_=>Err(RecipeError::new("RECIPE_WEIGHT_HOLDER_MODE must be attach or seed"))}
+}
+#[cfg(unix)]
+fn resident_weight_client()->Result<Option<&'static ResidentWeightClient>> {
+	let Some(path)=std::env::var_os("RECIPE_WEIGHT_HOLDER") else {return Ok(None);};
+	static CLIENT:std::sync::OnceLock<Result<ResidentWeightClient>>=std::sync::OnceLock::new();
+	CLIENT.get_or_init(|| {
+		let client=ResidentWeightClient::connect(Path::new(&path))?;
+		if resident_weight_seed()? {client.initialize()?;}
+		Ok(client)
+	}).as_ref().map(Some).map_err(Clone::clone)
+}
+#[cfg(unix)]
+fn resident_weight_key(gpu:&Gpu,bytes:usize,identity:&str)->Result<String> {
+	let mut uuid=[0u8;16];
+	#[cfg(nvidia)] if let Driver::Cuda(driver)=&gpu.driver {
+		gpu.activate()?;let get:unsafe extern "C" fn(*mut i32)->i32=driver._runtime.function(b"cuCtxGetDevice\0")?;
+		let query:unsafe extern "C" fn(*mut [u8;16],i32)->i32=driver._runtime.function(b"cuDeviceGetUuid\0")?;
+		let mut die=0;unsafe {gpu.status(get(&mut die),"resident identity device")?;gpu.status(query(&mut uuid,die),"resident identity UUID")?;}
+	}
+	let identity=format!("resident-weight-abi-1:{}:{uuid:?}:{bytes}:{identity}",gpu.name);
+	let mut child=Command::new("sha256sum").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().map_err(|error|RecipeError::new(format!("resident key SHA-256: {error}")))?;
+	child.stdin.take().ok_or_else(||RecipeError::new("resident key SHA-256 input is absent"))?.write_all(identity.as_bytes()).map_err(|error|RecipeError::new(format!("resident key SHA-256 input: {error}")))?;
+	let output=child.wait_with_output().map_err(|error|RecipeError::new(format!("resident key SHA-256 wait: {error}")))?;
+	require(output.status.success(),"resident key SHA-256 failed")?;
+	let text=String::from_utf8(output.stdout).map_err(|_|RecipeError::new("resident key SHA-256 output is invalid"))?;
+	let digest=text.split_whitespace().next().unwrap_or("");require(digest.len()==64 && digest.bytes().all(|byte|byte.is_ascii_hexdigit()),"resident key SHA-256 output differs")?;
+	Ok(format!("weights-v1-{digest}"))
+}
+fn resident_weight_credit(gpu:&Gpu)->Result<usize> {
+	#[cfg(unix)] if let Some(client)=resident_weight_client()? {
+		return client.allocations()?.iter().filter(|(_,name,_,ready)|name==&gpu.name && *ready).try_fold(0usize,|total,(_,_,bytes,_)|checked_add(total,*bytes,"resident held memory credit"));
+	}
+	Ok(0)
+}
 struct Remote {
 	channel: Mutex<RemoteChannel>,
 	wave: u32,
@@ -28791,6 +29257,12 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			let native_target = BackendTarget::Nvidia { architecture };
 			check(create(&mut context, 8, device), "context creation")?;
 			let cuda = Cuda {
+				host_register: runtime.function(b"cuMemHostRegister_v2\0")?,
+				host_unregister: runtime.function(b"cuMemHostUnregister\0")?,
+				ipc_export: runtime.function(b"cuIpcGetMemHandle\0")?,
+				ipc_open: runtime.function(b"cuIpcOpenMemHandle\0")?,
+				ipc_close: runtime.function(b"cuIpcCloseMemHandle\0")?,
+				copy_peer: runtime.function(b"cuMemcpyPeer\0")?,
 				host_alloc: runtime.function(b"cuMemHostAlloc\0")?,
 				host_device_pointer: runtime.function(b"cuMemHostGetDevicePointer_v2\0")?,
 				host_free: runtime.function(b"cuMemFreeHost\0")?,
@@ -29043,6 +29515,11 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+}
+#[cfg(target_os="linux")]
+unsafe extern "C" {
+	fn memfd_create(name:*const std::ffi::c_char,flags:u32)->i32;
+	fn fcntl(descriptor:i32,command:i32,...)->i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
