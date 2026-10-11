@@ -330,6 +330,8 @@ recipe schema finalize proposal.json answers.json schema.json
 
 `check` uses `curl` to send one active question at a time to a local Jev endpoint. Add `--model name` to select a model other than `jev-1.13`. Each request contains counts, dimensions, type evidence, and previous answers. It excludes column snippets and inactive questions. The command validates the categorical answers, writes the answers and loader schema, and prints one `id choice probability` line per question.
 
+The proposal, answers, and schema must name distinct files. The command rejects paths that differ only by letter case, including when the files do not exist yet.
+
 Column `snippets` contain the first, middle, and last row, with a zero-based `row`, up to 64 UTF-8 bytes of `text`, and the full value length in `bytes`. Empty tables have no snippets.
 
 The answers file names one choice for each question on the active branch:

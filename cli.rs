@@ -37,7 +37,7 @@ fn schema_file_identity(path: &Path) -> std::io::Result<(u64, u128)> {
 }
 
 fn schema_paths_distinct(paths: &[&str]) -> std::io::Result<()> {
-	let mut seen = Vec::<(PathBuf, Option<(u64, u128)>)>::new();
+	let mut seen = Vec::<(String, Option<(u64, u128)>)>::new();
 	for path in paths {
 		let path = Path::new(path);
 		let (resolved, identity) = match fs::canonicalize(path) {
@@ -52,10 +52,11 @@ fn schema_paths_distinct(paths: &[&str]) -> std::io::Result<()> {
 			}
 			Err(error) => return Err(error),
 		};
-		if seen.iter().any(|(other, file)| *other == resolved || identity.is_some() && identity == *file) {
-			return Err(std::io::Error::other("proposal, answers, and schema must name different files"));
+		let key = resolved.to_string_lossy().to_lowercase();
+		if seen.iter().any(|(other, file)| *other == key || identity.is_some() && identity == *file) {
+			return Err(std::io::Error::other("proposal, answers, and schema must name distinct files and differ beyond letter case"));
 		}
-		seen.push((resolved, identity));
+		seen.push((key, identity));
 	}
 	Ok(())
 }
