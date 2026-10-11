@@ -36051,7 +36051,7 @@ impl RatSession {
 impl RatState {
 	/// The valid choice nearest the proposal, each column scaled by the range
 	/// the choices span in it.
-	fn select(&self, proposal: &[f64]) -> Result<Vec<f64>> {
+	fn select(&self, proposal: &[f64], repeat: &mut RepeatPenalty) -> Result<Vec<f64>> {
 		require(proposal.len() == self.outputs.len() && proposal.iter().all(|value| value.is_finite()), "RAT proposal shape or values are invalid")?;
 		let ranges = (0..proposal.len())
 			.map(|column| {
@@ -36060,7 +36060,7 @@ impl RatState {
 				(low, high)
 			})
 			.collect::<Vec<_>>();
-		let mut best = None;
+		let (mut best, mut nearest) = (None, None);
 		for choice in &self.choices {
 			let mut distance = 0.0;
 			for (column, (low, high)) in ranges.iter().copied().enumerate() {
@@ -36072,11 +36072,22 @@ impl RatState {
 				distance += difference * difference;
 			}
 			require(distance.is_finite(), "RAT candidate distance overflow")?;
-			if best.as_ref().is_none_or(|(previous, _)| distance < *previous) {
-				best = Some((distance, choice));
+			if nearest.as_ref().is_none_or(|(previous, _)| distance < *previous) {
+				nearest = Some((distance, choice));
+			}
+			let key = self.values.iter().chain(choice).copied().collect::<Vec<_>>();
+			let favor = repeat.candidate_favor(&key, 1.0 / (1.0 + distance), self.choices.len());
+			if favor > 0.0 && best.as_ref().is_none_or(|(previous, _)| favor > *previous) {
+				best = Some((favor, choice));
 			}
 		}
-		Ok(best.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone())
+		if let Some((_, choice)) = best {
+			repeat.push(&self.values.iter().chain(choice).copied().collect::<Vec<_>>());
+			Ok(choice.clone())
+		} else {
+			// The finite choice set is exhausted; reuse a choice without a new proposal.
+			Ok(nearest.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone())
+		}
 	}
 }
 struct RatEpisode {
@@ -36087,7 +36098,7 @@ struct RatEpisode {
 /// One episode of a stateful evaluator: the proposer answers every state with
 /// the nearest valid choice until the evaluator scores the episode. Every
 /// observation is the state followed by the raw proposal.
-fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize) -> Result<RatEpisode> {
+fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize, repeat: &mut RepeatPenalty) -> Result<RatEpisode> {
 	let mut state = first;
 	let mut observations = Vec::new();
 	loop {
@@ -36095,7 +36106,7 @@ fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outp
 		tape.samples.write_float_bytes(0, &state.values, tape.program.artifact.layout.input_precision)?;
 		tape.forward(ForwardMode::Inference)?;
 		let proposal = tape.predictions_at(proposal_node as i32, outputs.len())?;
-		let action = state.select(&proposal)?;
+		let action = state.select(&proposal, repeat)?;
 		observations.push(state.values.iter().chain(&proposal).copied().collect());
 		session.send(&format!("choose {}", outputs.iter().zip(&action).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",")))?;
 		match session.frame()? {
@@ -36963,7 +36974,7 @@ impl Train {
 		let (penalty, window) = self.repeat.unwrap_or((config.rat_repeat_penalty, config.rat_repeat_window));
 		let mut repeat = RepeatPenalty::new(penalty, window)?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
-		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal, &mut repeat)?;
 		let initial_predictions = episode.action.clone();
 		let initial_reward = episode.score;
 		let initial_predicted_reward = tape.predictions()?[0];
@@ -36988,9 +36999,7 @@ impl Train {
 				replay.raw.pop_front();
 			}
 			for observation in &episode.observations {
-				let scored = repeat.score(observation, episode.score, target);
-				repeat.push(observation);
-				replay.observe(observation, scored)?;
+				replay.observe(observation, episode.score)?;
 			}
 			let (samples, targets) = replay.snapshot();
 			let fitted_rows = if let Some(selector) = &mut selector {
@@ -37017,7 +37026,7 @@ impl Train {
 				RatFrame::State(state) => state,
 				RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT reset did not produce a decision state")),
 			};
-			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal, &mut repeat)?;
 			predicted_reward = episode.observations.last().map(|observation| fitting.measure(observation, &[episode.score], config).map(EpochMetrics::predicted_mean)).transpose()?.unwrap_or(f64::NAN);
 			let epoch = iteration + 1;
 			let rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward: episode.score }, pred: RatModelPoint { r2: f64::NAN, reward: predicted_reward } };
