@@ -477,7 +477,7 @@ local.product.step:
 %local.value = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %local.sum, RECIPE_STATE %local.a, RECIPE_STATE %local.b.wide)
 %local.candidate = insertelement <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.current, RECIPE_STATE %local.value, i32 %local.product
 %local.product.next = add i32 %local.product, 1
-br label %local.product.loop
+br label %local.product.loop, !llvm.loop !0
 local.product.done:
 br i1 %local.k.more, label %local.k.loop, label %local.store
 local.store:
@@ -3014,3 +3014,8 @@ i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %length, i32 0,
 i32 %projection.gradient.offset, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k,
 i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) call void @llvm.amdgcn.s.barrier() %projection.next = add i32 %projection.gate, 1 br label %projection.loop
 invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = { nounwind "amdgpu-flat-work-group-size"="RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE" } attributes #1 = { alwaysinline nounwind } attributes #3 = { noinline nounwind }
+; The product loop must unroll completely: with the sums vector indexed by the
+; loop counter every backend spills it to scratch, and AMD scratch frames grow
+; past the compiler limit.
+!0 = distinct !{!0, !1}
+!1 = !{!"llvm.loop.unroll.full"}
