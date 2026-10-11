@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Verifies the file's canonical model on token pairs from README.md. Vocabulary
 # targets retain its pretrained output head. MSE is measured over one-hot targets.
-# Usage: RECIPE_TRAIN_GGUF=/path/model.gguf .github/runtime/train-check.sh
+# Usage: RECIPE_TRAIN_GGUF=/path/model.gguf RECIPE_TRAIN_DEVICE=cpu .github/runtime/train-check.sh
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 recipe=${RECIPE_BIN:-$root/target/release/recipe}
+device=${RECIPE_TRAIN_DEVICE:-cpu}
 gguf=${RECIPE_TRAIN_GGUF:?RECIPE_TRAIN_GGUF must name a GGUF file}
 work=${RECIPE_TRAIN_WORK:-$(mktemp -d /home/nate/codex/recipe-train-XXXXXX)}
 mkdir -p "$work"
@@ -83,7 +84,11 @@ fn main() {
 RECIPE
 
 for run in 1 2; do
-	if ! (cd "$work" && RECIPE_FORCE_CPU=1 "$recipe" run "$script" --device cpu --cfg stored) > "$work/run-$run.log" 2>&1; then
+	if ! (
+		cd "$work"
+		if [ "$device" = cpu ]; then export RECIPE_FORCE_CPU=1; else unset RECIPE_FORCE_CPU; fi
+		"$recipe" run "$script" --device "$device" --cfg stored
+	) > "$work/run-$run.log" 2>&1; then
 		tail -n 20 "$work/run-$run.log" >&2
 		exit 1
 	fi
