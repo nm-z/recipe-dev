@@ -51,6 +51,10 @@ Build with `CARGO_BUILD_JOBS=3` and
 Delete that target directory after the PR is merged or closed. Evidence
 directories contain logs and small outputs.
 
+Wrap each build or test command on Benji with
+`flock --close /home/nate/work/.build-slot-$((RANDOM%4+1)).lock`, and run it with
+`nice -n 19`. Run one command at a time for this worker.
+
 The evaluator's syntax check and historical-trace rejection run on Benji.
 The original Flash Next capture fails with `no captured per-device compute
 nodes` before SASS processing. CPU execution does not establish the held-out
