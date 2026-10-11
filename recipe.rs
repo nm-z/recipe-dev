@@ -2860,9 +2860,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
 			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
 			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
+			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
 			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			// Clang stamps its own newest PTX ISA and ignores the requested one, so the generator pins it instead, and the driver JIT then loads the artifact on every driver at or above that version.
+			// Both stages take the pinned ISA: the bitcode step rejects any target newer than its own default, and the generator stamps the version into the artifact so the driver JIT loads it on every driver at or above that version.
 			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
 			let mut llc = Command::new(generator);
 			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
