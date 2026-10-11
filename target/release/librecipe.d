@@ -1,0 +1,1 @@
+/home/nate/Developer/rev685/head/target/release/librecipe.rlib: /home/nate/Developer/rev685/head/Cargo.toml /home/nate/Developer/rev685/head/amd-nv-cpu.ll /home/nate/Developer/rev685/head/build.rs /home/nate/Developer/rev685/head/recipe.rs
