@@ -36050,8 +36050,8 @@ impl RatSession {
 	}
 }
 impl RatState {
-	/// The valid choice nearest the proposal, each column scaled by the range
-	/// the choices span in it.
+	/// The valid choice nearest the proposal after repetition adjustment, with
+	/// each column scaled by the range the choices span in it.
 	fn select(&self, proposal: &[f64], repeat: &mut RepeatPenalty) -> Result<Vec<f64>> {
 		require(proposal.len() == self.outputs.len() && proposal.iter().all(|value| value.is_finite()), "RAT proposal shape or values are invalid")?;
 		let ranges = (0..proposal.len())
@@ -36100,7 +36100,7 @@ struct RatEpisode {
 	action: Vec<f64>,
 }
 /// One episode of a stateful evaluator: the proposer answers every state with
-/// the nearest valid choice until the evaluator scores the episode. Every
+/// a repetition-adjusted valid choice until the evaluator scores the episode. Every
 /// observation is the state followed by the raw proposal.
 fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize, repeat: &mut RepeatPenalty) -> Result<RatEpisode> {
 	let mut state = first;
@@ -36707,10 +36707,10 @@ impl Train {
 		self.rat_target = Some(value);
 		self
 	}
-	/// Command-RAT repetition penalty, the rule of `Sampler::repeat`: a proposal
-	/// that matches one of the last `window` proposals has its score moved away
-	/// from the `.target()` by `penalty` before the evaluator sees it. The
-	/// default comes from `rat-repeat-penalty` and `rat-repeat-window` in `Cargo.toml`.
+	/// The `Sampler::repeat` rule over the last `window` RAT proposals. Repeated
+	/// command scores move away from `.target()` before evaluator fitting;
+	/// stateful choice favorability is adjusted before selecting an action.
+	/// Defaults come from `rat-repeat-penalty` and `rat-repeat-window` in `Cargo.toml`.
 	pub fn repeat(mut self, penalty: f64, window: usize) -> Self {
 		assert!(penalty.is_finite() && penalty >= 1.0, "RAT repeat penalty must be finite and at least one");
 		self.repeat = Some((penalty, window));
