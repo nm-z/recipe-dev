@@ -78,6 +78,9 @@ fn main() {
 			elif $mode == "extra" then .answers.unasked = .answers[$id]
 			elif $mode == "probability" then .answers[$id].probabilities[$choice] = 2
 			elif $mode == "distribution" then .answers[$id].probabilities[$choice] = 0.5
+			elif $mode == "contradiction" then (.answers[$id].probabilities | keys | map(select(. != $choice))[0]) as $other |
+				.answers[$id].probabilities |= with_entries(.value = (if .key == $choice then 0.1 elif .key == $other then 0.9 else 0 end))
+			elif $mode == "tie" then (.answers[$id].probabilities | length) as $count | .answers[$id].probabilities |= with_entries(.value = (1 / $count))
 			elif $mode == "type" then .answers[$id].type = "noul"
 			else . end
 		"#;
@@ -127,6 +130,37 @@ cmp "$work/decisions.txt" "$work/repeated.txt"
 [[ $(wc -l < "$work/decisions.txt") == 4 ]]
 pass 'deterministic probe, round trip, and finalize'
 
+# Aliases must fail before a request or a write, preserving all existing files.
+sha256sum "$work/proposal.json" "$work/answers.json" "$work/schema.json" > "$work/before-aliases.sha256"
+before_requests=$(printf '%s\n' "$work"/request-*.json | wc -l)
+reject_paths() {
+	if "$bin" schema check "$work/proposal.json" "$1" "$2" --jev "$endpoint" > "$work/alias.log" 2>&1; then echo 'accepted schema file aliases' >&2; exit 1; fi
+	sha256sum -c "$work/before-aliases.sha256" > "$work/alias-hashes.log"
+	[[ $(printf '%s\n' "$work"/request-*.json | wc -l) == "$before_requests" ]]
+}
+reject_paths "$work/answers.json" "$work/./answers.json"
+reject_paths "$work/answers.json" "$work/./proposal.json"
+reject_paths "$work/./proposal.json" "$work/schema.json"
+reject_paths "$work/fresh.json" "$work/./fresh.json"
+mkdir -p "$work/alias-directory"
+reject_paths "$work/answers.json" "$work/alias-directory/../answers.json"
+ln -sf "$work/answers.json" "$work/answer-link.json"
+reject_paths "$work/answer-link.json" "$work/answers.json"
+ln -sf "$work/proposal.json" "$work/proposal-link.json"
+reject_paths "$work/answers.json" "$work/proposal-link.json"
+rm -f "$work/proposal-hardlink.json"
+ln "$work/proposal.json" "$work/proposal-hardlink.json"
+reject_paths "$work/answers.json" "$work/proposal-hardlink.json"
+ln -sf "$work/fresh.json" "$work/dangling-link.json"
+reject_paths "$work/fresh.json" "$work/dangling-link.json"
+[[ ! -e "$work/fresh.json" ]]
+pass 'reject path, symlink, and hard-link aliases before requests or writes'
+
+printf 'tie' > "$work/mode"
+check
+jq -e '.answers | all(.probability > 0 and .probability <= 1)' "$work/answers.json" >/dev/null
+pass 'accept a highest-probability tie'
+
 printf 'correct' > "$work/mode"
 printf '1,2\n3,4\n5,6\n' > "$work/headerless.csv"
 probe "$work/headerless.csv"
@@ -147,7 +181,7 @@ jq -e '.tables.entries[0].columns[0].snippets | length == 3 and all(.text | utf8
 check
 if rg -q 'Sample 00000|engine works under load' "$work"/request-*.json; then echo 'cell value sent to Jev' >&2; exit 1; fi
 pass 'bounded snippets excluded from Jev requests'
-for mode in offered missing extra probability distribution type http bad-feature; do
+for mode in offered missing extra probability distribution contradiction type http bad-feature; do
 	printf '%s' "$mode" > "$work/mode"
 	reject "reject $mode without output files"
 done

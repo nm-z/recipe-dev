@@ -7,6 +7,59 @@ fn invalid(message: &str) -> ! {
 	std::process::exit(2)
 }
 
+fn schema_file_identity(path: &Path) -> std::io::Result<(u64, u128)> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		let metadata = fs::metadata(path)?;
+		Ok((metadata.dev(), u128::from(metadata.ino())))
+	}
+	#[cfg(windows)]
+	{
+		use std::os::windows::io::AsRawHandle;
+		#[repr(C)]
+		#[derive(Default)]
+		struct FileId { volume: u64, id: [u8; 16] }
+		#[link(name = "kernel32")]
+		unsafe extern "system" {
+			fn GetFileInformationByHandleEx(handle: *mut std::ffi::c_void, class: i32, info: *mut std::ffi::c_void, size: u32) -> i32;
+		}
+		let file = fs::File::open(path)?;
+		let mut info = FileId::default();
+		// FileIdInfo returns the volume and full 128-bit file ID, including on ReFS.
+		if unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 18, (&mut info as *mut FileId).cast(), std::mem::size_of::<FileId>() as u32) } == 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		Ok((info.volume, u128::from_le_bytes(info.id)))
+	}
+	#[cfg(not(any(unix, windows)))]
+	{ Err(std::io::Error::other("schema file identity is unsupported on this platform")) }
+}
+
+fn schema_paths_distinct(paths: &[&str]) -> std::io::Result<()> {
+	let mut seen = Vec::<(PathBuf, Option<(u64, u128)>)>::new();
+	for path in paths {
+		let path = Path::new(path);
+		let (resolved, identity) = match fs::canonicalize(path) {
+			Ok(resolved) => {
+				let identity = schema_file_identity(&resolved)?;
+				(resolved, Some(identity))
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() => {
+				let name = path.file_name().ok_or_else(|| std::io::Error::other("schema path must name a file"))?;
+				let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+				(fs::canonicalize(parent)?.join(name), None)
+			}
+			Err(error) => return Err(error),
+		};
+		if seen.iter().any(|(other, file)| *other == resolved || identity.is_some() && identity == *file) {
+			return Err(std::io::Error::other("proposal, answers, and schema must name different files"));
+		}
+		seen.push((resolved, identity));
+	}
+	Ok(())
+}
+
 fn jev_endpoint(endpoint: &str) -> bool {
 	let Some(address) = endpoint.strip_prefix("http://").map(|rest| rest.split('/').next().unwrap_or(rest)) else { return false };
 	let Some((node, port)) = address.rsplit_once(':') else { return false };
@@ -234,7 +287,8 @@ fn main() {
 						Some("--model") => arguments.next().unwrap_or_else(|| invalid(USAGE)),
 						_ => invalid(USAGE),
 					};
-					if arguments.next().is_some() || answers == output || answers == path || output == path { invalid(USAGE); }
+					if arguments.next().is_some() { invalid(USAGE); }
+					schema_paths_distinct(&[&path, &answers, &output]).unwrap_or_else(|error| invalid(&error.to_string()));
 					let (document, schema, decisions) = recipe::check_data_schema(&path, &model, |request| jev_request(&endpoint, request))
 						.unwrap_or_else(|error| invalid(&error.to_string()));
 					fs::write(&answers, document).unwrap_or_else(|error| invalid(&format!("cannot write {answers}: {error}")));

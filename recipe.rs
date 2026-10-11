@@ -34014,18 +34014,20 @@ pub fn check_data_schema(proposal: impl AsRef<Path>, model: &str, mut ask: impl 
 		require(choices.contains(&choice), format!("answer {id} selected {choice:?}, which the question does not offer"))?;
 		let JsonValue::Object(probabilities) = data_field(answer, "probabilities")? else { return Err(RecipeError::new(format!("question {id} probabilities must be an object"))) };
 		require(probabilities.len() == choices.len(), format!("question {id} probabilities must name every offered choice"))?;
-		let (mut seen, mut sum, mut selected) = (BTreeSet::new(), 0.0, 0.0);
+		let (mut seen, mut sum, mut selected, mut maximum) = (BTreeSet::new(), 0.0, 0.0, 0.0_f64);
 		for (label, value) in probabilities {
 			require(choices.contains(&label.as_str()) && seen.insert(label), format!("question {id} probability label {label:?} is unknown or repeated"))?;
 			let JsonValue::Number(value) = value else { return Err(RecipeError::new(format!("question {id} probability must be numeric"))) };
 			let probability = value.parse::<f64>().map_err(|_| RecipeError::new(format!("question {id} probability is invalid")))?;
 			require((0.0..=1.0).contains(&probability), format!("question {id} probability is outside 0 to 1"))?;
 			sum += probability;
+			maximum = maximum.max(probability);
 			if label == choice {
 				selected = probability;
 			}
 		}
 		require((sum - 1.0_f64).abs() <= 1e-6, format!("question {id} probabilities do not sum to 1"))?;
+		require(selected == maximum, format!("question {id} choice is not a highest-probability option"))?;
 		records.push(format!("{{\"id\":{},\"choice\":{},\"probability\":{selected}}}", data_json_string(id), data_json_string(choice)));
 		decided.insert(id.to_owned(), choice.to_owned());
 	}
