@@ -1,0 +1,1 @@
+Sample 01706: the compiler converges with new data.

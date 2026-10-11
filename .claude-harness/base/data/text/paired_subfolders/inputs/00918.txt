@@ -1,0 +1,1 @@
+Sample 00918: the device passes under load. It says, "check input, then retry."

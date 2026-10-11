@@ -1,0 +1,1 @@
+Sample 01538: the compiler converges on device.

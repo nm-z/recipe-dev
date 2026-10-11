@@ -1,0 +1,1 @@
+Sample 00650: the compiler converges under load.

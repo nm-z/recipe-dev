@@ -1,0 +1,1 @@
+Sample 00979: the kernel breaks on device.

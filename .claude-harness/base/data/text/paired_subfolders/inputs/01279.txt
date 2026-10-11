@@ -1,0 +1,1 @@
+Sample 01279: the signal breaks under load.

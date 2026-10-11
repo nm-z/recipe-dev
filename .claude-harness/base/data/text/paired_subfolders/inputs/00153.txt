@@ -1,0 +1,1 @@
+Sample 00153: the sensor diverges during testing. It says, "check input, then retry."

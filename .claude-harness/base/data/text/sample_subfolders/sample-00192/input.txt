@@ -1,0 +1,1 @@
+Sample 00192: the engine works with new data.

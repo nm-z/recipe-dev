@@ -1,0 +1,24 @@
+Sample 00000: the engine works under load. It says, "check input, then retry."
+Sample 00001: the sensor fails under load.
+Sample 00002: the compiler converges under load.
+Sample 00003: the kernel drifts after training.
+Sample 00004: the model improves after training.
+Sample 00005: the dataset stalls after training.
+Sample 00006: the device passes on device.
+Sample 00007: the signal breaks on device.
+Sample 00008: the engine responds on device.
+Sample 00009: the sensor diverges during testing.
+Sample 00010: the compiler learns during testing.
+Sample 00011: the kernel lags during testing.
+Sample 00012: the model works with new data.
+Sample 00013: the dataset fails with new data.
+Sample 00014: the device converges with new data.
+Sample 00015: the signal drifts at night.
+Sample 00016: the engine improves at night.
+Sample 00017: the sensor stalls at night. It says, "check input, then retry."
+Sample 00018: the compiler passes under load.
+Sample 00019: the kernel breaks under load.
+Sample 00020: the model responds under load.
+Sample 00021: the dataset diverges after training.
+Sample 00022: the device learns after training.
+Sample 00023: the signal lags after training.

@@ -1,0 +1,1 @@
+Sample 01139: the kernel lags after training. It says, "check input, then retry."

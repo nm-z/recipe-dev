@@ -1,0 +1,1 @@
+Sample 01663: the signal breaks on device.

@@ -1,0 +1,1481 @@
+diff --git a/recipe.rs b/recipe.rs
+index b092d1f0..16a3997b 100644
+--- a/recipe.rs
++++ b/recipe.rs
+@@ -1016,8 +1016,14 @@ const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
+ const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
+ const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
+ const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
+-const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888884488888884";
+-const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888884444444444";
++const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
++const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
++/// Epoch phase bits: the same fused epoch kernel runs its gradient section
++/// (clear, forward, loss, reverse) under bit 0 and its AdamW update under
++/// bit 1. A single-device route always dispatches both bits in one launch.
++const EPOCH_PHASE_GRADIENT: i32 = 1;
++const EPOCH_PHASE_UPDATE: i32 = 2;
++const EPOCH_PHASE_FUSED: i32 = EPOCH_PHASE_GRADIENT | EPOCH_PHASE_UPDATE;
+ const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
+ macro_rules! native_precisions {
+ 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
+@@ -1090,14 +1096,18 @@ pub(crate) struct NativeModelIr {
+ 	layout: NativeLayout,
+ 	precision: NativePrecision,
+ 	rows: usize,
++	loss_rows: usize,
+ 	schedule: NativeSchedule,
+ 	plans: Vec<NodePlan>,
+ 	storage_bytes: usize,
+ }
+ 
+ impl NativeModelIr {
+-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule) -> Result<Self> {
+-		require(rows != 0, "native model rows must be positive")?;
++	/// `loss_rows` is the complete batch the loss normalizes over. A shard of a
++	/// wider route holds `rows` of them, so shard losses and loss gradients sum
++	/// to exactly the unsharded quantities.
++	pub(crate) fn from_graph(graph: &Graph, rows: usize, loss_rows: usize, precision: Compute, schedule: NativeSchedule) -> Result<Self> {
++		require(rows != 0 && loss_rows >= rows, "native model rows must be positive")?;
+ 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
+ 		let precision = NativePrecision::new(precision)?;
+ 		let mut plans = Vec::with_capacity(graph.nodes.len());
+@@ -1120,7 +1130,7 @@ impl NativeModelIr {
+ 			}
+ 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
+ 		}
+-		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes })
++		Ok(Self { graph: graph.clone(), layout, precision, rows, loss_rows, schedule, plans, storage_bytes })
+ 	}
+ 	fn storage(&self) -> Vec<u8> {
+ 		let mut storage = Vec::with_capacity(self.storage_bytes);
+@@ -2400,9 +2410,14 @@ impl NativeModelIr {
+ 		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
+ 		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
+ 		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
+-		let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
+-		body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
+-		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
++		let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step, i32 %phase");
++		// The phase argument is grid-uniform, so every thread takes the same
++		// branch and the barriers inside each section stay collective. A fused
++		// dispatch runs both sections exactly as the unpartitioned kernel did;
++		// a sharded route runs the gradient section on every device, exchanges
++		// the accumulated gradient, and runs the update section once.
++		body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%phase.gradient.bit = and i32 %phase, 1\n%phase.gradient.on = icmp ne i32 %phase.gradient.bit, 0\nbr i1 %phase.gradient.on, label %phase.gradient, label %phase.select\nphase.gradient:\n"));
++		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "phase.gradient")?);
+ 		body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
+ 		body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
+ 		body.push_str(barrier(backend));
+@@ -2411,15 +2426,20 @@ impl NativeModelIr {
+ 		body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
+ 		body.push_str(barrier(backend));
+ 		body.push_str(&reverse);
++		body.push_str("br label %phase.select\nphase.select:\n%phase.update.bit = and i32 %phase, 2\n%phase.update.on = icmp ne i32 %phase.update.bit, 0\nbr i1 %phase.update.on, label %optimizer.entry, label %phase.exit\n");
+ 		body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
+-		body.push_str("ret void\n}\n");
++		body.push_str("br label %phase.exit\nphase.exit:\nret void\n}\n");
+ 		ir.push_str(&body);
+ 		Ok(prune_internal_definitions(ir))
+ 	}
+ 
+ 	fn emit_loss_and_seed(&self, backend: Backend, loss: LossFunction, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize) -> Result<String> {
+ 		let output = self.graph.output.elements();
+-		let items = checked_mul(self.rows, output, "native loss items")?;
++		// The loops walk this shard's own predictions while the loss and its
++		// gradient normalize over the complete route batch, so shard partials
++		// combine into exactly the unpartitioned objective.
++		let extent = checked_mul(self.rows, output, "native loss extent")?;
++		let items = checked_mul(self.loss_rows, output, "native loss items")?;
+ 		let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
+ 		let prediction_offset = last.value;
+ 		let adjoint_offset = last.adjoint;
+@@ -2430,7 +2450,7 @@ impl NativeModelIr {
+ 		if loss.0 <= 1 {
+ 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
+ 		}
+-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
++		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {extent}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+ 		let prediction = "%loss.prediction";
+ 		let target = "%loss.target";
+ 		let pred_ptr = "%loss.prediction.ptr";
+@@ -2458,7 +2478,7 @@ impl NativeModelIr {
+ 		} else {
+ 			zero.as_str()
+ 		};
+-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
++		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {extent}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+ 		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
+ 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
+ 		Ok(ir)
+@@ -2468,7 +2488,7 @@ impl NativeModelIr {
+ 		let parameters = i32::try_from(self.graph.parameters.len()).map_err(|_| RecipeError::new("native parameter count exceeds i32"))?;
+ 		let one = native_literal(state_precision, state_ty, 1.0);
+ 		let mut ir = String::new();
+-		ir.push_str(&format!("br label %optimizer.entry\noptimizer.entry:\n%optimizer.base = add i32 0, %tid\nbr label %optimizer.loop\noptimizer.loop:\n%optimizer.p = phi i32 [ %optimizer.base, %optimizer.entry ], [ %optimizer.next, %optimizer.advance ]\n%optimizer.more = icmp ult i32 %optimizer.p, {parameters}\nbr i1 %optimizer.more, label %optimizer.step, label %optimizer.done\noptimizer.step:\n"));
++		ir.push_str(&format!("optimizer.entry:\n%optimizer.base = add i32 0, %tid\nbr label %optimizer.loop\noptimizer.loop:\n%optimizer.p = phi i32 [ %optimizer.base, %optimizer.entry ], [ %optimizer.next, %optimizer.advance ]\n%optimizer.more = icmp ult i32 %optimizer.p, {parameters}\nbr i1 %optimizer.more, label %optimizer.step, label %optimizer.done\noptimizer.step:\n"));
+ 		ir.push_str(&format!("%optimizer.frozen.ptr = getelementptr i8, {pointer} %frozen, i32 %optimizer.p\n%optimizer.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %optimizer.p\n%optimizer.moment.ptr = getelementptr {state_ty}, {pointer} %moments, i32 %optimizer.p\n%optimizer.variance.ptr = getelementptr {state_ty}, {pointer} %variances, i32 %optimizer.p\n%optimizer.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %optimizer.p\n"));
+ 		ir.push_str(&format!("%optimizer.frozen.value = load i8, {pointer} %optimizer.frozen.ptr, align 1\n%optimizer.is.frozen = icmp ne i8 %optimizer.frozen.value, 0\nbr i1 %optimizer.is.frozen, label %optimizer.advance, label %optimizer.update\noptimizer.update:\n"));
+ 		ir.push_str(&format!("%optimizer.gradient.model = load {model_ty}, {pointer} %optimizer.gradient.ptr, align {model_align}\n%optimizer.gradient.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.gradient.model)\n%optimizer.moment.old = load {state_ty}, {pointer} %optimizer.moment.ptr, align {state_align}\n%optimizer.variance.old = load {state_ty}, {pointer} %optimizer.variance.ptr, align {state_align}\n%optimizer.weight.model = load {model_ty}, {pointer} %optimizer.weight.ptr, align {model_align}\n%optimizer.weight.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.weight.model)\n"));
+@@ -2865,9 +2885,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
+ 	}
+ }
+ 
+-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
++pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, loss_rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+ 	target.validate()?;
+-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
++	let model = NativeModelIr::from_graph(graph, rows, loss_rows, precision, schedule)?;
+ 	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| model.schedule.matrix);
+ 	let ir = model.emit(target.backend(), matrix, loss)?;
+ 	let key = native_artifact_key(target, &ir);
+@@ -3455,13 +3475,13 @@ use std::{
+ 	error::Error,
+ 	ffi::c_void,
+ 	fmt, fs,
+-	io::{IsTerminal, Write},
++	io::{IsTerminal, Read, Write},
+ 	mem::{size_of, size_of_val},
+ 	path::{Path, PathBuf},
+ 	process::Command,
+ 	ptr,
+ 	sync::{
+-		Mutex, OnceLock,
++		Arc, Mutex, OnceLock,
+ 		atomic::{AtomicBool, AtomicU64, Ordering},
+ 	},
+ 	time::{Duration, Instant},
+@@ -4915,7 +4935,7 @@ impl Recipe {
+ 		let result = bundle::run_infer(&path, input, |stored, samples| {
+ 			let config = Config::load()?;
+ 			let graph = materialize_saved_graph(stored, samples, device, config)?;
+-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, stored.model.loss)?;
++			let mut tape = NativeTape::new(&graph, samples, &[], &[device], stored.precision, stored.model.loss)?;
+ 			tape.inject_bn_stats(&stored.bn_stats)?;
+ 			tape.forward()?;
+ 			tape.predictions()
+@@ -5574,8 +5594,17 @@ struct NativeContractionShapes {
+ 	previous: Tile,
+ 	parameters: usize,
+ }
++/// The one placement policy: `multi-device = false | true | "auto"` in
++/// `[package.metadata.recipe]`. There is no code-side fallback value.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Placement {
++	Local,
++	Forced,
++	Auto,
++}
+ #[derive(Clone, Copy)]
+ struct Config {
++	multi_device: Placement,
+ 	kmeans_iterations: usize,
+ 	svm_iterations: usize,
+ 	svm_rate: f64,
+@@ -5610,7 +5639,7 @@ struct Config {
+ 	precision: Compute,
+ }
+ impl Config {
+-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
++	fn load() -> Result<Self> { Ok(Self { multi_device: match env!("RECIPE_MULTI_DEVICE") { "false" => Placement::Local, "true" => Placement::Forced, "auto" => Placement::Auto, value => return Err(RecipeError::new(format!("invalid multi-device placement {value:?}"))) }, kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+ }
+ fn number(name: &str, text: &str) -> Result<f64> {
+ 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
+@@ -5635,13 +5664,13 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
+ 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
+ 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
+ }
+-struct NativeTape {
++/// One device's placement of the model: every buffer the graph needs on that
++/// device and the contiguous rows the device trains on.
++struct Shard {
+ 	program: NativeProgram,
+-	precision: NativePrecision,
+ 	values: Buffer,
+ 	contexts: Buffer,
+ 	adjoints: Buffer,
+-	batch_normalizations: Vec<(usize, usize)>,
+ 	samples: Buffer,
+ 	input_adjoint: Buffer,
+ 	targets: Buffer,
+@@ -5651,36 +5680,102 @@ struct NativeTape {
+ 	variances: Buffer,
+ 	gradient: Buffer,
+ 	metrics: Buffer,
+-	best_loss: [f64; 4],
+ 	rows: u32,
++}
++unsafe impl Send for Shard {}
++/// The model placed across one route. A route of one device holds one shard
++/// and moves nothing; a wider route holds one shard per device and every epoch
++/// aggregates the shard gradients into one optimizer update on the first
++/// device, then returns the updated persistent state to every shard.
++struct NativeTape {
++	shards: Vec<Shard>,
++	precision: NativePrecision,
++	batch_normalizations: Vec<(usize, usize)>,
++	best_loss: [f64; 4],
+ 	parameters: usize,
+ 	step: u32,
+ 	output: usize,
+ 	capacity: usize,
++	loss: LossFunction,
+ }
+ macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
+-impl NativeTape {
+-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: LossFunction) -> Result<Self> {
++/// Contiguous row blocks: each shard takes `rows / devices` rows and the
++/// leading shards take the remainder, so predictions stay in row order.
++fn shard_rows(rows: usize, devices: usize) -> Vec<usize> { (0..devices).map(|index| rows / devices + usize::from(index < rows % devices)).collect() }
++#[derive(Clone, Copy)]
++enum MovementKind {
++	Metric,
++	Gradient,
++	Aggregate,
++	Weights,
++	Moments,
++	Variances,
++}
++struct Movement {
++	shard: usize,
++	upload: bool,
++	bytes: usize,
++	kind: MovementKind,
++}
++/// The exact transfers one route epoch performs, in execution order: each
++/// shard's loss metric, then for a wider route each shard's gradient, the
++/// aggregated gradient back to the first device, and the separate weight,
++/// moment, and variance movements that return the updated persistent state to
++/// every shard. The executor performs this list and the route predictor prices
++/// this list.
++fn route_movement(shards: usize, parameters: usize, precision: NativePrecision) -> Vec<Movement> {
++	let model = parameters * precision.model.bytes();
++	let state = parameters * precision.state.bytes();
++	let mut moves = Vec::new();
++	for shard in 0..shards {
++		moves.push(Movement { shard, upload: false, bytes: precision.state.bytes(), kind: MovementKind::Metric });
++	}
++	if shards < 2 {
++		return moves;
++	}
++	for shard in 0..shards {
++		moves.push(Movement { shard, upload: false, bytes: model, kind: MovementKind::Gradient });
++	}
++	moves.push(Movement { shard: 0, upload: true, bytes: model, kind: MovementKind::Aggregate });
++	for (kind, bytes) in [(MovementKind::Weights, model), (MovementKind::Moments, state), (MovementKind::Variances, state)] {
++		moves.push(Movement { shard: 0, upload: false, bytes, kind });
++		for shard in 1..shards {
++			moves.push(Movement { shard, upload: true, bytes, kind });
++		}
++	}
++	moves
++}
++/// Shard losses and loss gradients are normalized by the complete route batch,
++/// so every mean-family loss combines by summation. The root-mean-square loss
++/// stores the root of its shard partial and scales its gradient seed by that
++/// local root, so its exact combination is the root of the summed squares with
++/// each shard gradient rescaled by local root over route root.
++fn combined_objective(loss: LossFunction, metrics: &[f64]) -> f64 {
++	if let [only] = metrics {
++		return *only;
++	}
++	if loss.0 == 1 { metrics.iter().map(|metric| metric * metric).sum::<f64>().sqrt() } else { metrics.iter().sum() }
++}
++fn gradient_scales(loss: LossFunction, metrics: &[f64]) -> Vec<f64> {
++	if loss.0 != 1 {
++		return vec![1.0; metrics.len()];
++	}
++	let total = combined_objective(loss, metrics);
++	metrics.iter().map(|metric| if total > 0.0 { metric / total } else { 0.0 }).collect()
++}
++impl Shard {
++	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: LossFunction, loss_rows: usize) -> Result<Self> {
+ 		let input = graph.input.elements();
+-		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
+ 		let rows = samples.len() / input;
+-		let output = graph.output.elements();
+-		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
+-		let program = gpu.native_program(graph, rows, precision, loss)?;
++		let program = gpu.native_program(graph, rows, loss_rows, precision, loss)?;
+ 		let precision = program.artifact.precision;
+ 		let layout = program.artifact.layout.clone();
+ 		let parameters = graph.parameters.len();
+ 		let zeros = vec![0.0; parameters.max(1)];
+ 		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
+-		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
+-		require(graph.state.variances.is_empty() || graph.state.variances.len() == parameters, "saved optimizer variances have the wrong shape")?;
+-		require(graph.frozen.is_empty() || graph.frozen.len() == parameters, "frozen parameters have the wrong shape")?;
+ 		let moments = if graph.state.moments.is_empty() { zeros.clone() } else { graph.state.moments.clone() };
+ 		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
+ 		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
+-		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
+-		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
+-		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
+ 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
+ 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
+ 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
+@@ -5696,11 +5791,9 @@ impl NativeTape {
+ 		}
+ 		Ok(Self {
+ 			program,
+-			precision,
+ 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
+ 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
+ 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
+-			batch_normalizations,
+ 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
+ 			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
+ 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
+@@ -5710,58 +5803,27 @@ impl NativeTape {
+ 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
+ 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
+ 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
+-			best_loss,
+ 			rows: narrow(rows, "native rows")? as u32,
+-			parameters,
+-			step,
+-			output,
+-			capacity: rows,
+ 		})
+ 	}
+-	fn forward(&mut self) -> Result<()> {
++	fn forward(&self) -> Result<()> {
+ 		let threads = self.program.forward.geometry.threads()?;
+ 		let rows = self.rows;
+ 		let thread_count = threads;
+ 		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
+-		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+-		Ok(())
++		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))
+ 	}
+-	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
+-		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+-		require(stats.len() == expected, format!("batch normalization expected {expected} saved statistics, received {}", stats.len()))?;
+-		let mut offset = 0;
+-		for &(node, channels) in &self.batch_normalizations {
+-			let end = offset + 2 * channels;
+-			self.contexts.write_float_bytes(self.program.artifact.layout.contexts[node], &stats[offset..end], self.precision.model)?;
+-			offset = end;
+-		}
+-		Ok(())
+-	}
+-	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
+-		let mut stats = Vec::new();
+-		for &(node, channels) in &self.batch_normalizations {
+-			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
+-		}
+-		Ok(stats)
+-	}
+-	fn predictions(&self) -> Result<Vec<f64>> {
+-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+-		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+-	}
+-	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+-		require(self.step != 0, "optimizer epoch is absent")?;
++	fn epoch_phase(&self, rate: f64, config: Config, phase: i32, precision: NativePrecision, step: u32) -> Result<()> {
+ 		let threads = self.program.epoch.geometry.threads()?;
+ 		let rows = self.rows;
+ 		let thread_count = threads;
+-		let beta1 = self.precision.state.below_one(config.beta1);
+-		let beta2 = self.precision.state.below_one(config.beta2);
+-		let epsilon = self.precision.state.optimizer_epsilon(config.epsilon);
+-		let beta1_power = beta1.powi(self.step as i32);
+-		let beta2_power = beta2.powi(self.step as i32);
++		let beta1 = precision.state.below_one(config.beta1);
++		let beta2 = precision.state.below_one(config.beta2);
++		let epsilon = precision.state.optimizer_epsilon(config.epsilon);
++		let beta1_power = beta1.powi(step as i32);
++		let beta2_power = beta2.powi(step as i32);
+ 		let decay = config.decay;
+-		let step = self.step;
+-		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| self.precision.state.pack(value));
++		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| precision.state.pack(value));
+ 		let mut call = ptrs![
+ 			self.samples.pointer,
+ 			self.targets.pointer,
+@@ -5784,12 +5846,151 @@ impl NativeTape {
+ 			encoded[4],
+ 			encoded[5],
+ 			encoded[6],
+-			step
++			step,
++			phase
+ 		];
+-		debug(&format!("epoch {step} launch"))?;
++		debug(&format!("epoch {step} launch phase={phase} device={}", self.program.gpu.canonical()))?;
+ 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
+-		debug(&format!("epoch {step} launch complete"))?;
+-		let objective = self.metrics.download_float(1, self.precision.state)?[0];
++		debug(&format!("epoch {step} launch complete"))
++	}
++	fn predictions(&self, output: usize, precision: NativePrecision) -> Result<Vec<f64>> {
++		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
++		let values = self.values.download_float_bytes(offset, self.rows as usize * output, precision.model)?;
++		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.canonical())).map(|_| values)
++	}
++}
++impl NativeTape {
++	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &[&'static Gpu], precision: Compute, loss: LossFunction) -> Result<Self> {
++		require(!gpus.is_empty(), "a route selects at least one device")?;
++		let input = graph.input.elements();
++		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
++		let rows = samples.len() / input;
++		let output = graph.output.elements();
++		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
++		require(rows >= gpus.len(), format!("route of {} devices needs at least {} rows, received {rows}", gpus.len(), gpus.len()))?;
++		let parameters = graph.parameters.len();
++		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
++		require(graph.state.variances.is_empty() || graph.state.variances.len() == parameters, "saved optimizer variances have the wrong shape")?;
++		require(graph.frozen.is_empty() || graph.frozen.len() == parameters, "frozen parameters have the wrong shape")?;
++		let mut shards = Vec::with_capacity(gpus.len());
++		let mut row = 0;
++		for (gpu, count) in gpus.iter().zip(shard_rows(rows, gpus.len())) {
++			let (start, end) = (row, row + count);
++			let slice = &samples[start * input..end * input];
++			let target = if targets.is_empty() { &[][..] } else { &targets[start * output..end * output] };
++			shards.push(Shard::new(graph, slice, target, gpu, precision, loss, rows)?);
++			row = end;
++		}
++		let precision = shards[0].program.artifact.precision;
++		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
++		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
++		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
++		Ok(Self { shards, precision, batch_normalizations, best_loss, parameters, step, output, capacity: rows, loss })
++	}
++	/// Runs one operation on every shard of the route at once and keeps the
++	/// first failure. A route of one device runs it in place.
++	fn map<T: Send>(&self, operation: impl Fn(&Shard) -> Result<T> + Sync) -> Result<Vec<T>> {
++		if let [shard] = &self.shards[..] {
++			return operation(shard).map(|value| vec![value]);
++		}
++		std::thread::scope(|scope| {
++			let handles = self.shards.iter().map(|shard| scope.spawn(|| operation(shard))).collect::<Vec<_>>();
++			handles.into_iter().map(|handle| handle.join().map_err(|_| RecipeError::new("a device in the route panicked"))?).collect()
++		})
++	}
++	fn forward(&mut self) -> Result<()> { self.map(Shard::forward).map(|_| ()) }
++	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
++		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
++		require(stats.len() == expected, format!("batch normalization expected {expected} saved statistics, received {}", stats.len()))?;
++		for shard in &self.shards {
++			let mut offset = 0;
++			for &(node, channels) in &self.batch_normalizations {
++				let end = offset + 2 * channels;
++				shard.contexts.write_float_bytes(shard.program.artifact.layout.contexts[node], &stats[offset..end], self.precision.model)?;
++				offset = end;
++			}
++		}
++		Ok(())
++	}
++	/// A shard's statistics arena holds each channel's batch mean, then each
++	/// channel's scale `1/sqrt(variance + epsilon)`. The route's statistic is
++	/// the row-weighted mean over shards with the between-shard mean term, so
++	/// the merged variance is the variance of the complete batch.
++	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
++		let per_shard = self.map(|shard| {
++			let mut stats = Vec::new();
++			for &(node, channels) in &self.batch_normalizations {
++				stats.extend(shard.contexts.download_float_bytes(shard.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
++			}
++			Ok(stats)
++		})?;
++		if let [stats] = &per_shard[..] {
++			return Ok(stats.clone());
++		}
++		let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
++		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
++		let mut merged = vec![0.0; expected];
++		let mut offset = 0;
++		for &(_, channels) in &self.batch_normalizations {
++			for channel in 0..channels {
++				let (mut mean, mut moment) = (0.0, 0.0);
++				for (stats, shard) in per_shard.iter().zip(&self.shards) {
++					let share = f64::from(shard.rows) / self.capacity as f64;
++					let shard_mean = stats[offset + channel];
++					let scale = stats[offset + channels + channel];
++					let variance = if scale > 0.0 { (1.0 / (scale * scale) - epsilon).max(0.0) } else { 0.0 };
++					mean += share * shard_mean;
++					moment += share * (variance + shard_mean * shard_mean);
++				}
++				let variance = (moment - mean * mean).max(0.0);
++				merged[offset + channel] = mean;
++				merged[offset + channels + channel] = 1.0 / (variance + epsilon).sqrt();
++			}
++			offset += 2 * channels;
++		}
++		Ok(merged)
++	}
++	fn predictions(&self) -> Result<Vec<f64>> {
++		let (output, precision) = (self.output, self.precision);
++		Ok(self.map(|shard| shard.predictions(output, precision))?.concat())
++	}
++	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
++		require(self.step != 0, "optimizer epoch is absent")?;
++		let (precision, step, parameters) = (self.precision, self.step, self.parameters);
++		let phase = if self.shards.len() == 1 { EPOCH_PHASE_FUSED } else { EPOCH_PHASE_GRADIENT };
++		self.map(|shard| shard.epoch_phase(rate, config, phase, precision, step))?;
++		let mut metrics = vec![0.0; self.shards.len()];
++		let mut gradients = vec![Vec::new(); self.shards.len()];
++		let mut state = [Vec::new(), Vec::new(), Vec::new()];
++		// The executor performs exactly the movement list the route predictor
++		// prices, so the predicted and the executed epoch cannot drift apart.
++		for movement in route_movement(self.shards.len(), parameters, precision) {
++			let shard = &self.shards[movement.shard];
++			match (movement.kind, movement.upload) {
++				(MovementKind::Metric, false) => metrics[movement.shard] = shard.metrics.download_float(1, precision.state)?[0],
++				(MovementKind::Gradient, false) => gradients[movement.shard] = shard.gradient.download_float(parameters, precision.model)?,
++				(MovementKind::Aggregate, true) => {
++					let scales = gradient_scales(self.loss, &metrics);
++					let mut merged = vec![0.0; parameters.max(1)];
++					for (scale, gradient) in scales.iter().zip(&gradients) {
++						for (slot, value) in merged.iter_mut().zip(gradient) {
++							*slot += scale * value;
++						}
++					}
++					shard.gradient.write_float_bytes(0, &merged, precision.model)?;
++					// One optimizer update from the aggregated gradient.
++					shard.epoch_phase(rate, config, EPOCH_PHASE_UPDATE, precision, step)?;
++				}
++				(MovementKind::Weights, false) => state[0] = shard.weights.download_float(parameters, precision.model)?,
++				(MovementKind::Moments, false) => state[1] = shard.moments.download_float(parameters, precision.state)?,
++				(MovementKind::Variances, false) => state[2] = shard.variances.download_float(parameters, precision.state)?,
++				(MovementKind::Weights, true) => shard.weights.write_float_bytes(0, &state[0], precision.model)?,
++				(MovementKind::Moments, true) => shard.moments.write_float_bytes(0, &state[1], precision.state)?,
++				(MovementKind::Variances, true) => shard.variances.write_float_bytes(0, &state[2], precision.state)?,
++				_ => return Err(RecipeError::new("route movement direction is invalid")),
++			}
++		}
++		let objective = combined_objective(self.loss, &metrics);
+ 		debug(&format!("epoch {step} metric complete"))?;
+ 		let saved = self.observe(objective, tolerance)?;
+ 		Ok((objective, saved))
+@@ -5808,9 +6009,9 @@ impl NativeTape {
+ 		self.step = self.step.checked_add(1).ok_or_else(|| RecipeError::new("optimizer epoch overflows"))?;
+ 		Ok(())
+ 	}
+-	fn weights(&self) -> Result<Vec<f64>> { self.weights.download_float(self.parameters, self.precision.model) }
++	fn weights(&self) -> Result<Vec<f64>> { self.shards[0].weights.download_float(self.parameters, self.precision.model) }
+ 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+-		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
++		Ok((self.weights()?, self.shards[0].moments.download_float(self.parameters, self.precision.state)?, self.shards[0].variances.download_float(self.parameters, self.precision.state)?))
+ 	}
+ 	fn capture(&self, graph: &mut Graph) -> Result<()> {
+ 		let (weights, moments, variances) = self.optimizer_state()?;
+@@ -5821,18 +6022,23 @@ impl NativeTape {
+ 		graph.state.best_loss = self.best_loss.to_vec();
+ 		Ok(())
+ 	}
+-	fn tile(&self) -> Tile { self.program.tile }
++	fn tile(&self) -> Tile { self.shards[0].program.tile }
+ 	/// The dispatched contraction schedule, in model execution order: one
+ 	/// forward/gradient/previous group per contraction node, collapsed to a single
+ 	/// extent only when every group agrees.
+ 	fn schedule(&self) -> String {
+-		let extents = self.program.contractions.iter().flatten().flat_map(|node| [node.forward, node.gradient, node.previous]).map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).collect::<Vec<_>>();
++		let program = &self.shards[0].program;
++		let extents = program.contractions.iter().flatten().flat_map(|node| [node.forward, node.gradient, node.previous]).map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).collect::<Vec<_>>();
+ 		if extents.windows(2).all(|pair| pair[0] == pair[1]) { return extents.first().cloned().unwrap_or_default() }
+-		self.program.contractions.iter().flatten().map(|node| [node.forward, node.gradient, node.previous].map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).join("/")).collect::<Vec<_>>().join(" ")
++		program.contractions.iter().flatten().map(|node| [node.forward, node.gradient, node.previous].map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).join("/")).collect::<Vec<_>>().join(" ")
+ 	}
+ 	fn print_devices(&self) -> Result<()> {
+-		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+-		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
++		if let [shard] = &self.shards[..] {
++			eprintln!("{}.{}", shard.program.gpu.canonical(), self.precision.model.label());
++			return Ok(());
++		}
++		let route = self.shards.iter().map(|shard| format!("{}#{}", shard.program.gpu.canonical(), shard.rows)).collect::<Vec<_>>().join(",");
++		eprintln!("{route}.{}", self.precision.model.label());
+ 		Ok(())
+ 	}
+ }
+@@ -5948,10 +6154,10 @@ struct Dispatch {
+ }
+ type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
+ type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
+-type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
+-type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
+-type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
+-type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32);
++type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
++type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
++type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
++type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32, i32);
+ 
+ #[derive(Clone, Copy)]
+ enum NativeCpuEpoch {
+@@ -6043,6 +6249,7 @@ enum NativeBackend {
+ 	Amd(NativeHsaProgram),
+ 	#[cfg(nvidia)]
+ 	Nvidia(NativeCudaProgram),
++	Remote(u64),
+ }
+ 
+ struct NativeProgram {
+@@ -6176,17 +6383,25 @@ enum Driver {
+ 	Hsa(Hsa),
+ 	#[cfg(nvidia)]
+ 	Cuda(Cuda),
++	Remote(Remote),
+ }
+ #[allow(dead_code)]
+ struct Gpu {
++	host: String,
+ 	name: String,
+ 	backend: Backend,
+ 	native_target: BackendTarget,
+ 	driver: Driver,
+ 	memory: u64,
++	wave: u32,
+ 	shared_limit: u32,
+ 	dispatch: Mutex<()>,
+ }
++/// Canonical device identity: the host that owns the device, then its local
++/// name. A local and a remote device share one naming shape and one registry.
++impl Gpu {
++	fn canonical(&self) -> String { format!("{}:{}", self.host, self.name) }
++}
+ unsafe impl Send for Gpu {}
+ unsafe impl Sync for Gpu {}
+ fn native_target_label(target: &BackendTarget) -> &str {
+@@ -6281,16 +6496,16 @@ impl Gpu {
+ 	fn status(&self, status: i32, action: &str) -> Result<()> { driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend))) }
+ 	fn activate(&self) -> Result<()> {
+ 		match &self.driver {
+-			Driver::Cpu => Ok(()),
++			Driver::Cpu | Driver::Remote(_) => Ok(()),
+ 			#[cfg(nvidia)]
+ 			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
+ 			#[cfg(amd)]
+ 			Driver::Hsa(_) => Ok(()),
+ 		}
+ 	}
+-	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
+-		let vector_waves = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
+-		let shared_values = if matches!(&self.driver, Driver::Cpu) { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
++	fn native_program(&'static self, graph: &Graph, rows: usize, loss_rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
++		let vector_waves = if self.backend == Backend::Cpu { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
++		let shared_values = if self.backend == Backend::Cpu { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
+ 		let shapes = native_contraction_shapes(graph, rows)?;
+ 		let mut limits = Tile { m: 1, n: 1, k: 1 };
+ 		let mut dominant = None;
+@@ -6303,13 +6518,7 @@ impl Gpu {
+ 			let work = checked_mul(checked_mul(shape.gradient.m as usize, shape.gradient.n as usize, "native contraction output work")?, shape.gradient.k as usize, "native contraction work")?;
+ 			if dominant.is_none_or(|(_, best)| work > best) { dominant = Some((index, work)) }
+ 		}
+-		let wave = match &self.driver {
+-			Driver::Cpu => 1,
+-			#[cfg(amd)]
+-			Driver::Hsa(driver) => driver.wave,
+-			#[cfg(nvidia)]
+-			Driver::Cuda(driver) => driver.wave,
+-		};
++		let wave = self.wave;
+ 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
+ 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
+ 		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
+@@ -6374,7 +6583,7 @@ impl Gpu {
+ 		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
+ 		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
+ 		let schedule = NativeSchedule { matrix, block, tile: extent, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
+-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
++		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, loss_rows, schedule.clone())?;
+ 		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
+ 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
+ 		let required = fixed.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+@@ -6406,6 +6615,7 @@ impl Gpu {
+ 					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
+ 					Ok(pointer as u64)
+ 				}
++				Driver::Remote(remote) => remote.call(REMOTE_ALLOCATE, [bytes as u64, 0, 0], &[]).map(|(pointer, _)| pointer),
+ 			}
+ 		}
+ 	}
+@@ -6427,6 +6637,11 @@ impl Gpu {
+ 				Driver::Hsa(driver) => {
+ 					(driver.free)(pointer as Ptr);
+ 				}
++				// A free during teardown must not panic; a dead worker link
++				// already released the remote allocation with its process.
++				Driver::Remote(remote) => {
++					let _ = remote.call(REMOTE_FREE, [pointer, 0, 0], &[]);
++				}
+ 			}
+ 		}
+ 	}
+@@ -6444,6 +6659,7 @@ impl Gpu {
+ 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
+ 				#[cfg(amd)]
+ 				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
++				Driver::Remote(remote) => remote.call(REMOTE_UPLOAD, [dst, 0, 0], std::slice::from_raw_parts(src.cast::<u8>(), bytes)).map(|(pointer, _)| pointer),
+ 			}
+ 		}
+ 	}
+@@ -6460,6 +6676,11 @@ impl Gpu {
+ 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
+ 				#[cfg(amd)]
+ 				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
++				Driver::Remote(remote) => remote.call(REMOTE_DOWNLOAD, [src, bytes as u64, 0], &[]).and_then(|(_, body)| {
++					require(body.len() == bytes, "remote download returned the wrong width")?;
++					ptr::copy_nonoverlapping(body.as_ptr(), dst.cast::<u8>(), bytes);
++					Ok(())
++				}),
+ 			}
+ 		}
+ 	}
+@@ -6473,12 +6694,13 @@ impl Gpu {
+ 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
+ 				#[cfg(amd)]
+ 				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
++				Driver::Remote(remote) => remote.call(REMOTE_SYNCHRONIZE, [0; REMOTE_REQUEST_FIELDS], &[]).map(|_| ()),
+ 			}
+ 		}
+ 	}
+ }
+ static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
+-fn cpu_device() -> Result<Gpu> { Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
++fn cpu_device() -> Result<Gpu> { Ok(Gpu { host: hostname()?, name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, wave: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
+ fn devices() -> Result<&'static [Gpu]> {
+ 	DEVICES
+ 		.get_or_init(|| {
+@@ -6514,9 +6736,516 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
+ 	Ok(&found[0])
+ }
+ fn selected_gpu() -> Result<&'static Gpu> {
+-	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
+-	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+-	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
++	explicit_route()?.map_or_else(|| device(None), |route| Ok(route[0]))
++}
++fn hostname() -> Result<String> {
++	let mut name = [0_u8; 256];
++	require(unsafe { gethostname(name.as_mut_ptr().cast(), name.len()) } == 0, "cannot read hostname")?;
++	let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
++	String::from_utf8(name[..end].to_vec()).map_err(|error| RecipeError::new(format!("hostname is not UTF-8: {error}")))
++}
++/// Remote device transport. The client speaks driver verbs over the standard
++/// streams of `ssh <destination> recipe --worker`, so the link carries exactly
++/// the authentication and encryption of the operator's ssh configuration and
++/// no listening socket exists. A request names a verb, a device, three fields,
++/// and a payload; a reply carries a status, one result, and a payload.
++struct Remote {
++	channel: Arc<Mutex<RemoteChannel>>,
++	device: u64,
++}
++struct RemoteChannel {
++	_child: std::process::Child,
++	writer: std::process::ChildStdin,
++	reader: std::process::ChildStdout,
++}
++const REMOTE_DEVICES: u8 = 0;
++const REMOTE_ALLOCATE: u8 = 1;
++const REMOTE_FREE: u8 = 2;
++const REMOTE_UPLOAD: u8 = 3;
++const REMOTE_DOWNLOAD: u8 = 4;
++const REMOTE_SYNCHRONIZE: u8 = 5;
++const REMOTE_PROGRAM: u8 = 6;
++const REMOTE_LAUNCH: u8 = 7;
++const REMOTE_REQUEST_FIELDS: usize = 3;
++fn put(buffer: &mut Vec<u8>, value: u64) { buffer.extend_from_slice(&value.to_le_bytes()) }
++fn put_bytes(buffer: &mut Vec<u8>, value: &[u8]) {
++	put(buffer, value.len() as u64);
++	buffer.extend_from_slice(value);
++}
++struct Wire<'a> {
++	bytes: &'a [u8],
++	at: usize,
++}
++impl<'a> Wire<'a> {
++	fn new(bytes: &'a [u8]) -> Self { Self { bytes, at: 0 } }
++	fn take(&mut self, count: usize) -> Result<&'a [u8]> {
++		let end = checked_add(self.at, count, "remote frame field")?;
++		require(end <= self.bytes.len(), "remote frame is truncated")?;
++		let slice = &self.bytes[self.at..end];
++		self.at = end;
++		Ok(slice)
++	}
++	fn value(&mut self) -> Result<u64> { self.take(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())) }
++	fn slice(&mut self) -> Result<&'a [u8]> {
++		let count = word(self.value()?, "remote frame length")? as usize;
++		self.take(count)
++	}
++	fn text(&mut self) -> Result<String> { self.slice().and_then(|bytes| String::from_utf8(bytes.to_vec()).map_err(|error| RecipeError::new(format!("remote frame text is invalid: {error}")))) }
++}
++fn word(value: u64, role: &str) -> Result<u32> { u32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds u32"))) }
++fn transport(action: &str, error: std::io::Error) -> RecipeError { RecipeError::new(format!("remote {action}: {error}")) }
++fn write_frame(stream: &mut impl Write, head: &[u8], payload: &[u8]) -> Result<()> {
++	let mut frame = Vec::with_capacity(head.len() + 8 + payload.len());
++	frame.extend_from_slice(head);
++	put(&mut frame, payload.len() as u64);
++	frame.extend_from_slice(payload);
++	stream.write_all(&frame).map_err(|error| transport("write", error))?;
++	stream.flush().map_err(|error| transport("flush", error))
++}
++fn read_frame(stream: &mut impl Read, head: usize) -> Result<(Vec<u8>, Vec<u8>)> {
++	let mut header = vec![0_u8; head + 8];
++	stream.read_exact(&mut header).map_err(|error| transport("read", error))?;
++	let length = u64::from_le_bytes(header[head..].try_into().unwrap()) as usize;
++	let mut payload = vec![0_u8; length];
++	stream.read_exact(&mut payload).map_err(|error| transport("read", error))?;
++	header.truncate(head);
++	Ok((header, payload))
++}
++impl Remote {
++	fn call(&self, verb: u8, fields: [u64; REMOTE_REQUEST_FIELDS], payload: &[u8]) -> Result<(u64, Vec<u8>)> {
++		let mut channel = self.channel.lock().map_err(|_| RecipeError::new("remote transport lock is poisoned"))?;
++		let mut head = vec![verb];
++		put(&mut head, self.device);
++		for field in fields {
++			put(&mut head, field)
++		}
++		write_frame(&mut channel.writer, &head, payload)?;
++		let (header, payload) = read_frame(&mut channel.reader, 1 + 8)?;
++		let result = u64::from_le_bytes(header[1..].try_into().unwrap());
++		require(header[0] == 0, String::from_utf8_lossy(&payload).into_owned())?;
++		Ok((result, payload))
++	}
++}
++/// Every `Compute` is its variant tag and its two float layouts, so a device
++/// on another host rebuilds the identical native precision composition.
++impl Compute {
++	fn encode(self) -> [u8; 8] {
++		let (tag, arithmetic, storage, bits) = match self {
++			Self::F(format) => (0, format.arithmetic, format.storage, 0),
++			Self::Fp(format) => (1, format.arithmetic, format.storage, 0),
++			Self::Int(format) => (2, FloatLayout::new(0, 0, 0), FloatLayout::new(0, 0, 0), format.bits),
++			Self::Bf(format) => (3, format.arithmetic, format.storage, 0),
++			Self::Tf(format) => (4, format.arithmetic, format.storage, 0),
++		};
++		[tag, arithmetic.sign, arithmetic.exp, arithmetic.man, storage.sign, storage.exp, storage.man, bits]
++	}
++	fn decode(bytes: &[u8]) -> Result<Self> {
++		require(bytes.len() == 8, "remote compute encoding has the wrong width")?;
++		let format = FloatFormat { arithmetic: FloatLayout::new(bytes[1], bytes[2], bytes[3]), storage: FloatLayout::new(bytes[4], bytes[5], bytes[6]) };
++		match bytes[0] {
++			0 => Ok(Self::F(format)),
++			1 => Ok(Self::Fp(format)),
++			2 => Ok(Self::Int(IntFormat { bits: bytes[7] })),
++			3 => Ok(Self::Bf(format)),
++			4 => Ok(Self::Tf(format)),
++			tag => Err(RecipeError::new(format!("remote compute tag {tag} is unknown"))),
++		}
++	}
++}
++fn encode_dispatch(buffer: &mut Vec<u8>, dispatch: Option<Dispatch>) {
++	put(buffer, u64::from(dispatch.is_some()));
++	let dispatch = dispatch.unwrap_or(Dispatch { kernel: Kernel::remote(0, 1, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
++	put(buffer, u64::from(dispatch.kernel.shared));
++	put(buffer, u64::from(dispatch.kernel.element));
++	put(buffer, u64::from(dispatch.geometry.groups));
++	put(buffer, u64::from(dispatch.geometry.block));
++}
++fn decode_dispatch(wire: &mut Wire<'_>, layout: &'static [u8]) -> Result<Option<Dispatch>> {
++	let present = wire.value()? != 0;
++	let shared = word(wire.value()?, "remote dispatch shared memory")?;
++	let element = u8::try_from(wire.value()?).map_err(|_| RecipeError::new("remote dispatch element width is invalid"))?;
++	let groups = word(wire.value()?, "remote dispatch groups")?;
++	let block = word(wire.value()?, "remote dispatch block")?;
++	Ok(present.then_some(Dispatch { kernel: Kernel::remote(shared, element, layout), geometry: Geometry { groups, block } }))
++}
++/// Serves this host's own devices to one client over the standard streams the
++/// client's ssh session owns. A worker never republishes another host's
++/// devices, so exactly one host owns each device in a topology.
++pub fn worker() -> ! {
++	let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
++	let (mut reader, mut writer) = (stdin.lock(), stdout.lock());
++	let mut programs: Vec<(NativeBackend, Dispatch, Dispatch, Option<Dispatch>)> = Vec::new();
++	loop {
++		let Ok((header, payload)) = read_frame(&mut reader, 1 + 8 * (1 + REMOTE_REQUEST_FIELDS)) else { std::process::exit(0) };
++		let mut wire = Wire::new(&header[1..]);
++		let request = (0..1 + REMOTE_REQUEST_FIELDS).map(|_| wire.value()).collect::<Result<Vec<_>>>();
++		let reply = request.and_then(|fields| answer(header[0], &fields, &payload, &mut programs));
++		let (status, result, body) = match reply {
++			Ok((result, body)) => (0_u8, result, body),
++			Err(error) => (1, 0, error.to_string().into_bytes()),
++		};
++		let mut head = vec![status];
++		put(&mut head, result);
++		if write_frame(&mut writer, &head, &body).is_err() {
++			std::process::exit(0);
++		}
++	}
++}
++fn answer(verb: u8, fields: &[u64], payload: &[u8], programs: &mut Vec<(NativeBackend, Dispatch, Dispatch, Option<Dispatch>)>) -> Result<(u64, Vec<u8>)> {
++	let devices = devices()?;
++	if verb == REMOTE_DEVICES {
++		let mut body = Vec::new();
++		put_bytes(&mut body, hostname()?.as_bytes());
++		put(&mut body, devices.len() as u64);
++		for gpu in devices {
++			put_bytes(&mut body, gpu.name.as_bytes());
++			put_bytes(&mut body, native_target_label(&gpu.native_target).as_bytes());
++			put(&mut body, gpu.backend as u64);
++			put(&mut body, gpu.memory);
++			put(&mut body, u64::from(gpu.wave));
++			put(&mut body, u64::from(gpu.shared_limit));
++		}
++		return Ok((devices.len() as u64, body));
++	}
++	let gpu = devices.get(fields[0] as usize).ok_or_else(|| RecipeError::new(format!("remote device {} is absent", fields[0])))?;
++	match verb {
++		REMOTE_ALLOCATE => gpu.allocate(fields[1] as usize).map(|pointer| (pointer, Vec::new())),
++		REMOTE_FREE => {
++			gpu.free(fields[1]);
++			Ok((0, Vec::new()))
++		}
++		REMOTE_UPLOAD => gpu.upload(fields[1], payload.as_ptr().cast(), payload.len()).map(|pointer| (pointer, Vec::new())),
++		REMOTE_DOWNLOAD => {
++			let mut body = vec![0_u8; fields[2] as usize];
++			gpu.download(body.as_mut_ptr().cast(), fields[1], body.len()).map(|()| (0, body))
++		}
++		REMOTE_SYNCHRONIZE => gpu.synchronize().map(|()| (0, Vec::new())),
++		REMOTE_PROGRAM => {
++			let mut wire = Wire::new(payload);
++			let precision = NativePrecision::new(Compute::decode(wire.take(8)?)?)?;
++			let target = wire.text()?;
++			require(target == native_target_label(&gpu.native_target), format!("remote artifact targets {target:?}, device {} is {:?}", gpu.name, native_target_label(&gpu.native_target)))?;
++			let storage = wire.slice()?.to_vec();
++			let artifact = wire.slice()?.to_vec();
++			let path = std::env::temp_dir().join(format!("recipe-remote-{}-{}.{}", std::process::id(), programs.len(), gpu.native_target.artifact_extension()));
++			fs::write(&path, &artifact).map_err(|error| RecipeError::new(format!("cannot stage remote artifact {}: {error}", path.display())))?;
++			let artifact = NativeArtifact { backend: gpu.native_target.clone(), layout: NativeLayout { values: Vec::new(), contexts: Vec::new(), adjoints: Vec::new(), values_bytes: 0, contexts_bytes: 0, adjoints_bytes: 0 }, precision, artifact, path, storage };
++			let loaded = gpu.load_native(&artifact, word(fields[1], "remote waves")?, (fields[2] >> 32) as u32, fields[2] as u32)?;
++			let mut body = Vec::new();
++			for dispatch in [Some(loaded.1), Some(loaded.2), loaded.3] {
++				encode_dispatch(&mut body, dispatch)
++			}
++			programs.push(loaded);
++			Ok((programs.len() as u64 - 1, body))
++		}
++		REMOTE_LAUNCH => {
++			let program = programs.get(fields[1] as usize).ok_or_else(|| RecipeError::new(format!("remote program {} is absent", fields[1])))?;
++			let mut wire = Wire::new(payload);
++			let entry = match wire.value()? {
++				0 => NativeEntry::Forward,
++				1 => NativeEntry::Epoch,
++				_ => NativeEntry::ModelLoad,
++			};
++			let values = word(wire.value()?, "remote shared values")?;
++			let dispatch = match entry {
++				NativeEntry::Forward => program.1,
++				NativeEntry::Epoch => program.2,
++				NativeEntry::ModelLoad => program.3.ok_or_else(|| RecipeError::new("remote model-load symbol is absent"))?,
++			};
++			let mut slots = vec![[0_u8; 8]; dispatch.kernel.layout.len()];
++			for slot in &mut slots {
++				slot.copy_from_slice(wire.take(8)?)
++			}
++			let mut arguments = slots.iter().map(|slot| slot.as_ptr() as Ptr).collect::<Vec<_>>();
++			gpu.launch_native(&program.0, dispatch, entry, &mut arguments, word(fields[2], "remote thread count")?, values).map(|()| (0, Vec::new()))
++		}
++		_ => Err(RecipeError::new(format!("remote verb {verb} is unknown"))),
++	}
++}
++/// The devices the configured workers serve, one authoritative owner per
++/// device. Enumerated only when a placement actually reaches beyond the local
++/// host, so local runs never open a connection.
++static WORKER_DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
++fn worker_devices() -> Result<&'static [Gpu]> {
++	WORKER_DEVICES
++		.get_or_init(|| {
++			let mut found = Vec::new();
++			for destination in env!("RECIPE_WORKERS").split(';').filter(|value| !value.is_empty()) {
++				let mut child = Command::new("ssh")
++					.args(["-o", "BatchMode=yes", destination, "recipe", "--worker"])
++					.stdin(std::process::Stdio::piped())
++					.stdout(std::process::Stdio::piped())
++					.spawn()
++					.map_err(|error| RecipeError::new(format!("cannot reach worker {destination}: {error}")))?;
++				let writer = child.stdin.take().ok_or_else(|| RecipeError::new("worker stdin is absent"))?;
++				let reader = child.stdout.take().ok_or_else(|| RecipeError::new("worker stdout is absent"))?;
++				let channel = Arc::new(Mutex::new(RemoteChannel { _child: child, writer, reader }));
++				let probe = Remote { channel: channel.clone(), device: 0 };
++				let (count, body) = probe.call(REMOTE_DEVICES, [0; REMOTE_REQUEST_FIELDS], &[]).map_err(|error| RecipeError::new(format!("worker {destination}: {error}")))?;
++				let mut wire = Wire::new(&body);
++				// The host that owns a device is the authority on its own name.
++				let host = wire.text()?;
++				require(wire.value()? == count, "remote device count disagrees with the device list")?;
++				for device in 0..count {
++					let name = wire.text()?;
++					let label = wire.text()?;
++					let backend = match wire.value()? {
++						value if value == Backend::Cpu as u64 => Backend::Cpu,
++						value if value == Backend::Amd as u64 => Backend::Amd,
++						value if value == Backend::Nvidia as u64 => Backend::Nvidia,
++						value => return Err(RecipeError::new(format!("remote backend {value} is unknown"))),
++					};
++					let native_target = match backend {
++						Backend::Cpu => BackendTarget::Cpu { target: label },
++						Backend::Amd => BackendTarget::Amd { architecture: label },
++						Backend::Nvidia => BackendTarget::Nvidia { architecture: label },
++					};
++					let (memory, wave, shared_limit) = (wire.value()?, wire.value()?, wire.value()?);
++					let remote = Remote { channel: channel.clone(), device };
++					found.push(Gpu { host: host.clone(), name, backend, native_target, driver: Driver::Remote(remote), memory, wave: word(wave, "remote wave")?, shared_limit: word(shared_limit, "remote shared limit")?, dispatch: Mutex::new(()) });
++				}
++			}
++			let local = hostname()?;
++			require(!found.iter().any(|gpu| gpu.host == local), "a worker republishes this host's own devices")?;
++			Ok(found)
++		})
++		.as_ref()
++		.map(Vec::as_slice)
++		.map_err(Clone::clone)
++}
++/// Every device a route may select: this host's own devices, then each
++/// configured worker's devices.
++fn all_devices() -> Result<Vec<&'static Gpu>> {
++	Ok(devices()?.iter().chain(worker_devices()?).collect())
++}
++/// The route an explicit `--device` selector names: comma-separated canonical
++/// `host:name` or bare local names. Without a selector the placement policy
++/// chooses.
++fn explicit_route() -> Result<Option<Vec<&'static Gpu>>> {
++	let Some(names) = std::env::var("RECIPE_DEVICE").ok() else { return Ok(None) };
++	let local = hostname()?;
++	let resolve = |name: &str| -> Result<&'static Gpu> {
++		let bare = devices()?.iter().find(|gpu| gpu.name == name || gpu.canonical() == name);
++		if let Some(gpu) = bare {
++			return Ok(gpu);
++		}
++		match name.split_once(':') {
++			Some((host, _)) if host != local => {
++				// A local-only policy refuses a remote selector before any
++				// worker connection could open.
++				require(Config::load()?.multi_device != Placement::Local, "multi-device is false, so the route is one local device")?;
++				worker_devices()?.iter().find(|gpu| gpu.canonical() == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
++			}
++			_ => Err(RecipeError::new(format!("GPU {name:?} is absent"))),
++		}
++	};
++	let route = names.split(',').filter(|name| !name.is_empty()).map(resolve).collect::<Result<Vec<_>>>()?;
++	require(!route.is_empty(), "a route selects at least one device")?;
++	let mut canonical = route.iter().map(|gpu| gpu.canonical()).collect::<Vec<_>>();
++	canonical.sort_unstable();
++	canonical.dedup();
++	require(canonical.len() == route.len(), "a route selects each device once")?;
++	Ok(Some(route))
++}
++/// One measured host edge of a device: seconds of fixed latency and bytes per
++/// second in each direction, discovered from a small and a large transfer.
++/// Every route transfer is staged through this process, so these two edges are
++/// exactly the edges the executed movement list crosses.
++struct DeviceEdge {
++	up_latency: f64,
++	up_bandwidth: f64,
++	down_latency: f64,
++	down_bandwidth: f64,
++}
++/// One measured execution behavior of a device: seconds of fixed dispatch
++/// overhead per fused epoch and planned work units per second, discovered by
++/// timing the fused epoch of a small and a large fixed calibration model
++/// through the one native pipeline. The planned model itself is never
++/// allocated, forwarded, trained, or dispatched to price a route.
++struct DeviceRate {
++	overhead: f64,
++	rate: f64,
++}
++struct Topology {
++	devices: Vec<&'static Gpu>,
++	edges: Vec<DeviceEdge>,
++	rates: Vec<DeviceRate>,
++}
++const EDGE_SMALL_BYTES: usize = 1 << 12;
++const EDGE_LARGE_BYTES: usize = 1 << 20;
++fn measure_edge(gpu: &'static Gpu) -> Result<DeviceEdge> {
++	let mut staging = vec![0_u8; EDGE_LARGE_BYTES];
++	let target = gpu.allocate(EDGE_LARGE_BYTES)?;
++	gpu.upload(target, staging.as_ptr().cast(), EDGE_SMALL_BYTES)?;
++	gpu.synchronize()?;
++	let mut timed = |up: bool, bytes: usize| -> Result<f64> {
++		let started = Instant::now();
++		if up {
++			gpu.upload(target, staging.as_ptr().cast(), bytes)?;
++		} else {
++			gpu.download(staging.as_mut_ptr().cast(), target, bytes)?;
++		}
++		gpu.synchronize()?;
++		Ok(started.elapsed().as_secs_f64())
++	};
++	let mut directions = [(0.0, 0.0); 2];
++	for (index, up) in [true, false].into_iter().enumerate() {
++		let small = timed(up, EDGE_SMALL_BYTES)?;
++		let large = timed(up, EDGE_LARGE_BYTES)?;
++		// The slope of the two transfers is bandwidth, the intercept latency.
++		let bandwidth = (EDGE_LARGE_BYTES - EDGE_SMALL_BYTES) as f64 / (large - small).max(f64::MIN_POSITIVE);
++		directions[index] = ((small - EDGE_SMALL_BYTES as f64 / bandwidth).max(0.0), bandwidth);
++	}
++	gpu.free(target);
++	Ok(DeviceEdge { up_latency: directions[0].0, up_bandwidth: directions[0].1, down_latency: directions[1].0, down_bandwidth: directions[1].1 })
++}
++/// The planned work of one complete fused epoch: every contraction's forward,
++/// gradient, and previous-adjoint tile, every node's elementwise traffic, the
++/// loss reduction, and the optimizer update, in one unit the calibration
++/// measures per device.
++fn planned_epoch_work(graph: &Graph, rows: usize) -> Result<f64> {
++	let mut work = 0.0;
++	for shape in native_contraction_shapes(graph, rows)?.iter().flatten() {
++		for extent in [shape.forward, shape.gradient, shape.previous] {
++			work += 2.0 * f64::from(extent.m) * f64::from(extent.n) * f64::from(extent.k);
++		}
++	}
++	for node in &graph.nodes {
++		work += 8.0 * rows as f64 * node.output.elements() as f64;
++	}
++	work += 16.0 * graph.parameters.len() as f64;
++	work += 8.0 * (rows * graph.output.elements()) as f64;
++	Ok(work)
++}
++const CALIBRATION_FEATURES: usize = 24;
++const CALIBRATION_SIZES: [(usize, usize); 2] = [(512, 32), (4096, 96)];
++fn calibrate(gpu: &'static Gpu, config: Config) -> Result<DeviceRate> {
++	let mut points = [(0.0, 0.0); 2];
++	for (index, (rows, hidden)) in CALIBRATION_SIZES.into_iter().enumerate() {
++		let samples = (0..rows * CALIBRATION_FEATURES).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
++		let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
++		let model = surrogate_model(hidden);
++		let prepared = Prepared { samples: samples.clone(), targets: targets.clone(), target_width: 1, rows, source_rows: rows, features: CALIBRATION_FEATURES, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
++		let graph = compile(&model, &prepared, &targets, rows, gpu, config, true)?;
++		let mut tape = NativeTape::new(&graph, &samples, &targets, &[gpu], config.precision, mse)?;
++		tape.advance()?;
++		tape.epoch(config.surrogate_rate, 0.0, config)?;
++		let mut best = f64::INFINITY;
++		for _ in 0..2 {
++			tape.advance()?;
++			let started = Instant::now();
++			tape.epoch(config.surrogate_rate, 0.0, config)?;
++			best = best.min(started.elapsed().as_secs_f64());
++		}
++		points[index] = (planned_epoch_work(&graph, rows)?, best);
++	}
++	let rate = ((points[1].0 - points[0].0) / (points[1].1 - points[0].1).max(f64::MIN_POSITIVE)).max(1.0);
++	Ok(DeviceRate { overhead: (points[0].1 - points[0].0 / rate).max(0.0), rate })
++}
++static TOPOLOGY: OnceLock<Result<Topology>> = OnceLock::new();
++fn topology(config: Config) -> Result<&'static Topology> {
++	TOPOLOGY
++		.get_or_init(|| {
++			let devices = all_devices()?;
++			let (mut edges, mut rates) = (Vec::new(), Vec::new());
++			for gpu in &devices {
++				let edge = measure_edge(gpu)?;
++				let rate = calibrate(gpu, config)?;
++				eprintln!("measured {}: {:.3e} work/s, {:.6}s/dispatch, up {:.3e} B/s +{:.6}s, down {:.3e} B/s +{:.6}s", gpu.canonical(), rate.rate, rate.overhead, edge.up_bandwidth, edge.up_latency, edge.down_bandwidth, edge.down_latency);
++				edges.push(edge);
++				rates.push(rate);
++			}
++			Ok(Topology { devices, edges, rates })
++		})
++		.as_ref()
++		.map_err(Clone::clone)
++}
++struct RouteCost {
++	computation: f64,
++	transfers: f64,
++	synchronization: f64,
++	movement: f64,
++}
++impl RouteCost {
++	fn total(&self) -> f64 { self.computation + self.transfers + self.synchronization + self.movement }
++}
++/// The complete predicted epoch of one candidate route: concurrent shard
++/// computation at each device's measured rate, plus the priced movement list
++/// the executor performs — statistic and gradient transfers, one crossing
++/// latency and one dispatch overhead per synchronization, and the separate
++/// persistent weight, moment, and variance movements.
++fn route_cost(topology: &Topology, route: &[usize], graph: &Graph, rows: usize, precision: NativePrecision) -> Result<RouteCost> {
++	let shards = shard_rows(rows, route.len());
++	let (mut computation, mut synchronization) = (0.0_f64, 0.0_f64);
++	for (index, device) in route.iter().enumerate() {
++		let rate = &topology.rates[*device];
++		computation = computation.max(planned_epoch_work(graph, shards[index])? / rate.rate);
++		synchronization += rate.overhead;
++	}
++	if route.len() > 1 {
++		// The aggregated update is one more dispatch on the leading device.
++		let primary = &topology.rates[route[0]];
++		computation += 16.0 * graph.parameters.len() as f64 / primary.rate;
++		synchronization += primary.overhead;
++	}
++	let (mut transfers, mut movement) = (0.0, 0.0);
++	for entry in route_movement(route.len(), graph.parameters.len(), precision) {
++		let edge = &topology.edges[route[entry.shard]];
++		let (latency, bandwidth) = if entry.upload { (edge.up_latency, edge.up_bandwidth) } else { (edge.down_latency, edge.down_bandwidth) };
++		synchronization += latency;
++		let seconds = entry.bytes as f64 / bandwidth;
++		match entry.kind {
++			MovementKind::Weights | MovementKind::Moments | MovementKind::Variances => movement += seconds,
++			_ => transfers += seconds,
++		}
++	}
++	Ok(RouteCost { computation, transfers, synchronization, movement })
++}
++/// The route one run trains on. An explicit selector names it; otherwise
++/// `multi-device = false` keeps the local device, `true` forces every known
++/// device, and `"auto"` prices the complete predicted epoch of every candidate
++/// route and selects the fastest.
++fn select_route(config: Config, graph: &Graph, rows: usize, gpu: &'static Gpu) -> Result<Vec<&'static Gpu>> {
++	if let Some(route) = explicit_route()? {
++		if config.multi_device == Placement::Local {
++			require(route.len() == 1 && route[0].host == hostname()?, "multi-device is false, so the route is one local device")?;
++		}
++		return Ok(route);
++	}
++	match config.multi_device {
++		Placement::Local => Ok(vec![gpu]),
++		Placement::Forced => {
++			let mut route = all_devices()?;
++			// The compile device leads the route and applies the one update.
++			route.sort_by_key(|candidate| !std::ptr::eq(*candidate, gpu));
++			Ok(route)
++		}
++		Placement::Auto => {
++			let topology = topology(config)?;
++			let count = topology.devices.len();
++			require(count <= 12, "auto placement supports at most 12 devices")?;
++			let precision = NativePrecision::new(config.precision)?;
++			let mut best: Option<(Vec<usize>, f64)> = None;
++			for mask in 1_u32..1 << count {
++				let mut candidate = (0..count).filter(|device| mask >> device & 1 == 1).collect::<Vec<_>>();
++				if candidate.len() > rows {
++					continue;
++				}
++				// The fastest member leads the route and applies the one update;
++				// equal rates order by canonical name so selection is stable.
++				candidate.sort_by(|left, right| topology.rates[*right].rate.total_cmp(&topology.rates[*left].rate).then_with(|| topology.devices[*left].canonical().cmp(&topology.devices[*right].canonical())));
++				let cost = route_cost(topology, &candidate, graph, rows, precision)?;
++				let names = candidate.iter().map(|device| topology.devices[*device].canonical()).collect::<Vec<_>>().join(",");
++				eprintln!("route {names} predicted epoch {:.9}s = computation {:.9} + transfers {:.9} + synchronization {:.9} + persistent-state {:.9}", cost.total(), cost.computation, cost.transfers, cost.synchronization, cost.movement);
++				if best.as_ref().is_none_or(|(_, previous)| cost.total() < *previous) {
++					best = Some((candidate, cost.total()));
++				}
++			}
++			let (selected, total) = best.ok_or_else(|| RecipeError::new("no candidate route fits the workload"))?;
++			eprintln!("selected route {} predicted epoch {total:.9}s", selected.iter().map(|device| topology.devices[*device].canonical()).collect::<Vec<_>>().join(","));
++			Ok(selected.into_iter().map(|device| topology.devices[device]).collect())
++		}
++	}
+ }
+ #[cfg(amd)]
+ type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
+@@ -6697,19 +7426,19 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
+ 			match cpu.epoch {
+ 				NativeCpuEpoch::F64(function) => function(
+ 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
+-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
++					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
+ 				),
+ 				NativeCpuEpoch::F32(function) => function(
+ 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
+-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
++					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
+ 				),
+ 				NativeCpuEpoch::F16(function) => function(
+ 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
+-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
++					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
+ 				),
+ 				NativeCpuEpoch::F8(function) => function(
+ 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
+-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
++					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
+ 				),
+ 			}
+ 		}
+@@ -6723,34 +7452,56 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
+ 	}
+ }
+ 
+-impl NativeProgram {
+-	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
+-		native_artifact_contract(&artifact)?;
+-		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
+-		let (backend, forward, epoch, model_load) = match &gpu.driver {
++impl Gpu {
++	/// Loads one compiled artifact onto this device and reports the dispatch of
++	/// each entrypoint. A worker runs this for the devices it owns, so a remote
++	/// device is loaded by exactly the code that loads a local one.
++	fn load_native(&self, artifact: &NativeArtifact, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeBackend, Dispatch, Dispatch, Option<Dispatch>)> {
++		native_artifact_contract(artifact)?;
++		require(artifact.backend.backend() == self.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), self.backend))?;
++		match &self.driver {
+ 			Driver::Cpu => {
+ 				#[cfg(unix)]
+ 				{
+-					let cpu = load_native_cpu(&artifact)?;
+-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
+-					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
+-					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+-					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
++					let cpu = load_native_cpu(artifact)?;
++					let element = artifact.precision.model.bytes() as u8;
++					let forward = Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
++					let epoch = Dispatch { kernel: Kernel::remote(0, element, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
++					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
++					Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load))
+ 				}
+ 				#[cfg(not(unix))]
+-				return Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"));
++				Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"))
+ 			}
+ 			#[cfg(amd)]
+ 			Driver::Hsa(driver) => {
+-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves)? };
+-				(NativeBackend::Amd(program), forward, epoch, model_load)
++				let (program, forward, epoch, model_load) = unsafe { driver.load_native(artifact, waves)? };
++				Ok((NativeBackend::Amd(program), forward, epoch, model_load))
+ 			}
+ 			#[cfg(nvidia)]
+ 			Driver::Cuda(driver) => {
+-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves, schedule.shared_values, register_values)? };
+-				(NativeBackend::Nvidia(program), forward, epoch, model_load)
++				let (program, forward, epoch, model_load) = unsafe { driver.load_native(artifact, waves, shared_values, register_values)? };
++				Ok((NativeBackend::Nvidia(program), forward, epoch, model_load))
+ 			}
+-		};
++			Driver::Remote(remote) => {
++				let mut request = Vec::new();
++				request.extend_from_slice(&artifact.precision.model.encode());
++				put_bytes(&mut request, native_target_label(&artifact.backend).as_bytes());
++				put_bytes(&mut request, &artifact.storage);
++				put_bytes(&mut request, &artifact.artifact);
++				let (handle, body) = remote.call(REMOTE_PROGRAM, [u64::from(waves), u64::from(shared_values) << 32 | u64::from(register_values), 0], &request)?;
++				let mut wire = Wire::new(&body);
++				let forward = decode_dispatch(&mut wire, NATIVE_FORWARD_LAYOUT)?.ok_or_else(|| RecipeError::new("remote forward entrypoint is absent"))?;
++				let epoch = decode_dispatch(&mut wire, artifact.precision.epoch_layout)?.ok_or_else(|| RecipeError::new("remote epoch entrypoint is absent"))?;
++				let model_load = decode_dispatch(&mut wire, NATIVE_MODEL_LOAD_LAYOUT)?;
++				Ok((NativeBackend::Remote(handle), forward, epoch, model_load))
++			}
++		}
++	}
++}
++impl NativeProgram {
++	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
++		let (backend, forward, epoch, model_load) = gpu.load_native(&artifact, waves, schedule.shared_values, register_values)?;
+ 		debug(&format!("native load key={} path={} entrypoints={}", artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"), artifact.path.display(), if model_load.is_some() { "recipe_model_forward,recipe_model_epoch,recipe_model_load" } else { "recipe_model_forward,recipe_model_epoch" }))?; let block = forward.geometry.block.max(epoch.geometry.block);
+ 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
+ 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
+@@ -6779,19 +7530,25 @@ impl NativeProgram {
+ 	}
+ 
+ 	fn launch(&self, entry: NativeEntry, arguments: &mut [Ptr], threads: u32) -> Result<()> {
+-		let gpu = self.gpu;
++		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
++		self.gpu.launch_native(&self.backend, self.dispatch(entry)?, entry, arguments, threads, values)
++	}
++}
++impl Gpu {
++	/// Dispatches one loaded entrypoint. `values` is the dynamic shared-memory
++	/// element count the schedule reserved for this entry.
++	fn launch_native(&self, backend: &NativeBackend, dispatch: Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, values: u32) -> Result<()> {
++		let gpu = self;
+ 		require(!INTERRUPTED.load(Ordering::Acquire), "interrupted before native dispatch")?;
+-		let dispatch = self.dispatch(entry)?;
+ 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
+ 		gpu.activate()?;
+ 		let block = dispatch.geometry.block;
+-		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
+ 		let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
+ 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
+ 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
+ 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
+ 		unsafe {
+-			match (&self.backend, &gpu.driver) {
++			match (backend, &gpu.driver) {
+ 				#[cfg(unix)]
+ 				(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
+ 				#[cfg(amd)]
+@@ -6836,6 +7593,17 @@ impl NativeProgram {
+ 					let stream = ptr::null_mut();
+ 					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr(), ptr::null_mut()), "native dispatch")
+ 				}
++				(NativeBackend::Remote(handle), Driver::Remote(remote)) => {
++					let mut request = Vec::new();
++					put(&mut request, entry as u64);
++					put(&mut request, u64::from(values));
++					for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
++						let mut slot = [0_u8; 8];
++						ptr::copy_nonoverlapping((*argument).cast::<u8>(), slot.as_mut_ptr(), usize::from(*kind - b'0'));
++						request.extend_from_slice(&slot);
++					}
++					remote.call(REMOTE_LAUNCH, [*handle, u64::from(threads), 0], &request).map(|_| ())
++				}
+ 				_ => Err(RecipeError::new("native program backend changed after loading")),
+ 			}
+ 		}
+@@ -6901,7 +7669,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
+ 		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
+ 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
+ 		let hsa = Hsa { _runtime: runtime.clone(), reader_create, reader_destroy, executable_create, executable_destroy, executable_load, executable_freeze, symbol, symbol_info, allocate, allow, queue, cpu_agent, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found, agent, cus, wave, workgroup, lds };
+-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
++		Ok(Gpu { host: hostname()?, name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, wave, shared_limit: lds, dispatch: Mutex::new(()) })
+ 	}
+ }
+ fn load_nvidia() -> Result<Vec<Gpu>> {
+@@ -6948,7 +7716,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
+ 			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
+ 			check(create(&mut context, 0, device), "context creation")?;
+ 			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
+-			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
++			Ok(Gpu { host: hostname()?, name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, wave: wave as u32, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
+ 		};
+ 		let mut found = Vec::new();
+ 		for ordinal in 0..count {
+@@ -6985,6 +7753,7 @@ unsafe extern "C" {
+ 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+ 	#[cfg_attr(windows, link_name = "_write")]
+ 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
++	fn gethostname(name: *mut std::ffi::c_char, length: usize) -> i32;
+ }
+ fn distance(left: &[f64], right: &[f64]) -> f64 { left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum() }
+ fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) { state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY)) }
+@@ -6994,7 +7763,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
+ 		return Ok(samples[..rows * graph.output.elements()].to_vec());
+ 	}
+ 	let _ = targets;
+-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, mse)?;
++	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], &[gpu], precision, mse)?;
+ 	tape.forward()?;
+ 	tape.predictions()
+ }
+@@ -7006,7 +7775,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize,
+ 	let model = surrogate_model(hidden);
+ 	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), target_width: 1, rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+ 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
+-	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
++	let mut tape = NativeTape::new(&graph, samples, targets, &[gpu], config.precision, mse)?;
+ 	for _ in 0..config.surrogate_epochs {
+ 		tape.advance()?;
+ 		tape.epoch(config.surrogate_rate, 0.0, config)?;
+@@ -9941,7 +10710,10 @@ impl Train {
+ 		stored.graph.state.trained_samples.sort_unstable();
+ 		stored.graph.state.trained_samples.dedup();
+ 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_values]);
+-		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, model.loss)?;
++		// The route is selected from the exact compiled workload and the
++		// measured topology, before any training allocation exists.
++		let route = select_route(config, &stored.graph, training_rows, gpu)?;
++		let mut tape = NativeTape::new(&stored.graph, samples, targets, &route, config.precision, model.loss)?;
+ 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
+ 		tape.print_devices()?;
+ 		stored.bn_stats = tape.extract_bn_stats()?;
+@@ -9986,7 +10758,7 @@ impl Train {
+ 			let mut raw_outputs = Vec::new();
+ 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
+ 			for sample in prepared.samples.chunks_exact(prepared.features) {
+-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
++				let mut validation = NativeTape::new(&graph, sample, &[], &[gpu], config.precision, model.loss)?;
+ 				validation.inject_bn_stats(&stored.bn_stats)?;
+ 				validation.forward()?;
+ 				let raw = validation.predictions()?;
+@@ -10009,7 +10781,7 @@ impl Train {
+ 			let mut graph = stored.graph.clone();
+ 			graph.parameters = tape.weights()?;
+ 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
+-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
++			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, &[gpu], config.precision, model.loss)?;
+ 			validation.inject_bn_stats(&stored.bn_stats)?;
+ 			validation.forward()?;
+ 			let raw = validation.predictions()?;

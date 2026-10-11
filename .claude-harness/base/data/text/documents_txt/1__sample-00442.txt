@@ -1,0 +1,1 @@
+Sample 00442: the compiler learns during testing. It says, "check input, then retry."

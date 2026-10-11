@@ -1,0 +1,1 @@
+Sample 01190: the device converges under load. It says, "check input, then retry."

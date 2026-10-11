@@ -1,0 +1,1 @@
+Sample 01073: the sensor stalls during testing.

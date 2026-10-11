@@ -1,0 +1,1 @@
+Sample 01970: the compiler converges on device.

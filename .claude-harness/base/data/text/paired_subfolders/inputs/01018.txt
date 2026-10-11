@@ -1,0 +1,1 @@
+Sample 01018: the compiler learns during testing.

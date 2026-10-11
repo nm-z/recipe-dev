@@ -1,0 +1,1 @@
+Sample 01700: the model responds on device. It says, "check input, then retry."

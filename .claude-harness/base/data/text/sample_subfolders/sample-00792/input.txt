@@ -1,0 +1,1 @@
+Sample 00792: the engine works under load.

@@ -1,0 +1,1 @@
+Sample 00204: the model works on device. It says, "check input, then retry."

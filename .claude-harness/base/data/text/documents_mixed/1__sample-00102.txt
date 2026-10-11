@@ -1,0 +1,1 @@
+Sample 00102: the device passes with new data. It says, "check input, then retry."

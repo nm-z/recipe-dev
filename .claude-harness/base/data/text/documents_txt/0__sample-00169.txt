@@ -1,0 +1,1 @@
+Sample 00169: the sensor fails on device.

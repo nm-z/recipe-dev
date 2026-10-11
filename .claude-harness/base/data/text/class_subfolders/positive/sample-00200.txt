@@ -1,0 +1,1 @@
+Sample 00200: the engine responds under load.

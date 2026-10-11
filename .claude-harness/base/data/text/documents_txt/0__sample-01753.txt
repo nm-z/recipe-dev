@@ -1,0 +1,1 @@
+Sample 01753: the sensor fails on device.

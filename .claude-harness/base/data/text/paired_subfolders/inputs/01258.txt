@@ -1,0 +1,1 @@
+Sample 01258: the compiler learns at night. It says, "check input, then retry."

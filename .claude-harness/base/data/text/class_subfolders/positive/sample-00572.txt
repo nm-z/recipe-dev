@@ -1,0 +1,1 @@
+Sample 00572: the model responds with new data.

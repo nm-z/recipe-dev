@@ -1,0 +1,1 @@
+Sample 00014: the device converges with new data.

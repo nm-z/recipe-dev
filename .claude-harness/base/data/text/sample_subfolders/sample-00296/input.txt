@@ -1,0 +1,1 @@
+Sample 00296: the engine responds on device.

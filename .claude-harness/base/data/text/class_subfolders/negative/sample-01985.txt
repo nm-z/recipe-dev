@@ -1,0 +1,1 @@
+Sample 01985: the sensor stalls after training.

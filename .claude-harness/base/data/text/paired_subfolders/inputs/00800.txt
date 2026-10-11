@@ -1,0 +1,1 @@
+Sample 00800: the engine responds on device.

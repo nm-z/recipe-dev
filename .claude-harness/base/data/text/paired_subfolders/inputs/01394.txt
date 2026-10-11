@@ -1,0 +1,1 @@
+Sample 01394: the compiler converges on device. It says, "check input, then retry."

@@ -1,0 +1,1 @@
+Sample 00990: the device passes under load.
