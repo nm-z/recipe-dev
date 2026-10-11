@@ -1,6 +1,9 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [--ttl <minutes>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe schema probe <dataset>\n\trecipe schema finalize <proposal.json> <answers.json> <schema.json>";
+const USAGE: &str = concat!(
+	"usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [--ttl <minutes>] [-p <text>] [export]\n",
+	"\trecipe stats|keys <file.gguf>\n\trecipe schema probe <dataset>\n\trecipe schema finalize <proposal.json> <answers.json> <schema.json>\n\trecipe --runtime|--status",
+);
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -110,6 +113,8 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 		std::process::exit(status.code().unwrap_or(1));
 	}
 	for (key, value) in settings { unsafe { std::env::set_var(key, value); } }
+	#[cfg(unix)]
+	recipe::runtime_started().unwrap_or_else(|error| { fs::remove_file(&output).ok(); invalid(&error.to_string()); });
 	let inherited_device = std::env::var("RECIPE_DEVICE").ok();
 	if let Some(selection) = device.or(inherited_device.as_deref()) {
 		match recipe::run_remote_script(&output, selection, config, arguments) {
@@ -123,6 +128,8 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	}
 	let mut command = Command::new(&output);
 	command.args(arguments);
+	if let Ok(parent) = std::env::var("RECIPE_RUNTIME_JOB") { command.env("RECIPE_RUNTIME_PARENT", parent); }
+	command.env_remove("RECIPE_RUNTIME_JOB");
 	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
@@ -147,13 +154,13 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 }
 
 #[cfg(unix)]
-fn submit(source: &Path, device: Option<&str>) {
-	let code = recipe::runtime_submit(source, device).unwrap_or_else(|error| { eprintln!("{error}"); 1 });
+fn submit(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
+	let code = recipe::runtime_submit(source, device, config, settings, arguments).unwrap_or_else(|error| { eprintln!("{error}"); 1 });
 	std::process::exit(code);
 }
 #[cfg(not(unix))]
-fn submit(_source: &Path, _device: Option<&str>) {
-	invalid("the runtime scheduler requires Unix")
+fn submit(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
+	run(source, device, config, settings, arguments)
 }
 
 fn main() {
@@ -161,7 +168,6 @@ fn main() {
 	let (mut source, mut device, mut config) = (None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
 	let mut export_seen = false;
-	let mut submit_seen = false;
 	let mut settings = Vec::new();
 	let mut script_args = Vec::new();
 	while let Some(argument) = arguments.next() {
@@ -190,7 +196,6 @@ fn main() {
 			#[cfg(not(unix))]
 			invalid("the runtime scheduler requires Unix");
 		}
-		if argument == "--submit" { submit_seen = true; continue; }
 		if matches!(argument.as_str(), "--ctx" | "-p") {
 			let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			let key = if argument == "--ctx" { "RECIPE_CONTEXT" } else { "RECIPE_MESSAGE" };
@@ -279,8 +284,7 @@ fn main() {
 		invalid("recipe requires a Rust source")
 	}
 	if export_seen && devices.as_ref().is_some_and(|names| names.len() != 1) { invalid("export requires one device"); }
-	if submit_seen && (export_seen || config.is_some() || !settings.is_empty() || !script_args.is_empty()) {
-		invalid("--submit accepts only a source and --device")
-	}
-	if submit_seen { submit(source, device) } else if export_seen { export(source, device) } else { run(source, device, config.as_deref(), &settings, &script_args) }
+	if export_seen { export(source, device) }
+	else if std::env::var_os("RECIPE_RUNTIME_JOB").is_some() { run(source, device, config.as_deref(), &settings, &script_args) }
+	else { submit(source, device, config.as_deref(), &settings, &script_args) }
 }

@@ -2149,6 +2149,9 @@ fn runtime_configuration(manifest: &str) -> BuildResult<()> {
 		("runtime-idle-seconds", "RECIPE_RUNTIME_IDLE_SECONDS"),
 		("runtime-frame-bytes", "RECIPE_RUNTIME_FRAME_BYTES"),
 		("runtime-stream-bytes", "RECIPE_RUNTIME_STREAM_BYTES"),
+		("runtime-history-jobs", "RECIPE_RUNTIME_HISTORY_JOBS"),
+		("runtime-connect-seconds", "RECIPE_RUNTIME_CONNECT_SECONDS"),
+		("runtime-poll-milliseconds", "RECIPE_RUNTIME_POLL_MILLISECONDS"),
 	] {
 		let value = number(manifest, key)?;
 		if value.parse::<u64>().ok().filter(|v| *v != 0).is_none() {
