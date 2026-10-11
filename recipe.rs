@@ -15977,7 +15977,7 @@ impl MtpHead {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("MTP architecture is not a string"))?;
 		require(matches!(architecture, "qwen35" | "qwen4exp"), format!("MTP binding does not support architecture {architecture:?}"))?;
 		require(target.value("general.architecture").and_then(GgufValue::text) == Some(architecture), "MTP and main-model architectures differ")?;
-		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default() };
 		require(builder.integer("nextn_predict_layers")? == 1, "Qwen MTP requires one prediction layer")?;
 		let layer = builder.integer("block_count")?.checked_sub(1).ok_or_else(|| RecipeError::new("MTP block count is zero"))?;
 		require(target.integer_at(&format!("{architecture}.block_count"))? == layer, "MTP layer does not follow the main model's layers")?;
@@ -16053,9 +16053,9 @@ impl MtpHead {
 		if let Some(scale) = builder.optional("output_norm.weight") {
 			require(scale.shape == [width as u64], "MTP checkpoint output_norm has an invalid shape")?;
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
+		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("MTP tensors have no binding: {}", unread.join(", ")))?;
-		let tensors = builder.consumed.len();
+		let tensors = builder.plan.tensors.len();
 		let plan = builder.plan;
 		let tokens = natural("MTP draft tokens", env!("RECIPE_MTP_TOKENS"))?;
 		let probs = env!("RECIPE_MTP_PROBS").parse::<f64>().map_err(|_| RecipeError::new("MTP probability is invalid"))?;
@@ -16422,7 +16422,6 @@ impl MtpRuntime {
 /// Recipe blocks and, beside every block, the plan entries its weighted nodes
 /// take, in the order the lowering pushes those nodes.
 struct Builder<'a> {
-	consumed: BTreeSet<String>,
 	file: &'a Gguf,
 	architecture: &'a str,
 	rope: RopePairs,
@@ -16471,7 +16470,7 @@ impl<'a> Builder<'a> {
 			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: BTreeSet::new() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -17573,7 +17572,7 @@ fn visit_attention(blocks: &[Block], visit: &mut impl FnMut(&AttentionBlock)) {
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
