@@ -20727,7 +20727,7 @@ fn expert_request_bytes(graph:&Graph,precision:Compute)->Result<usize> {
 fn split_working_reserve(target:&Graph,head:Option<&Graph>)->usize {
 	let jobs=target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).collect::<Vec<_>>();
 	let rows=jobs.iter().filter(|job|job.dense()).flat_map(|job|job.tensors()).map(|tensor|(tensor.shape[1] as usize).div_ceil(6)).max().unwrap_or(0).max(10240);
-	let scratch=[5*10240*4,8*10240*2,8*10240/32*8,5*16*10240*4,5*rows*4,16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
+	let scratch=[EXPERT_SPLIT_PAYLOAD_BYTES,8*10240*2,8*10240/32*8,EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4,5*rows*4,16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
 	let tables=jobs.iter().map(|job|if job.dense(){job.tensors().len()*32}else{512*40}).sum::<usize>();
 	let positions=target.input.length.max(head.map_or(0,|graph|graph.input.length));
 	let reports=positions*jobs.len()*128;
@@ -21062,7 +21062,7 @@ impl ExpertExecution {
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
-			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 32*163840,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
+			let scratch = [EXPERT_SPLIT_PAYLOAD_BYTES, 8*10240*2, 8*10240/32*8, EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4, 5*dense_rows*4, 32*163840,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
 			#[cfg(nvidia)] if die != value.weights.plan.main_die {module=Some(ExpertModule::load(gpu,&bytes)?);}
 
@@ -21116,7 +21116,7 @@ impl ExpertExecution {
 				let mut record=native_words(&fields);
 				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
 				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
-				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),if layer.dense() {(layer.input_width()+3)&!3} else {layer.input_width().max(4096)} as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),if layer.dense() {(layer.input_width()+3)&!3} else {layer.input_width().max(EXPERT_SPLIT_MIN_PACKET_ROWS)} as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
 				record.extend(u32::from(layer.terminal).to_ne_bytes());
 				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
 				value.channel_tables.push(table);
@@ -21612,7 +21612,7 @@ const EXPERT_SPLIT_MAX_TOP_K: usize = 16;
 /// Each packet holds one f32 row of `EXPERT_SPLIT_PACKET_ROWS` values per position.
 const EXPERT_SPLIT_PAYLOAD_BYTES: usize = EXPERT_SPLIT_POSITIONS * EXPERT_SPLIT_PACKET_ROWS * 4;
 /// A return publishes `sequence * 64 + 63` as its local tag, independent of the peer sequence.
-const EXPERT_SPLIT_RETURN_TAG_STRIDE: u32 = 64;
+pub(crate) const EXPERT_SPLIT_RETURN_TAG_STRIDE: u32 = 64;
 const EXPERT_SPLIT_RETURN_TAG_OFFSET: u32 = 63;
 /// One combine record: a worker's payload address followed by its sequence address.
 const EXPERT_SPLIT_RESPONSE_BYTES: usize = 16;
@@ -21639,9 +21639,10 @@ const EXPERT_SPLIT_GRID: &str = r#"	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid
 	%stride = mul i32 %ntid, %nctaid
 "#;
 
-/// One `.cg` global load at `pointer + offset`. LLVM has no spelling for the
-/// cache operator, so this single instruction is written as inline asm.
-fn expert_split_cg(result: &str, element: &str, pointer: &str, offset: usize) -> String {
+/// One `.cg` global load at `pointer + offset`. LLVM has no spelling for the cache
+/// operator, so this single instruction is written as inline asm; every other memory
+/// operation in the transport is plain LLVM IR.
+fn expert_split_load(result: &str, element: &str, pointer: &str, offset: usize) -> String {
 	let (llvm, constraint) = match element { "u32" => ("i32", "=r"), "u64" => ("i64", "=l"), _ => ("float", "=f") };
 	let at = if offset == 0 { String::new() } else { format!("+{offset}") };
 	format!("\t{result} = call {llvm} asm sideeffect \"ld.global.cg.{element} $0, [$1{at}];\", \"{constraint},l,~{{memory}}\"(ptr addrspace(1) {pointer})\n")
@@ -21680,7 +21681,7 @@ position:
 	%record.ptr = getelementptr i32, ptr addrspace(1) %selected, i32 %record
 "#
 	);
-	ir.push_str(&expert_split_cg("%count", "u32", "%record.ptr", 0));
+	ir.push_str(&expert_split_load("%count", "u32", "%record.ptr", 0));
 	ir.push_str(
 		r#"	%bad.count = icmp ugt i32 %count, %top_k
 	br i1 %bad.count, label %reject, label %slot.start
@@ -21695,7 +21696,7 @@ slot.body:
 	%slot.ptr = getelementptr i32, ptr addrspace(1) %record.ptr, i32 %slot.index
 "#,
 	);
-	ir.push_str(&expert_split_cg("%expert", "u32", "%slot.ptr", 4));
+	ir.push_str(&expert_split_load("%expert", "u32", "%slot.ptr", 4));
 	ir.push_str(
 		r#"	%bad.expert = icmp uge i32 %expert, %experts
 	br i1 %bad.expert, label %reject, label %owner
@@ -21703,7 +21704,7 @@ owner:
 	%owner.ptr = getelementptr i32, ptr addrspace(1) %owners, i32 %expert
 "#,
 	);
-	ir.push_str(&expert_split_cg("%owner.id", "u32", "%owner.ptr", 0));
+	ir.push_str(&expert_split_load("%owner.id", "u32", "%owner.ptr", 0));
 	ir.push_str(
 		r#"	%mine = icmp eq i32 %owner.id, %die
 	br i1 %mine, label %owned, label %slot.latch
@@ -21719,11 +21720,11 @@ owned.write:
 	%coef.ptr = getelementptr float, ptr addrspace(1) %coefficients, i32 %coef.index
 "#,
 	);
-	ir.push_str(&expert_split_cg("%coef", "f32", "%coef.ptr", 0));
+	ir.push_str(&expert_split_load("%coef", "f32", "%coef.ptr", 0));
 	ir.push_str(
 		r#"	%route.index = add i32 %coef.row, %compact
 	%route.ptr = getelementptr float, ptr addrspace(1) %routing, i32 %route.index
-	call void asm sideeffect "st.volatile.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %route.ptr, float %coef)
+	store volatile float %coef, ptr addrspace(1) %route.ptr, align 4
 	br label %owned.count
 owned.count:
 	%counted = add i32 %compact, 1
@@ -21744,29 +21745,24 @@ count.done:
 copy:
 	br label %copy.loop
 copy.loop:
-	%k = phi i32 [%first, %copy], [%k.next, %copy.store]
+	%k = phi i32 [%first, %copy], [%k.next, %copy.body]
 	%k.more = icmp ult i32 %k, %packet_rows
 	br i1 %k.more, label %copy.body, label %position.done
 copy.body:
 	%k.in = icmp ult i32 %k, %rows
-	br i1 %k.in, label %copy.load, label %copy.zero
-copy.load:
 	%src.row = mul i32 %pos, %rows
 	%src.index = add i32 %src.row, %k
-	%src.ptr = getelementptr float, ptr addrspace(1) %hidden, i32 %src.index
+	%src.pick = select i1 %k.in, i32 %src.index, i32 0
+	%src.ptr = getelementptr float, ptr addrspace(1) %hidden, i32 %src.pick
 "#,
 	);
-	ir.push_str(&expert_split_cg("%loaded", "f32", "%src.ptr", 0));
+	ir.push_str(&expert_split_load("%loaded", "f32", "%src.ptr", 0));
 	ir.push_str(
-		r#"	br label %copy.store
-copy.zero:
-	br label %copy.store
-copy.store:
-	%value = phi float [%loaded, %copy.load], [0.0, %copy.zero]
+		r#"	%value = select i1 %k.in, float %loaded, float 0.0
 	%dst.row = mul i32 %pos, %packet_rows
 	%dst.index = add i32 %dst.row, %k
 	%dst.ptr = getelementptr float, ptr addrspace(1) %request, i32 %dst.index
-	call void asm sideeffect "st.volatile.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %dst.ptr, float %value)
+	store volatile float %value, ptr addrspace(1) %dst.ptr, align 4
 	%k.next = add i32 %k, %stride
 	br label %copy.loop, !llvm.loop !0
 position.done:
@@ -21818,20 +21814,20 @@ slot.body:
 	%pair.row = mul i32 %pos, %top_k
 	%pair = add i32 %pair.row, %slot.index
 	%coef.ptr = getelementptr float, ptr addrspace(1) %coefficients, i32 %pair
-	%coef = call float asm sideeffect "ld.volatile.global.f32 $0, [$1];", "=f,l,~{memory}"(ptr addrspace(1) %coef.ptr)
+	%coef = load volatile float, ptr addrspace(1) %coef.ptr, align 4
 	%out.row = mul i32 %pair, %rows
 	%out.index = add i32 %out.row, %col
 	%out.ptr = getelementptr float, ptr addrspace(1) %expert_outputs, i32 %out.index
 "#,
 	);
-	ir.push_str(&expert_split_cg("%out", "f32", "%out.ptr", 0));
+	ir.push_str(&expert_split_load("%out", "f32", "%out.ptr", 0));
 	ir.push_str(
 		r#"	%acc.next = call float @llvm.fma.f32(float %coef, float %out, float %acc)
 	%slot.next = add i32 %slot.index, 1
 	br label %slot, !llvm.loop !0
 row.store:
 	%partial.ptr = getelementptr float, ptr addrspace(1) %partial, i32 %idx
-	call void asm sideeffect "st.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %partial.ptr, float %acc)
+	store float %acc, ptr addrspace(1) %partial.ptr, align 4
 	%idx.next = add i32 %idx, %stride
 	br label %row, !llvm.loop !0
 done:
@@ -21856,29 +21852,24 @@ entry:
 	%tag = add i32 %tag.scaled, {EXPERT_SPLIT_RETURN_TAG_OFFSET}
 	br label %return.loop
 return.loop:
-	%idx = phi i32 [%first, %entry], [%idx.next, %return.store]
+	%idx = phi i32 [%first, %entry], [%idx.next, %return.body]
 	%idx.more = icmp ult i32 %idx, %total
 	br i1 %idx.more, label %return.body, label %return.publish
 return.body:
 	%pos = udiv i32 %idx, %packet_rows
 	%col = urem i32 %idx, %packet_rows
 	%col.in = icmp ult i32 %col, %rows
-	br i1 %col.in, label %return.read, label %return.zero
-return.read:
 	%src.row = mul i32 %pos, %rows
 	%src.index = add i32 %src.row, %col
-	%src.ptr = getelementptr float, ptr addrspace(1) %partial, i32 %src.index
+	%src.pick = select i1 %col.in, i32 %src.index, i32 0
+	%src.ptr = getelementptr float, ptr addrspace(1) %partial, i32 %src.pick
 "#
 	);
-	ir.push_str(&expert_split_cg("%loaded", "f32", "%src.ptr", 0));
+	ir.push_str(&expert_split_load("%loaded", "f32", "%src.ptr", 0));
 	ir.push_str(
-		r#"	br label %return.store
-return.zero:
-	br label %return.store
-return.store:
-	%value = phi float [%loaded, %return.read], [0.0, %return.zero]
+		r#"	%value = select i1 %col.in, float %loaded, float 0.0
 	%dst.ptr = getelementptr float, ptr addrspace(1) %response, i32 %idx
-	call void asm sideeffect "st.volatile.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %dst.ptr, float %value)
+	store volatile float %value, ptr addrspace(1) %dst.ptr, align 4
 	%idx.next = add i32 %idx, %stride
 	br label %return.loop, !llvm.loop !0
 return.publish:
@@ -21907,8 +21898,8 @@ wait.body:
 	%entry.ptr = getelementptr i8, ptr addrspace(1) %responses, i32 %entry.offset
 "#
 	);
-	ir.push_str(&expert_split_cg("%wait.payload", "u64", "%entry.ptr", 0));
-	ir.push_str(&expert_split_cg("%flag", "u64", "%entry.ptr", 8));
+	ir.push_str(&expert_split_load("%wait.payload", "u64", "%entry.ptr", 0));
+	ir.push_str(&expert_split_load("%flag", "u64", "%entry.ptr", 8));
 	ir.push_str(
 		r#"	%waited = call i32 @p2p_wait(i64 %flag, i32 %sequence, i64 %deadline)
 	%failed = icmp eq i32 %waited, 0
@@ -21935,17 +21926,17 @@ sum.body:
 "#,
 	);
 	ir.push_str(&format!("\t%record.offset = mul i32 %sum.w, {EXPERT_SPLIT_RESPONSE_BYTES}\n\t%record.ptr = getelementptr i8, ptr addrspace(1) %responses, i32 %record.offset\n"));
-	ir.push_str(&expert_split_cg("%payload", "u64", "%record.ptr", 0));
+	ir.push_str(&expert_split_load("%payload", "u64", "%record.ptr", 0));
 	ir.push_str(
 		r#"	%payload.ptr = inttoptr i64 %payload to ptr addrspace(1)
 	%value.ptr = getelementptr float, ptr addrspace(1) %payload.ptr, i32 %plane.index
-	%value = call float asm sideeffect "ld.volatile.global.f32 $0, [$1];", "=f,l,~{memory}"(ptr addrspace(1) %value.ptr)
+	%value = load volatile float, ptr addrspace(1) %value.ptr, align 4
 	%acc.next = fadd float %acc, %value
 	%sum.next = add i32 %sum.w, 1
 	br label %sum, !llvm.loop !0
 row.store:
 	%out.ptr = getelementptr float, ptr addrspace(1) %output, i32 %idx
-	call void asm sideeffect "st.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %out.ptr, float %acc)
+	store float %acc, ptr addrspace(1) %out.ptr, align 4
 	%idx.next = add i32 %idx, %stride
 	br label %row, !llvm.loop !0
 done:
@@ -21966,9 +21957,7 @@ fn expert_split_ir() -> String {
 }
 
 /// Keeps the functions from LLVM's output. LLVM's module header and declarations of
-/// the peer functions are dropped, since the appended module defines them. Integer
-/// loads, stores and parameters take the unsigned spelling the transport contract
-/// names; PTX assembles both spellings to the same instructions.
+/// the peer functions are dropped, since the appended module defines them.
 fn expert_split_text(lowered: &str) -> String {
 	let mut text = String::new();
 	let mut declaring = false;
@@ -21979,11 +21968,7 @@ fn expert_split_text(lowered: &str) -> String {
 			continue;
 		}
 		if trimmed.starts_with(".version") || trimmed.starts_with(".target") || trimmed.starts_with(".address_size") { continue; }
-		if trimmed.starts_with("ld.") || trimmed.starts_with("st.") || trimmed.contains(".param .b") {
-			text.push_str(&line.replace(".b32", ".u32").replace(".b64", ".u64"));
-		} else {
-			text.push_str(line);
-		}
+		text.push_str(line);
 		text.push('\n');
 	}
 	text
