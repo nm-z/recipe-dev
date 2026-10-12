@@ -8,7 +8,8 @@ const GGUF: &str = "/mnt/sentry-nfs/flash-next-q2/Qwen3.8-Flash-Next-UD-Q2_K_XL-
 // block mixes tokens (full attention every fourth block, a gated delta rule
 // otherwise), then mixes channels with 512 routed experts and one shared expert.
 #[rustfmt::skip]
-pub fn model() -> Model {
+fn main() {
+	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let width = 2560;
 	let (lanes, rank) = (4, 320);
 
@@ -80,12 +81,8 @@ pub fn model() -> Model {
 
 	// Leaving the hyper stream folds its 4 lanes back to one through the head
 	// mixer (output_hc_norm, _down, _up) before the vocabulary projection.
-	model.layer(248320)
-}
-#[rustfmt::skip]
-fn main() {
-	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
-	let model = model();
+	let model = model.layer(248320);
+
 	let mut infer = recipe.infer();
 	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }
 	if std::env::args().any(|arg| arg == "--memory") {
