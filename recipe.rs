@@ -8901,9 +8901,10 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
 	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
 	let split = if matches!(target, BackendTarget::Nvidia { .. }) { expert_split_functions()? } else { String::new() };
+	let expert_ir = if matches!(target, BackendTarget::Nvidia { .. }) { expert_forward::expert_forward_ir() } else { String::new() };
 	let p2p = if matches!(target, BackendTarget::Nvidia { .. }) { Some((p2p_functions()?, local_p2p_functions()?)) } else { None };
 	if let Some((p2p, local_p2p)) = &p2p {
-		parts.extend([MtpBatch::ptx().as_bytes(), p2p.as_bytes(), split.as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]);
+		parts.extend([MtpBatch::ptx().as_bytes(), p2p.as_bytes(), split.as_bytes(), PackedMatvec::ptx().as_bytes(), expert_ir.as_bytes(), local_p2p.as_bytes()]);
 	}
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	Ok(format!("recipe-native-{:016x}", native_fnv1a(&parts)))
@@ -9303,7 +9304,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(&expert_split_functions()?);
 			ptx_source.push_str(PackedMatvec::ptx());
 			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
-			if expert_calls {ptx_source.push_str(expert_forward_functions());}
+			if expert_calls {ptx_source.push_str(&expert_forward_ptx()?);}
 			let entries = ptx_source.lines().filter_map(|line| {
 				let words = line.split_whitespace().collect::<Vec<_>>();
 				let at = words.iter().position(|word| *word == ".entry")?;
@@ -20727,7 +20728,7 @@ fn expert_request_bytes(graph:&Graph,precision:Compute)->Result<usize> {
 fn split_working_reserve(target:&Graph,head:Option<&Graph>)->usize {
 	let jobs=target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).collect::<Vec<_>>();
 	let rows=jobs.iter().filter(|job|job.dense()).flat_map(|job|job.tensors()).map(|tensor|(tensor.shape[1] as usize).div_ceil(6)).max().unwrap_or(0).max(10240);
-	let scratch=[EXPERT_SPLIT_PAYLOAD_BYTES,8*10240*2,8*10240/32*8,EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4,5*rows*4,16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
+	let scratch=[EXPERT_SPLIT_PAYLOAD_BYTES,8*10240*2,8*10240/32*8,EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4,5*rows*4,16*expert_grid::GROUP_SCRATCH_BYTES,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
 	let tables=jobs.iter().map(|job|if job.dense(){job.tensors().len()*32}else{512*40}).sum::<usize>();
 	let positions=target.input.length.max(head.map_or(0,|graph|graph.input.length));
 	let reports=positions*jobs.len()*128;
@@ -21026,7 +21027,7 @@ impl ExpertExecution {
 	fn worker_source() -> Result<String> {
 		let peer = p2p_functions()?;
 		let local = local_p2p_functions()?;
-		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions()))
+		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_ptx()?))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
@@ -21059,10 +21060,10 @@ impl ExpertExecution {
 		let mut value = Self { pick_counts,pick_path,worker_path:cubin.clone(),failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
 		for die in (0..DIES).filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
 			let gpu = device(Some(&die_name(die)))?;
-			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
+			let jobs = Buffer::zeroed(gpu,value.layers.len()*expert_job::BYTES)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
-			let scratch = [EXPERT_SPLIT_PAYLOAD_BYTES, 8*10240*2, 8*10240/32*8, EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4, 5*dense_rows*4, 32*163840,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
+			let scratch = [EXPERT_SPLIT_PAYLOAD_BYTES, 8*10240*2, 8*10240/32*8, EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4, 5*dense_rows*4, 32*expert_grid::GROUP_SCRATCH_BYTES,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
 			#[cfg(nvidia)] if die != value.weights.plan.main_die {module=Some(ExpertModule::load(gpu,&bytes)?);}
 
@@ -21114,11 +21115,11 @@ impl ExpertExecution {
 				let fields=[request.address(),request.sequence_address(),route,route+512,worker.scratch[0].pointer,worker.scratch[1].pointer,worker.scratch[2].pointer,table.pointer,
 					worker.scratch[3].pointer,worker.scratch[4].pointer,worker.scratch[5].pointer,request.completion_address(),request.sequence_address()+4,response.address(),response.sequence_address(),worker.reports.pointer];
 				let mut record=native_words(&fields);
-				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
-				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
-				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),if layer.dense() {(layer.input_width()+3)&!3} else {layer.input_width().max(EXPERT_SPLIT_MIN_PACKET_ROWS)} as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
-				record.extend(u32::from(layer.terminal).to_ne_bytes());
-				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
+				debug_assert_eq!(record.len(),expert_job::dimension(0));for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
+				debug_assert_eq!(record.len(),expert_job::scratch(0));for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
+				debug_assert_eq!(record.len(),expert_job::flag(0));for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),if layer.dense() {(layer.input_width()+3)&!3} else {layer.input_width().max(EXPERT_SPLIT_MIN_PACKET_ROWS)} as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				debug_assert_eq!(record.len(),expert_job::TERMINAL);record.extend(u32::from(layer.terminal).to_ne_bytes());
+				record.resize(expert_job::BYTES,0);worker.jobs.write_bytes(layer.global*expert_job::BYTES,&record)?;
 				value.channel_tables.push(table);
 			}
 			let participants=channels.len()/6;
@@ -21126,19 +21127,19 @@ impl ExpertExecution {
 			let layer_responses=if layer.dense() {Some(Buffer::upload(main,&responses)?)} else {None};
 			let local=value.workers.iter().find(|worker|worker.die==value.weights.plan.main_die).unwrap();
 			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
-			let fields=[value.control.pointer,channels.pointer,layer_responses.as_ref().map_or(value.weights.response_table_address(),|table|table.pointer),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
+			let fields=[value.control.pointer,channels.pointer,layer_responses.as_ref().map_or(value.weights.response_table_address(),|table|table.pointer),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*expert_job::BYTES as u64];
 			let mut record=native_words(&fields);
-			for dimension in [layer.global as u32,participants as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
-			record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
-			record.extend(u32::from(layer.dense()).to_ne_bytes());
-			value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
+			debug_assert_eq!(record.len(),expert_main::GLOBAL);for dimension in [layer.global as u32,participants as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
+			debug_assert_eq!(record.len(),expert_main::PICK_COUNTS);record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
+			debug_assert_eq!(record.len(),expert_main::DENSE);record.extend(u32::from(layer.dense()).to_ne_bytes());
+			debug_assert_eq!(record.len(),expert_main::BYTES);value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
 			if let Some(table)=layer_responses {value.channel_tables.push(table);}
 		}
 		Ok(value)
 	}
 	fn start(&mut self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<()> {
 		require(!self.failed,"expert execution failed previously; retain its trace and replace the failed execution before another request")?;
-		require(capacity>0 && capacity<=5 && end>=begin,"expert request has an unsupported position capacity")?;
+		require(capacity>0 && capacity<=expert_grid::POSITIONS as u32 && end>=begin,"expert request has an unsupported position capacity")?;
 		let phases = (end-begin).div_ceil(capacity) as usize * layers;
 		let base = self.weights.reserve_sequences(u32::try_from(phases).map_err(|_| RecipeError::new("expert phase count overflows"))?)?;
 		require(base.checked_add(phases as u32).and_then(|sequence|sequence.checked_mul(64)).is_some(),"expert completion sequence exhausted")?;
@@ -37308,509 +37309,1899 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 
 /// Owned worker module text for preassembly without allocating model weights.
 pub fn expert_worker_ptx() -> Result<String> { ExpertExecution::worker_source() }
-fn expert_forward_functions() -> &'static str { r#"
-// Real forward glue. Every local completion stage has a distinct sequence.
-.func (.param .u32 result) split_grid(.param .u64 s0,.param .u64 f0,.param .u32 q0,.param .u64 d0) {
-	.reg .b64 s,f,d; .reg .b32 q,r; .reg .pred failed;
-	ld.param.u64 s,[s0]; ld.param.u64 f,[f0]; ld.param.u32 q,[q0]; ld.param.u64 d,[d0];
-	{ .param .u64 a,b,c; .param .u32 x,y;
-	st.param.u64 [a],s; st.param.u64 [b],f; st.param.u64 [c],d; st.param.u32 [x],q;
-	call.uni (y),split_local_publish,(a,b,x,c); ld.param.u32 r,[y]; }
-	setp.eq.u32 failed,r,0; @failed bra grid_done;
-	{ .param .u64 address,deadline; .param .u32 sequence,receipt;
-	st.param.u64 [address],f; st.param.u64 [deadline],d; st.param.u32 [sequence],q;
-	call.uni (receipt),split_local_wait,(address,sequence,deadline); ld.param.u32 r,[receipt]; }
-grid_done:
-	st.param.u32 [result],r; ret;
-}
-.func (.param .u32 result) split_mv(.param .u64 w0,.param .u32 t0,.param .u64 x0,.param .u64 s0,.param .u64 o0,
-	.param .u32 k0,.param .u32 m0,.param .u32 cap0,.param .u32 cols0,.param .u32 mask0,.param .u32 rank0,.param .u32 count0,.param .u64 sh0) {
-	.reg .b64 w,x,s,o,sh; .reg .b32 t,k,m,cap,cols,mask,rank,count,kind,lanes,ok; .reg .pred p;
-	ld.param.u64 w,[w0]; ld.param.u32 t,[t0]; ld.param.u64 x,[x0]; ld.param.u64 s,[s0]; ld.param.u64 o,[o0];
-	ld.param.u32 k,[k0]; ld.param.u32 m,[m0]; ld.param.u32 cap,[cap0]; ld.param.u32 cols,[cols0]; ld.param.u32 mask,[mask0];
-	ld.param.u32 rank,[rank0]; ld.param.u32 count,[count0]; ld.param.u64 sh,[sh0];
-	// Measured 256-thread expert tuples from 431203e's cta-256 table.
-	mov.u32 kind,0; mov.u32 lanes,8;
-	setp.eq.u32 p,t,17; @!p bra tuple_iq3;
-	setp.eq.u32 p,cap,8; @p mov.u32 kind,2;
-	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; bra tuple_ready;
-tuple_iq3:
-	setp.eq.u32 p,t,18; @!p bra tuple_q8;
-	setp.eq.u32 p,count,16; @p mov.u32 lanes,16; setp.eq.u32 p,cap,8; @p mov.u32 lanes,8; bra tuple_ready;
-tuple_q8:
-	setp.eq.u32 p,t,20; @!p bra tuple_q8_type;
-	setp.le.u32 p,cap,2; @p mov.u32 kind,2; bra tuple_ready;
-tuple_q8_type:
-	setp.eq.u32 p,t,8; @!p bra tuple_ready;
-	setp.eq.u32 p,k,2560; @p mov.u32 lanes,16;
-tuple_ready:
-	{ .param .u32 a,b,c,d,e,f,j,l,n,p,r,z; .param .u64 g,h,i,q;
-	st.param.u32 [a],t; st.param.u32 [b],cap; st.param.u32 [c],cols; st.param.u32 [d],kind; st.param.u32 [e],lanes; st.param.u32 [f],mask;
-	st.param.u64 [g],w; st.param.u64 [h],x; st.param.u64 [i],s; st.param.u64 [q],o;
-	st.param.u32 [j],k; st.param.u32 [l],m; st.param.u32 [n],rank; st.param.u32 [p],count;
-	call.uni (z),packed_matvec,(a,b,c,d,e,f,g,h,i,q,j,l,n,p); ld.param.u32 ok,[z]; }
-	st.param.u32 [result],ok; ret;
-}
-// One logical helper receipt per row-split group, recorded during execution.
-.func split_route_count(.param .u64 report0,.param .u32 rank0,.param .u32 field0,.param .u32 receipt0) {
-	.reg .b64 report,at; .reg .b32 rank,field,receipt,tid,old; .reg .pred p,q;
-	ld.param.u64 report,[report0]; ld.param.u32 rank,[rank0]; ld.param.u32 field,[field0]; ld.param.u32 receipt,[receipt0];
-	setp.eq.u32 p,receipt,0; @p mov.u32 field,4; mul.wide.u32 at,field,4; add.u64 at,report,at;
-	mov.u32 tid,%tid.x; setp.eq.u32 p,tid,0; setp.eq.u32 q,rank,0; and.pred p,p,q;
-	@p atom.global.add.u32 old,[at+32],1; ret;
-}
-.func (.param .u32 result) split_expert_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
-	.reg .b64 a<48>; .reg .b32 r<48>; .reg .pred p<12>; .reg .f32 f<8>;
-	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
-	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+24];
-	ld.global.u64 a7,[a0+32]; ld.global.u64 a8,[a0+40]; ld.global.u64 a9,[a0+48]; ld.global.u64 a10,[a0+56];
-	ld.global.u64 a11,[a0+64]; ld.global.u64 a12,[a0+72]; ld.global.u64 a13,[a0+80]; ld.global.u64 a14,[a0+88];
-	ld.global.u64 a15,[a0+96]; ld.global.u64 a16,[a0+104]; ld.global.u64 a17,[a0+112];
-	ld.global.u32 r2,[a0+128]; ld.global.u32 r3,[a0+132]; ld.global.u32 r4,[a0+136]; ld.global.u32 r5,[a0+140];
-	ld.global.u64 a18,[a0+144]; ld.global.u64 a19,[a0+152]; ld.global.u64 a20,[a0+160];
-	mov.u32 r6,%tid.x; mov.u32 r7,%ctaid.x; mov.u32 r8,%ntid.x; mov.u32 r9,%nctaid.x;
-	mad.lo.u32 r10,r7,r8,r6; mul.lo.u32 r11,r8,r9; setp.eq.u32 p0,r10,0;
-	mov.u32 r12,1; mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2],a21; add.u64 a22,a21,5000000000;
-	mov.u32 r13,0; @p0 st.global.v4.u32 [a2+32],{r13,r13,r13,r13}; @p0 st.global.u32 [a2+48],r13;
-	{ .param .u64 flag,limit; .param .u32 seq,ok; st.param.u64 [flag],a4; st.param.u64 [limit],a22; st.param.u32 [seq],r0;
-	call.uni (ok),p2p_wait,(flag,seq,limit); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,101; @p1 bra worker_done;
-	mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2+8],a21;
-	// Compact the padded packet to k-float columns; zero all selected-slot planes.
-	mul.lo.u32 r14,r2,r1; mov.u32 r15,r10;
-worker_copy:
-	setp.ge.u32 p1,r15,r14; @p1 bra worker_zero_begin;
-	div.u32 r16,r15,r2; rem.u32 r17,r15,r2; mad.lo.u32 r18,r16,4096,r17; mul.wide.u32 a23,r18,4; add.u64 a24,a3,a23;
-	add.u32 r18,r5,1; mul.lo.u32 r18,r18,r16; mul.wide.u32 a25,r18,4; add.u64 a26,a5,a25; ld.volatile.global.u32 r19,[a26];
-	mov.f32 f0,0f00000000; setp.ne.u32 p2,r19,0; @p2 ld.volatile.global.f32 f0,[a24];
-	mul.wide.u32 a23,r15,4; add.u64 a24,a7,a23; st.global.f32 [a24],f0; add.u32 r15,r15,r11; bra worker_copy;
-worker_zero_begin:
-	mul.lo.u32 r14,r14,r5; mov.u32 r15,r10;
-worker_zero:
-	setp.ge.u32 p1,r15,r14; @p1 bra worker_list;
-	mul.wide.u32 a23,r15,4; add.u64 a24,a11,a23; mov.u32 r16,0; st.global.u32 [a24],r16; add.u32 r15,r15,r11; bra worker_zero;
-worker_list:
-	@!p0 bra worker_prepare;
-	mov.u32 r14,0; mov.u32 r15,0;
-list_position:
-	setp.ge.u32 p1,r15,r1; @p1 bra list_done;
-	add.u32 r16,r5,1; mul.lo.u32 r16,r16,r15; mul.wide.u32 a23,r16,4; add.u64 a24,a5,a23; ld.volatile.global.u32 r17,[a24]; mov.u32 r18,0;
-list_slot:
-	setp.ge.u32 p1,r18,r17; @p1 bra list_next_position;
-	mul.wide.u32 a25,r18,4; add.u64 a26,a24,a25; ld.volatile.global.u32 r19,[a26+4]; mov.u32 r20,0;
-list_seen:
-	setp.ge.u32 p1,r20,r14; @p1 bra list_append;
-	mul.wide.u32 a27,r20,4; add.u64 a28,a5,a27; ld.volatile.global.u32 r21,[a28+1028]; setp.eq.u32 p2,r19,r21; @p2 bra list_next_slot;
-	add.u32 r20,r20,1; bra list_seen;
-list_append:
-	mul.wide.u32 a27,r14,4; add.u64 a28,a5,a27; st.volatile.global.u32 [a28+1028],r19; add.u32 r14,r14,1;
-list_next_slot:
-	add.u32 r18,r18,1; bra list_slot;
-list_next_position:
-	add.u32 r15,r15,1; bra list_position;
-list_done:
-	st.volatile.global.u32 [a5+1024],r14; st.global.u32 [a2+56],r14;
-worker_prepare:
-	mul.lo.u32 r22,r0,64;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,102; @p1 bra worker_done;
-	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a7; st.param.u64 [pk],a8; st.param.u64 [sc],a9; st.param.u32 [k],r2; st.param.u32 [c],r1; st.param.u32 [ac],r1;
-	st.param.u32 [rank],r7; st.param.u32 [count],r9; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
-	add.u32 r22,r22,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,103; @p1 bra worker_done;
-	ld.volatile.global.u32 r23,[a5+1024]; mov.u32 r24,0;
-wave_begin:
-	setp.ge.u32 p1,r24,r23; @p1 bra worker_reduce;
-	sub.u32 r25,r23,r24; min.u32 r25,r25,r9; rem.u32 r26,r7,r25; div.u32 r27,r7,r25;
-	add.u32 r28,r9,r25; sub.u32 r28,r28,1; sub.u32 r28,r28,r26; div.u32 r28,r28,r25;
-	add.u32 r29,r24,r26; mul.wide.u32 a23,r29,4; add.u64 a24,a5,a23; ld.volatile.global.u32 r30,[a24+1028];
-	{ .param .u64 ids,word; .param .u32 cols,top,ex; st.param.u64 [ids],a5; st.param.u32 [cols],r1; st.param.u32 [top],r5; st.param.u32 [ex],r30;
-	call.uni (word),mtp_group_cta,(ids,cols,top,ex); ld.param.u64 a29,[word]; }
-	cvt.u32.u64 r31,a29; popc.b32 r32,r31; mov.u32 r33,1; setp.gt.u32 p1,r32,1; @p1 mov.u32 r33,2; setp.gt.u32 p1,r32,2; @p1 mov.u32 r33,4; setp.gt.u32 p1,r32,4; @p1 mov.u32 r33,8;
-	mul.wide.u32 a23,r30,40; add.u64 a30,a10,a23; ld.global.u64 a31,[a30]; ld.global.u64 a32,[a30+8]; ld.global.u64 a33,[a30+16];
-	ld.global.u32 r34,[a30+24]; ld.global.u32 r35,[a30+28]; ld.global.u32 r36,[a30+32];
-	mul.wide.u32 a23,r26,163840; add.u64 a34,a13,a23; add.u64 a35,a34,20480; add.u64 a36,a34,65536;
-	// The measured fused path writes the group's compact active product directly.
-	mov.u32 r43,0; setp.eq.u32 p3,r34,r35; setp.eq.u32 p4,r34,17; setp.eq.u32 p5,r34,18; or.pred p4,p4,p5; and.pred p3,p3,p4;
-	setp.le.u32 p4,r33,2; and.pred p3,p3,p4; @!p3 bra gate_up_separate;
-	mov.u32 r43,1; mul.lo.u32 r44,r3,8; mul.lo.u32 r44,r44,r26; mul.wide.u32 a39,r44,4; add.u64 a39,a18,a39;
-	{ .param .u32 ty,cap,active,lanes,mask,k,m,rank,count,ok; .param .u64 g,u,x,sc,o;
-	st.param.u32 [ty],r34; st.param.u32 [cap],r33; st.param.u32 [active],r32; mov.u32 r44,16; st.param.u32 [lanes],r44; st.param.u32 [mask],r31;
-	st.param.u64 [g],a31; st.param.u64 [u],a32; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a39;
-	st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [rank],r27; st.param.u32 [count],r28;
-	call.uni (ok),packed_gate_up,(ty,cap,active,lanes,mask,g,u,x,sc,o,k,m,rank,count); ld.param.u32 r13,[ok]; }
-	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
-	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,206; bra gate_up_complete;
-gate_up_separate:
-	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
-	st.param.u64 [w],a31; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a34; st.param.u64 [sh],a1;
-	st.param.u32 [ty],r34; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
-	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
-	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
-	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,204;
-	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
-	st.param.u64 [w],a32; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a35; st.param.u64 [sh],a1;
-	st.param.u32 [ty],r35; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
-	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
-	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
-	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,205;
-gate_up_complete:
-	// Full-die completion before consuming row partitions from other CTAs.
-	div.u32 r37,r24,r9; mad.lo.u32 r22,r0,64,2; mad.lo.u32 r22,r37,8,r22;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,106; @p1 bra worker_done;
-	// Each group's compact product occupies eight columns in one full-die array.
-	mul.lo.u32 r38,r3,8; mul.lo.u32 r39,r3,r32; mad.lo.u32 r15,r27,r8,r6; mul.lo.u32 r16,r28,r8;
-product_loop:
-	setp.ge.u32 p1,r15,r38; @p1 bra product_done;
-	mov.f32 f0,0f00000000; setp.ge.u32 p2,r15,r39; @p2 bra product_store;
-	setp.ne.u32 p3,r43,0; @p3 bra product_next;
-	mul.wide.u32 a23,r15,4; add.u64 a24,a34,a23; add.u64 a25,a35,a23; ld.global.cg.f32 f1,[a24]; ld.global.cg.f32 f2,[a25];
-	mul.f32 f3,f1,0fbfb8aa3b; ex2.approx.f32 f3,f3; add.f32 f3,f3,0f3f800000; rcp.approx.f32 f3,f3; mul.f32 f0,f1,f3; mul.f32 f0,f0,f2;
-product_store:
-	mad.lo.u32 r17,r26,r38,r15; mul.wide.u32 a23,r17,4; add.u64 a24,a18,a23; st.global.f32 [a24],f0;
-product_next:
-	add.u32 r15,r15,r16; bra product_loop;
-product_done:
-	add.u32 r22,r22,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,107; @p1 bra worker_done;
-	mul.lo.u32 r40,r25,8;
-	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a18; st.param.u64 [pk],a19; st.param.u64 [sc],a20; st.param.u32 [k],r3; st.param.u32 [c],r40; st.param.u32 [ac],r40;
-	st.param.u32 [rank],r7; st.param.u32 [count],r9; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
-	add.u32 r22,r22,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,108; @p1 bra worker_done;
-	mul.lo.u32 r17,r26,r3; mul.wide.u32 a23,r17,16; add.u64 a37,a19,a23; mul.wide.u32 a23,r17,2; add.u64 a38,a20,a23;
-	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
-	st.param.u64 [w],a33; st.param.u64 [x],a37; st.param.u64 [sc],a38; st.param.u64 [o],a36; st.param.u64 [sh],a1;
-	st.param.u32 [ty],r36; st.param.u32 [k],r3; st.param.u32 [m],r2; st.param.u32 [cap],r33; st.param.u32 [c],r32; mov.u32 r13,0; st.param.u32 [mask],r13; st.param.u32 [rank],r27; st.param.u32 [count],r28;
-	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
-	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
-	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,209;
-	add.u32 r22,r22,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,110; @p1 bra worker_done;
-	{ .param .u32 mask,word; st.param.u32 [mask],r31; call.uni (word),mtp_column_word,(mask); ld.param.u32 r41,[word]; }
-	shr.u64 a23,a29,32; cvt.u32.u64 r42,a23; mul.lo.u32 r14,r32,r2; mad.lo.u32 r15,r27,r8,r6;
-scatter_loop:
-	setp.ge.u32 p1,r15,r14; @p1 bra scatter_done;
-	div.u32 r16,r15,r2; rem.u32 r17,r15,r2; mul.lo.u32 r18,r16,4; shr.u32 r19,r41,r18; and.b32 r19,r19,15;
-	mul.lo.u32 r18,r19,4; shr.u32 r20,r42,r18; and.b32 r20,r20,15; mad.lo.u32 r21,r19,r5,r20; mad.lo.u32 r21,r21,r2,r17;
-	mul.wide.u32 a23,r15,4; add.u64 a24,a36,a23; ld.global.cg.f32 f0,[a24]; mul.wide.u32 a25,r21,4; add.u64 a26,a11,a25; st.global.f32 [a26],f0;
-	mul.lo.u32 r16,r28,r8; add.u32 r15,r15,r16; bra scatter_loop;
-scatter_done:
-	add.u32 r22,r22,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,111; @p1 bra worker_done;
-	add.u32 r24,r24,r9; bra wave_begin;
-worker_reduce:
-	mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2+16],a21;
-	{ .param .u64 ids,coef,in,out; .param .u32 top,rows,cols,ok; st.param.u64 [ids],a5; st.param.u64 [coef],a6; st.param.u64 [in],a11; st.param.u64 [out],a12;
-	st.param.u32 [top],r5; st.param.u32 [rows],r2; st.param.u32 [cols],r1; call.uni (ok),split_local_combine,(ids,coef,in,out,top,rows,cols); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,212;
-	mad.lo.u32 r22,r0,64,62;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
-	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,113; @p1 bra worker_done;
-	{ .param .u64 in,out,sl,fl,dl; .param .u32 seq,rows,cols,stride,ok; st.param.u64 [in],a12; st.param.u64 [out],a16; st.param.u64 [sl],a14; st.param.u64 [fl],a17; st.param.u64 [dl],a22;
-	st.param.u32 [seq],r0; st.param.u32 [rows],r2; st.param.u32 [cols],r1; mov.u32 r13,4096; st.param.u32 [stride],r13;
-	call.uni (ok),split_return,(in,out,sl,fl,seq,dl,rows,cols,stride); ld.param.u32 r13,[ok]; }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,114;
-worker_done:
-	mov.u64 a21,%globaltimer; @p0 st.global.u64 [a2+24],a21;
-	setp.eq.u32 p1,r6,0; mul.wide.u32 a23,r7,4; add.u64 a24,a2,a23; @p1 st.global.u32 [a24+64],r12;
-	st.param.u32 [result],r12; ret;
-}
-// Dense slices write disjoint output rows into the main tape.
-.func split_dense_typed(.param .u64 w0,.param .u32 t0,.param .u64 x0,.param .u64 o0,.param .u32 k0,.param .u32 m0,.param .u32 c0) {
-	.reg .b64 w,x,o,a<4>; .reg .b32 t,k,m,c,r<15>; .reg .f32 f<4>; .reg .pred p<3>;
-	ld.param.u64 w,[w0]; ld.param.u32 t,[t0]; ld.param.u64 x,[x0]; ld.param.u64 o,[o0]; ld.param.u32 k,[k0]; ld.param.u32 m,[m0]; ld.param.u32 c,[c0];
-	mov.u32 r0,%tid.x; mov.u32 r1,%ctaid.x; mov.u32 r2,%ntid.x; mov.u32 r3,%nctaid.x;
-	and.b32 r4,r0,31; shr.u32 r5,r0,5; shr.u32 r6,r2,5; mad.lo.u32 r5,r1,r6,r5; mul.lo.u32 r6,r6,r3; mul.lo.u32 r7,m,c;
-dt_row:
-	setp.ge.u32 p0,r5,r7; @p0 ret; rem.u32 r8,r5,m; div.u32 r9,r5,m; mov.f32 f0,0f00000000; mov.u32 r10,r4;
-dt_k:
-	setp.ge.u32 p0,r10,k; @p0 bra dt_sum;
-	mad.lo.u32 r11,r8,k,r10; mad.lo.u32 r12,r9,k,r10; mul.wide.u32 a0,r12,4; add.u64 a1,x,a0; ld.global.f32 f1,[a1];
-	setp.eq.u32 p1,t,30; @p1 bra dt_bf;
-	mul.wide.u32 a0,r11,4; add.u64 a1,w,a0; ld.global.f32 f2,[a1]; bra dt_fma;
-dt_bf:
-	mul.wide.u32 a0,r11,2; add.u64 a1,w,a0; ld.global.u16 r13,[a1]; shl.b32 r13,r13,16; mov.b32 f2,r13;
-dt_fma:
-	fma.rn.f32 f0,f1,f2,f0; add.u32 r10,r10,32; bra dt_k;
-dt_sum:
-	mov.u32 r14,16;
-dt_shuffle:
-	shfl.sync.bfly.b32 r13,f0,r14,31,-1; mov.b32 f3,r13; add.f32 f0,f0,f3; shr.u32 r14,r14,1; setp.ne.u32 p0,r14,0; @p0 bra dt_shuffle;
-	setp.eq.u32 p0,r4,0; mul.wide.u32 a0,r5,4; add.u64 a1,o,a0; @p0 st.global.f32 [a1],f0;
-	add.u32 r5,r5,r6; bra dt_row;
-}
-.func (.param .u32 result) split_dense_layer(.param .u64 desc0,.param .u32 seq0,.param .u32 cols0,.param .u64 sh0,.param .u64 report0) {
-	.reg .b64 a<30>; .reg .b32 r<32>; .reg .pred p<6>; .reg .f32 f;
-	ld.param.u64 a0,[desc0]; ld.param.u32 r0,[seq0]; ld.param.u32 r1,[cols0]; ld.param.u64 a1,[sh0]; ld.param.u64 a2,[report0];
-	ld.global.u64 a3,[a0]; ld.global.u64 a4,[a0+8]; ld.global.u64 a5,[a0+16]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+40]; ld.global.u64 a8,[a0+48];
-	ld.global.u64 a9,[a0+56]; ld.global.u64 a10,[a0+72]; ld.global.u64 a11,[a0+88]; ld.global.u64 a12,[a0+96]; ld.global.u64 a13,[a0+112];
-	ld.global.u32 r2,[a0+128]; ld.global.u32 r3,[a0+136]; ld.global.u32 r4,[a0+176];
-	mov.u32 r5,%tid.x; mov.u32 r6,%ctaid.x; mov.u32 r7,%ntid.x; mov.u32 r8,%nctaid.x; mad.lo.u32 r9,r6,r7,r5; mul.lo.u32 r10,r7,r8;
-	setp.eq.u32 p0,r9,0; mov.u32 r11,1; mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2],a14; add.u64 a15,a14,5000000000;
-	mov.u32 r12,0; @p0 st.global.v4.u32 [a2+32],{r12,r12,r12,r12}; @p0 st.global.u32 [a2+48],r12;
-	// A die holding none of this layer's rows receives no packet and sends no reply.
-	setp.ne.u32 p1,r3,0; @p1 bra dl_has_rows;
-	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+8],a14; @p0 st.global.u64 [a2+16],a14; bra dl_done;
-dl_has_rows:
-	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a4; st.param.u64 [dl],a15; st.param.u32 [sq],r0; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r12,[ok]; }
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,401; @p1 bra dl_done;
-	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+8],a14;
-	ld.volatile.global.u64 a16,[a5]; ld.volatile.global.u32 r13,[a5+8]; ld.volatile.global.u32 r14,[a5+12];
-	mov.u32 r15,r9; mul.lo.u32 r16,r2,r1;
-dl_copy:
-	setp.ge.u32 p1,r15,r16; @p1 bra dl_copied; div.u32 r17,r15,r2; rem.u32 r18,r15,r2; mad.lo.u32 r19,r17,r4,r18;
-	mul.wide.u32 a17,r19,4; add.u64 a18,a3,a17; ld.volatile.global.f32 f,[a18]; mul.wide.u32 a17,r15,4; add.u64 a18,a6,a17; st.global.f32 [a18],f;
-	add.u32 r15,r15,r10; bra dl_copy;
-dl_copied:
-	mul.lo.u32 r20,r0,64;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,402; @p1 bra dl_done;
-	ld.global.u32 r27,[a0+180]; setp.eq.u32 p1,r27,0; @p1 bra dl_prepared;
-	{ .param .u64 x,pk,sc; .param .u32 k,c,ac,rank,count; st.param.u64 [x],a6; st.param.u64 [pk],a7; st.param.u64 [sc],a8; st.param.u32 [k],r2; st.param.u32 [c],r1; st.param.u32 [ac],r1; st.param.u32 [rank],r6; st.param.u32 [count],r8; call.uni packed_prepare,(x,pk,sc,k,c,ac,rank,count); }
-dl_prepared:
-	add.u32 r20,r20,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,403; @p1 bra dl_done;
-	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+16],a14; mov.u32 r21,0;
-	mov.u32 r22,1; setp.gt.u32 p1,r1,1; @p1 mov.u32 r22,2; setp.gt.u32 p1,r1,2; @p1 mov.u32 r22,4; setp.gt.u32 p1,r1,4; @p1 mov.u32 r22,8;
-dl_slice:
-	setp.ge.u32 p1,r21,r3; @p1 bra dl_return; mul.wide.u32 a17,r21,40; add.u64 a18,a9,a17;
-	ld.global.u64 a19,[a18]; ld.global.u32 r23,[a18+8]; ld.global.u32 r24,[a18+12]; ld.global.u32 r25,[a18+16]; ld.global.u64 a20,[a18+32];
-	setp.eq.u32 p1,r23,0; setp.eq.u32 p2,r23,30; or.pred p1,p1,p2; @p1 bra dl_typed;
-	ld.global.u32 r28,[a18+24]; bfind.u32 r30,r22; shl.b32 r30,r30,3; shr.u32 r28,r28,r30; and.b32 r28,r28,255; mov.u32 r29,0;
-	setp.eq.u32 p1,r23,17; setp.eq.u32 p2,r22,8; and.pred p1,p1,p2; @p1 mov.u32 r29,2;
-	{ .param .u64 w,x,s,o; .param .u32 t,k,m,cap,c,kind,lanes,mask,rank,count,ok;
-	st.param.u64 [w],a19; st.param.u64 [x],a7; st.param.u64 [s],a8; st.param.u64 [o],a10;
-	st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [cap],r22; st.param.u32 [c],r1; st.param.u32 [kind],r29; st.param.u32 [lanes],r28;
-	mov.u32 r12,0; st.param.u32 [mask],r12; st.param.u32 [rank],r6; st.param.u32 [count],r8;
-	call.uni (ok),packed_matvec,(t,cap,c,kind,lanes,mask,w,x,s,o,k,m,rank,count); ld.param.u32 r12,[ok]; }
-	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r6; st.param.u32 [receipt],r12;
-	mov.u32 r30,0; st.param.u32 [field],r30; call.uni split_route_count,(rp,rank,field,receipt); }
-
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,404; @p1 bra dl_done; bra dl_computed;
-dl_typed:
-	{ .param .u64 w,x,o; .param .u32 t,k,m,c; st.param.u64 [w],a19; st.param.u64 [x],a6; st.param.u64 [o],a10; st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [c],r1; call.uni split_dense_typed,(w,t,x,o,k,m,c); }
-	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r6;
-	mov.u32 r30,1; st.param.u32 [field],r30; st.param.u32 [receipt],r30; call.uni split_route_count,(rp,rank,field,receipt); }
-dl_computed:
-	add.u32 r20,r20,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,405; @p1 bra dl_done;
-	// Terminal compact rows have no later consumers of inactive positions.
-	// Writing the complete row coalesces peer traffic while retaining its active logit.
-	ld.global.u32 r31,[a0+184]; setp.ne.u32 p1,r31,0; setp.eq.u32 p2,r1,1; and.pred p1,p1,p2;
-	setp.gt.u32 p2,r13,1; and.pred p1,p1,p2; setp.le.u32 p2,r13,8; and.pred p1,p1,p2;
-	@p1 bra dl_padded_begin;
-	 mov.u32 r15,r9; mul.lo.u32 r16,r25,r1;
-dl_scatter:
-	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r25; rem.u32 r18,r15,r25; mul.wide.u32 a17,r18,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_scatter_next; mad.lo.u32 r19,r18,r13,r14; add.u32 r19,r19,r17;
-	mul.wide.u32 a17,r15,4; add.u64 a18,a10,a17; ld.global.f32 f,[a18]; mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
-dl_scatter_next:
-	add.u32 r15,r15,r10; bra dl_scatter;
-dl_padded_begin:
-	mov.u32 r15,r9; mul.lo.u32 r16,r25,r13;
-dl_padded:
-	setp.ge.u32 p1,r15,r16; @p1 bra dl_scattered; div.u32 r17,r15,r13; rem.u32 r26,r15,r13;
-	mul.wide.u32 a17,r17,4; add.u64 a18,a20,a17; ld.global.u32 r18,[a18]; setp.eq.u32 p2,r18,-1; @p2 bra dl_padded_next;
-	mad.lo.u32 r19,r18,r13,r26; mov.f32 f,0f00000000; setp.eq.u32 p2,r26,r14;
-	mul.wide.u32 a17,r17,4; add.u64 a18,a10,a17; @p2 ld.global.f32 f,[a18];
-	mul.wide.u32 a17,r19,4; add.u64 a18,a16,a17; st.volatile.global.f32 [a18],f;
-dl_padded_next:
-	add.u32 r15,r15,r10; bra dl_padded;
-dl_scattered:
-	add.u32 r20,r20,1;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a12; st.param.u64 [dl],a15; st.param.u32 [sq],r20; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r12,[ok]; }
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,406; @p1 bra dl_done; add.u32 r21,r21,1; bra dl_slice;
-dl_return:
-	mul.lo.u32 r20,r0,64; add.u32 r20,r20,63;
-	{ .param .u64 sl,fl,dl; .param .u32 tag,sq,ok; st.param.u64 [sl],a11; st.param.u64 [fl],a13; st.param.u64 [dl],a15; st.param.u32 [tag],r20; st.param.u32 [sq],r0; call.uni (ok),p2p_publish_tagged,(sl,fl,tag,sq,dl); ld.param.u32 r12,[ok]; }
-	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,407;
-dl_done:
-	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+24],a14; @p0 st.global.u32 [a2+56],r3;
-	setp.eq.u32 p1,r5,0; mul.wide.u32 a17,r6,4; add.u64 a18,a2,a17; @p1 st.global.u32 [a18+64],r11; st.param.u32 [result],r11; ret;
-}
-.func (.param .u32 result) split_dense_forward(.param .u64 desc0,.param .u64 source0,.param .u64 output0,.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
-	.reg .b64 a<25>; .reg .b32 r<27>; .reg .pred p<4>; .reg .f32 f; .reg .f32 v<4>;
-	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[output0]; ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a3,[sh0];
-	ld.global.u64 a4,[a0]; ld.global.u64 a5,[a0+8]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+64]; ld.global.u32 r4,[a0+72]; ld.global.u32 r5,[a0+76]; ld.global.u32 r6,[a0+80];
-	ld.global.u64 a8,[a4+32]; ld.global.u64 a9,[a4+40]; ld.volatile.global.u32 r7,[a4]; ld.volatile.global.u32 r8,[a4+4]; ld.volatile.global.u32 r9,[a4+8]; ld.volatile.global.u32 r10,[a4+12]; ld.volatile.global.u32 r11,[a4+16];
-	mov.u32 r12,%tid.x; mov.u32 r13,%ctaid.x; mov.u32 r14,%ntid.x; mov.u32 r15,%nctaid.x; mad.lo.u32 r16,r13,r14,r12; mul.lo.u32 r17,r14,r15; setp.eq.u32 p0,r16,0;
-	mov.u64 a10,%globaltimer; add.u64 a11,a10,5000000000; ld.volatile.global.u32 r18,[a4+24]; setp.ne.u32 p1,r18,0; @p1 bra df_fail;
-	sub.u32 r18,r3,r8; div.u32 r18,r18,r9; mul.lo.u32 r18,r18,r10; sub.u32 r19,r4,r11; add.u32 r18,r18,r19; add.u32 r19,r18,r7; add.u32 r19,r19,1;
-	mov.u32 r20,r16; mul.lo.u32 r21,r6,r2;
-df_gather:
-	setp.ge.u32 p1,r20,r21; @p1 bra df_ready; div.u32 r22,r20,r6; rem.u32 r23,r20,r6; mad.lo.u32 r24,r23,r0,r1; add.u32 r24,r24,r22;
-	mul.wide.u32 a12,r24,4; add.u64 a13,a1,a12; ld.global.f32 f,[a13]; mul.wide.u32 a12,r20,4; add.u64 a13,a6,a12; st.global.f32 [a13],f; add.u32 r20,r20,r17; bra df_gather;
-df_ready:
-	mul.lo.u32 r25,r19,64;
-	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a8; st.param.u64 [fl],a9; st.param.u64 [dl],a11; st.param.u32 [sq],r25; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r26,[ok]; }
-	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,411; @p1 bra df_failed; mov.u32 r20,0; add.u32 r24,r6,3; and.b32 r24,r24,-4;
-df_send:
-	setp.ge.u32 p1,r20,r5; @p1 bra df_local; mul.wide.u32 a12,r20,48; add.u64 a13,a5,a12; ld.global.u64 a14,[a13]; ld.global.u64 a15,[a13+8]; ld.global.u64 a16,[a13+24]; ld.global.u64 a17,[a13+32];
-	@p0 st.volatile.global.u64 [a15],a2; @p0 st.volatile.global.u32 [a15+8],r0; @p0 st.volatile.global.u32 [a15+12],r1;
-	// Real values only, as 16-byte stores when the width and both buffers allow it.
-	and.b32 r12,r6,3; setp.ne.u32 p3,r12,0; @p3 bra df_packet_scalar; or.b64 a12,a6,a14; and.b64 a12,a12,15; setp.ne.u64 p3,a12,0; @p3 bra df_packet_scalar;
-	shr.u32 r12,r6,2; mov.u32 r21,r16; mul.lo.u32 r22,r12,r2;
-df_packet_quad:
-	setp.ge.u32 p1,r21,r22; @p1 bra df_publish; div.u32 r13,r21,r12; rem.u32 r14,r21,r12; shl.b32 r14,r14,2;
-	mad.lo.u32 r15,r13,r6,r14; mul.wide.u32 a12,r15,4; add.u64 a13,a6,a12; ld.global.v4.f32 {v0,v1,v2,v3},[a13];
-	mad.lo.u32 r15,r13,r24,r14; mul.wide.u32 a12,r15,4; add.u64 a13,a14,a12; st.volatile.global.v4.f32 [a13],{v0,v1,v2,v3};
-	add.u32 r21,r21,r17; bra df_packet_quad;
-df_packet_scalar:
-	mov.u32 r21,r16; mul.lo.u32 r22,r24,r2;
-df_packet:
-	setp.ge.u32 p1,r21,r22; @p1 bra df_publish; div.u32 r23,r21,r24; rem.u32 r25,r21,r24; setp.lt.u32 p2,r25,r6; mov.f32 f,0f00000000;
-	mad.lo.u32 r25,r23,r6,r25; mul.wide.u32 a12,r25,4; add.u64 a13,a6,a12; @p2 ld.global.f32 f,[a13]; mul.wide.u32 a12,r21,4; add.u64 a13,a14,a12; st.volatile.global.f32 [a13],f;
-	add.u32 r21,r21,r17; bra df_packet;
-df_publish:
-	mul.lo.u32 r25,r19,64; add.u32 r25,r25,32; add.u32 r25,r25,r20;
-	{ .param .u64 sl,fl,dl; .param .u32 tag,sq,ok; st.param.u64 [sl],a16; st.param.u64 [fl],a17; st.param.u64 [dl],a11; st.param.u32 [tag],r25; st.param.u32 [sq],r19; call.uni (ok),p2p_publish_tagged,(sl,fl,tag,sq,dl); ld.param.u32 r26,[ok]; }
-	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,412; @p1 bra df_failed; add.u32 r20,r20,1; bra df_send;
-df_local:
-	ld.global.u64 a18,[a7+120]; mul.wide.u32 a12,r18,128; add.u64 a18,a18,a12;
-	{ .param .u64 d,sh,rp; .param .u32 sq,c,ok; st.param.u64 [d],a7; st.param.u64 [sh],a3; st.param.u64 [rp],a18; st.param.u32 [sq],r19; st.param.u32 [c],r2; call.uni (ok),split_dense_layer,(d,sq,c,sh,rp); ld.param.u32 r26,[ok]; }
-	setp.ne.u32 p1,r26,1; @p1 bra df_failed; ld.global.u64 a19,[a0+16]; mov.u32 r20,0;
-df_wait:
-	setp.ge.u32 p1,r20,r5; @p1 bra df_success; mul.wide.u32 a12,r20,16; add.u64 a13,a19,a12; ld.global.u64 a17,[a13+8];
-	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a17; st.param.u64 [dl],a11; st.param.u32 [sq],r19; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r26,[ok]; }
-	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,413; @p1 bra df_failed; add.u32 r20,r20,1; bra df_wait;
-df_success:
-	mov.u32 r26,1; st.param.u32 [result],r26; ret;
-df_failed:
-	@p0 st.volatile.global.u32 [a4+24],r26; @p0 st.volatile.global.u32 [a4+28],r4;
-df_fail:
-	mov.u32 r26,0; st.param.u32 [result],r26; ret;
+mod expert_forward {
+/// Byte layout of the 192-byte per-layer job descriptor. The host writes it in `ExpertWorker::new` and
+/// the device IR in `expert_forward_ir` reads it, so both take every offset from here.
+pub mod expert_job {
+	/// Bytes per layer in the job buffer.
+	pub const BYTES: usize = 192;
+	/// Sixteen u64 pointer fields, in host write order (see the `P_*` indices).
+	pub const fn pointer(field: usize) -> usize {
+		8 * field
+	}
+	/// Four u32 dimensions: input width, hidden width, slice or expert count, and ten.
+	pub const fn dimension(field: usize) -> usize {
+		128 + 4 * field
+	}
+	/// Three u64 scratch pointers (the `S_*` indices).
+	pub const fn scratch(field: usize) -> usize {
+		144 + 8 * field
+	}
+	/// Four u32 layer flags: dense, last-only, row stride, and typed weights (the `F_*` indices).
+	pub const fn flag(field: usize) -> usize {
+		168 + 4 * field
+	}
+	/// One u32 terminal flag.
+	pub const TERMINAL: usize = 184;
+	pub const P_REQUEST: usize = 0;
+	pub const P_REQUEST_SEQUENCE: usize = 1;
+	pub const P_ROUTE: usize = 2;
+	pub const P_ROUTE_RESPONSE: usize = 3;
+	pub const P_SCRATCH_A: usize = 4;
+	pub const P_SCRATCH_B: usize = 5;
+	pub const P_SCRATCH_C: usize = 6;
+	pub const P_TABLE: usize = 7;
+	pub const P_SCRATCH_D: usize = 8;
+	pub const P_SCRATCH_E: usize = 9;
+	pub const P_SCRATCH_F: usize = 10;
+	pub const P_REQUEST_COMPLETION: usize = 11;
+	pub const P_REQUEST_SEQUENCE_NEXT: usize = 12;
+	pub const P_RESPONSE: usize = 13;
+	pub const P_RESPONSE_SEQUENCE: usize = 14;
+	pub const P_REPORTS: usize = 15;
+	pub const D_INPUT_WIDTH: usize = 0;
+	pub const D_HIDDEN: usize = 1;
+	pub const D_SLICES: usize = 2;
+	pub const D_TEN: usize = 3;
+	pub const S_SCRATCH_G: usize = 0;
+	pub const S_SCRATCH_H: usize = 1;
+	pub const S_SCRATCH_I: usize = 2;
+	pub const F_DENSE: usize = 0;
+	pub const F_LAST_ONLY: usize = 1;
+	pub const F_STRIDE: usize = 2;
+	pub const F_TYPED: usize = 3;
 }
 
-.visible .entry expert_split_worker(.param .u64 jobs0,.param .u32 first0,.param .u32 layers0,.param .u32 base0,.param .u32 tokens0,.param .u32 capacity0) {
-	.reg .b64 a<8>; .reg .b32 r<16>; .reg .pred p<3>;
-	ld.param.u64 a0,[jobs0]; ld.param.u32 r0,[first0]; ld.param.u32 r1,[layers0]; ld.param.u32 r2,[base0]; ld.param.u32 r3,[tokens0]; ld.param.u32 r4,[capacity0];
-	cvta.shared.u64 a1,scratch; mov.u32 r5,0; mov.u32 r6,0;
-entry_chunk:
-	setp.ge.u32 p0,r5,r3; @p0 ret; sub.u32 r7,r3,r5; min.u32 r7,r7,r4; mov.u32 r8,0;
-entry_layer:
-	add.u32 r9,r0,r8; mul.wide.u32 a2,r9,192; add.u64 a3,a0,a2; ld.global.u64 a4,[a3+120]; mul.wide.u32 a5,r6,128; add.u64 a4,a4,a5;
-	add.u32 r10,r2,r6; add.u32 r10,r10,1;
-	ld.global.u32 r12,[a3+172]; mov.u32 r13,r7; setp.ne.u32 p1,r12,0; @p1 mov.u32 r13,1;
-	ld.global.u32 r12,[a3+168]; setp.ne.u32 p1,r12,0; @p1 bra entry_dense;
-	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r13;
-	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
-	bra entry_result;
-entry_dense:
-	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a3; st.param.u64 [sh],a1; st.param.u64 [report],a4; st.param.u32 [seq],r10; st.param.u32 [cols],r13;
-	call.uni (ok),split_dense_layer,(desc,seq,cols,sh,report); ld.param.u32 r11,[ok]; }
-entry_result:
-	setp.ne.u32 p0,r11,1; @p0 ret; add.u32 r6,r6,1; add.u32 r8,r8,1; setp.lt.u32 p0,r8,r1; @p0 bra entry_layer;
-	add.u32 r5,r5,r4; bra entry_chunk;
-}
-.func (.param .u32 result) split_main_forward(.param .u64 desc0,.param .u64 source0,.param .u64 coef0,.param .u64 selected0,.param .u64 output0,
-	.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
-	.reg .b64 a<36>; .reg .b32 r<32>; .reg .pred p<8>; .reg .f32 f;
-	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[coef0]; ld.param.u64 a3,[selected0]; ld.param.u64 a4,[output0];
-	ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a5,[sh0];
-	ld.global.u32 r30,[a0+104]; setp.ne.u32 p1,r30,0; @!p1 bra main_expert;
-	{ .param .u64 d,x,o,h; .param .u32 l,b,c,t,ok; st.param.u64 [d],a0; st.param.u64 [x],a1; st.param.u64 [o],a4; st.param.u64 [h],a5; st.param.u32 [l],r0; st.param.u32 [b],r1; st.param.u32 [c],r2; st.param.u32 [t],r3;
-	call.uni (ok),split_dense_forward,(d,x,o,l,b,c,t,h); ld.param.u32 r30,[ok]; }
-	st.param.u32 [result],r30; ret;
-main_expert:
-
-	ld.global.u64 a6,[a0]; ld.global.u64 a7,[a0+8]; ld.global.u64 a8,[a0+16]; ld.global.u64 a9,[a0+24];
-	ld.global.u64 a10,[a0+32]; ld.global.u64 a11,[a0+40]; ld.global.u64 a12,[a0+48]; ld.global.u64 a13,[a0+56]; ld.global.u64 a14,[a0+64];
-	ld.global.u64 a29,[a0+96];
-	ld.global.u32 r4,[a0+72]; ld.global.u32 r5,[a0+76]; ld.global.u32 r6,[a0+80]; ld.global.u32 r7,[a0+84]; ld.global.u32 r8,[a0+88];
-	ld.volatile.global.u32 r9,[a6]; ld.volatile.global.u32 r10,[a6+4]; ld.volatile.global.u32 r11,[a6+8]; ld.volatile.global.u32 r12,[a6+12]; ld.volatile.global.u32 r13,[a6+16];
-	ld.global.u64 a15,[a6+32]; ld.global.u64 a16,[a6+40]; ld.volatile.global.u32 r14,[a6+24]; setp.ne.u32 p0,r14,0; @p0 bra main_invalid;
-	sub.u32 r14,r3,r10; div.u32 r14,r14,r11; mul.lo.u32 r14,r14,r12; sub.u32 r15,r4,r13; add.u32 r14,r14,r15; add.u32 r15,r9,r14; add.u32 r15,r15,1;
-	mov.u32 r16,%tid.x; mov.u32 r17,%ctaid.x; mov.u32 r18,%ntid.x; mov.u32 r19,%nctaid.x; mad.lo.u32 r20,r17,r18,r16; mul.lo.u32 r21,r18,r19;
-	setp.eq.u32 p0,r20,0; mov.u64 a17,%globaltimer; add.u64 a18,a17,5000000000;
-	mov.u32 r22,0;
-main_validate_position:
-	setp.ge.u32 p1,r22,r2; @p1 bra main_validated;
-	add.u32 r23,r8,1; add.u32 r24,r22,r1; mul.lo.u32 r24,r24,r23; mul.wide.u32 a19,r24,4; add.u64 a20,a3,a19; ld.global.cg.u32 r25,[a20];
-	setp.gt.u32 p1,r25,r8; @p1 mov.u32 r30,304; @p1 bra main_failed; mov.u32 r26,0;
-main_validate_slot:
-	setp.ge.u32 p1,r26,r25; @p1 bra main_validate_next;
-	mul.wide.u32 a21,r26,4; add.u64 a22,a20,a21; ld.global.cg.u32 r27,[a22+4];
-	setp.ge.u32 p1,r27,r7; @p1 mov.u32 r30,305; @p1 bra main_failed;
-	add.u32 r26,r26,1; bra main_validate_slot;
-main_validate_next:
-	add.u32 r22,r22,1; bra main_validate_position;
-main_validated:
-	mov.u32 r22,r20; mul.lo.u32 r23,r6,r2;
-main_gather:
-	setp.ge.u32 p1,r22,r23; @p1 bra main_routes;
-	div.u32 r24,r22,r6; rem.u32 r25,r22,r6; mad.lo.u32 r26,r25,r0,r1; add.u32 r26,r26,r24; mul.wide.u32 a19,r26,4; add.u64 a20,a1,a19; ld.global.f32 f,[a20];
-	mul.wide.u32 a19,r22,4; add.u64 a20,a10,a19; st.global.f32 [a20],f; add.u32 r22,r22,r21; bra main_gather;
-main_routes:
-	mov.u32 r22,r20; add.u32 r23,r8,1; mul.lo.u32 r23,r23,r2;
-main_route_loop:
-	setp.ge.u32 p1,r22,r23; @p1 bra main_ready;
-	add.u32 r24,r8,1; div.u32 r25,r22,r24; rem.u32 r26,r22,r24; add.u32 r27,r1,r25; mad.lo.u32 r27,r27,r24,r26;
-	mul.wide.u32 a19,r27,4; add.u64 a20,a3,a19; ld.global.cg.u32 r28,[a20]; mul.wide.u32 a21,r22,4; add.u64 a22,a12,a21; st.global.u32 [a22],r28;
-	setp.eq.u32 p1,r26,0; @p1 bra main_route_next;
-	add.u32 r27,r1,r25; mul.lo.u32 r27,r27,r24; mul.wide.u32 a19,r27,4; add.u64 a20,a3,a19; ld.global.cg.u32 r27,[a20];
-	setp.gt.u32 p1,r26,r27; @p1 bra main_route_next;
-	mul.wide.u32 a30,r28,4; add.u64 a30,a29,a30; atom.global.add.u32 r31,[a30],1;
-	// Router coefficients are expert-major in the native TopK value buffer.
-	mad.lo.u32 r27,r28,r0,r1; add.u32 r27,r27,r25; mul.wide.u32 a19,r27,4; add.u64 a20,a2,a19; ld.global.f32 f,[a20];
-	mad.lo.u32 r27,r25,r8,r26; sub.u32 r27,r27,1; mul.wide.u32 a19,r27,4; add.u64 a20,a11,a19; st.global.f32 [a20],f;
-main_route_next:
-	add.u32 r22,r22,r21; bra main_route_loop;
-main_ready:
-	mul.lo.u32 r29,r15,64;
-	{ .param .u64 sl,fl,dl; .param .u32 seq,ok; st.param.u64 [sl],a15; st.param.u64 [fl],a16; st.param.u64 [dl],a18; st.param.u32 [seq],r29;
-	call.uni (ok),split_grid,(sl,fl,seq,dl); ld.param.u32 r30,[ok]; }
-	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,301; @p1 bra main_failed;
-	mov.u32 r22,0;
-main_send:
-	setp.ge.u32 p1,r22,r5; @p1 bra main_local;
-	mul.wide.u32 a19,r22,48; add.u64 a20,a7,a19; ld.global.u64 a23,[a20]; ld.global.u64 a24,[a20+8]; ld.global.u64 a25,[a20+16]; ld.global.u64 a26,[a20+24]; ld.global.u64 a27,[a20+32]; ld.global.u32 r23,[a20+40];
-	{ .param .u64 x,ids,co,ow,req,rec,routing,sl,fl,dl; .param .u32 seq,die,ex,top,rows,cols,stride,ok;
-	st.param.u64 [x],a10; st.param.u64 [ids],a12; st.param.u64 [co],a11; st.param.u64 [ow],a9; st.param.u64 [req],a23; st.param.u64 [rec],a24; st.param.u64 [routing],a25; st.param.u64 [sl],a26; st.param.u64 [fl],a27; st.param.u64 [dl],a18;
-	st.param.u32 [seq],r15; st.param.u32 [die],r23; st.param.u32 [ex],r7; st.param.u32 [top],r8; st.param.u32 [rows],r6; st.param.u32 [cols],r2; mov.u32 r23,4096; st.param.u32 [stride],r23;
-	call.uni (ok),split_send,(x,ids,co,ow,req,rec,routing,sl,fl,seq,dl,die,ex,top,rows,cols,stride); ld.param.u32 r30,[ok]; }
-	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,302; @p1 bra main_failed;
-	add.u32 r22,r22,1; bra main_send;
-main_local:
-	ld.global.u64 a28,[a14+120]; mul.wide.u32 a19,r14,128; add.u64 a28,a28,a19;
-	{ .param .u64 desc,sh,report; .param .u32 seq,cols,ok; st.param.u64 [desc],a14; st.param.u64 [sh],a5; st.param.u64 [report],a28; st.param.u32 [seq],r15; st.param.u32 [cols],r2;
-	call.uni (ok),split_expert_layer,(desc,seq,cols,sh,report); ld.param.u32 r30,[ok]; }
-	setp.ne.u32 p1,r30,1; @p1 bra main_failed;
-	{ .param .u64 table,out,dl; .param .u32 seq,rows,workers,cols,stride,ok; st.param.u64 [table],a8; st.param.u64 [out],a13; st.param.u64 [dl],a18;
-	st.param.u32 [seq],r15; st.param.u32 [rows],r6; st.param.u32 [workers],r5; st.param.u32 [cols],r2; mov.u32 r23,4096; st.param.u32 [stride],r23;
-	call.uni (ok),split_combine,(table,out,seq,dl,rows,workers,cols,stride); ld.param.u32 r30,[ok]; }
-	setp.eq.u32 p1,r30,0; @p1 mov.u32 r30,303; @p1 bra main_failed;
-	mov.u32 r22,r20; mul.lo.u32 r23,r6,r2;
-main_scatter:
-	setp.ge.u32 p1,r22,r23; @p1 bra main_success;
-	div.u32 r24,r22,r6; rem.u32 r25,r22,r6; mad.lo.u32 r26,r25,r0,r1; add.u32 r26,r26,r24;
-	mul.wide.u32 a19,r22,4; add.u64 a20,a13,a19; ld.global.cg.f32 f,[a20]; mul.wide.u32 a21,r26,4; add.u64 a22,a4,a21; st.global.f32 [a22],f;
-	add.u32 r22,r22,r21; bra main_scatter;
-main_success:
-	mov.u32 r30,1; st.param.u32 [result],r30; ret;
-main_failed:
-	@p0 st.volatile.global.u32 [a6+24],r30; @p0 st.volatile.global.u32 [a6+28],r4;
-main_invalid:
-	mov.u32 r30,0; st.param.u32 [result],r30; ret;
+/// Packed-matvec operand selection and the device grid size; the host sizes its scratch from these too.
+pub mod expert_grid {
+	/// Scratch bytes per row-split group in the worker's gate/up product buffer.
+	pub const GROUP_SCRATCH_BYTES: usize = 163840;
+	/// Position capacity of one split phase.
+	pub const POSITIONS: usize = 5;
+	/// Row stride of the padded expert packet, in floats.
+	pub const ROW_STRIDE: usize = 4096;
 }
 
-"# }
+/// One measured expert tuple override: when the type matches and the operand equals (or is at most)
+/// `value`, the selected output becomes `result`. Rules for one output apply in order; the last match wins.
+struct TupleRule {
+	ty: u32,
+	operand: Operand,
+	at_most: bool,
+	value: u32,
+	result: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Operand {
+	Cap,
+	Count,
+	Columns,
+}
+
+impl Operand {
+	fn name(self) -> &'static str {
+		match self {
+			Self::Cap => "%cap",
+			Self::Count => "%count",
+			Self::Columns => "%k",
+		}
+	}
+}
+
+/// Measured 256-thread expert tuples from 431203e's cta-256 table: the matvec kind and lane count by type.
+const SPLIT_MV_KIND: &[TupleRule] = &[
+	TupleRule { ty: 17, operand: Operand::Cap, at_most: false, value: 8, result: 2 },
+	TupleRule { ty: 20, operand: Operand::Cap, at_most: true, value: 2, result: 2 },
+];
+const SPLIT_MV_KIND_DEFAULT: u32 = 0;
+const SPLIT_MV_LANES: &[TupleRule] = &[
+	TupleRule { ty: 17, operand: Operand::Count, at_most: false, value: 16, result: 16 },
+	TupleRule { ty: 18, operand: Operand::Count, at_most: false, value: 16, result: 16 },
+	TupleRule { ty: 18, operand: Operand::Cap, at_most: false, value: 8, result: 8 },
+	TupleRule { ty: 8, operand: Operand::Columns, at_most: false, value: 2560, result: 16 },
+];
+const SPLIT_MV_LANES_DEFAULT: u32 = 8;
+
+/// Text of one LLVM function. Mutable state lives in named allocas that mem2reg promotes; each
+/// instruction that yields a value gets a fresh SSA name.
+struct Ir {
+	body: String,
+	slots: String,
+	declared: std::collections::BTreeSet<String>,
+	next: usize,
+}
+
+impl Ir {
+	fn new() -> Self {
+		Self { body: String::new(), slots: String::new(), declared: Default::default(), next: 0 }
+	}
+
+	/// Emit an instruction that yields a value and return its name.
+	fn value(&mut self, expr: impl AsRef<str>) -> String {
+		self.next += 1;
+		let name = format!("%v{}", self.next);
+		self.body += &format!("\t{name} = {}\n", expr.as_ref());
+		name
+	}
+
+	/// Emit an instruction with no result.
+	fn inst(&mut self, text: impl AsRef<str>) {
+		self.body += &format!("\t{}\n", text.as_ref());
+	}
+
+	fn label(&mut self, name: &str) {
+		self.body += &format!("{name}:\n");
+	}
+
+	/// A label name unique within this function.
+	fn fresh(&mut self, stem: &str) -> String {
+		self.next += 1;
+		format!("{stem}.{}", self.next)
+	}
+
+	/// Declare the named slot at function entry on first use.
+	fn declare(&mut self, name: &str, ty: &str) {
+		if self.declared.insert(name.to_owned()) {
+			self.slots += &format!("\t%{name} = alloca {ty}\n");
+		}
+	}
+
+	/// Read a mutable slot, named after the PTX register it carries.
+	fn get(&mut self, name: &str, ty: &str) -> String {
+		self.declare(name, ty);
+		self.value(format!("load {ty}, ptr %{name}"))
+	}
+
+	fn set(&mut self, name: &str, ty: &str, value: impl AsRef<str>) {
+		self.declare(name, ty);
+		self.inst(format!("store {ty} {}, ptr %{name}", value.as_ref()));
+	}
+
+	/// Finish a `define` with its signature, placing slots at the head of the entry block.
+	fn function(self, signature: &str) -> String {
+		format!("{signature} #0 {{\nentry:\n{}{}}}\n\n", self.slots, self.body)
+	}
+
+	/// Finish a kernel definition; kernels take no inlining attribute.
+	fn kernel(self, signature: &str) -> String {
+		format!("{signature} {{\nentry:\n{}{}}}\n\n", self.slots, self.body)
+	}
+}
+
+/// Select the measured output for one tuple: rules apply in order, so a later match overrides an earlier one.
+fn tuple_select(ir: &mut Ir, rules: &[TupleRule], default: u32) -> String {
+	let mut current = default.to_string();
+	for rule in rules {
+		let typed = ir.value(format!("icmp eq i32 %t, {}", rule.ty));
+		let compare = ir.value(format!("icmp {} i32 {}, {}", if rule.at_most { "ule" } else { "eq" }, rule.operand.name(), rule.value));
+		let hit = ir.value(format!("and i1 {typed}, {compare}"));
+		current = ir.value(format!("select i1 {hit}, i32 {}, i32 {current}", rule.result));
+	}
+	current
+}
+
+/// Grid-wide completion point shared by every expert stage: publish this die's partial, then wait for
+/// the other dies' partials when this die published anything.
+fn split_grid() -> String {
+	let mut ir = Ir::new();
+	let published = ir.value("call i32 @split_local_publish(ptr addrspace(1) %s, ptr addrspace(1) %f, i32 %q, i64 %d)");
+	let needed = ir.value(format!("icmp ne i32 {published}, 0"));
+	ir.inst(format!("br i1 {needed}, label %wait, label %done"));
+	ir.label("wait");
+	let receipt = ir.value("call i32 @split_local_wait(ptr addrspace(1) %f, i32 %q, i64 %d)");
+	ir.inst("br label %done");
+	ir.label("done");
+	let result = ir.value(format!("phi i32 [ {published}, %entry ], [ {receipt}, %wait ]"));
+	ir.inst(format!("ret i32 {result}"));
+	ir.function("define i32 @split_grid(ptr addrspace(1) %s, ptr addrspace(1) %f, i32 %q, i64 %d)")
+}
+
+/// Packed matvec with the measured kind and lane count for this tuple.
+fn split_mv() -> String {
+	let mut ir = Ir::new();
+	let kind = tuple_select(&mut ir, SPLIT_MV_KIND, SPLIT_MV_KIND_DEFAULT);
+	let lanes = tuple_select(&mut ir, SPLIT_MV_LANES, SPLIT_MV_LANES_DEFAULT);
+	let ok = ir.value(format!(
+		"call i32 @packed_matvec(i32 %t, i32 %cap, i32 %cols, i32 {kind}, i32 {lanes}, i32 %mask, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %s, ptr addrspace(1) %o, i32 %k, i32 %m, i32 %rank, i32 %count)"
+	));
+	ir.inst(format!("ret i32 {ok}"));
+	ir.function("define i32 @split_mv(ptr addrspace(1) %w, i32 %t, ptr addrspace(1) %x, ptr addrspace(1) %s, ptr addrspace(1) %o, i32 %k, i32 %m, i32 %cap, i32 %cols, i32 %mask, i32 %rank, i32 %count, ptr %sh)")
+}
+
+/// Count one helper receipt for the row-split group on rank 0's first thread.
+fn split_route_count() -> String {
+	let mut ir = Ir::new();
+	let zero = ir.value("icmp eq i32 %receipt, 0");
+	let field = ir.value(format!("select i1 {zero}, i32 4, i32 %field"));
+	let wide = ir.value(format!("zext i32 {field} to i64"));
+	let bytes = ir.value(format!("mul i64 {wide}, 4"));
+	let at = ir.value(format!("getelementptr i8, ptr addrspace(1) %report, i64 {bytes}"));
+	let tid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.tid.x()");
+	let first = ir.value(format!("icmp eq i32 {tid}, 0"));
+	let rank0 = ir.value("icmp eq i32 %rank, 0");
+	let both = ir.value(format!("and i1 {first}, {rank0}"));
+	ir.inst(format!("br i1 {both}, label %count, label %done"));
+	ir.label("count");
+	let counter = ir.value(format!("getelementptr i8, ptr addrspace(1) {at}, i64 32"));
+	ir.value(format!("atomicrmw add ptr addrspace(1) {counter}, i32 1 monotonic, align 4"));
+	ir.inst("br label %done");
+	ir.label("done");
+	ir.inst("ret void");
+	ir.function("define void @split_route_count(ptr addrspace(1) %report, i32 %rank, i32 %field, i32 %receipt)")
+}
+
+/// Dense slice product on one die: each warp owns output rows, lanes stride the inner dimension, and a
+/// butterfly reduction leaves the row sum in lane 0. Typed weights are f32 or bf16 (type 30).
+fn split_dense_typed() -> String {
+	let mut ir = Ir::new();
+	let tid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.tid.x()");
+	let ctaid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()");
+	let ntid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()");
+	let nctaid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()");
+	let lane = ir.value(format!("and i32 {tid}, 31"));
+	let warp = ir.value(format!("lshr i32 {tid}, 5"));
+	let warps = ir.value(format!("lshr i32 {ntid}, 5"));
+	let first_block = ir.value(format!("mul i32 {ctaid}, {warps}"));
+	let first = ir.value(format!("add i32 {first_block}, {warp}"));
+	let stride = ir.value(format!("mul i32 {warps}, {nctaid}"));
+	let total = ir.value("mul i32 %m, %c");
+	ir.inst("br label %row");
+	ir.label("row");
+	let row = ir.value(format!("phi i32 [ {first}, %entry ], [ %row.next, %row.end ]"));
+	let more = ir.value(format!("icmp ult i32 {row}, {total}"));
+	ir.inst(format!("br i1 {more}, label %row.body, label %exit"));
+	ir.label("row.body");
+	let out_row = ir.value(format!("urem i32 {row}, %m"));
+	let in_row = ir.value(format!("udiv i32 {row}, %m"));
+	ir.inst("br label %kloop");
+	ir.label("kloop");
+	let kk = ir.value(format!("phi i32 [ {lane}, %row.body ], [ %k.next, %fma ]"));
+	let acc = ir.value("phi float [ 0.000000e+00, %row.body ], [ %fma.value, %fma ]");
+	// Forward references to %fma.value, %k.next, %offset.next and %partial.next are named literally.
+	let kdone = ir.value(format!("icmp uge i32 {kk}, %k"));
+	ir.inst(format!("br i1 {kdone}, label %sum, label %k.body"));
+	// The k loop label is kloop; the parameter %k keeps its name.
+	ir.label("k.body");
+	let weight_index = ir.value(format!("mul i32 {out_row}, %k"));
+	let weight_at = ir.value(format!("add i32 {weight_index}, {kk}"));
+	let input_index = ir.value(format!("mul i32 {in_row}, %k"));
+	let input_at = ir.value(format!("add i32 {input_index}, {kk}"));
+	let input_wide = ir.value(format!("zext i32 {input_at} to i64"));
+	let input_bytes = ir.value(format!("mul i64 {input_wide}, 4"));
+	let input_ptr = ir.value(format!("getelementptr i8, ptr addrspace(1) %x, i64 {input_bytes}"));
+	let input = ir.value(format!("load float, ptr addrspace(1) {input_ptr}, align 4"));
+	let bf = ir.value("icmp eq i32 %t, 30");
+	ir.inst(format!("br i1 {bf}, label %bf, label %f32"));
+	ir.label("f32");
+	let weight_wide = ir.value(format!("zext i32 {weight_at} to i64"));
+	let weight_bytes = ir.value(format!("mul i64 {weight_wide}, 4"));
+	let weight_ptr = ir.value(format!("getelementptr i8, ptr addrspace(1) %w, i64 {weight_bytes}"));
+	let weight32 = ir.value(format!("load float, ptr addrspace(1) {weight_ptr}, align 4"));
+	ir.inst("br label %fma");
+	ir.label("bf");
+	let weight_wide16 = ir.value(format!("zext i32 {weight_at} to i64"));
+	let weight_bytes16 = ir.value(format!("mul i64 {weight_wide16}, 2"));
+	let weight_ptr16 = ir.value(format!("getelementptr i8, ptr addrspace(1) %w, i64 {weight_bytes16}"));
+	let raw = ir.value(format!("load i16, ptr addrspace(1) {weight_ptr16}, align 2"));
+	let widened = ir.value(format!("zext i16 {raw} to i32"));
+	let shifted = ir.value(format!("shl i32 {widened}, 16"));
+	let weight16 = ir.value(format!("bitcast i32 {shifted} to float"));
+	ir.inst("br label %fma");
+	ir.label("fma");
+	let weight = ir.value(format!("phi float [ {weight32}, %f32 ], [ {weight16}, %bf ]"));
+	ir.inst(format!("%fma.value = call float @llvm.fma.f32(float {input}, float {weight}, float {acc})"));
+	ir.inst(format!("%k.next = add i32 {kk}, 32"));
+	ir.inst("br label %kloop");
+	ir.label("sum");
+	ir.inst("br label %shuffle");
+	ir.label("shuffle");
+	let offset = ir.value("phi i32 [ 16, %sum ], [ %offset.next, %shuffle ]");
+	let partial = ir.value(format!("phi float [ {acc}, %sum ], [ %partial.next, %shuffle ]"));
+	let bits = ir.value(format!("bitcast float {partial} to i32"));
+	let other_bits = ir.value(format!("call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 {bits}, i32 {offset}, i32 31)"));
+	let other = ir.value(format!("bitcast i32 {other_bits} to float"));
+	ir.inst(format!("%partial.next = fadd float {partial}, {other}"));
+	ir.inst(format!("%offset.next = lshr i32 {offset}, 1"));
+	let again = ir.value("icmp ne i32 %offset.next, 0");
+	ir.inst(format!("br i1 {again}, label %shuffle, label %store, !llvm.loop !{UNROLL_DISABLED}"));
+	ir.label("store");
+	let writer = ir.value(format!("icmp eq i32 {lane}, 0"));
+	ir.inst(format!("br i1 {writer}, label %write, label %row.end"));
+	ir.label("write");
+	let out_wide = ir.value(format!("zext i32 {row} to i64"));
+	let out_bytes = ir.value(format!("mul i64 {out_wide}, 4"));
+	let out_ptr = ir.value(format!("getelementptr i8, ptr addrspace(1) %o, i64 {out_bytes}"));
+	ir.inst(format!("store float %partial.next, ptr addrspace(1) {out_ptr}, align 4"));
+	ir.inst("br label %row.end");
+	ir.label("row.end");
+	ir.inst(format!("%row.next = add i32 {row}, {stride}"));
+	ir.inst("br label %row");
+	ir.label("exit");
+	ir.inst("ret void");
+	ir.function("define void @split_dense_typed(ptr addrspace(1) %w, i32 %t, ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %k, i32 %m, i32 %c)")
+}
+
+const I32: &str = "i32";
+const I64: &str = "i64";
+const F32: &str = "float";
+const V4F32: &str = "<4 x float>";
+const V4I32: &str = "<4 x i32>";
+const GLOBAL: &str = "ptr addrspace(1)";
+/// Metadata node that keeps LLVM from unrolling the butterfly reduction into five static shuffles.
+const UNROLL_DISABLED: usize = 900;
+
+/// Natural alignment of a memory access. Descriptor words are naturally aligned, and stating it keeps
+/// LLVM from splitting a 64-bit descriptor load into two 32-bit loads.
+fn align_of(ty: &str) -> usize {
+	match ty {
+		"i64" => 8,
+		"i16" => 2,
+		V4F32 | V4I32 => 16,
+		_ => 4,
+	}
+}
+
+fn sreg(ir: &mut Ir, name: &str) -> String {
+	ir.value(format!("call i32 @llvm.nvvm.read.ptx.sreg.{name}()"))
+}
+
+fn timer(ir: &mut Ir) -> String {
+	ir.value("call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()")
+}
+
+fn gep(ir: &mut Ir, base: &str, bytes: &str) -> String {
+	ir.value(format!("getelementptr i8, ptr addrspace(1) {base}, i64 {bytes}"))
+}
+
+/// Load from a global address; `volatile` loads are the PTX `ld.volatile` form.
+fn ld(ir: &mut Ir, ty: &str, address: &str, volatile: bool) -> String {
+	let qualifier = if volatile { "volatile " } else { "" };
+	ir.value(format!("load {qualifier}{ty}, ptr addrspace(1) {address}, align {}", align_of(ty)))
+}
+
+fn st(ir: &mut Ir, ty: &str, value: &str, address: &str, volatile: bool) {
+	let qualifier = if volatile { "volatile " } else { "" };
+	ir.inst(format!("store {qualifier}{ty} {value}, ptr addrspace(1) {address}, align {}", align_of(ty)));
+}
+
+/// Load a `ty` value at constant byte `offset` from a global base.
+fn field(ir: &mut Ir, base: &str, offset: usize, ty: &str) -> String {
+	let at = gep(ir, base, &offset.to_string());
+	ld(ir, ty, &at, false)
+}
+
+/// Load one i32 field of a dense-slice table entry.
+fn table_field(ir: &mut Ir, base: &str, offset: usize) -> String {
+	field(ir, base, offset, I32)
+}
+
+/// Load a 64-bit descriptor word at `offset` from a global base and view it as an address.
+fn word_address(ir: &mut Ir, base: &str, offset: usize, volatile: bool) -> String {
+	let at = gep(ir, base, &offset.to_string());
+	let word = ld(ir, I64, &at, volatile);
+	ir.value(format!("inttoptr i64 {word} to ptr addrspace(1)"))
+}
+
+/// Scale a 32-bit index to a byte offset.
+fn byte_offset(ir: &mut Ir, index: &str, scale: usize) -> String {
+	let wide = ir.value(format!("zext i32 {index} to i64"));
+	ir.value(format!("mul i64 {wide}, {scale}"))
+}
+
+/// Address of element `index` (scaled by `scale` bytes) past `base`.
+fn element(ir: &mut Ir, base: &str, index: &str, scale: usize) -> String {
+	let bytes = byte_offset(ir, index, scale);
+	gep(ir, base, &bytes)
+}
+
+/// Run `body` only where `pred` holds, as a predicated PTX instruction.
+fn when(ir: &mut Ir, pred: &str, body: impl FnOnce(&mut Ir)) {
+	let yes = ir.fresh("when");
+	let done = format!("{yes}.done");
+	ir.inst(format!("br i1 {pred}, label %{yes}, label %{done}"));
+	ir.label(&yes);
+	body(ir);
+	ir.inst(format!("br label %{done}"));
+	ir.label(&done);
+}
+
+/// `while cond { body }`: `cond` reads its state from slots, so it is re-evaluated each iteration.
+fn while_loop(ir: &mut Ir, cond: impl FnOnce(&mut Ir) -> String, body: impl FnOnce(&mut Ir)) {
+	let head = ir.fresh("loop");
+	let inside = format!("{head}.body");
+	let exit = format!("{head}.exit");
+	ir.inst(format!("br label %{head}"));
+	ir.label(&head);
+	let more = cond(ir);
+	ir.inst(format!("br i1 {more}, label %{inside}, label %{exit}"));
+	ir.label(&inside);
+	body(ir);
+	ir.inst(format!("br label %{head}"));
+	ir.label(&exit);
+}
+
+/// Store `code` into the status slot and leave for `done` unless `ok` is nonzero.
+fn leave_unless(ir: &mut Ir, ok: &str, code: u32, status: &str, done: &str) {
+	let failed = ir.value(format!("icmp eq i32 {ok}, 0"));
+	let stop = ir.fresh("stop");
+	let go = format!("{stop}.go");
+	ir.inst(format!("br i1 {failed}, label %{stop}, label %{go}"));
+	ir.label(&stop);
+	ir.set(status, I32, code.to_string());
+	ir.inst(format!("br label %{done}"));
+	ir.label(&go);
+}
+
+/// Call the grid completion point with sequence `sequence` and deadline `deadline`.
+fn grid(ir: &mut Ir, sl: &str, fl: &str, sequence: &str, deadline: &str) -> String {
+	ir.value(format!("call i32 @split_grid(ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline})"))
+}
+
+/// Byte offset of a dense-layer slice record in the route table (40 bytes each).
+const DENSE_SLICE_BYTES: usize = 40;
+
+/// Advance the grid sequence counter `r20` and return its new value.
+fn advance(ir: &mut Ir) -> String {
+	let current = ir.get("r20", I32);
+	let next = ir.value(format!("add i32 {current}, 1"));
+	ir.set("r20", I32, &next);
+	next
+}
+
+/// Index of the highest set bit of the power-of-two `value`.
+fn log2_of(ir: &mut Ir, value: &str) -> String {
+	let leading = ir.value(format!("call i32 @llvm.ctlz.i32(i32 {value}, i1 false)"));
+	ir.value(format!("sub i32 31, {leading}"))
+}
+
+/// Dense-layer completion: the last partial row group publishes and the device waits on the grid.
+fn split_dense_layer() -> String {
+	use expert_job::*;
+	let mut ir = Ir::new();
+	let a3 = word_address(&mut ir, "%desc", pointer(P_REQUEST), false);
+	let a4 = word_address(&mut ir, "%desc", pointer(P_REQUEST_SEQUENCE), false);
+	let a5 = word_address(&mut ir, "%desc", pointer(P_ROUTE), false);
+	let a6 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_A), false);
+	let a7 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_B), false);
+	let a8 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_C), false);
+	let a9 = word_address(&mut ir, "%desc", pointer(P_TABLE), false);
+	let a10 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_E), false);
+	let a11 = word_address(&mut ir, "%desc", pointer(P_REQUEST_COMPLETION), false);
+	let a12 = word_address(&mut ir, "%desc", pointer(P_REQUEST_SEQUENCE_NEXT), false);
+	let a13 = word_address(&mut ir, "%desc", pointer(P_RESPONSE_SEQUENCE), false);
+	let r2 = field(&mut ir, "%desc", dimension(D_INPUT_WIDTH), I32);
+	let r3 = field(&mut ir, "%desc", dimension(D_SLICES), I32);
+	let r4 = field(&mut ir, "%desc", flag(F_STRIDE), I32);
+	let r5 = sreg(&mut ir, "tid.x");
+	let r6 = sreg(&mut ir, "ctaid.x");
+	let r7 = sreg(&mut ir, "ntid.x");
+	let r8 = sreg(&mut ir, "nctaid.x");
+	let block = ir.value(format!("mul i32 {r6}, {r7}"));
+	let gid = ir.value(format!("add i32 {block}, {r5}"));
+	let stride = ir.value(format!("mul i32 {r7}, {r8}"));
+	let leader = ir.value(format!("icmp eq i32 {gid}, 0"));
+	ir.set("r11", I32, "1");
+	let started = timer(&mut ir);
+	when(&mut ir, &leader, |ir| {
+		st(ir, I64, &started, "%report", false);
+	});
+	let deadline = ir.value(format!("add i64 {started}, 5000000000"));
+	when(&mut ir, &leader, |ir| {
+		let at = gep(ir, "%report", "32");
+		ir.inst(format!("store {V4I32} zeroinitializer, ptr addrspace(1) {at}, align 16"));
+		let at = gep(ir, "%report", "48");
+		st(ir, I32, "0", &at, false);
+	});
+	let has_rows = ir.value(format!("icmp ne i32 {r3}, 0"));
+	ir.inst(format!("br i1 {has_rows}, label %dl.rows, label %dl.empty"));
+	ir.label("dl.empty");
+	when(&mut ir, &leader, |ir| {
+		let at = timer(ir);
+		let first = gep(ir, "%report", "8");
+		st(ir, I64, &at, &first, false);
+		let second = gep(ir, "%report", "16");
+		st(ir, I64, &at, &second, false);
+	});
+	ir.inst("br label %dl.done");
+	ir.label("dl.rows");
+	let receipt = ir.value(format!("call i32 @p2p_wait(ptr addrspace(1) {a4}, i32 %seq, i64 {deadline})"));
+	leave_unless(&mut ir, &receipt, 401, "r11", "dl.done");
+	when(&mut ir, &leader, |ir| {
+		let at = timer(ir);
+		let slot = gep(ir, "%report", "8");
+		st(ir, I64, &at, &slot, false);
+	});
+	let route_table = word_address(&mut ir, &a5, 0, true);
+	ir.set("a16", GLOBAL, &route_table);
+	let route_at_8 = gep(&mut ir, &a5, "8");
+	let route_rows = ld(&mut ir, I32, &route_at_8, true);
+	ir.set("r13", I32, &route_rows);
+	let route_at_12 = gep(&mut ir, &a5, "12");
+	let route_width = ld(&mut ir, I32, &route_at_12, true);
+	ir.set("r14", I32, &route_width);
+	ir.set("r15", I32, &gid);
+	let copy_bound = ir.value(format!("mul i32 {r2}, %cols"));
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r15", I32);
+			ir.value(format!("icmp ult i32 {index}, {copy_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r15", I32);
+			let row = ir.value(format!("udiv i32 {index}, {r2}"));
+			let column = ir.value(format!("urem i32 {index}, {r2}"));
+			let source_row = ir.value(format!("mul i32 {row}, {r4}"));
+			let source = ir.value(format!("add i32 {source_row}, {column}"));
+			let from = element(ir, &a3, &source, 4);
+			let value = ld(ir, F32, &from, true);
+			let to = element(ir, &a6, &index, 4);
+			st(ir, F32, &value, &to, false);
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r15", I32, &next);
+		},
+	);
+	let grid_seq = ir.value("mul i32 %seq, 64");
+	ir.set("r20", I32, &grid_seq);
+	let published = grid(&mut ir, &a11, &a12, &grid_seq, &deadline);
+	leave_unless(&mut ir, &published, 402, "r11", "dl.done");
+	let typed_flag = field(&mut ir, "%desc", flag(F_TYPED), I32);
+	let prepare = ir.value(format!("icmp ne i32 {typed_flag}, 0"));
+	when(&mut ir, &prepare, |ir| {
+		ir.inst(format!("call void @packed_prepare(ptr addrspace(1) {a6}, ptr addrspace(1) {a7}, ptr addrspace(1) {a8}, i32 {r2}, i32 %cols, i32 %cols, i32 {r6}, i32 {r8})"));
+	});
+	let next_seq = advance(&mut ir);
+	let ready = grid(&mut ir, &a11, &a12, &next_seq, &deadline);
+	leave_unless(&mut ir, &ready, 403, "r11", "dl.done");
+	when(&mut ir, &leader, |ir| {
+		let at = timer(ir);
+		let slot = gep(ir, "%report", "16");
+		st(ir, I64, &at, &slot, false);
+	});
+	ir.set("r21", I32, "0");
+	let cap_gt1 = ir.value("icmp ugt i32 %cols, 1");
+	let cap_gt2 = ir.value("icmp ugt i32 %cols, 2");
+	let cap_gt4 = ir.value("icmp ugt i32 %cols, 4");
+	let cap2 = ir.value(format!("select i1 {cap_gt1}, i32 2, i32 1"));
+	let cap4 = ir.value(format!("select i1 {cap_gt2}, i32 4, i32 {cap2}"));
+	let cap = ir.value(format!("select i1 {cap_gt4}, i32 8, i32 {cap4}"));
+	ir.set("r22", I32, &cap);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r21", I32);
+			ir.value(format!("icmp ult i32 {index}, {r3}"))
+		},
+		|ir| {
+			let index = ir.get("r21", I32);
+			let entry = element(ir, &a9, &index, DENSE_SLICE_BYTES);
+			let weights = word_address(ir, &entry, 0, false);
+			let ty = table_field(ir, &entry, 8);
+			let rows_k = table_field(ir, &entry, 12);
+			let rows_m = table_field(ir, &entry, 16);
+			let scales = word_address(ir, &entry, 32, false);
+			let cap = ir.get("r22", I32);
+			let typed_zero = ir.value(format!("icmp eq i32 {ty}, 0"));
+			let typed_bf = ir.value(format!("icmp eq i32 {ty}, 30"));
+			let typed = ir.value(format!("or i1 {typed_zero}, {typed_bf}"));
+			let dense_block = ir.fresh("dl.typed");
+			let packed_block = format!("{dense_block}.packed");
+			let joined = format!("{dense_block}.computed");
+			ir.inst(format!("br i1 {typed}, label %{dense_block}, label %{packed_block}"));
+			ir.label(&packed_block);
+			let meta = field(ir, &entry, 24, I32);
+			let log2 = log2_of(ir, &cap);
+			let shift = ir.value(format!("mul i32 {log2}, 8"));
+			let shifted = ir.value(format!("lshr i32 {meta}, {shift}"));
+			let lanes = ir.value(format!("and i32 {shifted}, 255"));
+			let is17 = ir.value(format!("icmp eq i32 {ty}, 17"));
+			let cap8 = ir.value(format!("icmp eq i32 {cap}, 8"));
+			let gated = ir.value(format!("and i1 {is17}, {cap8}"));
+			let kind = ir.value(format!("select i1 {gated}, i32 2, i32 0"));
+			let receipt = ir.value(format!(
+				"call i32 @packed_matvec(i32 {ty}, i32 {cap}, i32 %cols, i32 {kind}, i32 {lanes}, i32 0, ptr addrspace(1) {weights}, ptr addrspace(1) {a7}, ptr addrspace(1) {a8}, ptr addrspace(1) {a10}, i32 {rows_k}, i32 {rows_m}, i32 {r6}, i32 {r8})"
+			));
+			ir.inst(format!("call void @split_route_count(ptr addrspace(1) %report, i32 {r6}, i32 0, i32 {receipt})"));
+			leave_unless(ir, &receipt, 404, "r11", "dl.done");
+			ir.inst(format!("br label %{joined}"));
+			ir.label(&dense_block);
+			ir.inst(format!("call void @split_dense_typed(ptr addrspace(1) {weights}, i32 {ty}, ptr addrspace(1) {a6}, ptr addrspace(1) {a10}, i32 {rows_k}, i32 {rows_m}, i32 %cols)"));
+			ir.inst(format!("call void @split_route_count(ptr addrspace(1) %report, i32 {r6}, i32 1, i32 1)"));
+			ir.inst(format!("br label %{joined}"));
+			ir.label(&joined);
+			let computed_seq = advance(ir);
+			let computed = grid(ir, &a11, &a12, &computed_seq, &deadline);
+			leave_unless(ir, &computed, 405, "r11", "dl.done");
+			let terminal = field(ir, "%desc", TERMINAL, I32);
+			let has_terminal = ir.value(format!("icmp ne i32 {terminal}, 0"));
+			let one_column = ir.value("icmp eq i32 %cols, 1");
+			let route_rows = ir.get("r13", I32);
+			let wide_rows = ir.value(format!("icmp ugt i32 {route_rows}, 1"));
+			let small_rows = ir.value(format!("icmp ule i32 {route_rows}, 8"));
+			let padded_terms = ir.value(format!("and i1 {has_terminal}, {one_column}"));
+			let padded_rows = ir.value(format!("and i1 {wide_rows}, {small_rows}"));
+			let padded = ir.value(format!("and i1 {padded_terms}, {padded_rows}"));
+			let padded_block = ir.fresh("dl.padded");
+			let scatter_block = format!("{padded_block}.scatter");
+			let scattered = format!("{padded_block}.scattered");
+			ir.inst(format!("br i1 {padded}, label %{padded_block}, label %{scatter_block}"));
+			ir.label(&scatter_block);
+			ir.set("r15", I32, &gid);
+			let scatter_bound = ir.value(format!("mul i32 {rows_m}, %cols"));
+			while_loop(
+				ir,
+				|ir| {
+					let position = ir.get("r15", I32);
+					ir.value(format!("icmp ult i32 {position}, {scatter_bound}"))
+				},
+				|ir| {
+					let position = ir.get("r15", I32);
+					let row = ir.value(format!("udiv i32 {position}, {rows_m}"));
+					let column = ir.value(format!("urem i32 {position}, {rows_m}"));
+					let slot_at = element(ir, &scales, &column, 4);
+					let slot = ld(ir, I32, &slot_at, false);
+					let valid = ir.value(format!("icmp ne i32 {slot}, -1"));
+					when(ir, &valid, |ir| {
+						let width = ir.get("r13", I32);
+						let offset = ir.get("r14", I32);
+						let scaled = ir.value(format!("mul i32 {slot}, {width}"));
+						let target_row = ir.value(format!("add i32 {scaled}, {offset}"));
+						let target = ir.value(format!("add i32 {target_row}, {row}"));
+						let from = element(ir, &a10, &position, 4);
+						let value = ld(ir, F32, &from, false);
+						let to_base = ir.get("a16", GLOBAL);
+						let to = element(ir, &to_base, &target, 4);
+						st(ir, F32, &value, &to, true);
+					});
+					let next = ir.value(format!("add i32 {position}, {stride}"));
+					ir.set("r15", I32, &next);
+				},
+			);
+			ir.inst(format!("br label %{scattered}"));
+			ir.label(&padded_block);
+			ir.set("r15", I32, &gid);
+			let padded_width = ir.get("r13", I32);
+			let padded_bound = ir.value(format!("mul i32 {rows_m}, {padded_width}"));
+			while_loop(
+				ir,
+				|ir| {
+					let position = ir.get("r15", I32);
+					ir.value(format!("icmp ult i32 {position}, {padded_bound}"))
+				},
+				|ir| {
+					let position = ir.get("r15", I32);
+					let width = ir.get("r13", I32);
+					let row = ir.value(format!("udiv i32 {position}, {width}"));
+					let column = ir.value(format!("urem i32 {position}, {width}"));
+					let slot_at = element(ir, &scales, &row, 4);
+					let slot = ld(ir, I32, &slot_at, false);
+					let valid = ir.value(format!("icmp ne i32 {slot}, -1"));
+					when(ir, &valid, |ir| {
+						let offset = ir.get("r14", I32);
+						let scaled = ir.value(format!("mul i32 {slot}, {width}"));
+						let target_row = ir.value(format!("add i32 {scaled}, {column}"));
+						let owns = ir.value(format!("icmp eq i32 {column}, {offset}"));
+						ir.set("dl.value", F32, "0.0");
+						when(ir, &owns, |ir| {
+							let from = element(ir, &a10, &row, 4);
+							let value = ld(ir, F32, &from, false);
+							ir.set("dl.value", F32, &value);
+						});
+						let value = ir.get("dl.value", F32);
+						let to_base = ir.get("a16", GLOBAL);
+						let to = element(ir, &to_base, &target_row, 4);
+						st(ir, F32, &value, &to, true);
+					});
+					let next = ir.value(format!("add i32 {position}, {stride}"));
+					ir.set("r15", I32, &next);
+				},
+			);
+			ir.inst(format!("br label %{scattered}"));
+			ir.label(&scattered);
+			let scattered_seq = advance(ir);
+			let scattered_grid = grid(ir, &a11, &a12, &scattered_seq, &deadline);
+			leave_unless(ir, &scattered_grid, 406, "r11", "dl.done");
+			let next_slice = ir.get("r21", I32);
+			let advanced = ir.value(format!("add i32 {next_slice}, 1"));
+			ir.set("r21", I32, &advanced);
+		},
+	);
+	let tag_base = ir.value("mul i32 %seq, 64");
+	let tag = ir.value(format!("add i32 {tag_base}, 63"));
+	let tagged = ir.value(format!("call i32 @p2p_publish_tagged(ptr addrspace(1) {a11}, ptr addrspace(1) {a13}, i32 {tag}, i32 %seq, i64 {deadline})"));
+	leave_unless(&mut ir, &tagged, 407, "r11", "dl.done");
+	ir.inst("br label %dl.done");
+	ir.label("dl.done");
+	let finished = timer(&mut ir);
+	when(&mut ir, &leader, |ir| {
+		let at = gep(ir, "%report", "24");
+		st(ir, I64, &finished, &at, false);
+		let rows = gep(ir, "%report", "56");
+		st(ir, I32, &r3, &rows, false);
+	});
+	let status = ir.get("r11", I32);
+	let first_thread = ir.value(format!("icmp eq i32 {r5}, 0"));
+	when(&mut ir, &first_thread, |ir| {
+		let slot = element(ir, "%report", &r6, 4);
+		let at = gep(ir, &slot, "64");
+		st(ir, I32, &status, &at, false);
+	});
+	ir.inst(format!("ret i32 {status}"));
+	ir.function("define i32 @split_dense_layer(ptr addrspace(1) %desc, i32 %seq, i32 %cols, ptr %sh, ptr addrspace(1) %report)")
+}
+
+/// Byte layout of the 108-byte main-die descriptor the host writes once per layer. Pointer fields occupy
+/// 0..72, dimensions 72..96, the pick-count pointer 96, and the dense flag 104.
+pub mod expert_main {
+	pub const BYTES: usize = 108;
+	pub const CONTROL: usize = 0;
+	pub const CHANNELS: usize = 8;
+	pub const RESPONSES: usize = 16;
+	pub const OWNER: usize = 24;
+	pub const SCRATCH_A: usize = 32;
+	pub const SCRATCH_B: usize = 40;
+	pub const SCRATCH_C: usize = 48;
+	pub const SCRATCH_D: usize = 56;
+	pub const LOCAL_JOB: usize = 64;
+	pub const GLOBAL: usize = 72;
+	pub const PARTICIPANTS: usize = 76;
+	pub const INPUT_WIDTH: usize = 80;
+	pub const EXPERT_COUNT: usize = 84;
+	pub const TOP: usize = 88;
+	pub const PICK_COUNTS: usize = 96;
+	pub const DENSE: usize = 104;
+}
+
+/// Cache-global load at a constant byte offset. LLVM has no `.cg` qualifier, so this one instruction is inline asm.
+fn ld_cg(ir: &mut Ir, ty: &str, base: &str, offset: usize) -> String {
+	let at = gep(ir, base, &offset.to_string());
+	let bits = ir.value(format!("ptrtoint ptr addrspace(1) {at} to i64"));
+	let (constraint, text) = if ty == F32 { ("=f", "ld.global.cg.f32") } else { ("=r", "ld.global.cg.u32") };
+	ir.value(format!("call {ty} asm sideeffect \"{text} $0, [$1];\", \"{constraint},l\"(i64 {bits})"))
+}
+
+/// Dense forward of one main-die layer: gather the input rows, publish them to each peer, run the local
+/// dense slices, then wait for every peer's reply. Returns 1 on success and 0 otherwise.
+fn split_dense_forward() -> String {
+	use expert_main::*;
+	let mut ir = Ir::new();
+	let control = word_address(&mut ir, "%desc", CONTROL, false);
+	let channels = word_address(&mut ir, "%desc", CHANNELS, false);
+	let scratch = word_address(&mut ir, "%desc", SCRATCH_A, false);
+	let local_job = word_address(&mut ir, "%desc", LOCAL_JOB, false);
+	let r4 = field(&mut ir, "%desc", GLOBAL, I32);
+	let r5 = field(&mut ir, "%desc", PARTICIPANTS, I32);
+	let r6 = field(&mut ir, "%desc", INPUT_WIDTH, I32);
+	let a8 = word_address(&mut ir, &control, 32, false);
+	let a9 = word_address(&mut ir, &control, 40, false);
+	let r7 = ld_control(&mut ir, &control, 0);
+	let r8 = ld_control(&mut ir, &control, 4);
+	let r9 = ld_control(&mut ir, &control, 8);
+	let r10 = ld_control(&mut ir, &control, 12);
+	let r11 = ld_control(&mut ir, &control, 16);
+	let r12 = sreg(&mut ir, "tid.x");
+	let r13 = sreg(&mut ir, "ctaid.x");
+	let r14 = sreg(&mut ir, "ntid.x");
+	let r15 = sreg(&mut ir, "nctaid.x");
+	let block = ir.value(format!("mul i32 {r13}, {r14}"));
+	let gid = ir.value(format!("add i32 {block}, {r12}"));
+	let stride = ir.value(format!("mul i32 {r14}, {r15}"));
+	let leader = ir.value(format!("icmp eq i32 {gid}, 0"));
+	let started = timer(&mut ir);
+	let deadline = ir.value(format!("add i64 {started}, 5000000000"));
+	let failed = ld_control(&mut ir, &control, 24);
+	let already = ir.value(format!("icmp ne i32 {failed}, 0"));
+	ir.inst(format!("br i1 {already}, label %df.fail, label %df.start"));
+	ir.label("df.start");
+	// Layer index r18 = ((absolute - begin) / capacity) * layers + (global - first); its sequence r19 follows the base.
+	let shifted = ir.value(format!("sub i32 %absolute, {r8}"));
+	let phases = ir.value(format!("udiv i32 {shifted}, {r9}"));
+	let phase_layers = ir.value(format!("mul i32 {phases}, {r10}"));
+	let layer_local = ir.value(format!("sub i32 {r4}, {r11}"));
+	let layer = ir.value(format!("add i32 {phase_layers}, {layer_local}"));
+	let sequence_base = ir.value(format!("add i32 {layer}, {r7}"));
+	let sequence = ir.value(format!("add i32 {sequence_base}, 1"));
+	ir.set("r18", I32, &layer);
+	ir.set("r19", I32, &sequence);
+	let gather_bound = ir.value(format!("mul i32 {r6}, %cols"));
+	ir.set("r20", I32, &gid);
+	ir.inst("br label %df.gather");
+	ir.label("df.gather");
+	let index = ir.get("r20", I32);
+	let more = ir.value(format!("icmp ult i32 {index}, {gather_bound}"));
+	ir.inst(format!("br i1 {more}, label %df.gather.body, label %df.ready"));
+	ir.label("df.gather.body");
+	let row = ir.value(format!("udiv i32 {index}, {r6}"));
+	let column = ir.value(format!("urem i32 {index}, {r6}"));
+	let source_row = ir.value(format!("mul i32 {column}, %length"));
+	let source_begin = ir.value(format!("add i32 {source_row}, {row}"));
+	let source_index = ir.value(format!("add i32 {source_begin}, %begin"));
+	let from = element(&mut ir, "%source", &source_index, 4);
+	let value = ld(&mut ir, F32, &from, false);
+	let to = element(&mut ir, &scratch, &index, 4);
+	st(&mut ir, F32, &value, &to, false);
+	let next = ir.value(format!("add i32 {index}, {stride}"));
+	ir.set("r20", I32, &next);
+	ir.inst("br label %df.gather");
+	ir.label("df.ready");
+	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
+	let ready = grid(&mut ir, &a8, &a9, &ready_seq, &deadline);
+	leave_unless(&mut ir, &ready, 411, "r26", "df.failed");
+	ir.set("r20", I32, "0");
+	let padded_width = ir.value(format!("add i32 {r6}, 3"));
+	let row_pad = ir.value(format!("and i32 {padded_width}, -4"));
+	ir.set("r24", I32, &row_pad);
+	ir.inst("br label %df.send");
+	ir.label("df.send");
+	let peer = ir.get("r20", I32);
+	let more = ir.value(format!("icmp ult i32 {peer}, {r5}"));
+	ir.inst(format!("br i1 {more}, label %df.send.body, label %df.local"));
+	ir.label("df.send.body");
+	let peer_wide = byte_offset(&mut ir, &peer, 48);
+	let entry = gep(&mut ir, &channels, &peer_wide);
+	let request = word_address(&mut ir, &entry, 0, false);
+	let request_seq = word_address(&mut ir, &entry, 8, false);
+	let response = word_address(&mut ir, &entry, 24, false);
+	let response_seq = word_address(&mut ir, &entry, 32, false);
+	when(&mut ir, &leader, |ir| {
+		let output = ir.value("ptrtoint ptr addrspace(1) %output to i64");
+		st(ir, I64, &output, &request_seq, true);
+		let width_at = gep(ir, &request_seq, "8");
+		st(ir, I32, "%length", &width_at, true);
+		let begin_at = gep(ir, &request_seq, "12");
+		st(ir, I32, "%begin", &begin_at, true);
+	});
+	// Packets are 16-byte vector copies when the width and both buffers allow it, otherwise scalar copies.
+	let width_rem = ir.value(format!("and i32 {r6}, 3"));
+	let width_bad = ir.value(format!("icmp ne i32 {width_rem}, 0"));
+	let scratch_bits = ir.value(format!("ptrtoint ptr addrspace(1) {scratch} to i64"));
+	let response_bits = ir.value(format!("ptrtoint ptr addrspace(1) {request} to i64"));
+	let both_bits = ir.value(format!("or i64 {scratch_bits}, {response_bits}"));
+	let aligned_bits = ir.value(format!("and i64 {both_bits}, 15"));
+	let misaligned = ir.value(format!("icmp ne i64 {aligned_bits}, 0"));
+	let scalar = ir.value(format!("or i1 {width_bad}, {misaligned}"));
+	let quad_block = ir.fresh("df.quad");
+	let scalar_block = format!("{quad_block}.scalar");
+	let published = format!("{quad_block}.publish");
+	ir.inst(format!("br i1 {scalar}, label %{scalar_block}, label %{quad_block}"));
+	ir.label(&quad_block);
+	let quad_width = ir.value(format!("lshr i32 {r6}, 2"));
+	let quad_bound = ir.value(format!("mul i32 {quad_width}, %cols"));
+	ir.set("r21", I32, &gid);
+	ir.set("r22", I32, &quad_bound);
+	let quad_head = ir.fresh("df.quad.head");
+	ir.inst(format!("br label %{quad_head}"));
+	ir.label(&quad_head);
+	let quad_index = ir.get("r21", I32);
+	let quad_end = ir.get("r22", I32);
+	let quad_more = ir.value(format!("icmp ult i32 {quad_index}, {quad_end}"));
+	let quad_body = format!("{quad_head}.body");
+	let quad_exit = format!("{quad_head}.exit");
+	ir.inst(format!("br i1 {quad_more}, label %{quad_body}, label %{quad_exit}"));
+	ir.label(&quad_body);
+	let quad_row = ir.value(format!("udiv i32 {quad_index}, {quad_width}"));
+	let quad_col = ir.value(format!("urem i32 {quad_index}, {quad_width}"));
+	let quad_lane = ir.value(format!("shl i32 {quad_col}, 2"));
+	let read_row = ir.value(format!("mul i32 {quad_row}, {r6}"));
+	let read_index = ir.value(format!("add i32 {read_row}, {quad_lane}"));
+	let read_at = element(&mut ir, &scratch, &read_index, 4);
+	let vector = ir.value(format!("load {V4F32}, ptr addrspace(1) {read_at}, align 16"));
+	let write_row = ir.value(format!("mul i32 {quad_row}, {row_pad}"));
+	let write_index = ir.value(format!("add i32 {write_row}, {quad_lane}"));
+	let write_at = element(&mut ir, &request, &write_index, 4);
+	ir.inst(format!("store volatile {V4F32} {vector}, ptr addrspace(1) {write_at}, align 16"));
+	let quad_next = ir.value(format!("add i32 {quad_index}, {stride}"));
+	ir.set("r21", I32, &quad_next);
+	ir.inst(format!("br label %{quad_head}"));
+	ir.label(&quad_exit);
+	ir.inst(format!("br label %{published}"));
+	ir.label(&scalar_block);
+	let scalar_end = ir.value(format!("mul i32 {row_pad}, %cols"));
+	ir.set("r21", I32, &gid);
+	ir.set("r22", I32, &scalar_end);
+	let scalar_head = ir.fresh("df.scalar.head");
+	ir.inst(format!("br label %{scalar_head}"));
+	ir.label(&scalar_head);
+	let scalar_index = ir.get("r21", I32);
+	let scalar_limit = ir.get("r22", I32);
+	let scalar_more = ir.value(format!("icmp ult i32 {scalar_index}, {scalar_limit}"));
+	let scalar_body = format!("{scalar_head}.body");
+	let scalar_exit = format!("{scalar_head}.exit");
+	ir.inst(format!("br i1 {scalar_more}, label %{scalar_body}, label %{scalar_exit}"));
+	ir.label(&scalar_body);
+	let scalar_row = ir.value(format!("udiv i32 {scalar_index}, {row_pad}"));
+	let scalar_col = ir.value(format!("urem i32 {scalar_index}, {row_pad}"));
+	let inside = ir.value(format!("icmp ult i32 {scalar_col}, {r6}"));
+	ir.set("df.value", F32, "0.0");
+	let fetch = ir.fresh("df.fetch");
+	let fetch_done = format!("{fetch}.done");
+	ir.inst(format!("br i1 {inside}, label %{fetch}, label %{fetch_done}"));
+	ir.label(&fetch);
+	let fetch_row = ir.value(format!("mul i32 {scalar_row}, {r6}"));
+	let fetch_index = ir.value(format!("add i32 {fetch_row}, {scalar_col}"));
+	let fetch_at = element(&mut ir, &scratch, &fetch_index, 4);
+	let fetched = ld(&mut ir, F32, &fetch_at, false);
+	ir.set("df.value", F32, &fetched);
+	ir.inst(format!("br label %{fetch_done}"));
+	ir.label(&fetch_done);
+	let scalar_value = ir.get("df.value", F32);
+	let scalar_write_row = ir.value(format!("mul i32 {scalar_index}, 1"));
+	let scalar_write_at = element(&mut ir, &request, &scalar_write_row, 4);
+	st(&mut ir, F32, &scalar_value, &scalar_write_at, true);
+	let scalar_next = ir.value(format!("add i32 {scalar_index}, {stride}"));
+	ir.set("r21", I32, &scalar_next);
+	ir.inst(format!("br label %{scalar_head}"));
+	ir.label(&scalar_exit);
+	ir.inst(format!("br label %{published}"));
+	ir.label(&published);
+	let tag_base = ir.value(format!("mul i32 {sequence}, 64"));
+	let tag_row = ir.value(format!("add i32 {tag_base}, 32"));
+	let tag = ir.value(format!("add i32 {tag_row}, {peer}"));
+	let sent = ir.value(format!("call i32 @p2p_publish_tagged(ptr addrspace(1) {response}, ptr addrspace(1) {response_seq}, i32 {tag}, i32 {sequence}, i64 {deadline})"));
+	leave_unless(&mut ir, &sent, 412, "r26", "df.failed");
+	let peer_next = ir.get("r20", I32);
+	let advanced = ir.value(format!("add i32 {peer_next}, 1"));
+	ir.set("r20", I32, &advanced);
+	ir.inst("br label %df.send");
+	ir.label("df.local");
+	let report_at_layer = word_address(&mut ir, &local_job, 120, false);
+	let layer_index = ir.get("r18", I32);
+	let report = element(&mut ir, &report_at_layer, &layer_index, 128);
+	let sequence_local = ir.get("r19", I32);
+	let local = ir.value(format!("call i32 @split_dense_layer(ptr addrspace(1) {local_job}, i32 {sequence_local}, i32 %cols, ptr %sh, ptr addrspace(1) {report})"));
+	ir.set("r26", I32, &local);
+	let local_ok = ir.value(format!("icmp ne i32 {local}, 1"));
+	let receive_block = ir.fresh("df.receive");
+	ir.inst(format!("br i1 {local_ok}, label %df.failed, label %{receive_block}"));
+	ir.label(&receive_block);
+	let responses = word_address(&mut ir, "%desc", RESPONSES, false);
+	ir.set("r20", I32, "0");
+	let wait_head = ir.fresh("df.wait.head");
+	let wait_body = format!("{wait_head}.body");
+	let wait_exit = format!("{wait_head}.exit");
+	ir.inst(format!("br label %{wait_head}"));
+	ir.label(&wait_head);
+	let waiting = ir.get("r20", I32);
+	let waiting_more = ir.value(format!("icmp ult i32 {waiting}, {r5}"));
+	ir.inst(format!("br i1 {waiting_more}, label %{wait_body}, label %{wait_exit}"));
+	ir.label(&wait_body);
+	let waiting_wide = byte_offset(&mut ir, &waiting, 16);
+	let waiting_entry = gep(&mut ir, &responses, &waiting_wide);
+	let waiting_seq = word_address(&mut ir, &waiting_entry, 8, false);
+	let waited = ir.value(format!("call i32 @p2p_wait(ptr addrspace(1) {waiting_seq}, i32 {sequence_local}, i64 {deadline})"));
+	leave_unless(&mut ir, &waited, 413, "r26", "df.failed");
+	let waiting_next = ir.value(format!("add i32 {waiting}, 1"));
+	ir.set("r20", I32, &waiting_next);
+	ir.inst(format!("br label %{wait_head}"));
+	ir.label(&wait_exit);
+	ir.set("r26", I32, "1");
+	ir.inst("br label %df.success");
+	ir.label("df.success");
+	ir.inst("ret i32 1");
+	ir.label("df.failed");
+	let status = ir.get("r26", I32);
+	when(&mut ir, &leader, |ir| {
+		let status_at = gep(ir, &control, "24");
+		st(ir, I32, &status, &status_at, true);
+		let rows_at = gep(ir, &control, "28");
+		st(ir, I32, &r4, &rows_at, true);
+	});
+	ir.inst("br label %df.fail");
+	ir.label("df.fail");
+	ir.inst("ret i32 0");
+	ir.function("define i32 @split_dense_forward(ptr addrspace(1) %desc, ptr addrspace(1) %source, ptr addrspace(1) %output, i32 %length, i32 %begin, i32 %cols, i32 %absolute, ptr %sh)")
+}
+
+/// Volatile u32 control word at a constant byte offset.
+fn ld_control(ir: &mut Ir, control: &str, offset: usize) -> String {
+	let at = gep(ir, control, &offset.to_string());
+	ld(ir, I32, &at, true)
+}
+
+/// Leave for `done` with status `code` when the i1 `failed` holds.
+fn leave_if(ir: &mut Ir, failed: &str, code: u32, status: &str, done: &str) {
+	let stop = ir.fresh("stop");
+	let go = format!("{stop}.go");
+	ir.inst(format!("br i1 {failed}, label %{stop}, label %{go}"));
+	ir.label(&stop);
+	ir.set(status, I32, code.to_string());
+	ir.inst(format!("br label %{done}"));
+	ir.label(&go);
+}
+
+/// Persistent expert worker: every layer of every token chunk, each run as its split stage.
+fn expert_split_worker() -> String {
+	use expert_job::*;
+	let mut ir = Ir::new();
+	ir.set("r5", I32, "0");
+	ir.set("r6", I32, "0");
+	let scratch = ir.value("addrspacecast ptr addrspace(3) @scratch to ptr");
+	ir.inst("br label %chunk");
+	ir.label("chunk");
+	let start = ir.get("r5", I32);
+	let more = ir.value(format!("icmp ult i32 {start}, %tokens"));
+	ir.inst(format!("br i1 {more}, label %chunk.body, label %exit"));
+	ir.label("chunk.body");
+	let start_again = ir.get("r5", I32);
+	let remaining = ir.value(format!("sub i32 %tokens, {start_again}"));
+	let rows = ir.value(format!("call i32 @llvm.umin.i32(i32 {remaining}, i32 %capacity)"));
+	ir.set("r7", I32, &rows);
+	ir.set("r8", I32, "0");
+	ir.inst("br label %layer");
+	ir.label("layer");
+	let layer_index = ir.get("r8", I32);
+	let global_layer = ir.value(format!("add i32 %first, {layer_index}"));
+	let desc_at = element(&mut ir, "%jobs", &global_layer, expert_job::BYTES);
+	let desc = desc_at;
+	let reports = word_address(&mut ir, &desc, pointer(P_REPORTS), false);
+	let phase = ir.get("r6", I32);
+	let report = element(&mut ir, &reports, &phase, 128);
+	let phase_seq = ir.value(format!("add i32 %base, {phase}"));
+	let seq = ir.value(format!("add i32 {phase_seq}, 1"));
+	let last_only = field(&mut ir, &desc, flag(F_LAST_ONLY), I32);
+	let rows_now = ir.get("r7", I32);
+	let last = ir.value(format!("icmp ne i32 {last_only}, 0"));
+	let cols = ir.value(format!("select i1 {last}, i32 1, i32 {rows_now}"));
+	let dense_flag = field(&mut ir, &desc, flag(F_DENSE), I32);
+	let is_dense = ir.value(format!("icmp ne i32 {dense_flag}, 0"));
+	ir.inst(format!("br i1 {is_dense}, label %dense, label %expert"));
+	ir.label("expert");
+	let expert_status = ir.value(format!("call i32 @split_expert_layer(ptr addrspace(1) {desc}, i32 {seq}, i32 {cols}, ptr {scratch}, ptr addrspace(1) {report})"));
+	ir.set("r11", I32, &expert_status);
+	ir.inst("br label %result");
+	ir.label("dense");
+	let dense_status = ir.value(format!("call i32 @split_dense_layer(ptr addrspace(1) {desc}, i32 {seq}, i32 {cols}, ptr {scratch}, ptr addrspace(1) {report})"));
+	ir.set("r11", I32, &dense_status);
+	ir.inst("br label %result");
+	ir.label("result");
+	let status = ir.get("r11", I32);
+	let done = ir.value(format!("icmp eq i32 {status}, 1"));
+	ir.inst(format!("br i1 {done}, label %layer.next, label %exit"));
+	ir.label("layer.next");
+	let phase_now = ir.get("r6", I32);
+	let phase_next = ir.value(format!("add i32 {phase_now}, 1"));
+	ir.set("r6", I32, &phase_next);
+	let index_now = ir.get("r8", I32);
+	let index_next = ir.value(format!("add i32 {index_now}, 1"));
+	ir.set("r8", I32, &index_next);
+	let layers_more = ir.value(format!("icmp ult i32 {index_next}, %layers"));
+	ir.inst(format!("br i1 {layers_more}, label %layer, label %chunk.step"));
+	ir.label("chunk.step");
+	let chunk_now = ir.get("r5", I32);
+	let chunk_next = ir.value(format!("add i32 {chunk_now}, %capacity"));
+	ir.set("r5", I32, &chunk_next);
+	ir.inst("br label %chunk");
+	ir.label("exit");
+	ir.inst("ret void");
+	ir.kernel("define protected ptx_kernel void @expert_split_worker(ptr addrspace(1) %jobs, i32 %first, i32 %layers, i32 %base, i32 %tokens, i32 %capacity)")
+}
+
+/// Branch to `done` when the i1 `failed` holds; `status` already carries the code to report.
+fn jump_if(ir: &mut Ir, failed: &str, done: &str) {
+	let go = ir.fresh("jump.go");
+	ir.inst(format!("br i1 {failed}, label %{done}, label %{go}"));
+	ir.label(&go);
+}
+
+/// Main-die expert layer: validate and route the selected positions, send each peer its rows, run the
+/// local expert layer, then combine the peers' products into the output.
+fn split_main_forward() -> String {
+	use expert_main::*;
+	let mut ir = Ir::new();
+	let dense = field(&mut ir, "%desc", DENSE, I32);
+	let is_dense = ir.value(format!("icmp ne i32 {dense}, 0"));
+	ir.inst(format!("br i1 {is_dense}, label %dense, label %expert"));
+	ir.label("dense");
+	let dense_status = ir.value("call i32 @split_dense_forward(ptr addrspace(1) %desc, ptr addrspace(1) %source, ptr addrspace(1) %output, i32 %length, i32 %begin, i32 %cols, i32 %absolute, ptr %sh)");
+	ir.inst(format!("ret i32 {dense_status}"));
+	ir.label("expert");
+	let control = word_address(&mut ir, "%desc", CONTROL, false);
+	let channels = word_address(&mut ir, "%desc", CHANNELS, false);
+	let responses = word_address(&mut ir, "%desc", RESPONSES, false);
+	let owner = word_address(&mut ir, "%desc", OWNER, false);
+	let x = word_address(&mut ir, "%desc", SCRATCH_A, false);
+	let co = word_address(&mut ir, "%desc", SCRATCH_B, false);
+	let ids = word_address(&mut ir, "%desc", SCRATCH_C, false);
+	let table = word_address(&mut ir, "%desc", SCRATCH_D, false);
+	let local = word_address(&mut ir, "%desc", LOCAL_JOB, false);
+	let pick = word_address(&mut ir, "%desc", PICK_COUNTS, false);
+	let r4 = field(&mut ir, "%desc", GLOBAL, I32);
+	let r5 = field(&mut ir, "%desc", PARTICIPANTS, I32);
+	let r6 = field(&mut ir, "%desc", INPUT_WIDTH, I32);
+	let r7 = field(&mut ir, "%desc", EXPERT_COUNT, I32);
+	let r8 = field(&mut ir, "%desc", TOP, I32);
+	let r9 = ld_control(&mut ir, &control, 0);
+	let r10 = ld_control(&mut ir, &control, 4);
+	let r11 = ld_control(&mut ir, &control, 8);
+	let r12 = ld_control(&mut ir, &control, 12);
+	let r13 = ld_control(&mut ir, &control, 16);
+	let completion = word_address(&mut ir, &control, 32, false);
+	let sequence_word = word_address(&mut ir, &control, 40, false);
+	let failed = ld_control(&mut ir, &control, 24);
+	let invalid = ir.value(format!("icmp ne i32 {failed}, 0"));
+	ir.inst(format!("br i1 {invalid}, label %main.invalid, label %main.start"));
+	ir.label("main.start");
+	// Layer index r14 = (absolute - begin) / capacity * layers + (global - first); sequence r15 = base + r14 + 1.
+	let shifted = ir.value(format!("sub i32 %absolute, {r10}"));
+	let phases = ir.value(format!("udiv i32 {shifted}, {r11}"));
+	let phase_layers = ir.value(format!("mul i32 {phases}, {r12}"));
+	let layer_local = ir.value(format!("sub i32 {r4}, {r13}"));
+	let layer = ir.value(format!("add i32 {phase_layers}, {layer_local}"));
+	let sequence_base = ir.value(format!("add i32 {r9}, {layer}"));
+	let sequence = ir.value(format!("add i32 {sequence_base}, 1"));
+	ir.set("r14", I32, &layer);
+	ir.set("r15", I32, &sequence);
+	let tid = sreg(&mut ir, "tid.x");
+	let ctaid = sreg(&mut ir, "ctaid.x");
+	let ntid = sreg(&mut ir, "ntid.x");
+	let nctaid = sreg(&mut ir, "nctaid.x");
+	let block = ir.value(format!("mul i32 {ctaid}, {ntid}"));
+	let gid = ir.value(format!("add i32 {block}, {tid}"));
+	let stride = ir.value(format!("mul i32 {ntid}, {nctaid}"));
+	let leader = ir.value(format!("icmp eq i32 {gid}, 0"));
+	let started = timer(&mut ir);
+	let deadline = ir.value(format!("add i64 {started}, 5000000000"));
+	let width_plus = ir.value(format!("add i32 {r8}, 1"));
+	let gather_bound = ir.value(format!("mul i32 {r6}, %cols"));
+	let route_bound = ir.value(format!("mul i32 {width_plus}, %cols"));
+	ir.set("r22", I32, "0");
+	// Validate every selected position's slot count and slot index before any device work.
+	while_loop(
+		&mut ir,
+		|ir| {
+			let position = ir.get("r22", I32);
+			ir.value(format!("icmp ult i32 {position}, %cols"))
+		},
+		|ir| {
+			let position = ir.get("r22", I32);
+			let base = ir.value(format!("add i32 {position}, %begin"));
+			let row_index = ir.value(format!("mul i32 {base}, {width_plus}"));
+			let row = element(ir, "%selected", &row_index, 4);
+			let count = ld_cg(ir, I32, &row, 0);
+			let overflow = ir.value(format!("icmp ugt i32 {count}, {r8}"));
+			leave_if(ir, &overflow, 304, "r30", "main.failed");
+			ir.set("r26", I32, "0");
+			while_loop(
+				ir,
+				|ir| {
+					let slot = ir.get("r26", I32);
+					ir.value(format!("icmp ult i32 {slot}, {count}"))
+				},
+				|ir| {
+					let slot = ir.get("r26", I32);
+					let slot_at = element(ir, &row, &slot, 4);
+					let index = ld_cg(ir, I32, &slot_at, 4);
+					let too_big = ir.value(format!("icmp uge i32 {index}, {r7}"));
+					leave_if(ir, &too_big, 305, "r30", "main.failed");
+					let next = ir.value(format!("add i32 {slot}, 1"));
+					ir.set("r26", I32, &next);
+				},
+			);
+			let next_position = ir.get("r22", I32);
+			let advanced = ir.value(format!("add i32 {next_position}, 1"));
+			ir.set("r22", I32, &advanced);
+		},
+	);
+	// Gather the input rows once per (row, column) into the padded send buffer.
+	ir.set("r22", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r22", I32);
+			ir.value(format!("icmp ult i32 {index}, {gather_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r22", I32);
+			let row = ir.value(format!("udiv i32 {index}, {r6}"));
+			let column = ir.value(format!("urem i32 {index}, {r6}"));
+			let source_row = ir.value(format!("mul i32 {column}, %length"));
+			let source_begin = ir.value(format!("add i32 {source_row}, %begin"));
+			let source_index = ir.value(format!("add i32 {source_begin}, {row}"));
+			let from = element(ir, "%source", &source_index, 4);
+			let value = ld(ir, F32, &from, false);
+			let to = element(ir, &x, &index, 4);
+			st(ir, F32, &value, &to, false);
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r22", I32, &next);
+		},
+	);
+	// Route: copy each selected index into its slot and count and weight every routed pick.
+	ir.set("r22", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r22", I32);
+			ir.value(format!("icmp ult i32 {index}, {route_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r22", I32);
+			let row = ir.value(format!("udiv i32 {index}, {width_plus}"));
+			let slot = ir.value(format!("urem i32 {index}, {width_plus}"));
+			let base_row = ir.value(format!("add i32 %begin, {row}"));
+			let selected_index = ir.value(format!("mul i32 {base_row}, {width_plus}"));
+			let selected_at = ir.value(format!("add i32 {selected_index}, {slot}"));
+			let selected_word = element(ir, "%selected", &selected_at, 4);
+			let chosen = ld_cg(ir, I32, &selected_word, 0);
+			let id_at = element(ir, &ids, &index, 4);
+			st(ir, I32, &chosen, &id_at, false);
+			let count_index = ir.value(format!("mul i32 {base_row}, {width_plus}"));
+			let count_word = element(ir, "%selected", &count_index, 4);
+			let count = ld_cg(ir, I32, &count_word, 0);
+			let nonzero = ir.value(format!("icmp ne i32 {slot}, 0"));
+			let within = ir.value(format!("icmp ule i32 {slot}, {count}"));
+			let counted = ir.value(format!("and i1 {nonzero}, {within}"));
+			when(ir, &counted, |ir| {
+				let pick_at = element(ir, &pick, &chosen, 4);
+				ir.inst(format!("atomicrmw add ptr addrspace(1) {pick_at}, i32 1 monotonic, align 4"));
+				let coef_index = ir.value(format!("mul i32 {chosen}, %length"));
+				let coef_column = ir.value(format!("add i32 {coef_index}, {row}"));
+				let coef_row = ir.value(format!("add i32 {coef_column}, %begin"));
+				let coef_at = element(ir, "%coef", &coef_row, 4);
+				let coef = ld(ir, F32, &coef_at, false);
+				let out_row = ir.value(format!("mul i32 {row}, {r8}"));
+				let out_index = ir.value(format!("add i32 {out_row}, {slot}"));
+				let out_slot = ir.value(format!("sub i32 {out_index}, 1"));
+				let out_at = element(ir, &co, &out_slot, 4);
+				st(ir, F32, &coef, &out_at, false);
+			});
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r22", I32, &next);
+		},
+	);
+	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
+	let ready = grid(&mut ir, &completion, &sequence_word, &ready_seq, &deadline);
+	leave_unless(&mut ir, &ready, 301, "r30", "main.failed");
+	// Send every peer its request; a peer that cannot take the request fails the layer.
+	ir.set("r22", I32, "0");
+	while_loop(
+		&mut ir,
+		|ir| {
+			let peer = ir.get("r22", I32);
+			ir.value(format!("icmp ult i32 {peer}, {r5}"))
+		},
+		|ir| {
+			let peer = ir.get("r22", I32);
+			let peer_bytes = byte_offset(ir, &peer, 48);
+			let entry = gep(ir, &channels, &peer_bytes);
+			let request = word_address(ir, &entry, 0, false);
+			let rec = word_address(ir, &entry, 8, false);
+			let routing = word_address(ir, &entry, 16, false);
+			let sl = word_address(ir, &entry, 24, false);
+			let fl = word_address(ir, &entry, 32, false);
+			let die = field(ir, &entry, 40, I32);
+			let sent = ir.value(format!(
+				"call i32 @split_send(ptr addrspace(1) {x}, ptr addrspace(1) {ids}, ptr addrspace(1) {co}, ptr addrspace(1) {owner}, ptr addrspace(1) {request}, ptr addrspace(1) {rec}, ptr addrspace(1) {routing}, ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline}, i32 {die}, i32 {r7}, i32 {r8}, i32 {r6}, i32 %cols, i32 4096)"
+			));
+			leave_unless(ir, &sent, 302, "r30", "main.failed");
+			let next = ir.value(format!("add i32 {peer}, 1"));
+			ir.set("r22", I32, &next);
+		},
+	);
+	// Local expert layer on this die, then combine every peer's product.
+	let local_at_layer = word_address(&mut ir, &local, 120, false);
+	let layer_index = ir.get("r14", I32);
+	let report = element(&mut ir, &local_at_layer, &layer_index, 128);
+	let local_seq = ir.get("r15", I32);
+	let local_status = ir.value(format!("call i32 @split_expert_layer(ptr addrspace(1) {local}, i32 {local_seq}, i32 %cols, ptr %sh, ptr addrspace(1) {report})"));
+	ir.set("r30", I32, &local_status);
+	let local_bad = ir.value(format!("icmp ne i32 {local_status}, 1"));
+	jump_if(&mut ir, &local_bad, "main.failed");
+	let combine_seq = ir.get("r15", I32);
+	let combined = ir.value(format!(
+		"call i32 @split_combine(ptr addrspace(1) {responses}, ptr addrspace(1) {table}, i32 {combine_seq}, i64 {deadline}, i32 {r6}, i32 {r5}, i32 %cols, i32 4096)"
+	));
+	leave_unless(&mut ir, &combined, 303, "r30", "main.failed");
+	// Scatter the combined rows to the output.
+	ir.set("r22", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r22", I32);
+			ir.value(format!("icmp ult i32 {index}, {gather_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r22", I32);
+			let row = ir.value(format!("udiv i32 {index}, {r6}"));
+			let column = ir.value(format!("urem i32 {index}, {r6}"));
+			let out_row = ir.value(format!("mul i32 {column}, %length"));
+			let out_begin = ir.value(format!("add i32 {out_row}, %begin"));
+			let out_index = ir.value(format!("add i32 {out_begin}, {row}"));
+			let from = element(ir, &table, &index, 4);
+			let value = ld_cg(ir, F32, &from, 0);
+			let to = element(ir, "%output", &out_index, 4);
+			st(ir, F32, &value, &to, false);
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r22", I32, &next);
+		},
+	);
+	ir.set("r30", I32, "1");
+	ir.inst("br label %main.done");
+	ir.label("main.failed");
+	let status = ir.get("r30", I32);
+	when(&mut ir, &leader, |ir| {
+		let status_at = gep(ir, &control, "24");
+		st(ir, I32, &status, &status_at, true);
+		let rows_at = gep(ir, &control, "28");
+		st(ir, I32, &r4, &rows_at, true);
+	});
+	ir.inst("br label %main.invalid");
+	ir.label("main.done");
+	ir.inst("ret i32 1");
+	ir.label("main.invalid");
+	ir.inst("ret i32 0");
+	ir.function("define i32 @split_main_forward(ptr addrspace(1) %desc, ptr addrspace(1) %source, ptr addrspace(1) %coef, ptr addrspace(1) %selected, ptr addrspace(1) %output, i32 %length, i32 %begin, i32 %cols, i32 %absolute, ptr %sh)")
+}
+
+/// Record a failure status in `r12` and keep going, as the reference's predicated `mov` does.
+fn note_status(ir: &mut Ir, failed: &str, code: u32) {
+	when(ir, failed, |ir| {
+		ir.set("r12", I32, code.to_string());
+	});
+}
+
+/// Increment a slot and return the new value.
+fn bump(ir: &mut Ir, slot: &str, by: &str) -> String {
+	let current = ir.get(slot, I32);
+	let next = ir.value(format!("add i32 {current}, {by}"));
+	ir.set(slot, I32, &next);
+	next
+}
+
+/// Zero-test of a status value as an i1.
+fn is_zero(ir: &mut Ir, value: &str) -> String {
+	ir.value(format!("icmp eq i32 {value}, 0"))
+}
+
+/// Prepare the packed operand of one row slice: `packed_prepare` is defined by another block.
+fn packed_prepare(ir: &mut Ir, x: &str, pk: &str, sc: &str, k: &str, c: &str, rank: &str, count: &str) {
+	ir.inst(format!("call void @packed_prepare(ptr addrspace(1) {x}, ptr addrspace(1) {pk}, ptr addrspace(1) {sc}, i32 {k}, i32 {c}, i32 {c}, i32 {rank}, i32 {count})"));
+}
+
+/// Packed gate/up of one group's rows through the fused path; returns the receipt.
+fn packed_gate_up(ir: &mut Ir, ty: &str, cap: &str, active: &str, mask: &str, g: &str, u: &str, x: &str, sc: &str, o: &str, k: &str, m: &str, rank: &str, count: &str) -> String {
+	ir.value(format!(
+		"call i32 @packed_gate_up(i32 {ty}, i32 {cap}, i32 {active}, i32 16, i32 {mask}, ptr addrspace(1) {g}, ptr addrspace(1) {u}, ptr addrspace(1) {x}, ptr addrspace(1) {sc}, ptr addrspace(1) {o}, i32 {k}, i32 {m}, i32 {rank}, i32 {count})"
+	))
+}
+
+/// Split matvec of one weight matrix: `split_mv` selects the measured kind and lanes.
+fn split_mv_call(ir: &mut Ir, w: &str, ty: &str, x: &str, sc: &str, o: &str, k: &str, m: &str, cap: &str, cols: &str, mask: &str, rank: &str, count: &str) -> String {
+	ir.value(format!(
+		"call i32 @split_mv(ptr addrspace(1) {w}, i32 {ty}, ptr addrspace(1) {x}, ptr addrspace(1) {sc}, ptr addrspace(1) {o}, i32 {k}, i32 {m}, i32 {cap}, i32 {cols}, i32 {mask}, i32 {rank}, i32 {count}, ptr %sh)"
+	))
+}
+
+/// Route-count receipt for one stage: `split_route_count` is a function of this block.
+fn route_count(ir: &mut Ir, rank: &str, field: usize, receipt: &str) {
+	ir.inst(format!("call void @split_route_count(ptr addrspace(1) %report, i32 {rank}, i32 {field}, i32 {receipt})"));
+}
+
+/// One expert layer on one die: copy the padded packet, run the grouped gate/up and down products into the
+/// combine planes, and reduce. Status 1 means every stage completed; other codes name the failing stage.
+fn split_expert_layer() -> String {
+	use expert_grid::ROW_STRIDE;
+	use expert_job::*;
+	let mut ir = Ir::new();
+	let a3 = word_address(&mut ir, "%desc", pointer(P_REQUEST), false);
+	let a4 = word_address(&mut ir, "%desc", pointer(P_REQUEST_SEQUENCE), false);
+	let a5 = word_address(&mut ir, "%desc", pointer(P_ROUTE), false);
+	let a6 = word_address(&mut ir, "%desc", pointer(P_ROUTE_RESPONSE), false);
+	let a7 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_A), false);
+	let a8 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_B), false);
+	let a9 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_C), false);
+	let a10 = word_address(&mut ir, "%desc", pointer(P_TABLE), false);
+	let a11 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_D), false);
+	let a12 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_E), false);
+	let a13 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_F), false);
+	let a14 = word_address(&mut ir, "%desc", pointer(P_REQUEST_COMPLETION), false);
+	let a15 = word_address(&mut ir, "%desc", pointer(P_REQUEST_SEQUENCE_NEXT), false);
+	let a16 = word_address(&mut ir, "%desc", pointer(P_RESPONSE), false);
+	let a17 = word_address(&mut ir, "%desc", pointer(P_RESPONSE_SEQUENCE), false);
+	let r2 = field(&mut ir, "%desc", dimension(D_INPUT_WIDTH), I32);
+	let r3 = field(&mut ir, "%desc", dimension(D_HIDDEN), I32);
+	let r5 = field(&mut ir, "%desc", dimension(D_TEN), I32);
+	let a18 = word_address(&mut ir, "%desc", scratch(S_SCRATCH_G), false);
+	let a19 = word_address(&mut ir, "%desc", scratch(S_SCRATCH_H), false);
+	let a20 = word_address(&mut ir, "%desc", scratch(S_SCRATCH_I), false);
+	let tid = sreg(&mut ir, "tid.x");
+	let ctaid = sreg(&mut ir, "ctaid.x");
+	let ntid = sreg(&mut ir, "ntid.x");
+	let nctaid = sreg(&mut ir, "nctaid.x");
+	let block = ir.value(format!("mul i32 {ctaid}, {ntid}"));
+	let gid = ir.value(format!("add i32 {block}, {tid}"));
+	let stride = ir.value(format!("mul i32 {ntid}, {nctaid}"));
+	let leader = ir.value(format!("icmp eq i32 {gid}, 0"));
+	let started = timer(&mut ir);
+	let deadline = ir.value(format!("add i64 {started}, 5000000000"));
+	ir.set("r12", I32, "1");
+	when(&mut ir, &leader, |ir| {
+		st(ir, I64, &started, "%report", false);
+		let at = gep(ir, "%report", "32");
+		ir.inst(format!("store {V4I32} zeroinitializer, ptr addrspace(1) {at}, align 16"));
+		let at = gep(ir, "%report", "48");
+		st(ir, I32, "0", &at, false);
+	});
+	let receipt = ir.value(format!("call i32 @p2p_wait(ptr addrspace(1) {a4}, i32 %seq, i64 {deadline})"));
+	leave_unless(&mut ir, &receipt, 101, "r12", "split.done");
+	let copied = timer(&mut ir);
+	when(&mut ir, &leader, |ir| {
+		let at = gep(ir, "%report", "8");
+		st(ir, I64, &copied, &at, false);
+	});
+	// Compact the padded packet to k-float columns; the flag table says which positions hold data.
+	let copy_bound = ir.value(format!("mul i32 {r2}, %cols"));
+	ir.set("r15", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r15", I32);
+			ir.value(format!("icmp ult i32 {index}, {copy_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r15", I32);
+			let row = ir.value(format!("udiv i32 {index}, {r2}"));
+			let column = ir.value(format!("urem i32 {index}, {r2}"));
+			let padded_row = ir.value(format!("mul i32 {row}, {ROW_STRIDE}"));
+			let padded = ir.value(format!("add i32 {padded_row}, {column}"));
+			let from = element(ir, &a3, &padded, 4);
+			let flag_row = ir.value(format!("add i32 {r5}, 1"));
+			let flag_index = ir.value(format!("mul i32 {flag_row}, {row}"));
+			let flag_at = element(ir, &a5, &flag_index, 4);
+			let flag = ld(ir, I32, &flag_at, true);
+			ir.set("f0", F32, "0.0");
+			let loaded = ir.value(format!("icmp ne i32 {flag}, 0"));
+			when(ir, &loaded, |ir| {
+				let value = ld(ir, F32, &from, true);
+				ir.set("f0", F32, &value);
+			});
+			let value = ir.get("f0", F32);
+			let to = element(ir, &a7, &index, 4);
+			st(ir, F32, &value, &to, false);
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r15", I32, &next);
+		},
+	);
+	let zero_bound = ir.value(format!("mul i32 {copy_bound}, {r5}"));
+	ir.set("r15", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r15", I32);
+			ir.value(format!("icmp ult i32 {index}, {zero_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r15", I32);
+			let to = element(ir, &a11, &index, 4);
+			st(ir, I32, "0", &to, false);
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r15", I32, &next);
+		},
+	);
+	// The leader lists each position's distinct slots in the list table.
+	let list_build = ir.fresh("list.build");
+	let list_skip = format!("{list_build}.skip");
+	ir.inst(format!("br i1 {leader}, label %{list_build}, label %{list_skip}"));
+	ir.label(&list_build);
+	ir.set("r14", I32, "0");
+	ir.set("r15", I32, "0");
+	while_loop(
+		&mut ir,
+		|ir| {
+			let position = ir.get("r15", I32);
+			ir.value(format!("icmp ult i32 {position}, %cols"))
+		},
+		|ir| {
+			let position = ir.get("r15", I32);
+			let row_scale = ir.value(format!("add i32 {r5}, 1"));
+			let row_index = ir.value(format!("mul i32 {row_scale}, {position}"));
+			let row = element(ir, &a5, &row_index, 4);
+			let count = ld(ir, I32, &row, true);
+			ir.set("r18", I32, "0");
+			while_loop(
+				ir,
+				|ir| {
+					let slot = ir.get("r18", I32);
+					ir.value(format!("icmp ult i32 {slot}, {count}"))
+				},
+				|ir| {
+					let slot = ir.get("r18", I32);
+					let slot_at = element(ir, &row, &slot, 4);
+					let entry_at = gep(ir, &slot_at, "4");
+					let entry = ld(ir, I32, &entry_at, true);
+					ir.set("r19", I32, &entry);
+					ir.set("r20", I32, "0");
+					ir.set("found", I32, "0");
+					while_loop(
+						ir,
+						|ir| {
+							let probe = ir.get("r20", I32);
+							let listed = ir.get("r14", I32);
+							let inside = ir.value(format!("icmp ult i32 {probe}, {listed}"));
+							let seen = ir.get("found", I32);
+							let unseen = ir.value(format!("icmp eq i32 {seen}, 0"));
+							ir.value(format!("and i1 {inside}, {unseen}"))
+						},
+						|ir| {
+							let probe = ir.get("r20", I32);
+							let probe_index = element(ir, &a5, &probe, 4);
+							let probe_at = gep(ir, &probe_index, "1028");
+							let listed = ld(ir, I32, &probe_at, true);
+							let current = ir.get("r19", I32);
+							let same = ir.value(format!("icmp eq i32 {current}, {listed}"));
+							when(ir, &same, |ir| {
+								ir.set("found", I32, "1");
+							});
+							bump(ir, "r20", "1");
+						},
+					);
+					let seen = ir.get("found", I32);
+					let unseen = ir.value(format!("icmp eq i32 {seen}, 0"));
+					when(ir, &unseen, |ir| {
+						let listed = ir.get("r14", I32);
+						let append_index = element(ir, &a5, &listed, 4);
+						let append_at = gep(ir, &append_index, "1028");
+						let current = ir.get("r19", I32);
+						st(ir, I32, &current, &append_at, true);
+						bump(ir, "r14", "1");
+					});
+					bump(ir, "r18", "1");
+				},
+			);
+			bump(ir, "r15", "1");
+		},
+	);
+	let listed_total = ir.get("r14", I32);
+	let list_count_at = gep(&mut ir, &a5, "1024");
+	st(&mut ir, I32, &listed_total, &list_count_at, true);
+	let report_count_at = gep(&mut ir, "%report", "56");
+	st(&mut ir, I32, &listed_total, &report_count_at, false);
+	ir.inst(format!("br label %{list_skip}"));
+	ir.label(&list_skip);
+	// Every CTA prepares its row slice, then runs its waves of expert groups.
+	let prepare_seq = ir.value("mul i32 %seq, 64");
+	ir.set("r22", I32, &prepare_seq);
+	let first_grid = grid(&mut ir, &a14, &a15, &prepare_seq, &deadline);
+	leave_unless(&mut ir, &first_grid, 102, "r12", "split.done");
+	packed_prepare(&mut ir, &a7, &a8, &a9, &r2, &r2, &ctaid, &nctaid);
+	let prepared_seq = bump(&mut ir, "r22", "1");
+	let prepared = grid(&mut ir, &a14, &a15, &prepared_seq, &deadline);
+	leave_unless(&mut ir, &prepared, 103, "r12", "split.done");
+	let groups_at = gep(&mut ir, &a5, "1024");
+	let groups = ld(&mut ir, I32, &groups_at, true);
+	ir.set("r23", I32, &groups);
+	ir.set("r24", I32, "0");
+	while_loop(
+		&mut ir,
+		|ir| {
+			let wave = ir.get("r24", I32);
+			let total = ir.get("r23", I32);
+			ir.value(format!("icmp ult i32 {wave}, {total}"))
+		},
+		|ir| {
+			let wave = ir.get("r24", I32);
+			let groups_left = ir.get("r23", I32);
+			let remaining = ir.value(format!("sub i32 {groups_left}, {wave}"));
+			let fan = ir.value(format!("call i32 @llvm.umin.i32(i32 {remaining}, i32 {nctaid})"));
+			ir.set("r25", I32, &fan);
+			let within = ir.value(format!("urem i32 {ctaid}, {fan}"));
+			ir.set("r26", I32, &within);
+			let rank = ir.value(format!("udiv i32 {ctaid}, {fan}"));
+			ir.set("r27", I32, &rank);
+			let spread = ir.value(format!("add i32 {nctaid}, {fan}"));
+			let spread_less = ir.value(format!("sub i32 {spread}, 1"));
+			let spread_within = ir.value(format!("sub i32 {spread_less}, {within}"));
+			let rounds = ir.value(format!("udiv i32 {spread_within}, {fan}"));
+			ir.set("r28", I32, &rounds);
+			let group_slot = ir.value(format!("add i32 {wave}, {within}"));
+			let entry_at = element(ir, &a5, &group_slot, 4);
+			let ex_at = gep(ir, &entry_at, "1028");
+			let ex = ld(ir, I32, &ex_at, true);
+			let word = ir.value(format!("call i64 @mtp_group_cta(ptr addrspace(1) {a5}, i32 %cols, i32 {r5}, i32 {ex})"));
+			ir.set("a29", I64, &word);
+			let mask = ir.value(format!("trunc i64 {word} to i32"));
+			let active = ir.value(format!("call i32 @llvm.ctpop.i32(i32 {mask})"));
+			let above1 = ir.value(format!("icmp ugt i32 {active}, 1"));
+			let above2 = ir.value(format!("icmp ugt i32 {active}, 2"));
+			let above4 = ir.value(format!("icmp ugt i32 {active}, 4"));
+			let cap2 = ir.value(format!("select i1 {above1}, i32 2, i32 1"));
+			let cap4 = ir.value(format!("select i1 {above2}, i32 4, i32 {cap2}"));
+			let cap = ir.value(format!("select i1 {above4}, i32 8, i32 {cap4}"));
+			let group = element(ir, &a10, &ex, 40);
+			let w_gate = word_address(ir, &group, 0, false);
+			let w_up = word_address(ir, &group, 8, false);
+			let w_down = word_address(ir, &group, 16, false);
+			let ty_gate = field(ir, &group, 24, I32);
+			let ty_up = field(ir, &group, 28, I32);
+			let ty_down = field(ir, &group, 32, I32);
+			let group_scratch = element(ir, &a13, &within, 163840);
+			let up_scratch = gep(ir, &group_scratch, "20480");
+			let down_scratch = gep(ir, &group_scratch, "65536");
+			let same_pair = ir.value(format!("icmp eq i32 {ty_gate}, {ty_up}"));
+			let is17 = ir.value(format!("icmp eq i32 {ty_gate}, 17"));
+			let is18 = ir.value(format!("icmp eq i32 {ty_gate}, 18"));
+			let either = ir.value(format!("or i1 {is17}, {is18}"));
+			let narrow = ir.value(format!("icmp ule i32 {cap}, 2"));
+			let fused_both = ir.value(format!("and i1 {same_pair}, {either}"));
+			let fused = ir.value(format!("and i1 {fused_both}, {narrow}"));
+			ir.set("r43", I32, "0");
+			let fused_block = ir.fresh("wave.fused");
+			let separate_block = format!("{fused_block}.separate");
+			let gate_done = format!("{fused_block}.gate_up");
+			ir.inst(format!("br i1 {fused}, label %{fused_block}, label %{separate_block}"));
+			ir.label(&fused_block);
+			ir.set("r43", I32, "1");
+			let row_offset = ir.value(format!("mul i32 {r3}, 8"));
+			let row_at = ir.value(format!("mul i32 {row_offset}, {within}"));
+			let out_at = element(ir, &a18, &row_at, 4);
+			let fused_receipt = packed_gate_up(ir, &ty_gate, &cap, &active, &mask, &w_gate, &w_up, &a8, &a9, &out_at, &r2, &r3, &rank, &rounds);
+			ir.set("r13", I32, &fused_receipt);
+			route_count(ir, &rank, 0, &fused_receipt);
+			let fused_zero = is_zero(ir, &fused_receipt);
+			note_status(ir, &fused_zero, 206);
+			ir.inst(format!("br label %{gate_done}"));
+			ir.label(&separate_block);
+			let gate_receipt = split_mv_call(ir, &w_gate, &ty_gate, &a8, &a9, &group_scratch, &r2, &r3, &cap, &active, &mask, &rank, &rounds);
+			route_count(ir, &rank, 0, &gate_receipt);
+			let gate_zero = is_zero(ir, &gate_receipt);
+			note_status(ir, &gate_zero, 204);
+			let up_receipt = split_mv_call(ir, &w_up, &ty_up, &a8, &a9, &up_scratch, &r2, &r3, &cap, &active, &mask, &rank, &rounds);
+			route_count(ir, &rank, 0, &up_receipt);
+			let up_zero = is_zero(ir, &up_receipt);
+			note_status(ir, &up_zero, 205);
+			ir.inst(format!("br label %{gate_done}"));
+			ir.label(&gate_done);
+			let gate_round = ir.value(format!("udiv i32 {wave}, {nctaid}"));
+			let tag_base = ir.value("mul i32 %seq, 64");
+			let tag_plus = ir.value(format!("add i32 {tag_base}, 2"));
+			let tag_round = ir.value(format!("mul i32 {gate_round}, 8"));
+			let tag = ir.value(format!("add i32 {tag_plus}, {tag_round}"));
+			ir.set("r22", I32, &tag);
+			let gate_seq = grid(ir, &a14, &a15, &tag, &deadline);
+			leave_unless(ir, &gate_seq, 106, "r12", "split.done");
+			let product_bound = ir.value(format!("mul i32 {r3}, 8"));
+			let product_cols = ir.value(format!("mul i32 {r3}, {active}"));
+			let product_stride = ir.value(format!("mul i32 {rounds}, {ntid}"));
+			let rank_threads = ir.value(format!("mul i32 {rank}, {ntid}"));
+			let product_start = ir.value(format!("add i32 {rank_threads}, {tid}"));
+			ir.set("r15", I32, &product_start);
+			while_loop(
+				ir,
+				|ir| {
+					let index = ir.get("r15", I32);
+					ir.value(format!("icmp ult i32 {index}, {product_bound}"))
+				},
+				|ir| {
+					let index = ir.get("r15", I32);
+					let fused_now = ir.get("r43", I32);
+					let unfused = ir.value(format!("icmp eq i32 {fused_now}, 0"));
+					let inside_cols = ir.value(format!("icmp ult i32 {index}, {product_cols}"));
+					let compute = ir.value(format!("and i1 {unfused}, {inside_cols}"));
+					let outside = ir.value(format!("icmp uge i32 {index}, {product_cols}"));
+					let store = ir.value(format!("or i1 {outside}, {unfused}"));
+					ir.set("f0", F32, "0.0");
+					when(ir, &compute, |ir| {
+						let gate_at = element(ir, &group_scratch, &index, 4);
+						let gate_value = ld_cg(ir, F32, &gate_at, 0);
+						let up_at = element(ir, &up_scratch, &index, 4);
+						let up_value = ld_cg(ir, F32, &up_at, 0);
+						let scaled = ir.value(format!("fmul float {gate_value}, 0xBFF7154760000000"));
+						let exponent = ir.value(format!("call float @llvm.exp2.f32(float {scaled})"));
+						let denominator = ir.value(format!("fadd float {exponent}, 1.000000e+00"));
+						let reciprocal = ir.value(format!("fdiv float 1.000000e+00, {denominator}"));
+						let product = ir.value(format!("fmul float {gate_value}, {reciprocal}"));
+						let combined = ir.value(format!("fmul float {product}, {up_value}"));
+						ir.set("f0", F32, &combined);
+					});
+					when(ir, &store, |ir| {
+						let value = ir.get("f0", F32);
+						let row_base = ir.value(format!("mul i32 {within}, {product_bound}"));
+						let slot_index = ir.value(format!("add i32 {row_base}, {index}"));
+						let to = element(ir, &a18, &slot_index, 4);
+						st(ir, F32, &value, &to, false);
+					});
+					let next = ir.value(format!("add i32 {index}, {product_stride}"));
+					ir.set("r15", I32, &next);
+				},
+			);
+			let product_seq = bump(ir, "r22", "1");
+			let product_grid = grid(ir, &a14, &a15, &product_seq, &deadline);
+			leave_unless(ir, &product_grid, 107, "r12", "split.done");
+			let prepare_cols = ir.value(format!("mul i32 {fan}, 8"));
+			packed_prepare(ir, &a18, &a19, &a20, &r3, &prepare_cols, &ctaid, &nctaid);
+			let prepared_seq = bump(ir, "r22", "1");
+			let prepared_grid = grid(ir, &a14, &a15, &prepared_seq, &deadline);
+			leave_unless(ir, &prepared_grid, 108, "r12", "split.done");
+			let down_row = ir.value(format!("mul i32 {within}, {r3}"));
+			let down_in = element(ir, &a19, &down_row, 16);
+			let down_scale = element(ir, &a20, &down_row, 2);
+			let down_receipt = split_mv_call(ir, &w_down, &ty_down, &down_in, &down_scale, &down_scratch, &r3, &r2, &cap, &active, "0", &rank, &rounds);
+			route_count(ir, &rank, 0, &down_receipt);
+			let down_zero = is_zero(ir, &down_receipt);
+			note_status(ir, &down_zero, 209);
+			let scatter_seq = bump(ir, "r22", "1");
+			let scatter_grid = grid(ir, &a14, &a15, &scatter_seq, &deadline);
+			leave_unless(ir, &scatter_grid, 110, "r12", "split.done");
+			let column_words = ir.value(format!("call i32 @mtp_column_word(i32 {mask})"));
+			let high_bits = ir.value(format!("lshr i64 {word}, 32"));
+			let high_word = ir.value(format!("trunc i64 {high_bits} to i32"));
+			let scatter_bound = ir.value(format!("mul i32 {active}, {r2}"));
+			let rank_lanes = ir.value(format!("mul i32 {rank}, {ntid}"));
+			let scatter_start = ir.value(format!("add i32 {rank_lanes}, {tid}"));
+			ir.set("r15", I32, &scatter_start);
+			let scatter_stride = ir.value(format!("mul i32 {rounds}, {ntid}"));
+			while_loop(
+				ir,
+				|ir| {
+					let index = ir.get("r15", I32);
+					ir.value(format!("icmp ult i32 {index}, {scatter_bound}"))
+				},
+				|ir| {
+					let index = ir.get("r15", I32);
+					let row = ir.value(format!("udiv i32 {index}, {r2}"));
+					let column = ir.value(format!("urem i32 {index}, {r2}"));
+					let row_shift = ir.value(format!("mul i32 {row}, 4"));
+					let gate_bits = ir.value(format!("lshr i32 {column_words}, {row_shift}"));
+					let gate_slot = ir.value(format!("and i32 {gate_bits}, 15"));
+					let up_shift = ir.value(format!("mul i32 {gate_slot}, 4"));
+					let up_bits = ir.value(format!("lshr i32 {high_word}, {up_shift}"));
+					let up_slot = ir.value(format!("and i32 {up_bits}, 15"));
+					let plane = ir.value(format!("mul i32 {gate_slot}, {r5}"));
+					let plane_slot = ir.value(format!("add i32 {plane}, {up_slot}"));
+					let plane_row = ir.value(format!("mul i32 {plane_slot}, {r2}"));
+					let plane_index = ir.value(format!("add i32 {plane_row}, {column}"));
+					let from = element(ir, &down_scratch, &index, 4);
+					let value = ld_cg(ir, F32, &from, 0);
+					let to = element(ir, &a11, &plane_index, 4);
+					st(ir, F32, &value, &to, false);
+					let next = ir.value(format!("add i32 {index}, {scatter_stride}"));
+					ir.set("r15", I32, &next);
+				},
+			);
+			let scatter_seq = bump(ir, "r22", "1");
+			let scatter_grid = grid(ir, &a14, &a15, &scatter_seq, &deadline);
+			leave_unless(ir, &scatter_grid, 111, "r12", "split.done");
+			let next_wave = ir.value(format!("add i32 {wave}, {nctaid}"));
+			ir.set("r24", I32, &next_wave);
+		},
+	);
+	// Reduce the planes on this die.
+	when(&mut ir, &leader, |ir| {
+		let at = timer(ir);
+		let slot = gep(ir, "%report", "16");
+		st(ir, I64, &at, &slot, false);
+	});
+	let combined = ir.value(format!("call i32 @split_local_combine(ptr addrspace(1) {a5}, ptr addrspace(1) {a6}, ptr addrspace(1) {a11}, ptr addrspace(1) {a12}, i32 {r5}, i32 {r2}, i32 %cols)"));
+	let combined_zero = is_zero(&mut ir, &combined);
+	note_status(&mut ir, &combined_zero, 212);
+	let reduce_seq = ir.value("mul i32 %seq, 64");
+	let reduce_tag = ir.value(format!("add i32 {reduce_seq}, 62"));
+	ir.set("r22", I32, &reduce_tag);
+	let reduced = grid(&mut ir, &a14, &a15, &reduce_tag, &deadline);
+	leave_unless(&mut ir, &reduced, 113, "r12", "split.done");
+	let returned = ir.value(format!("call i32 @split_return(ptr addrspace(1) {a12}, ptr addrspace(1) {a16}, ptr addrspace(1) {a14}, ptr addrspace(1) {a17}, i32 %seq, i64 {deadline}, i32 {r2}, i32 %cols, i32 {ROW_STRIDE})"));
+	let returned_zero = is_zero(&mut ir, &returned);
+	note_status(&mut ir, &returned_zero, 114);
+	ir.inst("br label %split.done");
+	ir.label("split.done");
+	let finished = timer(&mut ir);
+	when(&mut ir, &leader, |ir| {
+		let at = gep(ir, "%report", "24");
+		st(ir, I64, &finished, &at, false);
+	});
+	let status = ir.get("r12", I32);
+	let first_thread = ir.value(format!("icmp eq i32 {tid}, 0"));
+	when(&mut ir, &first_thread, |ir| {
+		let slot = element(ir, "%report", &ctaid, 4);
+		let at = gep(ir, &slot, "64");
+		st(ir, I32, &status, &at, false);
+	});
+	ir.inst(format!("ret i32 {status}"));
+	ir.function("define i32 @split_expert_layer(ptr addrspace(1) %desc, i32 %seq, i32 %cols, ptr %sh, ptr addrspace(1) %report)")
+}
+
+/// LLVM declarations of the device functions this block calls; their bodies come from other blocks.
+/// LLVM declarations of the device functions this block calls; their bodies come from other blocks.
+fn expert_forward_declarations() -> String {
+	[
+		"declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()",
+		"declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()",
+		"declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()",
+		"declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()",
+		"declare i64 @llvm.nvvm.read.ptx.sreg.globaltimer()",
+		"declare i32 @llvm.nvvm.shfl.sync.bfly.i32(i32, i32, i32, i32)",
+		"declare float @llvm.fma.f32(float, float, float)",
+		"declare float @llvm.exp2.f32(float)",
+		"declare i32 @llvm.ctlz.i32(i32, i1)",
+		"declare i32 @llvm.ctpop.i32(i32)",
+		"declare i32 @llvm.umin.i32(i32, i32)",
+		"declare i32 @split_local_publish(ptr addrspace(1), ptr addrspace(1), i32, i64)",
+		"declare i32 @split_local_wait(ptr addrspace(1), i32, i64)",
+		"declare i32 @p2p_wait(ptr addrspace(1), i32, i64)",
+		"declare i32 @p2p_publish_tagged(ptr addrspace(1), ptr addrspace(1), i32, i32, i64)",
+		"declare void @packed_prepare(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32, i32, i32)",
+		"declare i32 @packed_matvec(i32, i32, i32, i32, i32, i32, ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32, i32)",
+		"declare i32 @packed_gate_up(i32, i32, i32, i32, i32, ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32, i32)",
+		"declare i64 @mtp_group_cta(ptr addrspace(1), i32, i32, i32)",
+		"declare i32 @mtp_column_word(i32)",
+		"declare i32 @split_local_combine(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32)",
+		"declare i32 @split_return(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i64, i32, i32, i32)",
+		"declare i32 @split_send(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i64, i32, i32, i32, i32, i32, i32)",
+		"declare i32 @split_combine(ptr addrspace(1), ptr addrspace(1), i32, i64, i32, i32, i32, i32)",
+	]
+	.iter()
+	.map(|line| format!("{line}\n"))
+	.collect()
+}
+
+/// The module text for the expert forward device functions.
+pub fn expert_forward_ir() -> String {
+	let mut module = String::from("@scratch = external addrspace(3) global [0 x i8], align 16\n");
+	module += &expert_forward_declarations();
+	module += "\n";
+	for function in [
+		split_grid(),
+		split_mv(),
+		split_route_count(),
+		split_dense_typed(),
+		split_dense_layer(),
+		split_dense_forward(),
+		split_expert_layer(),
+		split_main_forward(),
+	] {
+		module += &function;
+	}
+	module += &expert_split_worker();
+	// The reference keeps each stage as its own device function, so none may be inlined into another.
+	module += "attributes #0 = { noinline nounwind }\n";
+	module += &format!("!{UNROLL_DISABLED} = distinct !{{!{UNROLL_DISABLED}, !{}}}\n!{} = !{{!\"llvm.loop.unroll.disable\"}}\n", UNROLL_DISABLED + 1, UNROLL_DISABLED + 1);
+	module
+}
+}
+
+use expert_forward::{expert_grid, expert_job, expert_main};
+
+/// PTX text of the expert forward device functions, compiled from `expert_forward::expert_forward_ir` with the
+/// NVIDIA LLVM toolchain. Compiled text is cached under the native artifact directory by the hash of the IR.
+fn expert_forward_ptx() -> Result<String> {
+	let ir = expert_forward::expert_forward_ir();
+	let mut hash = 14695981039346656037_u64;
+	for byte in ir.as_bytes() {
+		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
+	}
+	let key = format!("recipe-expert-forward-{hash:016x}");
+	let directory = native_artifact_directory(&key)?;
+	let output = directory.join("expert-forward.ptx");
+	if let Ok(cached) = fs::read_to_string(&output) {
+		return Ok(cached);
+	}
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("expert forward artifact directory: {error}")))?;
+	let source = directory.join("expert-forward.ll");
+	let bitcode = directory.join("expert-forward.bc");
+	fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write expert forward IR: {error}")))?;
+	let mut compile = Command::new(native_nvidia_compiler()?);
+	compile.args(["-target", "nvptx64-nvidia-cuda", "-march=sm_52", "--cuda-feature=+ptx74", "-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(&source).arg("-o").arg(&bitcode);
+	native_command(compile, "expert forward LLVM IR compiler", &key)?;
+	let mut generate = Command::new(native_nvidia_codegen()?);
+	generate.args(["-mtriple=nvptx64-nvidia-cuda", "-mcpu=sm_52", "-mattr=+ptx74", "-O2", "-o"]).arg(&output).arg(&bitcode);
+	native_command(generate, "expert forward PTX code generator", &key)?;
+	let text = fs::read_to_string(&output).map_err(|error| RecipeError::new(format!("cannot read expert forward PTX: {error}")))?;
+	// The caller's module supplies the version, target, and address size, so only function text is kept.
+	let body = text
+		.lines()
+		.filter(|line| !(line.starts_with("//") || line.starts_with(".version") || line.starts_with(".target") || line.starts_with(".address_size")))
+		.collect::<Vec<_>>()
+		.join("\n");
+	fs::write(&output, &body).map_err(|error| RecipeError::new(format!("cannot cache expert forward PTX: {error}")))?;
+	Ok(body)
+}
