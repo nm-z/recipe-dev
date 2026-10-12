@@ -4575,16 +4575,18 @@ impl NativeModelIr {
 				(reverse, Primitive::Rope) => {
 					let body = if reverse { "rope_body_adjoint" } else { "rope_body" };
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
-					let ty = self.node_precision(node).model_type;
-					let base = native_literal(self.node_precision(node).model, ty, node.argument[1]);
-					let mscale = native_literal(self.node_precision(node).model, ty, node.argument[4]);
-					let factor = native_literal(self.node_precision(node).model, ty, node.argument[5]);
-					let chain = native_literal(self.node_precision(node).model, ty, node.argument[6]);
-					let fast = native_literal(self.node_precision(node).model, ty, node.argument[7]);
-					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
+					// Rotary constants belong to angle arithmetic, not tensor storage.
+					let precision = self.node_precision(node);
+					let ty = precision.state_type;
+					let base = native_literal(precision.state, ty, node.argument[1]);
+					let mscale = native_literal(precision.state, ty, node.argument[4]);
+					let factor = native_literal(precision.state, ty, node.argument[5]);
+					let chain = node.argument[6] > 0.0;
+					let fast = native_literal(precision.state, ty, node.argument[7]);
+					let slow = native_literal(precision.state, ty, node.argument[8]);
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, {pointer} {context}, i1 {sectioned}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
+							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, {pointer} {context}, i1 {sectioned}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, i1 {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
 							context = pointers.context,
 							sectioned = node.program_count != 0,
 							position_origin = if reverse { "" } else if self.layout.window_positions < self.graph.input.length { ", i32 %begin" } else { ", i32 0" },
@@ -22318,8 +22320,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
 	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 1.0, 0.0, 0.0];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
-	// The recurrent read uses the same inverse-root key-width scale as attention.
-	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
+	// The recurrence kernel scales its query by the inverse root of the key width.
 	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);

@@ -2577,7 +2577,7 @@ finish.direct:
 ret RECIPE_STATE %rotated.value
 }
 define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i1 %sectioned, i64 %p, i32 %channels, i32 %length,
-	i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse, i32 %position.origin ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
+	i32 %head.width, i32 %dims, i32 %rotated, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide, RECIPE_STATE %factor.wide, i1 %chain.on, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, i1 %has.factors, i1 %reverse, i32 %position.origin ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %p
@@ -2585,7 +2585,6 @@ define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %weig
 %value = call RECIPE_STATE @recipe.decode(double %value.model)
 %rotates = icmp ult i64 %channel, %rotated.wide %inside = icmp ult i64 %local, %dims.wide %active = and i1 %rotates, %inside
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
-%base.wide = call RECIPE_STATE @recipe.decode(double %base) %mscale.wide = call RECIPE_STATE @recipe.decode(double %yarn.mscale) %factor.wide = call RECIPE_STATE @recipe.decode(double %yarn.factor) %low.wide = call RECIPE_STATE @recipe.decode(double %yarn.low) %high.wide = call RECIPE_STATE @recipe.decode(double %yarn.high)
 %unrotated.model = call double @recipe.encode(RECIPE_STATE %value)
 br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local, %half
 %local.upper = sub i64 %local, %half %index = select i1 %upper, i64 %local.upper, i64 %local
@@ -2606,8 +2605,6 @@ br label %factor.ready
 factor.ready:
 %frequency.factor = phi RECIPE_STATE [ %factor.loaded, %factor.load ], [ %one, %factor.one ]
 %position.i32 = call i32 @rope_position(ptr addrspace(1) %context, i1 %sectioned, i64 %p, i64 %per.row, i64 %length.wide, i64 %position, i32 %index.i32, i32 %position.origin)
-%chain.zero = call double @recipe.from.u32(i32 0)
-%chain.on = call i1 @recipe.ogt(double %angle.chain, double %chain.zero)
 %rotated.value = call RECIPE_STATE @rope_pair(RECIPE_STATE %value, RECIPE_STATE %other, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide, RECIPE_STATE %factor.wide, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, RECIPE_STATE %frequency.factor, i64 %index, i32 %dims, i32 %position.i32, i1 %upper, i1 %reverse, i1 %chain.on)
 br label %finish.direct
 finish.direct:
@@ -2620,14 +2617,13 @@ assign: store double %result, ptr addrspace(1) %output.ptr, align 8 ret void }
 ; The adjoint twin: the same angles and coefficients, read from a state-typed delta
 ; and added into a state-typed previous, so nothing on the adjoint side is rounded.
 define internal void @rope_body_adjoint( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i1 %sectioned, i64 %p, i32 %channels, i32 %length,
- i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
+	i32 %head.width, i32 %dims, i32 %rotated, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide, RECIPE_STATE %factor.wide, i1 %chain.on, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, i1 %has.factors, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input, i64 %p
 %value = load RECIPE_STATE, ptr addrspace(1) %input.ptr, align RECIPE_STATE_ALIGN
 %rotates = icmp ult i64 %channel, %rotated.wide %inside = icmp ult i64 %local, %dims.wide %active = and i1 %rotates, %inside
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
-%base.wide = call RECIPE_STATE @recipe.decode(double %base) %mscale.wide = call RECIPE_STATE @recipe.decode(double %yarn.mscale) %factor.wide = call RECIPE_STATE @recipe.decode(double %yarn.factor) %low.wide = call RECIPE_STATE @recipe.decode(double %yarn.low) %high.wide = call RECIPE_STATE @recipe.decode(double %yarn.high)
 br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local, %half
 %local.upper = sub i64 %local, %half %index = select i1 %upper, i64 %local.upper, i64 %local
 %half.stride = mul i64 %half, %length.wide %partner.up = add i64 %p, %half.stride %partner.down = sub i64 %p, %half.stride
@@ -2646,8 +2642,6 @@ br label %factor.ready
 factor.ready:
 %frequency.factor = phi RECIPE_STATE [ %factor.loaded, %factor.load ], [ %one, %factor.one ]
 %position.i32 = call i32 @rope_position(ptr addrspace(1) %context, i1 %sectioned, i64 %p, i64 %per.row, i64 %length.wide, i64 %position, i32 %index.i32, i32 0)
-%chain.zero = call double @recipe.from.u32(i32 0)
-%chain.on = call i1 @recipe.ogt(double %angle.chain, double %chain.zero)
 %rotated.value = call RECIPE_STATE @rope_pair(RECIPE_STATE %value, RECIPE_STATE %other, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide, RECIPE_STATE %factor.wide, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, RECIPE_STATE %frequency.factor, i64 %index, i32 %dims, i32 %position.i32, i1 %upper, i1 %reverse, i1 %chain.on)
 br label %finish.direct
 finish.direct:
