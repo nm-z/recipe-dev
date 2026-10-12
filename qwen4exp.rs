@@ -26,6 +26,8 @@ pub fn model() -> Model {
 				.attn(qwen4exp.attention.head_count)
 				.kv(qwen4exp.attention.head_count_kv)
 				.head(qwen4exp.attention.key_length)
+				.gate()
+				.qk(rms)
 				// M-RoPE sections [11, 11, 10] split the 32 rotary pairs over time, height and
 				// width positions; text gives all three the token position, so this is
 				// plain rotation of the first 64 channels. Images would need the sections.
@@ -36,6 +38,7 @@ pub fn model() -> Model {
 					qwen4exp.attention.compress_ratios[block].max(1),
 					qwen4exp.attention.indexer.top_k
 				)
+				.score(rms, qwen4exp.rope.dimension_count)
 		} else {
 			recipe.model()
 				.delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
@@ -63,6 +66,8 @@ pub fn model() -> Model {
 		).fp(32));
 	}
 
+	// Leaving the hyper stream folds its 4 lanes back to one through the head
+	// mixer (output_hc_norm, _down, _up) before the vocabulary projection.
 	model.layer(tokenizer.ggml.tokens)
 }
 
