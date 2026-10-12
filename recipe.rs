@@ -8874,7 +8874,6 @@ fn native_nvidia_maxrreg() -> Option<u32> {
 	std::env::var("RECIPE_MAXRREG").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| (32..=255).contains(value))
 }
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
-	let mut hash = 14695981039346656037_u64;
 	let version = match target {
 		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v6".as_slice(),
 		BackendTarget::Amd { .. } => b"recipe-native-v3".as_slice(),
@@ -8899,17 +8898,25 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
-	let local_p2p = local_p2p_functions();
 	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
 	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
-	if matches!(target, BackendTarget::Nvidia { .. }) { parts.extend([MtpBatch::ptx().as_bytes(), p2p_functions().as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]); }
+	let p2p = if matches!(target, BackendTarget::Nvidia { .. }) { Some((p2p_functions()?, local_p2p_functions()?)) } else { None };
+	if let Some((p2p, local_p2p)) = &p2p {
+		parts.extend([MtpBatch::ptx().as_bytes(), p2p.as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]);
+	}
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
+	Ok(format!("recipe-native-{:016x}", native_fnv1a(&parts)))
+}
+
+/// FNV-1a over length-prefixed parts, so the same bytes split differently hash apart.
+fn native_fnv1a(parts: &[&[u8]]) -> u64 {
+	let mut hash = 14695981039346656037_u64;
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
 	}
-	Ok(format!("recipe-native-{hash:016x}"))
+	hash
 }
 
 /// Run a compiler and return whatever it wrote to its diagnostic stream, which
@@ -9290,8 +9297,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			}
 
 			ptx_source.push_str(MtpBatch::ptx());
-			ptx_source.push_str(p2p_functions());
-			ptx_source.push_str(&local_p2p_functions());
+			ptx_source.push_str(&p2p_functions()?);
+			ptx_source.push_str(&local_p2p_functions()?);
 			ptx_source.push_str(expert_split_functions());
 			ptx_source.push_str(PackedMatvec::ptx());
 			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
@@ -20389,17 +20396,215 @@ enum PlacedSource {
 /// Device functions for a persistent Flash-Next token kernel. Append this text
 /// after the caller's PTX header and call `p2p_wait` and `p2p_publish` in that kernel.
 /// Every payload writer must call publication; launch no more than one CTA per SM.
-pub fn p2p_functions() -> &'static str {
-	let source = include_str!("barrier.ptx");
-	let start = source.find("// Hand-owned sm_52 peer publication.").expect("owned P2P functions");
-	let end = source[start..].find("// Persistent all-SM packed layer chain.").expect("owned P2P function boundary") + start;
-	&source[start..end]
+pub fn p2p_functions() -> Result<String> { native_p2p_ptx(P2pScope::Peer) }
+/// The die-local copy of the same protocol: completion addresses of the executing
+/// die need GPU-scope fences rather than system-scope ones.
+fn local_p2p_functions() -> Result<String> { native_p2p_ptx(P2pScope::Local) }
+
+/// The two copies of the publication protocol. They differ only in the fence that
+/// orders a publisher's payload before its slot, and in the symbols they define.
+#[derive(Clone, Copy)]
+enum P2pScope {
+	Peer,
+	Local,
 }
-// Internal completion addresses belong to the executing die. Peer publication
-// retains the system fences in the original owned functions.
-fn local_p2p_functions() -> String {
-	p2p_functions().lines().filter(|line| !line.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
-		.replace("p2p_wait", "split_local_wait").replace("p2p_publish", "split_local_publish").replace("membar.sys", "membar.gl")
+impl P2pScope {
+	fn prefix(self) -> &'static str {
+		match self {
+			Self::Peer => "p2p",
+			Self::Local => "split_local",
+		}
+	}
+	/// The fence that orders a publisher's payload before its slot and receipt.
+	fn publish_fence(self) -> &'static str {
+		match self {
+			Self::Peer => "fence seq_cst",
+			Self::Local => "fence syncscope(\"device\") seq_cst",
+		}
+	}
+}
+
+/// LLVM IR for `p2p_wait`, `p2p_publish_tagged` and `p2p_publish`. Each CTA owns a
+/// `SLOT_STRIDE`-byte completion slot, and the coordinator warp of CTA 0 reads one
+/// slot per lane, so a grid holds at most `COORDINATOR_CTAS` CTAs. The `.cg` load
+/// bypasses L1 for slots written by other CTAs, and LLVM has no spelling for that
+/// cache operator, so it is the one inline asm instruction.
+fn p2p_ir(scope: P2pScope) -> String {
+	let prefix = scope.prefix();
+	let publish_fence = scope.publish_fence();
+	let stride = PeerPacket::SLOT_STRIDE;
+	let lanes = PeerPacket::COORDINATOR_CTAS;
+	format!(
+		r#"target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+@{prefix}_publish_ok = internal addrspace(3) global i32 undef, align 4
+
+declare i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+declare void @llvm.nvvm.barrier0()
+declare i1 @llvm.nvvm.vote.all.sync(i32, i1)
+declare i1 @llvm.nvvm.vote.any.sync(i32, i1)
+
+define external i32 @{prefix}_wait(i64 %address, i32 %want, i64 %deadline) {{
+entry:
+	%wait_pointer = inttoptr i64 %address to ptr addrspace(1)
+	br label %wait_again
+
+wait_again:
+	%value = load volatile i32, ptr addrspace(1) %wait_pointer, align 4
+	%same = icmp eq i32 %value, %want
+	br i1 %same, label %wait_success, label %wait_check
+
+wait_check:
+	%now = call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
+	%expired = icmp uge i64 %now, %deadline
+	br i1 %expired, label %wait_timeout, label %wait_again
+
+wait_success:
+	fence syncscope("device") seq_cst
+	ret i32 1
+
+wait_timeout:
+	ret i32 0
+}}
+
+define external i32 @{prefix}_publish_tagged(i64 %slots, i64 %remote_sequence, i32 %sequence, i32 %peer_sequence, i64 %deadline) noinline {{
+entry:
+	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+	%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+	%count = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+	{publish_fence}
+	call void @llvm.nvvm.barrier0()
+	%cta64 = zext i32 %cta to i64
+	%offset = mul i64 %cta64, {stride}
+	%pointer = add i64 %slots, %offset
+	%lead = icmp eq i32 %tid, 0
+	br i1 %lead, label %write_slot, label %after_slot
+
+write_slot:
+	%slot_pointer = inttoptr i64 %pointer to ptr addrspace(1)
+	store volatile i32 %sequence, ptr addrspace(1) %slot_pointer, align 4
+	fence syncscope("device") seq_cst
+	store i32 1, ptr addrspace(3) @{prefix}_publish_ok, align 4
+	br label %after_slot
+
+after_slot:
+	%not_cta0 = icmp ne i32 %cta, 0
+	br i1 %not_cta0, label %join, label %coordinator_gate
+
+coordinator_gate:
+	%not_scan_lane = icmp uge i32 %tid, {lanes}
+	br i1 %not_scan_lane, label %join, label %coordinator
+
+coordinator:
+	%scan_index = zext i32 %tid to i64
+	%scan_offset = mul i64 %scan_index, {stride}
+	%scan_pointer = add i64 %slots, %scan_offset
+	br label %scan
+
+scan:
+	%in_range = icmp ult i32 %tid, %count
+	br i1 %in_range, label %scan_load, label %scan_test
+
+scan_load:
+	%loaded = call i32 asm sideeffect "ld.global.cg.u32 $0, [$1];", "=r,l,~{{memory}}"(i64 %scan_pointer)
+	br label %scan_test
+
+scan_test:
+	%value_now = phi i32 [ %sequence, %scan ], [ %loaded, %scan_load ]
+	%lane_ready = icmp eq i32 %value_now, %sequence
+	%all_ready = call i1 @llvm.nvvm.vote.all.sync(i32 -1, i1 %lane_ready)
+	br i1 %all_ready, label %publish_success, label %scan_wait
+
+scan_wait:
+	%scan_now = call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
+	%lane_expired = icmp uge i64 %scan_now, %deadline
+	%any_expired = call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1 %lane_expired)
+	br i1 %any_expired, label %publish_timeout, label %scan
+
+publish_success:
+	%lead_success = icmp eq i32 %tid, 0
+	br i1 %lead_success, label %publish_remote, label %join
+
+publish_remote:
+	{publish_fence}
+	%remote_pointer = inttoptr i64 %remote_sequence to ptr addrspace(1)
+	store volatile i32 %peer_sequence, ptr addrspace(1) %remote_pointer, align 4
+	br label %publish_result
+
+publish_timeout:
+	br label %publish_result
+
+publish_result:
+	%published = phi i32 [ 1, %publish_remote ], [ 0, %publish_timeout ]
+	%lead_result = icmp eq i32 %tid, 0
+	br i1 %lead_result, label %publish_store, label %join
+
+publish_store:
+	store i32 %published, ptr addrspace(3) @{prefix}_publish_ok, align 4
+	br label %join
+
+join:
+	call void @llvm.nvvm.barrier0()
+	%final = load i32, ptr addrspace(3) @{prefix}_publish_ok, align 4
+	ret i32 %final
+}}
+
+define external i32 @{prefix}_publish(i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline) {{
+entry:
+	%result = call i32 @{prefix}_publish_tagged(i64 %slots, i64 %remote_sequence, i32 %sequence, i32 %sequence, i64 %deadline)
+	ret i32 %result
+}}
+"#
+	)
+}
+
+/// Compile one scope's publication functions with the NVIDIA clang and llc stages,
+/// for sm_52 as the owned block was. The PTX is cached by the hash of its IR.
+fn native_p2p_ptx(scope: P2pScope) -> Result<String> {
+	let architecture = "sm_52";
+	let ptx_feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
+	let ir = p2p_ir(scope);
+	let parts: [&[u8]; 4] = [b"recipe-native-p2p-v1", architecture.as_bytes(), ptx_feature.as_bytes(), ir.as_bytes()];
+	let key = format!("recipe-native-p2p-{:016x}", native_fnv1a(&parts));
+	let directory = native_artifact_directory(&key)?;
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native P2P directory: {error}")))?;
+	let output = directory.join("p2p.ptx");
+	if !output.is_file() {
+		let source = directory.join("p2p.ll");
+		let bitcode = directory.join("p2p.bc");
+		let staged = directory.join("p2p.staged.ptx");
+		fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write native P2P IR: {error}")))?;
+		let mut command = Command::new(native_nvidia_compiler()?);
+		command
+			.args(["-target", "nvptx64-nvidia-cuda"])
+			.arg(format!("-march={architecture}"))
+			.arg(format!("--cuda-feature={ptx_feature}"))
+			.args(["-O2", "-emit-llvm", "-c", "-x", "ir"])
+			.arg(&source)
+			.arg("-o")
+			.arg(&bitcode);
+		let diagnostic = native_command(command, "P2P LLVM IR compiler", &key)?;
+		validate_nvidia_ptx_feature(&ptx_feature, &diagnostic)?;
+		let mut command = Command::new(native_nvidia_codegen()?);
+		command
+			.args(["-mtriple=nvptx64-nvidia-cuda"])
+			.arg(format!("-mcpu={architecture}"))
+			.arg(format!("-mattr={ptx_feature}"))
+			.args(["-O2", "-o"])
+			.arg(&staged)
+			.arg(&bitcode);
+		let generated = native_command(command, "P2P PTX code generator", &key);
+		fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native P2P bitcode: {error}")))?;
+		validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
+		fs::rename(&staged, &output).map_err(|error| RecipeError::new(format!("cannot store native P2P PTX: {error}")))?;
+	}
+	let ptx = fs::read_to_string(&output).map_err(|error| RecipeError::new(format!("cannot read native P2P PTX: {error}")))?;
+	// The caller's module supplies the header, so only the functions and symbols are kept.
+	Ok(ptx.lines().filter(|line| !line.starts_with("//") && !line.starts_with(".version") && !line.starts_with(".target") && !line.starts_with(".address_size")).map(|line| format!("{line}\n")).collect())
 }
 /// A receiving die's resident peer packet and local CTA completion slots.
 /// Allocate alongside the weight holder and retain across tokens. Before reuse
@@ -20416,6 +20621,8 @@ impl PeerPacket {
 	pub const PAYLOAD_BYTES: usize = 16384;
 	pub const SEQUENCE_OFFSET: u64 = 16384;
 	pub const SLOT_STRIDE: usize = 128;
+	/// CTAs one coordinator warp can scan: lane `i` reads CTA `i`'s completion slot.
+	pub const COORDINATOR_CTAS: usize = 32;
 	/// Completion slots per SM: a split worker may keep two CTAs resident on each.
 	pub const CTAS_PER_SM: usize = 2;
 	pub const PACKET_BYTES: usize = 16452;
@@ -20430,7 +20637,7 @@ impl PeerPacket {
 		{
 			let gpu = device(Some(name))?;
 			let ctas = match &gpu.driver { Driver::Cuda(driver) => driver.cus, _ => return Err(RecipeError::new("P2P requires a local NVIDIA device")) };
-			require(ctas != 0 && ctas <= 32, "P2P coordinator supports one CTA per SM on devices with 1..32 SMs")?;
+			require(ctas != 0 && (ctas as usize) <= Self::COORDINATOR_CTAS, format!("P2P coordinator supports one CTA per SM on devices with 1..{} SMs", Self::COORDINATOR_CTAS))?;
 			let packet = gpu.allocate_bytes(packet_bytes)?;
 			let slots = match gpu.allocate_bytes(ctas as usize * Self::CTAS_PER_SM * Self::SLOT_STRIDE) {
 				Ok(slots) => slots,
@@ -20815,13 +21022,15 @@ impl ExpertExecution {
 		self.worker_path=path.to_path_buf();
 		Ok(())
 	}
-	fn worker_source() -> String {
-		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
+	fn worker_source() -> Result<String> {
+		let peer = p2p_functions()?;
+		let local = local_p2p_functions()?;
+		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions()))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
 		let main = device(Some(&format!("nv{}", plan.main_die)))?;
-		let source = Self::worker_source();
+		let source = Self::worker_source()?;
 		// RECIPE_WORKER_MAXRREG caps worker registers so more threads fit per SM; it is part of the cubin's identity.
 		let maxrreg = std::env::var("RECIPE_WORKER_MAXRREG").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| (32..=255).contains(value));
 		let key = native_artifact_key(&main.native_target, &format!("{source}\n// maxrregcount {maxrreg:?}\n"))?;
@@ -36692,7 +36901,7 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 }
 
 /// Owned worker module text for preassembly without allocating model weights.
-pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source() }
+pub fn expert_worker_ptx() -> Result<String> { ExpertExecution::worker_source() }
 fn expert_forward_functions() -> &'static str { r#"
 // Real forward glue. Every local completion stage has a distinct sequence.
 .func (.param .u32 result) split_grid(.param .u64 s0,.param .u64 f0,.param .u32 q0,.param .u64 d0) {
