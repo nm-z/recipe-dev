@@ -8900,9 +8900,10 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
 	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
+	let split = if matches!(target, BackendTarget::Nvidia { .. }) { expert_split_functions()? } else { String::new() };
 	let p2p = if matches!(target, BackendTarget::Nvidia { .. }) { Some((p2p_functions()?, local_p2p_functions()?)) } else { None };
 	if let Some((p2p, local_p2p)) = &p2p {
-		parts.extend([MtpBatch::ptx().as_bytes(), p2p.as_bytes(), expert_split_functions().as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]);
+		parts.extend([MtpBatch::ptx().as_bytes(), p2p.as_bytes(), split.as_bytes(), PackedMatvec::ptx().as_bytes(), expert_forward_functions().as_bytes(), local_p2p.as_bytes()]);
 	}
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	Ok(format!("recipe-native-{:016x}", native_fnv1a(&parts)))
@@ -9299,7 +9300,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(MtpBatch::ptx());
 			ptx_source.push_str(&p2p_functions()?);
 			ptx_source.push_str(&local_p2p_functions()?);
-			ptx_source.push_str(expert_split_functions());
+			ptx_source.push_str(&expert_split_functions()?);
 			ptx_source.push_str(PackedMatvec::ptx());
 			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
 			if expert_calls {ptx_source.push_str(expert_forward_functions());}
@@ -21025,7 +21026,7 @@ impl ExpertExecution {
 	fn worker_source() -> Result<String> {
 		let peer = p2p_functions()?;
 		let local = local_p2p_functions()?;
-		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions()))
+		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions()))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
@@ -21532,8 +21533,8 @@ impl ExpertSplitWeights {
 		}
 		for die in 0..DIES {
 			if devices[die].is_none() { continue; }
-			let request = PeerPacket::with_payload(&die_name(die), 5 * 10240 * 4)?;
-			let response = PeerPacket::with_payload(&die_name(value.plan.main_die), 5 * 10240 * 4)?;
+			let request = PeerPacket::with_payload(&die_name(die), EXPERT_SPLIT_PAYLOAD_BYTES)?;
+			let response = PeerPacket::with_payload(&die_name(value.plan.main_die), EXPERT_SPLIT_PAYLOAD_BYTES)?;
 			if die != value.plan.main_die { request.enable_sender(&response)?; response.enable_sender(&request)?; }
 			value.requests.push(request);
 			value.responses.push(response);
@@ -21602,11 +21603,431 @@ impl ExpertSplitWeights {
 	}
 }
 
+/// Expert split transport geometry. The host allocates each expert channel packet
+/// from these constants, and the transport IR below reads the same values.
+const EXPERT_SPLIT_POSITIONS: usize = 5;
+const EXPERT_SPLIT_PACKET_ROWS: usize = 10240;
+const EXPERT_SPLIT_MIN_PACKET_ROWS: usize = 4096;
+const EXPERT_SPLIT_MAX_TOP_K: usize = 16;
+/// Each packet holds one f32 row of `EXPERT_SPLIT_PACKET_ROWS` values per position.
+const EXPERT_SPLIT_PAYLOAD_BYTES: usize = EXPERT_SPLIT_POSITIONS * EXPERT_SPLIT_PACKET_ROWS * 4;
+/// A return publishes `sequence * 64 + 63` as its local tag, independent of the peer sequence.
+const EXPERT_SPLIT_RETURN_TAG_STRIDE: u32 = 64;
+const EXPERT_SPLIT_RETURN_TAG_OFFSET: u32 = 63;
+/// One combine record: a worker's payload address followed by its sequence address.
+const EXPERT_SPLIT_RESPONSE_BYTES: usize = 16;
+
+/// Peer functions the appended module already defines through `p2p_functions()`.
+const EXPERT_SPLIT_DECLARATIONS: &str = r#"declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+declare float @llvm.fma.f32(float, float, float)
+declare i32 @p2p_publish(i64, i64, i32, i64)
+declare i32 @p2p_publish_tagged(i64, i64, i32, i32, i64)
+declare i32 @p2p_wait(i64, i32, i64)
+
+"#;
+
+/// Each CTA-collective thread's first index and the grid stride, read once per function.
+const EXPERT_SPLIT_GRID: &str = r#"	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+	%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+	%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+	%nctaid = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+	%first.cta = mul i32 %cta, %ntid
+	%first = add i32 %first.cta, %tid
+	%stride = mul i32 %ntid, %nctaid
+"#;
+
+/// One `.cg` global load at `pointer + offset`. LLVM has no spelling for the
+/// cache operator, so this single instruction is written as inline asm.
+fn expert_split_cg(result: &str, element: &str, pointer: &str, offset: usize) -> String {
+	let (llvm, constraint) = match element { "u32" => ("i32", "=r"), "u64" => ("i64", "=l"), _ => ("float", "=f") };
+	let at = if offset == 0 { String::new() } else { format!("+{offset}") };
+	format!("\t{result} = call {llvm} asm sideeffect \"ld.global.cg.{element} $0, [$1{at}];\", \"{constraint},l,~{{memory}}\"(ptr addrspace(1) {pointer})\n")
+}
+
+/// Pushes each token's routed rows to the owning die's packet. Thread 0 of CTA 0
+/// records the owned slots and their coefficients; the copy spreads the rows.
+fn expert_split_send_ir() -> String {
+	let mut ir = format!(
+		r#"define external i32 @split_send(ptr addrspace(1) %hidden, ptr addrspace(1) %selected, ptr addrspace(1) %coefficients, ptr addrspace(1) %owners, ptr addrspace(1) %request, ptr addrspace(1) %records, ptr addrspace(1) %routing, i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline, i32 %die, i32 %experts, i32 %top_k, i32 %rows, i32 %positions, i32 %packet_rows) {{
+entry:
+{EXPERT_SPLIT_GRID}	%lead = or i32 %tid, %cta
+	%thread0 = icmp eq i32 %lead, 0
+	%record.stride = add i32 %top_k, 1
+	%bad.top.zero = icmp eq i32 %top_k, 0
+	%bad.top = icmp ugt i32 %top_k, {EXPERT_SPLIT_MAX_TOP_K}
+	%bad.packet.high = icmp ugt i32 %packet_rows, {EXPERT_SPLIT_PACKET_ROWS}
+	%bad.packet.low = icmp ult i32 %packet_rows, {EXPERT_SPLIT_MIN_PACKET_ROWS}
+	%bad.rows.zero = icmp eq i32 %rows, 0
+	%bad.rows = icmp ugt i32 %rows, %packet_rows
+	%bad.positions.zero = icmp eq i32 %positions, 0
+	%bad.positions = icmp ugt i32 %positions, {EXPERT_SPLIT_POSITIONS}
+	%bad.die = icmp uge i32 %die, {DIES}
+	%bad.0 = or i1 %bad.top.zero, %bad.top
+	%bad.1 = or i1 %bad.0, %bad.packet.high
+	%bad.2 = or i1 %bad.1, %bad.packet.low
+	%bad.3 = or i1 %bad.2, %bad.rows.zero
+	%bad.4 = or i1 %bad.3, %bad.rows
+	%bad.5 = or i1 %bad.4, %bad.positions.zero
+	%bad.6 = or i1 %bad.5, %bad.positions
+	%bad.7 = or i1 %bad.6, %bad.die
+	br i1 %bad.7, label %reject, label %position
+position:
+	%pos = phi i32 [0, %entry], [%pos.next, %position.done]
+	%record = mul i32 %pos, %record.stride
+	%record.ptr = getelementptr i32, ptr addrspace(1) %selected, i32 %record
+"#
+	);
+	ir.push_str(&expert_split_cg("%count", "u32", "%record.ptr", 0));
+	ir.push_str(
+		r#"	%bad.count = icmp ugt i32 %count, %top_k
+	br i1 %bad.count, label %reject, label %slot.start
+slot.start:
+	br label %slot
+slot:
+	%slot.index = phi i32 [0, %slot.start], [%slot.next, %slot.latch]
+	%compact = phi i32 [0, %slot.start], [%compact.next, %slot.latch]
+	%slot.more = icmp ult i32 %slot.index, %count
+	br i1 %slot.more, label %slot.body, label %slot.done
+slot.body:
+	%slot.ptr = getelementptr i32, ptr addrspace(1) %record.ptr, i32 %slot.index
+"#,
+	);
+	ir.push_str(&expert_split_cg("%expert", "u32", "%slot.ptr", 4));
+	ir.push_str(
+		r#"	%bad.expert = icmp uge i32 %expert, %experts
+	br i1 %bad.expert, label %reject, label %owner
+owner:
+	%owner.ptr = getelementptr i32, ptr addrspace(1) %owners, i32 %expert
+"#,
+	);
+	ir.push_str(&expert_split_cg("%owner.id", "u32", "%owner.ptr", 0));
+	ir.push_str(
+		r#"	%mine = icmp eq i32 %owner.id, %die
+	br i1 %mine, label %owned, label %slot.latch
+owned:
+	br i1 %thread0, label %owned.write, label %owned.count
+owned.write:
+	%write.index = add i32 %record, %compact
+	%write.slot = getelementptr i32, ptr addrspace(1) %records, i32 %write.index
+	%write.expert = getelementptr i8, ptr addrspace(1) %write.slot, i64 4
+	store volatile i32 %expert, ptr addrspace(1) %write.expert, align 4
+	%coef.row = mul i32 %pos, %top_k
+	%coef.index = add i32 %coef.row, %slot.index
+	%coef.ptr = getelementptr float, ptr addrspace(1) %coefficients, i32 %coef.index
+"#,
+	);
+	ir.push_str(&expert_split_cg("%coef", "f32", "%coef.ptr", 0));
+	ir.push_str(
+		r#"	%route.index = add i32 %coef.row, %compact
+	%route.ptr = getelementptr float, ptr addrspace(1) %routing, i32 %route.index
+	call void asm sideeffect "st.volatile.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %route.ptr, float %coef)
+	br label %owned.count
+owned.count:
+	%counted = add i32 %compact, 1
+	br label %slot.latch
+slot.latch:
+	%compact.next = phi i32 [%compact, %owner], [%counted, %owned.count]
+	%slot.next = add i32 %slot.index, 1
+	br label %slot, !llvm.loop !0
+slot.done:
+	br i1 %thread0, label %count.write, label %count.done
+count.write:
+	%count.ptr = getelementptr i32, ptr addrspace(1) %records, i32 %record
+	store volatile i32 %compact, ptr addrspace(1) %count.ptr, align 4
+	br label %count.done
+count.done:
+	%empty = icmp eq i32 %compact, 0
+	br i1 %empty, label %position.done, label %copy
+copy:
+	br label %copy.loop
+copy.loop:
+	%k = phi i32 [%first, %copy], [%k.next, %copy.store]
+	%k.more = icmp ult i32 %k, %packet_rows
+	br i1 %k.more, label %copy.body, label %position.done
+copy.body:
+	%k.in = icmp ult i32 %k, %rows
+	br i1 %k.in, label %copy.load, label %copy.zero
+copy.load:
+	%src.row = mul i32 %pos, %rows
+	%src.index = add i32 %src.row, %k
+	%src.ptr = getelementptr float, ptr addrspace(1) %hidden, i32 %src.index
+"#,
+	);
+	ir.push_str(&expert_split_cg("%loaded", "f32", "%src.ptr", 0));
+	ir.push_str(
+		r#"	br label %copy.store
+copy.zero:
+	br label %copy.store
+copy.store:
+	%value = phi float [%loaded, %copy.load], [0.0, %copy.zero]
+	%dst.row = mul i32 %pos, %packet_rows
+	%dst.index = add i32 %dst.row, %k
+	%dst.ptr = getelementptr float, ptr addrspace(1) %request, i32 %dst.index
+	call void asm sideeffect "st.volatile.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %dst.ptr, float %value)
+	%k.next = add i32 %k, %stride
+	br label %copy.loop, !llvm.loop !0
+position.done:
+	%pos.next = add i32 %pos, 1
+	%pos.more = icmp ult i32 %pos.next, %positions
+	br i1 %pos.more, label %position, label %publish, !llvm.loop !0
+publish:
+	%ok = call i32 @p2p_publish(i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline)
+	ret i32 %ok
+reject:
+	ret i32 0
+}
+
+"#,
+	);
+	ir
+}
+
+/// Sums each expert CTA's planes for its token positions on the worker die.
+fn expert_split_local_combine_ir() -> String {
+	let mut ir = String::from(
+		r#"define external i32 @split_local_combine(ptr addrspace(1) %records, ptr addrspace(1) %coefficients, ptr addrspace(1) %expert_outputs, ptr addrspace(1) %partial, i32 %top_k, i32 %rows, i32 %positions) {
+entry:
+"#,
+	);
+	ir.push_str(EXPERT_SPLIT_GRID);
+	ir.push_str(
+		r#"	%total = mul i32 %rows, %positions
+	%record.stride = add i32 %top_k, 1
+	br label %row
+row:
+	%idx = phi i32 [%first, %entry], [%idx.next, %row.store]
+	%idx.more = icmp ult i32 %idx, %total
+	br i1 %idx.more, label %row.body, label %done
+row.body:
+	%pos = udiv i32 %idx, %rows
+	%col = urem i32 %idx, %rows
+	%record = mul i32 %pos, %record.stride
+	%count.ptr = getelementptr i32, ptr addrspace(1) %records, i32 %record
+	%count = load volatile i32, ptr addrspace(1) %count.ptr, align 4
+	%bad.count = icmp ugt i32 %count, %top_k
+	br i1 %bad.count, label %reject, label %slot
+slot:
+	%slot.index = phi i32 [0, %row.body], [%slot.next, %slot.body]
+	%acc = phi float [0.0, %row.body], [%acc.next, %slot.body]
+	%slot.more = icmp ult i32 %slot.index, %count
+	br i1 %slot.more, label %slot.body, label %row.store
+slot.body:
+	%pair.row = mul i32 %pos, %top_k
+	%pair = add i32 %pair.row, %slot.index
+	%coef.ptr = getelementptr float, ptr addrspace(1) %coefficients, i32 %pair
+	%coef = call float asm sideeffect "ld.volatile.global.f32 $0, [$1];", "=f,l,~{memory}"(ptr addrspace(1) %coef.ptr)
+	%out.row = mul i32 %pair, %rows
+	%out.index = add i32 %out.row, %col
+	%out.ptr = getelementptr float, ptr addrspace(1) %expert_outputs, i32 %out.index
+"#,
+	);
+	ir.push_str(&expert_split_cg("%out", "f32", "%out.ptr", 0));
+	ir.push_str(
+		r#"	%acc.next = call float @llvm.fma.f32(float %coef, float %out, float %acc)
+	%slot.next = add i32 %slot.index, 1
+	br label %slot, !llvm.loop !0
+row.store:
+	%partial.ptr = getelementptr float, ptr addrspace(1) %partial, i32 %idx
+	call void asm sideeffect "st.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %partial.ptr, float %acc)
+	%idx.next = add i32 %idx, %stride
+	br label %row, !llvm.loop !0
+done:
+	ret i32 1
+reject:
+	ret i32 0
+}
+
+"#,
+	);
+	ir
+}
+
+/// Writes each worker's rows of the returned positions into its response packet,
+/// zero-filled past the rows, then publishes them under the return tag.
+fn expert_split_return_ir() -> String {
+	let mut ir = format!(
+		r#"define external i32 @split_return(ptr addrspace(1) %partial, ptr addrspace(1) %response, i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline, i32 %rows, i32 %positions, i32 %packet_rows) {{
+entry:
+{EXPERT_SPLIT_GRID}	%total = mul i32 %positions, %packet_rows
+	%tag.scaled = mul i32 %sequence, {EXPERT_SPLIT_RETURN_TAG_STRIDE}
+	%tag = add i32 %tag.scaled, {EXPERT_SPLIT_RETURN_TAG_OFFSET}
+	br label %return.loop
+return.loop:
+	%idx = phi i32 [%first, %entry], [%idx.next, %return.store]
+	%idx.more = icmp ult i32 %idx, %total
+	br i1 %idx.more, label %return.body, label %return.publish
+return.body:
+	%pos = udiv i32 %idx, %packet_rows
+	%col = urem i32 %idx, %packet_rows
+	%col.in = icmp ult i32 %col, %rows
+	br i1 %col.in, label %return.read, label %return.zero
+return.read:
+	%src.row = mul i32 %pos, %rows
+	%src.index = add i32 %src.row, %col
+	%src.ptr = getelementptr float, ptr addrspace(1) %partial, i32 %src.index
+"#
+	);
+	ir.push_str(&expert_split_cg("%loaded", "f32", "%src.ptr", 0));
+	ir.push_str(
+		r#"	br label %return.store
+return.zero:
+	br label %return.store
+return.store:
+	%value = phi float [%loaded, %return.read], [0.0, %return.zero]
+	%dst.ptr = getelementptr float, ptr addrspace(1) %response, i32 %idx
+	call void asm sideeffect "st.volatile.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %dst.ptr, float %value)
+	%idx.next = add i32 %idx, %stride
+	br label %return.loop, !llvm.loop !0
+return.publish:
+	%ok = call i32 @p2p_publish_tagged(i64 %slots, i64 %remote_sequence, i32 %tag, i32 %sequence, i64 %deadline)
+	ret i32 %ok
+}
+
+"#,
+	);
+	ir
+}
+
+/// Waits for every worker's response, then sums the worker payloads in die order.
+fn expert_split_combine_ir() -> String {
+	let mut ir = format!(
+		r#"define external i32 @split_combine(ptr addrspace(1) %responses, ptr addrspace(1) %output, i32 %sequence, i64 %deadline, i32 %rows, i32 %workers, i32 %positions, i32 %packet_rows) {{
+entry:
+{EXPERT_SPLIT_GRID}	%total = mul i32 %rows, %positions
+	br label %wait.loop
+wait.loop:
+	%w = phi i32 [0, %entry], [%w.next, %wait.ok]
+	%w.more = icmp ult i32 %w, %workers
+	br i1 %w.more, label %wait.body, label %row
+wait.body:
+	%entry.offset = mul i32 %w, {EXPERT_SPLIT_RESPONSE_BYTES}
+	%entry.ptr = getelementptr i8, ptr addrspace(1) %responses, i32 %entry.offset
+"#
+	);
+	ir.push_str(&expert_split_cg("%wait.payload", "u64", "%entry.ptr", 0));
+	ir.push_str(&expert_split_cg("%flag", "u64", "%entry.ptr", 8));
+	ir.push_str(
+		r#"	%waited = call i32 @p2p_wait(i64 %flag, i32 %sequence, i64 %deadline)
+	%failed = icmp eq i32 %waited, 0
+	br i1 %failed, label %reject, label %wait.ok
+wait.ok:
+	%w.next = add i32 %w, 1
+	br label %wait.loop, !llvm.loop !0
+row:
+	%idx = phi i32 [%first, %wait.loop], [%idx.next, %row.store]
+	%idx.more = icmp ult i32 %idx, %total
+	br i1 %idx.more, label %row.body, label %done
+row.body:
+	%pos = udiv i32 %idx, %rows
+	%col = urem i32 %idx, %rows
+	%plane = mul i32 %pos, %packet_rows
+	%plane.index = add i32 %plane, %col
+	br label %sum
+sum:
+	%sum.w = phi i32 [0, %row.body], [%sum.next, %sum.body]
+	%acc = phi float [0.0, %row.body], [%acc.next, %sum.body]
+	%sum.more = icmp ult i32 %sum.w, %workers
+	br i1 %sum.more, label %sum.body, label %row.store
+sum.body:
+"#,
+	);
+	ir.push_str(&format!("\t%record.offset = mul i32 %sum.w, {EXPERT_SPLIT_RESPONSE_BYTES}\n\t%record.ptr = getelementptr i8, ptr addrspace(1) %responses, i32 %record.offset\n"));
+	ir.push_str(&expert_split_cg("%payload", "u64", "%record.ptr", 0));
+	ir.push_str(
+		r#"	%payload.ptr = inttoptr i64 %payload to ptr addrspace(1)
+	%value.ptr = getelementptr float, ptr addrspace(1) %payload.ptr, i32 %plane.index
+	%value = call float asm sideeffect "ld.volatile.global.f32 $0, [$1];", "=f,l,~{memory}"(ptr addrspace(1) %value.ptr)
+	%acc.next = fadd float %acc, %value
+	%sum.next = add i32 %sum.w, 1
+	br label %sum, !llvm.loop !0
+row.store:
+	%out.ptr = getelementptr float, ptr addrspace(1) %output, i32 %idx
+	call void asm sideeffect "st.global.f32 [$0], $1;", "l,f,~{memory}"(ptr addrspace(1) %out.ptr, float %acc)
+	%idx.next = add i32 %idx, %stride
+	br label %row, !llvm.loop !0
+done:
+	ret i32 1
+reject:
+	ret i32 0
+}
+"#,
+	);
+	ir
+}
+
+/// The LLVM module for the four expert split transport functions. Loops keep their
+/// textual shape: LLVM must not unroll a loop, since its cache loads and peer
+/// operations appear once per function in the transport contract.
+fn expert_split_ir() -> String {
+	[EXPERT_SPLIT_DECLARATIONS.to_owned(), expert_split_send_ir(), expert_split_local_combine_ir(), expert_split_return_ir(), expert_split_combine_ir(), "!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.disable\"}\n".to_owned()].concat()
+}
+
+/// Keeps the functions from LLVM's output. LLVM's module header and declarations of
+/// the peer functions are dropped, since the appended module defines them. Integer
+/// loads, stores and parameters take the unsigned spelling the transport contract
+/// names; PTX assembles both spellings to the same instructions.
+fn expert_split_text(lowered: &str) -> String {
+	let mut text = String::new();
+	let mut declaring = false;
+	for line in lowered.lines() {
+		let trimmed = line.trim();
+		if declaring || trimmed.starts_with(".extern") {
+			declaring = !trimmed.ends_with(';');
+			continue;
+		}
+		if trimmed.starts_with(".version") || trimmed.starts_with(".target") || trimmed.starts_with(".address_size") { continue; }
+		if trimmed.starts_with("ld.") || trimmed.starts_with("st.") || trimmed.contains(".param .b") {
+			text.push_str(&line.replace(".b32", ".u32").replace(".b64", ".u64"));
+		} else {
+			text.push_str(line);
+		}
+		text.push('\n');
+	}
+	text
+}
+
+/// Key for the cached transport PTX: the IR and the PTX version it is lowered for.
+fn expert_split_key(ir: &str, feature: &str) -> String {
+	let mut hash = 14695981039346656037_u64;
+	for byte in b"recipe-expert-split-v1".iter().chain(feature.as_bytes()).chain(ir.as_bytes()) {
+		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
+	}
+	format!("recipe-expert-split-{hash:016x}")
+}
+
 /// Append callable expert transport functions after p2p_functions() in the
 /// holder's persistent step module. The source has no separate entry or launch.
-pub fn expert_split_functions() -> &'static str {
-	let source = include_str!("barrier.ptx");
-	&source[source.find("// Expert split transport.").expect("owned expert split PTX")..]
+/// The PTX is compiled from `expert_split_ir` once per IR and cached on disk.
+pub fn expert_split_functions() -> Result<String> {
+	let ir = expert_split_ir();
+	let feature = format!("+ptx{}", native_nvidia_ptx_version("sm_52")?);
+	let key = expert_split_key(&ir, &feature);
+	let directory = native_artifact_directory(&key)?;
+	let path = directory.join("expert-split.ptx");
+	if path.is_file() {
+		return fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read expert split PTX {}: {error}", path.display())));
+	}
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create expert split PTX directory: {error}")))?;
+	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+	let stem = format!(".recipe-expert-split-{}-{serial}", std::process::id());
+	let source = directory.join(format!("{stem}.ll"));
+	let bitcode = directory.join(format!("{stem}.bc"));
+	let lowered = directory.join(format!("{stem}.ptx"));
+	let _temporary = NativeTemporaryFiles { paths: vec![source.clone(), bitcode.clone(), lowered.clone()] };
+	fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write expert split LLVM IR: {error}")))?;
+	let mut command = Command::new(native_nvidia_compiler()?);
+	command.args(["-target", "nvptx64-nvidia-cuda", "-march=sm_52"]).arg(format!("--cuda-feature={feature}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(&source).arg("-o").arg(&bitcode);
+	native_command(command, "expert split LLVM IR compiler", &key)?;
+	let mut command = Command::new(native_nvidia_codegen()?);
+	command.arg("-mtriple=nvptx64-nvidia-cuda").arg("-mcpu=sm_52").arg(format!("-mattr={feature}")).args(["-O2", "-o"]).arg(&lowered).arg(&bitcode);
+	native_command(command, "expert split PTX code generator", &key)?;
+	let lowered_text = fs::read_to_string(&lowered).map_err(|error| RecipeError::new(format!("cannot read expert split PTX: {error}")))?;
+	let text = expert_split_text(&lowered_text);
+	fs::write(&path, &text).map_err(|error| RecipeError::new(format!("cannot write expert split PTX {}: {error}", path.display())))?;
+	Ok(text)
 }
 
 /// A model placed across the selected devices: contiguous block ranges, each
