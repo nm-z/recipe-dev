@@ -8956,6 +8956,16 @@ fn native_command(mut command: Command, role: &str, key: &str) -> Result<String>
 	Err(RecipeError::new(format!("{role} failed: {diagnostic}{kept}")))
 }
 
+/// The forward declaration of function `name` as `ptx` defines it, so a caller
+/// compiled before the definition declares exactly the prototype ptxas will see.
+fn ptx_declaration(ptx: &str, name: &str) -> Result<String> {
+	let call = format!(" {name}(");
+	let at = ptx.find(&call).ok_or_else(|| RecipeError::new(format!("generated PTX defines no {name}")))?;
+	let start = ptx[..at].rfind('\n').map_or(0, |index| index + 1);
+	// Parameters hold no parentheses, so the first `)` after the name closes them.
+	let end = ptx[at..].find(')').map(|offset| at + offset + 1).ok_or_else(|| RecipeError::new(format!("generated PTX header of {name} is unterminated")))?;
+	Ok(format!("{};", &ptx[start..end]))
+}
 /// Compile LLVM IR with the NVIDIA clang and llc stages for sm_52 and return its functions as PTX text.
 /// The caller's module supplies the header, so the output drops LLVM's module header, comments, and
 /// `.extern .func` declarations, which name functions that the appended module defines before use.
@@ -9348,9 +9358,10 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				let at = ptx_source.find(".address_size 64").ok_or_else(|| RecipeError::new("native packed PTX has no address-size declaration"))? + ".address_size 64".len();
 				ptx_source.insert_str(at, &format!("\n{}", PackedMatvec::declarations()));
 			}
-			if expert_calls {
+			let forward = if expert_calls { Some(native_nvidia_functions("expert-forward", &expert_forward::expert_forward_ir())?) } else { None };
+			if let Some(forward) = &forward {
 				let at=ptx_source.find(".address_size 64").ok_or_else(||RecipeError::new("native expert PTX has no address-size declaration"))?+".address_size 64".len();
-				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
+				ptx_source.insert_str(at, &format!("\n{}\n", ptx_declaration(forward, "split_main_forward")?));
 			}
 
 			ptx_source.push_str(&MtpBatch::ptx()?);
@@ -9359,7 +9370,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(&expert_split_functions()?);
 			ptx_source.push_str(PackedMatvec::ptx());
 			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
-			if expert_calls {ptx_source.push_str(&native_nvidia_functions("expert-forward", &expert_forward::expert_forward_ir())?);}
+			if let Some(forward) = &forward {ptx_source.push_str(forward);}
 			let entries = ptx_source.lines().filter_map(|line| {
 				let words = line.split_whitespace().collect::<Vec<_>>();
 				let at = words.iter().position(|word| *word == ".entry")?;
@@ -29736,7 +29747,8 @@ impl Gpu {
 				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
-					require(bytes as u64 <= self.free_bytes()?, format!("{} allocation of {bytes} bytes exceeds usable device memory", self.name))?;
+					let free = self.free_bytes()?;
+					require(bytes as u64 <= free, format!("{} allocation of {bytes} bytes exceeds usable device memory ({free} bytes free)", self.name))?;
 					let mut pointer = 0;
 					self.status((driver.allocate)(&mut pointer, bytes), "allocation")?;
 					Ok(pointer)
