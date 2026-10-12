@@ -16332,6 +16332,88 @@ fn key_color(name: &str, color: bool) -> String {
 	if !color { return name.to_owned(); }
 	name.split('.').enumerate().map(|(index, part)| format!("\x1b[{}m{part}\x1b[0m", [96, 95, 94, 93, 92, 91][index % 6])).collect::<Vec<_>>().join(".")
 }
+/// The numeric model a `.sym.rs` model names: every GGUF key path in the source
+/// (`<architecture>.…`, `tokenizer.…`, `general.…`) becomes the value the file
+/// holds, so the generated source reads as plain numbers. A path the file holds no
+/// key for is an error, never a default: a constant the file lacks is written in
+/// the model as a literal. The file is the `GGUF` environment variable, else the
+/// source's `const GGUF` path. A list of strings becomes its count.
+pub fn numeric_source(text: &str) -> Result<String> {
+	use GgufValue as V;
+	let named = text.lines().find_map(|line| line.trim().strip_prefix("const GGUF: &str = \"").and_then(|rest| rest.split('"').next()).map(str::to_owned));
+	let path = std::env::var("GGUF").ok().or(named).ok_or_else(|| RecipeError::new("a .sym.rs model names its file in const GGUF: &str = \"...\""))?;
+	let file = Gguf::open(&resolve_path(&path)?)?;
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{path} names no general.architecture")))?.to_owned();
+	let roots = [architecture.as_str(), "tokenizer", "general"];
+	let scalar = |value: &GgufValue, suffix: &str| -> Result<String> {
+		Ok(match value {
+			V::U8(v) => format!("{v}{suffix}"), V::I8(v) => format!("{v}{suffix}"), V::U16(v) => format!("{v}{suffix}"), V::I16(v) => format!("{v}{suffix}"),
+			V::U32(v) => format!("{v}{suffix}"), V::I32(v) => format!("{v}{suffix}"), V::U64(v) => format!("{v}{suffix}"), V::I64(v) => format!("{v}{suffix}"),
+			V::F32(v) => format!("{:?}", f64::from(*v)), V::F64(v) => format!("{v:?}"), V::Bool(v) => v.to_string(), V::String(v) => format!("{v:?}"),
+			V::Array(_) => return Err(RecipeError::new("a GGUF list nests a list")),
+		})
+	};
+	let render = |value: &GgufValue| -> Result<String> {
+		match value {
+			// A list's type follows its first value, so integers index and compare as usize.
+			V::Array(values) if values.iter().all(|value| matches!(value, V::String(_))) => Ok(values.len().to_string()),
+			V::Array(values) => {
+				let suffix = if values.iter().all(|value| matches!(value, V::U8(_) | V::U16(_) | V::U32(_) | V::U64(_) | V::I8(_) | V::I16(_) | V::I32(_) | V::I64(_))) { "_usize" } else { "" };
+				let items = values.iter().enumerate().map(|(index, value)| scalar(value, if index == 0 { suffix } else { "" })).collect::<Result<Vec<_>>>()?;
+				Ok(format!("[{}]", items.join(", ")))
+			}
+			value => scalar(value, ""),
+		}
+	};
+	let (bytes, mut output, mut at) = (text.as_bytes(), String::with_capacity(text.len()), 0);
+	let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+	while at < bytes.len() {
+		// Comments and string literals pass through untouched.
+		if text[at..].starts_with("//") {
+			let end = text[at..].find('\n').map_or(bytes.len(), |offset| at + offset);
+			output.push_str(&text[at..end]);
+			at = end;
+			continue;
+		}
+		if bytes[at] == b'"' {
+			let mut end = at + 1;
+			while end < bytes.len() && bytes[end] != b'"' { end += if bytes[end] == b'\\' { 2 } else { 1 }; }
+			let end = (end + 1).min(bytes.len());
+			output.push_str(&text[at..end]);
+			at = end;
+			continue;
+		}
+		// A key path starts a word that no field access precedes; a range's `..` is not one.
+		let accessed = at > 0 && bytes[at - 1] == b'.' && !(at > 1 && bytes[at - 2] == b'.');
+		let starts = word(bytes[at]) && !accessed && (at == 0 || !word(bytes[at - 1]));
+		let root = starts.then(|| roots.iter().find(|root| text[at..].starts_with(&format!("{root}.")) && !text[at + root.len() + 1..].starts_with('.'))).flatten();
+		let Some(root) = root else {
+			let next = text[at..].chars().next().map_or(1, char::len_utf8);
+			output.push_str(&text[at..at + next]);
+			at += next;
+			continue;
+		};
+		// The dotted segments after the root, stopping before a method call.
+		let (mut segments, mut end) = (vec![(*root).to_owned()], at + root.len());
+		while end < bytes.len() && bytes[end] == b'.' {
+			let start = end + 1;
+			let mut stop = start;
+			while stop < bytes.len() && word(bytes[stop]) { stop += 1; }
+			if stop == start || bytes.get(stop) == Some(&b'(') { break; }
+			segments.push(text[start..stop].to_owned());
+			end = stop;
+		}
+		let found = (1..=segments.len()).rev().find(|count| file.value(&segments[..*count].join(".")).is_some());
+		let Some(count) = found else {
+			return Err(RecipeError::new(format!("{} holds no key {}; write a constant the file lacks as a literal", path, segments.join("."))));
+		};
+		require(count == segments.len(), format!("{} names {} inside key {}", segments.join("."), segments[count..].join("."), segments[..count].join(".")))?;
+		output.push_str(&render(file.value(&segments.join(".")).unwrap())?);
+		at = end;
+	}
+	Ok(output)
+}
+
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	use GgufValue::*;
 	let file = Gguf::open(&resolve_path(path)?)?;
