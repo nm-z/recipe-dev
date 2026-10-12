@@ -1793,6 +1793,9 @@ pub(crate) struct NativeLayout {
 	/// Single-position packed inputs, shared by contractions with the same source.
 	pub packed_inputs: Vec<Option<(usize, usize)>>,
 	pub packed_routes: Option<usize>,
+	/// Context offset and size of the arrival counters and partial sums the
+	/// position-batched matvecs share; one node uses it at a time.
+	pub span_scratch: Option<(usize, usize)>,
 	/// Output and retained-KV fingerprint planes for reference runs. Each plane
 	/// holds one bounded window; collected observations live in RAM.
 	pub fingerprints: Option<usize>,
@@ -2520,6 +2523,8 @@ impl NativeLayout {
 		if packed_workspace.bytes!=0 {
 			let mut consumers = std::collections::BTreeMap::<(i32,usize),Vec<usize>>::new();
 			for (index,node) in graph.nodes.iter().enumerate() {
+				// A position-batched matvec stages its own input, so it never prepares one for others.
+				if span_matvec_parts(node,graph.stored.get(index).and_then(Option::as_ref),packed_weight(graph,index,true).is_some()).is_some() {continue;}
 				if node.precision != Compute::FP32 || casts[index][0].is_some() || node.source < 0 || node.block_kind=="split_dense"
 					|| packed_contraction_parts(node,graph.stored.get(index).and_then(Option::as_ref),packed_weight(graph,index,true).is_some()).is_none() {continue;}
 				let source = &graph.nodes[node.source as usize];
@@ -2536,6 +2541,10 @@ impl NativeLayout {
 		let packed_scratch = if packed_workspace.bytes!=0 {Some(context_plan.allocate(&[(packed_workspace.bytes,BufferLifetime::Retained)],16,0,false)?)} else {None};
 		if let Some(scratch)=packed_scratch {for (slot,_) in packed_inputs.iter_mut().flatten() {*slot=checked_add(scratch,*slot,"shared packed input offset")?;}}
 		let packed_routes = if inference && rows == 1 { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len(), 20, "packed route records")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
+		let span_size = if inference && rows == 1 { graph.nodes.iter().enumerate()
+			.filter_map(|(index, node)| span_matvec_parts(node, graph.stored.get(index).and_then(Option::as_ref), packed_weight(graph, index, true).is_some()))
+			.map(|parts| span_matvec_scratch(&parts)).max().unwrap_or(0) } else { 0 };
+		let span_scratch = if span_size != 0 { Some((context_plan.allocate(&[(span_size, BufferLifetime::Retained)], 16, 0, false)?, span_size)) } else { None };
 		let fingerprints = if inference && rows == 1 && ["RECIPE_REFERENCE", "RECIPE_REFERENCE_WRITE"].iter().any(|name| std::env::var_os(name).is_some()) {
 			let bytes = checked_mul(checked_mul(window_positions, graph.nodes.len(), "operation fingerprint count")?, 16, "output and KV fingerprint bytes")?;
 			Some(context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false)?)
@@ -2547,7 +2556,7 @@ impl NativeLayout {
 			context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false).map(Some)
 		}).collect::<Result<Vec<_>>>()?;
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_inputs, packed_routes, fingerprints, cache_channel_fingerprints })
+		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_inputs, packed_routes, span_scratch, fingerprints, cache_channel_fingerprints })
 	}
 }
 
@@ -2589,6 +2598,527 @@ fn packed_contraction_word(kind: u32, block: u32) -> Option<u64> {
 	}
 	choices.into_iter().enumerate().try_fold(0, |word, (slot, item)| item.map(|(method, lanes)| word | (u64::from(method | lanes << 8) << (slot * 16))))
 }
+/// Stored weight layouts the position-batched matvec decodes in registers.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum SpanWeight { F32, F16, BF16, Q8_0, Q4K, Q5K, Q6K }
+impl SpanWeight {
+	/// Values one lane decodes per task: one 16-byte line of a float format,
+	/// one Q8_0 block, one Q5_K sub-block pair, or a quarter of a Q6_K half.
+	fn task(self) -> usize { match self { Self::F32 => 4, Self::F16 | Self::BF16 => 8, Self::Q8_0 => 32, Self::Q4K | Self::Q5K => 64, Self::Q6K => 32 } }
+	fn block(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 => 1, Self::Q8_0 => 32, Self::Q4K | Self::Q5K | Self::Q6K => 256 } }
+	fn stride(self) -> usize { match self { Self::F32 => 4, Self::F16 | Self::BF16 => 2, Self::Q8_0 => 34, Self::Q4K => 144, Self::Q5K => 176, Self::Q6K => 210 } }
+	/// Staged activations gain four floats every `pad` values, so the eight lanes of a
+	/// 16-byte shared-load phase read eight different bank quads.
+	fn pad(self) -> usize { match self { Self::F32 => 0, Self::F16 | Self::BF16 | Self::Q8_0 => 32, Self::Q4K | Self::Q5K => 64, Self::Q6K => 128 } }
+	/// Tasks a chunk boundary must respect: a Q6_K task's values interleave across its superblock.
+	fn granule(self) -> usize { if self == Self::Q6K { 8 } else { 1 } }
+	/// Tasks each lane keeps in flight, about 64-80 weight bytes.
+	fn unroll(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 => 4, Self::Q8_0 | Self::Q6K => 2, Self::Q4K | Self::Q5K => 1 } }
+	/// Byte alignment the weight lines need beyond the format's own.
+	fn alignment(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 | Self::Q4K | Self::Q5K => 16, Self::Q8_0 | Self::Q6K => 2 } }
+	fn name(self) -> &'static str { match self { Self::F32 => "f32", Self::F16 => "f16", Self::BF16 => "bf16", Self::Q8_0 => "q8_0", Self::Q4K => "q4k", Self::Q5K => "q5k", Self::Q6K => "q6k" } }
+}
+/// Where a plane's activations and outputs live.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum SpanLayout {
+	/// Channel-major tapes: input channel c of position p at c * x + p, output row r at r * y + p.
+	Tape { x: usize, y: usize },
+	/// Position-major columns, as the dense split stages them: input channel c of
+	/// position p at p * k + c, output row r at p * rows + r.
+	Columns,
+}
+/// One row plane of a decode contraction: `rows` outputs of `k` inputs at every
+/// position of a window of at most `SPAN_POSITIONS`, weights read once for all of
+/// them. Zero rows means the caller passes the count at run time; such a plane reads
+/// its input whole and covers only the widths whose input fits the shared tile.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SpanSpec { weight: SpanWeight, k: usize, rows: usize, layout: SpanLayout, bias: bool, relu: bool }
+/// How one window width divides the plane: chunks of the input staged in shared
+/// memory, groups of rows, and the lanes that share one row.
+#[derive(Clone, Copy, Debug)]
+struct SpanPlan { lanes: usize, chunk: usize, chunks: usize, last: usize, group: usize, groups: usize, stride: usize }
+const SPAN_POSITIONS: usize = 4;
+const SPAN_TILE_FLOATS: usize = 10240;
+/// The planning grid: one 256-thread workgroup per SM of a 16-SM die. Any grid runs the plan.
+const SPAN_WORKGROUPS: usize = 16;
+const SPAN_WARPS: usize = 8;
+fn span_lanes(tasks: usize) -> usize {
+	[32, 16, 8, 4, 2].into_iter().find(|&lanes| tasks * 100 >= 85 * lanes * tasks.div_ceil(lanes)).unwrap_or(1)
+}
+impl SpanSpec {
+	fn tasks(&self) -> usize { self.k / self.weight.task() }
+	fn row_bytes(&self) -> usize { self.k / self.weight.block() * self.weight.stride() }
+	fn padded(&self, values: usize) -> usize { let pad = self.weight.pad(); if pad == 0 { values } else { values + 4 * values.div_ceil(pad) } }
+	fn valid(&self) -> bool {
+		let w = self.weight;
+		self.k != 0 && self.k % w.block() == 0 && self.k % w.task() == 0 && self.tasks() % w.granule() == 0
+			&& self.row_bytes() % w.alignment() == 0 && self.padded(w.task() * w.granule()) <= SPAN_TILE_FLOATS / SPAN_POSITIONS
+			&& (!self.bias || w == SpanWeight::F32 && self.rows != 0) && self.rows.checked_mul(self.k).is_some_and(|count| count < 1 << 31)
+			&& match self.layout {
+				SpanLayout::Tape { x, y } => self.rows != 0 && x != 0 && y != 0 && x.max(y).checked_mul(self.k.max(self.rows)).is_some_and(|extent| extent < 1 << 40),
+				SpanLayout::Columns => true,
+			}
+	}
+	/// Whether a width's input fits the shared tile in one chunk.
+	fn whole(&self, positions: usize) -> bool { positions * self.padded(self.tasks() * self.weight.task()).next_multiple_of(4) <= SPAN_TILE_FLOATS }
+	fn plan(&self, positions: usize) -> SpanPlan {
+		let (w, tasks) = (self.weight, self.tasks());
+		if self.rows == 0 {
+			// Run-time rows: one chunk; the groups divide the rows among the workgroups as it runs.
+			return SpanPlan { lanes: span_lanes(tasks), chunk: tasks, chunks: 1, last: tasks, group: 0, groups: 0, stride: self.padded(tasks * w.task()).next_multiple_of(4) };
+		}
+		let granule = w.granule();
+		let mut most = tasks;
+		while most > granule && positions * self.padded(most * w.task()).next_multiple_of(4) > SPAN_TILE_FLOATS { most -= granule; }
+		let needed = tasks.div_ceil(most);
+		let slots = SPAN_WARPS * 32 / span_lanes(tasks.div_ceil(needed));
+		// Few rows: every group holds them all and chunks spread the input across the
+		// grid; many rows: groups spread the rows and each stages as little as it must.
+		let (group, chunks) = if self.rows <= slots {
+			(self.rows, needed.max(SPAN_WORKGROUPS.min(tasks / (2 * span_lanes(tasks.div_ceil(needed)))).max(1)))
+		} else {
+			(self.rows.div_ceil(SPAN_WORKGROUPS.div_ceil(needed)), needed)
+		};
+		let chunk = tasks.div_ceil(chunks).next_multiple_of(granule);
+		let chunks = tasks.div_ceil(chunk);
+		SpanPlan { lanes: span_lanes(chunk), chunk, chunks, last: tasks - (chunks - 1) * chunk, group, groups: self.rows.div_ceil(group), stride: self.padded(chunk * w.task()).next_multiple_of(4) }
+	}
+	fn counter_bytes(plan: &SpanPlan) -> usize { (plan.groups * 4).next_multiple_of(16) }
+	/// Global scratch one call needs: arrival counters per row group and, when the
+	/// input is split, one partial sum per chunk, row and position.
+	fn scratch_bytes(&self) -> usize {
+		(1..=SPAN_POSITIONS).map(|positions| {
+			let plan = self.plan(positions);
+			Self::counter_bytes(&plan) + if plan.chunks > 1 { plan.chunks * self.rows * positions * 4 } else { 0 }
+		}).max().unwrap_or(0)
+	}
+	fn key(&self) -> String {
+		let layout = match self.layout { SpanLayout::Tape { x, y } => format!("t{x}_{y}"), SpanLayout::Columns => "c".to_owned() };
+		format!("{}.k{}.r{}.{layout}{}{}", self.weight.name(), self.k, self.rows, if self.bias { ".bias" } else { "" }, if self.relu { ".relu" } else { "" })
+	}
+}
+/// LLVM declarations the matvec bodies call, for any not yet in `ir`.
+fn span_matvec_declarations(ir: &str) -> String {
+	[
+		("@llvm.nvvm.read.ptx.sreg.tid.x(", "declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()"),
+		("@llvm.nvvm.read.ptx.sreg.ctaid.x(", "declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()"),
+		("@llvm.nvvm.read.ptx.sreg.ntid.x(", "declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()"),
+		("@llvm.nvvm.read.ptx.sreg.nctaid.x(", "declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()"),
+		("@llvm.nvvm.shfl.sync.bfly.i32(", "declare i32 @llvm.nvvm.shfl.sync.bfly.i32(i32, i32, i32, i32)"),
+		("@llvm.nvvm.barrier0(", "declare void @llvm.nvvm.barrier0()"),
+		("@llvm.nvvm.barrier0.or(", "declare i32 @llvm.nvvm.barrier0.or(i32)"),
+		("@llvm.fshr.i32(", "declare i32 @llvm.fshr.i32(i32, i32, i32)"),
+		("@llvm.fmuladd.f32(", "declare float @llvm.fmuladd.f32(float, float, float)"),
+	].into_iter().filter(|(name, _)| !ir.lines().any(|line| line.starts_with("declare") && line.contains(name))).map(|(_, line)| format!("{line}\n")).collect()
+}
+/// The metadata node marking weight loads invariant, so they use the read-only path.
+const SPAN_INVARIANT: &str = "!8191";
+
+/// One plane's position-batched matvec. Every thread of the grid calls it with the
+/// same arguments; `span` (1 to 4) positions starting at `begin` of `x` produce `rows`
+/// channels of `y`, both laid out as the spec's layout says, with `rows` the plane's
+/// own count unless the spec leaves it to the caller. Each workgroup stages its input
+/// chunk in shared memory once, `lanes` lanes decode each weight once and multiply it by every position,
+/// and chunks of one row group meet in `scratch`, summed in chunk order by the
+/// workgroup that completes the group last.
+fn span_matvec_function(spec: &SpanSpec, name: &str, shared: &str) -> String {
+	let mut ir = String::new();
+	let o = &mut ir;
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	let arguments = "ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) %scratch, i32 %begin, i32 %rows";
+	emit!("define internal void @{name}({arguments}, i32 %span) #1 {{\nentry:\nswitch i32 %span, label %exit [");
+	for s in 1..=SPAN_POSITIONS { emit!("i32 {s}, label %s{s}"); }
+	emit!("]");
+	for s in 1..=SPAN_POSITIONS { emit!("s{s}:\ncall void @{name}.s{s}({arguments})\nbr label %exit"); }
+	emit!("exit:\nret void\n}}");
+	// Each width is its own function: the optimizer then cannot merge the paths'
+	// blocks into one register allocation that every width pays for.
+	for s in 1..=SPAN_POSITIONS {
+		emit!("define internal void @{name}.s{s}({arguments}) #3 {{\nentry:");
+		emit!("%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()\n%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()\n%ncta = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()");
+		emit!("%warp = lshr i32 %tid, 5\n%lane = and i32 %tid, 31\n%warps = lshr i32 %ntid, 5\n%begin.wide = zext i32 %begin to i64\n%stage.step = shl i32 %ntid, 3\n%first = icmp eq i32 %tid, 0");
+		for j in 1..8 { emit!("%stage.offset{j} = mul i32 %ntid, {j}"); }
+		emit!("br label %s{s}");
+		span_matvec_path(o, spec, s, shared);
+		emit!("exit:\nret void\n}}");
+	}
+	ir
+}
+
+fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	let plan = spec.plan(s);
+	let w = spec.weight;
+	let (e, l, u) = (w.task(), plan.lanes, w.unroll());
+	let p = format!("s{s}");
+	// A plane sized at run time takes the whole input, so widths it cannot stage do nothing.
+	if spec.rows == 0 && !spec.whole(s) { emit!("{p}:\nbr label %exit"); return; }
+	let invariant = format!("!invariant.load {SPAN_INVARIANT}");
+	emit!("{p}:");
+	emit!("%{p}.lane = and i32 %lane, {}\n%{p}.slot.in = lshr i32 %lane, {}\n%{p}.slot.base = mul i32 %warp, {}\n%{p}.slot = add i32 %{p}.slot.base, %{p}.slot.in\n%{p}.slots = mul i32 %warps, {}",
+		l - 1, l.trailing_zeros(), 32 / l, 32 / l);
+	if l == 32 { emit!("%{p}.mask = add i32 -1, 0"); } else { emit!("%{p}.mask.shift = mul i32 %{p}.slot.in, {l}\n%{p}.mask = shl i32 {}, %{p}.mask.shift", (1u64 << l) - 1); }
+	emit!("%{p}.partials = getelementptr i8, ptr addrspace(1) %scratch, i64 {}", SpanSpec::counter_bytes(&plan));
+	let (rows, group, groups, units) = if spec.rows == 0 {
+		emit!("%{p}.group0 = add i32 %rows, %ncta\n%{p}.group1 = sub i32 %{p}.group0, 1\n%{p}.group2 = udiv i32 %{p}.group1, %ncta\n%{p}.group.none = icmp eq i32 %{p}.group2, 0\n%{p}.group = select i1 %{p}.group.none, i32 1, i32 %{p}.group2");
+		emit!("%{p}.groups0 = add i32 %rows, %{p}.group\n%{p}.groups1 = sub i32 %{p}.groups0, 1\n%{p}.groups = udiv i32 %{p}.groups1, %{p}.group");
+		("%rows".to_owned(), format!("%{p}.group"), format!("%{p}.groups"), format!("%{p}.groups"))
+	} else {
+		(spec.rows.to_string(), plan.group.to_string(), plan.groups.to_string(), (plan.chunks * plan.groups).to_string())
+	};
+	emit!("br label %{p}.unit\n{p}.unit:");
+	emit!("%{p}.u = phi i32 [ %cta, %{p} ], [ %{p}.u.next, %{p}.unit.next ]\n%{p}.staged = phi i32 [ -1, %{p} ], [ %{p}.c, %{p}.unit.next ]");
+	emit!("%{p}.u.more = icmp ult i32 %{p}.u, {units}\nbr i1 %{p}.u.more, label %{p}.unit.body, label %exit\n{p}.unit.body:");
+	emit!("%{p}.c = udiv i32 %{p}.u, {groups}\n%{p}.g = urem i32 %{p}.u, {groups}\n%{p}.c.last = icmp eq i32 %{p}.c, {}\n%{p}.ctasks = select i1 %{p}.c.last, i32 {}, i32 {}",
+		plan.chunks - 1, plan.last, plan.chunk);
+	emit!("%{p}.cbase = mul i32 %{p}.c, {}\n%{p}.restage = icmp ne i32 %{p}.c, %{p}.staged\nbr i1 %{p}.restage, label %{p}.stage, label %{p}.compute", plan.chunk);
+	// Stage the chunk's activations: position-major, padded, eight loads in flight per thread.
+	emit!("{p}.stage:\ncall void @llvm.nvvm.barrier0()\n%{p}.celems = mul i32 %{p}.ctasks, {e}\n%{p}.items = mul i32 %{p}.celems, {s}\n%{p}.k0 = mul i32 %{p}.cbase, {e}\nbr label %{p}.stage.loop\n{p}.stage.loop:");
+	emit!("%{p}.si = phi i32 [ %tid, %{p}.stage ], [ %{p}.si.next, %{p}.stage.loop ]");
+	let (channel, position) = match spec.layout { SpanLayout::Tape { x, .. } => (x, 1), SpanLayout::Columns => (1, spec.k) };
+	for j in 0..8 {
+		let q = format!("%{p}.st{j}");
+		if j == 0 { emit!("{q}.i = add i32 %{p}.si, 0"); } else { emit!("{q}.i = add i32 %{p}.si, %stage.offset{j}"); }
+		emit!("{q}.ok = icmp ult i32 {q}.i, %{p}.items\n{q}.ic = select i1 {q}.ok, i32 {q}.i, i32 0\n{q}.kk = udiv i32 {q}.ic, {s}\n{q}.p = urem i32 {q}.ic, {s}\n{q}.k = add i32 %{p}.k0, {q}.kk");
+		emit!("{q}.k.wide = zext i32 {q}.k to i64\n{q}.row = mul i64 {q}.k.wide, {}\n{q}.p.wide = zext i32 {q}.p to i64\n{q}.position = add i64 %begin.wide, {q}.p.wide\n{q}.column = mul i64 {q}.position, {}\n{q}.at = add i64 {q}.row, {q}.column", channel, position);
+		emit!("{q}.from = getelementptr float, ptr addrspace(1) %x, i64 {q}.at\n{q}.v = load float, ptr addrspace(1) {q}.from, align 4");
+	}
+	for j in 0..8 {
+		let q = format!("%{p}.st{j}");
+		if w.pad() == 0 { emit!("{q}.slot = add i32 {q}.kk, 0"); } else { emit!("{q}.period = lshr i32 {q}.kk, {}\n{q}.gap = shl i32 {q}.period, 2\n{q}.slot = add i32 {q}.kk, {q}.gap", w.pad().trailing_zeros()); }
+		emit!("{q}.plane = mul i32 {q}.p, {}\n{q}.to.index = add i32 {q}.plane, {q}.slot\n{q}.to = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.to.index\nstore float {q}.v, ptr addrspace(3) {q}.to, align 4", plan.stride);
+	}
+	emit!("%{p}.si.next = add i32 %{p}.si, %stage.step\n%{p}.si.more = icmp ult i32 %{p}.si.next, %{p}.items\nbr i1 %{p}.si.more, label %{p}.stage.loop, label %{p}.stage.done");
+	emit!("{p}.stage.done:\ncall void @llvm.nvvm.barrier0()\nbr label %{p}.compute\n{p}.compute:");
+	emit!("%{p}.g0 = mul i32 %{p}.g, {group}\n%{p}.grem = sub i32 {rows}, %{p}.g0\n%{p}.gsmall = icmp ult i32 %{p}.grem, {group}\n%{p}.rows = select i1 %{p}.gsmall, i32 %{p}.grem, i32 {group}");
+	emit!("%{p}.rounds0 = add i32 %{p}.ctasks, {}\n%{p}.rounds = udiv i32 %{p}.rounds0, {}\nbr label %{p}.row\n{p}.row:", l * u - 1, l * u);
+	emit!("%{p}.rl = phi i32 [ %{p}.slot, %{p}.compute ], [ %{p}.rl.next, %{p}.row.next ]\n%{p}.rl.more = icmp ult i32 %{p}.rl, %{p}.rows\nbr i1 %{p}.rl.more, label %{p}.row.body, label %{p}.rows.done");
+	emit!("{p}.row.body:\n%{p}.r = add i32 %{p}.g0, %{p}.rl\n%{p}.r.wide = zext i32 %{p}.r to i64\n%{p}.roff = mul i64 %{p}.r.wide, {}\n%{p}.wrow = getelementptr i8, ptr addrspace(1) %w, i64 %{p}.roff\nbr label %{p}.task\n{p}.task:", spec.row_bytes());
+	emit!("%{p}.round = phi i32 [ 0, %{p}.row.body ], [ %{p}.round.next, %{p}.task.body ]");
+	for q in 0..s { emit!("%{p}.acc{q} = phi float [ 0.0, %{p}.row.body ], [ %{p}.acc{q}.u{u}, %{p}.task.body ]"); }
+	emit!("%{p}.t.more = icmp ult i32 %{p}.round, %{p}.rounds\nbr i1 %{p}.t.more, label %{p}.task.body, label %{p}.task.done\n{p}.task.body:\n%{p}.tb = mul i32 %{p}.round, {}", l * u);
+	for q in 0..s { emit!("%{p}.acc{q}.u0 = fadd float %{p}.acc{q}, 0.0"); }
+	for j in 0..u {
+		let t = format!("%{p}.t{j}");
+		emit!("{t}.l0 = add i32 %{p}.tb, {}\n{t}.l = add i32 {t}.l0, %{p}.lane\n{t}.ok = icmp ult i32 {t}.l, %{p}.ctasks\n{t}.cl = select i1 {t}.ok, i32 {t}.l, i32 0\n{t} = add i32 %{p}.cbase, {t}.cl", j * l);
+		span_task_load(o, w, &t, &format!("%{p}.wrow"), &invariant);
+	}
+	for j in 0..u {
+		let t = format!("%{p}.t{j}");
+		span_task_compute(o, w, &t, s, plan.stride, shared);
+		for q in 0..s {
+			emit!("{t}.sum{q} = fadd float %{p}.acc{q}.u{j}, {t}.d{q}\n%{p}.acc{q}.u{} = select i1 {t}.ok, float {t}.sum{q}, float %{p}.acc{q}.u{j}", j + 1);
+		}
+	}
+	emit!("%{p}.round.next = add i32 %{p}.round, 1\nbr label %{p}.task\n{p}.task.done:");
+	let mut sums: Vec<String> = (0..s).map(|q| format!("%{p}.acc{q}")).collect();
+	let mut offset = l / 2;
+	while offset > 0 {
+		for (q, sum) in sums.iter_mut().enumerate() {
+			let r = format!("%{p}.red{offset}.{q}");
+			emit!("{r}.bits = bitcast float {sum} to i32\n{r}.partner.bits = call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 %{p}.mask, i32 {r}.bits, i32 {offset}, i32 31)\n{r}.partner = bitcast i32 {r}.partner.bits to float\n{r} = fadd float {sum}, {r}.partner");
+			*sum = r;
+		}
+		offset /= 2;
+	}
+	emit!("%{p}.lead = icmp eq i32 %{p}.lane, 0\nbr i1 %{p}.lead, label %{p}.write, label %{p}.row.next\n{p}.write:");
+	if plan.chunks == 1 {
+		for (q, sum) in sums.iter().enumerate() { span_store(o, spec, &format!("%{p}.out{q}"), sum, &format!("%{p}.r"), &q.to_string()); }
+	} else {
+		for (q, sum) in sums.iter().enumerate() {
+			emit!("%{p}.part{q}.c = mul i32 %{p}.c, {}\n%{p}.part{q}.r = mul i32 %{p}.r, {s}\n%{p}.part{q}.i0 = add i32 %{p}.part{q}.c, %{p}.part{q}.r\n%{p}.part{q}.i = add i32 %{p}.part{q}.i0, {q}", spec.rows * s);
+			emit!("%{p}.part{q}.to = getelementptr float, ptr addrspace(1) %{p}.partials, i32 %{p}.part{q}.i\nstore float {sum}, ptr addrspace(1) %{p}.part{q}.to, align 4");
+		}
+	}
+	emit!("br label %{p}.row.next\n{p}.row.next:\n%{p}.rl.next = add i32 %{p}.rl, %{p}.slots\nbr label %{p}.row\n{p}.rows.done:");
+	if plan.chunks == 1 {
+		emit!("br label %{p}.unit.next");
+	} else {
+		// The group's last workgroup to finish a chunk adds the chunks in order.
+		emit!("fence syncscope(\"device\") release\ncall void @llvm.nvvm.barrier0()\nbr i1 %first, label %{p}.arrive, label %{p}.arrived\n{p}.arrive:");
+		emit!("%{p}.counter = getelementptr i32, ptr addrspace(1) %scratch, i32 %{p}.g\n%{p}.prior = atomicrmw add ptr addrspace(1) %{p}.counter, i32 1 syncscope(\"device\") monotonic, align 4");
+		emit!("%{p}.complete = icmp eq i32 %{p}.prior, {}\n%{p}.complete.flag = zext i1 %{p}.complete to i32\nbr label %{p}.arrived\n{p}.arrived:", plan.chunks - 1);
+		emit!("%{p}.flag = phi i32 [ 0, %{p}.rows.done ], [ %{p}.complete.flag, %{p}.arrive ]\n%{p}.any = call i32 @llvm.nvvm.barrier0.or(i32 %{p}.flag)\n%{p}.is.last = icmp ne i32 %{p}.any, 0\nbr i1 %{p}.is.last, label %{p}.reduce, label %{p}.unit.next");
+		emit!("{p}.reduce:\nfence syncscope(\"device\") acquire\n%{p}.ritems = mul i32 %{p}.rows, {s}\nbr label %{p}.red\n{p}.red:");
+		emit!("%{p}.ri = phi i32 [ %tid, %{p}.reduce ], [ %{p}.ri.next, %{p}.red.body ]\n%{p}.ri.more = icmp ult i32 %{p}.ri, %{p}.ritems\nbr i1 %{p}.ri.more, label %{p}.red.body, label %{p}.red.done\n{p}.red.body:");
+		emit!("%{p}.rr = udiv i32 %{p}.ri, {s}\n%{p}.rp = urem i32 %{p}.ri, {s}\n%{p}.rrow = add i32 %{p}.g0, %{p}.rr\n%{p}.pidx0 = mul i32 %{p}.rrow, {s}\n%{p}.pidx = add i32 %{p}.pidx0, %{p}.rp");
+		for c in 0..plan.chunks {
+			emit!("%{p}.pi{c} = add i32 %{p}.pidx, {}\n%{p}.pp{c} = getelementptr float, ptr addrspace(1) %{p}.partials, i32 %{p}.pi{c}\n%{p}.pv{c} = load volatile float, ptr addrspace(1) %{p}.pp{c}, align 4", c * spec.rows * s);
+		}
+		emit!("%{p}.ps0 = fadd float %{p}.pv0, 0.0");
+		for c in 1..plan.chunks { emit!("%{p}.ps{c} = fadd float %{p}.ps{}, %{p}.pv{c}", c - 1); }
+		span_store(o, spec, &format!("%{p}.fin"), &format!("%{p}.ps{}", plan.chunks - 1), &format!("%{p}.rrow"), &format!("%{p}.rp"));
+		emit!("%{p}.ri.next = add i32 %{p}.ri, %ntid\nbr label %{p}.red\n{p}.red.done:\nbr i1 %first, label %{p}.reset, label %{p}.unit.next\n{p}.reset:");
+		emit!("%{p}.counter.reset = getelementptr i32, ptr addrspace(1) %scratch, i32 %{p}.g\nstore atomic i32 0, ptr addrspace(1) %{p}.counter.reset syncscope(\"device\") monotonic, align 4\nbr label %{p}.unit.next");
+	}
+	emit!("{p}.unit.next:\n%{p}.u.next = add i32 %{p}.u, %ncta\nbr label %{p}.unit");
+}
+
+/// Add the bias, apply the ReLU and store one output value at row `row`, position offset `position`.
+fn span_store(o: &mut String, spec: &SpanSpec, q: &str, value: &str, row: &str, position: &str) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	let mut value = value.to_owned();
+	if spec.bias {
+		emit!("{q}.bias.row = zext i32 {row} to i64\n{q}.bias.at = add i64 {q}.bias.row, {}\n{q}.bias.from = getelementptr float, ptr addrspace(1) %w, i64 {q}.bias.at\n{q}.bias = load float, ptr addrspace(1) {q}.bias.from, align 4, !invariant.load {SPAN_INVARIANT}\n{q}.biased = fadd float {value}, {q}.bias", spec.rows * spec.k);
+		value = format!("{q}.biased");
+	}
+	if spec.relu {
+		emit!("{q}.positive = fcmp ogt float {value}, 0.0\n{q}.relu = select i1 {q}.positive, float {value}, float 0.0");
+		value = format!("{q}.relu");
+	}
+	let (row_stride, position_stride) = match spec.layout {
+		SpanLayout::Tape { y, .. } => (y.to_string(), "1".to_owned()),
+		SpanLayout::Columns if spec.rows == 0 => { emit!("{q}.rows = zext i32 %rows to i64"); ("1".to_owned(), format!("{q}.rows")) }
+		SpanLayout::Columns => ("1".to_owned(), spec.rows.to_string()),
+	};
+	emit!("{q}.row = zext i32 {row} to i64\n{q}.base = mul i64 {q}.row, {row_stride}\n{q}.offset = zext i32 {position} to i64\n{q}.position = add i64 %begin.wide, {q}.offset\n{q}.column = mul i64 {q}.position, {position_stride}\n{q}.at = add i64 {q}.base, {q}.column");
+	emit!("{q}.to = getelementptr float, ptr addrspace(1) %y, i64 {q}.at\nstore float {value}, ptr addrspace(1) {q}.to, align 4");
+}
+
+/// Words of `count` bytes starting at an even address: the aligned words that cover them,
+/// funnel-shifted down by the address's two-byte offset.
+fn span_words(o: &mut String, q: &str, at: &str, count: usize, invariant: &str) -> Vec<String> {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	emit!("{q}.address = ptrtoint ptr addrspace(1) {at} to i64\n{q}.misalign = and i64 {q}.address, 3\n{q}.back = sub i64 0, {q}.misalign\n{q}.aligned = getelementptr i8, ptr addrspace(1) {at}, i64 {q}.back\n{q}.misalign32 = trunc i64 {q}.misalign to i32\n{q}.shift = shl i32 {q}.misalign32, 3");
+	for m in 0..=count / 4 {
+		emit!("{q}.raw{m}.at = getelementptr i8, ptr addrspace(1) {q}.aligned, i64 {}\n{q}.raw{m} = load i32, ptr addrspace(1) {q}.raw{m}.at, align 4, {invariant}", 4 * m);
+	}
+	(0..count / 4).map(|m| {
+		emit!("{q}.w{m} = call i32 @llvm.fshr.i32(i32 {q}.raw{}, i32 {q}.raw{m}, i32 {q}.shift)", m + 1);
+		format!("{q}.w{m}")
+	}).collect()
+}
+
+fn span_task_load(o: &mut String, w: SpanWeight, t: &str, row: &str, invariant: &str) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	match w {
+		SpanWeight::F32 | SpanWeight::F16 | SpanWeight::BF16 => {
+			emit!("{t}.wide = zext i32 {t} to i64\n{t}.byte = shl i64 {t}.wide, 4\n{t}.at = getelementptr i8, ptr addrspace(1) {row}, i64 {t}.byte\n{t}.line = load <4 x i32>, ptr addrspace(1) {t}.at, align 16, {invariant}");
+		}
+		SpanWeight::Q8_0 => {
+			emit!("{t}.wide = zext i32 {t} to i64\n{t}.byte = mul i64 {t}.wide, 34\n{t}.at = getelementptr i8, ptr addrspace(1) {row}, i64 {t}.byte\n{t}.scale.half = load half, ptr addrspace(1) {t}.at, align 2, {invariant}\n{t}.codes.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 2");
+			span_words(o, &format!("{t}.codes"), &format!("{t}.codes.at"), 32, invariant);
+		}
+		SpanWeight::Q4K | SpanWeight::Q5K => {
+			// Q4_K keeps no high bits: its codes follow the scales directly.
+			let (stride, codes) = if w == SpanWeight::Q5K { (176, 48) } else { (144, 16) };
+			emit!("{t}.block = lshr i32 {t}, 2\n{t}.pair = and i32 {t}, 3\n{t}.block.wide = zext i32 {t}.block to i64\n{t}.byte = mul i64 {t}.block.wide, {stride}\n{t}.at = getelementptr i8, ptr addrspace(1) {row}, i64 {t}.byte");
+			emit!("{t}.head = load <4 x i32>, ptr addrspace(1) {t}.at, align 16, {invariant}");
+			if w == SpanWeight::Q5K {
+				emit!("{t}.high0.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 16\n{t}.high0 = load <4 x i32>, ptr addrspace(1) {t}.high0.at, align 16, {invariant}");
+				emit!("{t}.high1.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 32\n{t}.high1 = load <4 x i32>, ptr addrspace(1) {t}.high1.at, align 16, {invariant}");
+			}
+			emit!("{t}.pair32 = shl i32 {t}.pair, 5\n{t}.low.offset0 = add i32 {t}.pair32, {codes}\n{t}.low.offset = zext i32 {t}.low.offset0 to i64\n{t}.low0.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 {t}.low.offset");
+			emit!("{t}.low0 = load <4 x i32>, ptr addrspace(1) {t}.low0.at, align 16, {invariant}\n{t}.low1.at = getelementptr i8, ptr addrspace(1) {t}.low0.at, i64 16\n{t}.low1 = load <4 x i32>, ptr addrspace(1) {t}.low1.at, align 16, {invariant}");
+		}
+		SpanWeight::Q6K => {
+			emit!("{t}.block = lshr i32 {t}, 3\n{t}.half0 = lshr i32 {t}, 2\n{t}.half = and i32 {t}.half0, 1\n{t}.quarter = and i32 {t}, 3\n{t}.block.wide = zext i32 {t}.block to i64\n{t}.byte = mul i64 {t}.block.wide, 210\n{t}.at = getelementptr i8, ptr addrspace(1) {row}, i64 {t}.byte");
+			emit!("{t}.half64 = shl i32 {t}.half, 6\n{t}.quarter8 = shl i32 {t}.quarter, 3\n{t}.a.offset = add i32 {t}.half64, {t}.quarter8\n{t}.b.offset = add i32 {t}.a.offset, 32\n{t}.half32 = shl i32 {t}.half, 5\n{t}.c.offset0 = add i32 {t}.half32, {t}.quarter8\n{t}.c.offset = add i32 {t}.c.offset0, 128\n{t}.half8 = shl i32 {t}.half, 3\n{t}.d.offset = add i32 {t}.half8, 192");
+			for piece in ["a", "b", "c", "d"] {
+				emit!("{t}.{piece}.offset.wide = zext i32 {t}.{piece}.offset to i64\n{t}.{piece}.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 {t}.{piece}.offset.wide");
+				span_words(o, &format!("{t}.{piece}"), &format!("{t}.{piece}.at"), 8, invariant);
+			}
+			emit!("{t}.scale.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 208\n{t}.scale.half = load half, ptr addrspace(1) {t}.scale.at, align 2, {invariant}");
+		}
+	}
+}
+
+/// Read four staged activations of position `position` at float offset `index` of the chunk.
+fn span_activations(o: &mut String, q: &str, shared: &str, stride: usize, position: usize, index: &str) -> [String; 4] {
+	o.push_str(&format!("{q}.offset = add i32 {index}, {}\n{q}.at = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.offset\n{q} = load <4 x float>, ptr addrspace(3) {q}.at, align 16\n", position * stride));
+	std::array::from_fn(|i| { o.push_str(&format!("{q}.e{i} = extractelement <4 x float> {q}, i32 {i}\n")); format!("{q}.e{i}") })
+}
+/// Fold products into a running sum: `sum + Σ weights[i] * values[i]`.
+/// The exact float of each byte of a word, less `bias`: or-ing the byte into the
+/// mantissa of 2^23 and subtracting 2^23 + `bias`.
+fn span_bytes(o: &mut String, q: &str, word: &str, less: u32) -> [String; 4] {
+	std::array::from_fn(|b| {
+		o.push_str(&format!("{q}.b{b}.shift = lshr i32 {word}, {}\n{q}.b{b}.byte = and i32 {q}.b{b}.shift, 255\n{q}.b{b}.bits = or i32 {q}.b{b}.byte, 1258291200\n{q}.b{b}.float = bitcast i32 {q}.b{b}.bits to float\n{q}.b{b} = fsub float {q}.b{b}.float, {}\n", 8 * b, span_float(8388608.0 + f64::from(less))));
+		format!("{q}.b{b}")
+	})
+}
+fn span_float(value: f64) -> String { format!("0x{:016X}", value.to_bits()) }
+
+/// Four decoded weights of a task, the staged offset of the four activations they
+/// multiply, the scale group whose sum they join, and the code that decodes them.
+struct SpanQuad { decode: String, weights: [String; 4], offset: String, group: usize }
+/// Each position's contribution `{t}.d{p}` of task `t`, whose loads `span_task_load` emitted.
+/// Quads are decoded and multiplied in turn, so a lane holds four weights and four
+/// activations at a time rather than the whole task.
+fn span_task_compute(o: &mut String, w: SpanWeight, t: &str, positions: usize, stride: usize, shared: &str) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	macro_rules! code { ($s:expr, $($arg:tt)*) => {{ $s.push_str(&format!($($arg)*)); $s.push('\n'); }} }
+	let mut quads = Vec::new();
+	// Each scale group's sums meet the task's total through its scale, or directly.
+	let scales: Vec<Option<String>> = match w {
+		SpanWeight::F32 | SpanWeight::F16 | SpanWeight::BF16 => {
+			let values = w.task();
+			emit!("{t}.first = mul i32 {t}.cl, {values}");
+			if w.pad() == 0 { emit!("{t}.slot = add i32 {t}.first, 0"); } else { emit!("{t}.period = lshr i32 {t}.first, {}\n{t}.gap = shl i32 {t}.period, 2\n{t}.slot = add i32 {t}.first, {t}.gap", w.pad().trailing_zeros()); }
+			let mut weights = Vec::new();
+			for m in 0..4 {
+				emit!("{t}.word{m} = extractelement <4 x i32> {t}.line, i32 {m}");
+				match w {
+					SpanWeight::F32 => { emit!("{t}.v{m} = bitcast i32 {t}.word{m} to float"); weights.push(format!("{t}.v{m}")); }
+					SpanWeight::F16 => {
+						emit!("{t}.lo{m}.bits = trunc i32 {t}.word{m} to i16\n{t}.lo{m}.half = bitcast i16 {t}.lo{m}.bits to half\n{t}.lo{m} = fpext half {t}.lo{m}.half to float");
+						emit!("{t}.hi{m}.shift = lshr i32 {t}.word{m}, 16\n{t}.hi{m}.bits = trunc i32 {t}.hi{m}.shift to i16\n{t}.hi{m}.half = bitcast i16 {t}.hi{m}.bits to half\n{t}.hi{m} = fpext half {t}.hi{m}.half to float");
+						weights.extend([format!("{t}.lo{m}"), format!("{t}.hi{m}")]);
+					}
+					_ => {
+						emit!("{t}.lo{m}.bits = shl i32 {t}.word{m}, 16\n{t}.lo{m} = bitcast i32 {t}.lo{m}.bits to float\n{t}.hi{m}.bits = and i32 {t}.word{m}, -65536\n{t}.hi{m} = bitcast i32 {t}.hi{m}.bits to float");
+						weights.extend([format!("{t}.lo{m}"), format!("{t}.hi{m}")]);
+					}
+				}
+			}
+			for quad in 0..values / 4 {
+				quads.push(SpanQuad { decode: format!("{t}.o{quad} = add i32 {t}.slot, {}\n", 4 * quad), weights: std::array::from_fn(|i| weights[4 * quad + i].clone()), offset: format!("{t}.o{quad}"), group: 0 });
+			}
+			vec![None]
+		}
+		SpanWeight::Q8_0 => {
+			emit!("{t}.scale = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {t}.cl, 36");
+			for m in 0..8 {
+				let mut decode = String::new();
+				code!(decode, "{t}.signed{m} = xor i32 {t}.codes.w{m}, -2139062144\n{t}.o{m} = add i32 {t}.slot, {}", 4 * m);
+				let weights = span_bytes(&mut decode, &format!("{t}.q{m}"), &format!("{t}.signed{m}"), 128);
+				quads.push(SpanQuad { decode, weights, offset: format!("{t}.o{m}"), group: 0 });
+			}
+			vec![Some(format!("{t}.scale"))]
+		}
+		SpanWeight::Q4K | SpanWeight::Q5K => {
+			emit!("{t}.head0 = extractelement <4 x i32> {t}.head, i32 0\n{t}.y = extractelement <4 x i32> {t}.head, i32 1\n{t}.z = extractelement <4 x i32> {t}.head, i32 2\n{t}.wd = extractelement <4 x i32> {t}.head, i32 3");
+			emit!("{t}.d.bits = trunc i32 {t}.head0 to i16\n{t}.d.half = bitcast i16 {t}.d.bits to half\n{t}.d = fpext half {t}.d.half to float\n{t}.dmin.shift = lshr i32 {t}.head0, 16\n{t}.dmin.bits = trunc i32 {t}.dmin.shift to i16\n{t}.dmin.half = bitcast i16 {t}.dmin.bits to half\n{t}.dmin = fpext half {t}.dmin.half to float");
+			emit!("{t}.low.pair = icmp ult i32 {t}.pair, 2\n{t}.pair.byte = and i32 {t}.pair, 1\n{t}.pair.shift = shl i32 {t}.pair.byte, 4");
+			for half in 0..2 {
+				let h = format!("{t}.s{half}");
+				emit!("{h}.shift = add i32 {t}.pair.shift, {}\n{h}.y0 = lshr i32 {t}.y, {h}.shift\n{h}.yb = and i32 {h}.y0, 255\n{h}.z0 = lshr i32 {t}.z, {h}.shift\n{h}.zb = and i32 {h}.z0, 255\n{h}.w0 = lshr i32 {t}.wd, {h}.shift\n{h}.wb = and i32 {h}.w0, 255", 8 * half);
+				emit!("{h}.sc.lo = and i32 {h}.yb, 63\n{h}.m.lo = and i32 {h}.zb, 63\n{h}.sc.hi0 = and i32 {h}.wb, 15\n{h}.sc.hi1 = lshr i32 {h}.yb, 6\n{h}.sc.hi2 = shl i32 {h}.sc.hi1, 4\n{h}.sc.hi = or i32 {h}.sc.hi0, {h}.sc.hi2");
+				emit!("{h}.m.hi0 = lshr i32 {h}.wb, 4\n{h}.m.hi1 = lshr i32 {h}.zb, 6\n{h}.m.hi2 = shl i32 {h}.m.hi1, 4\n{h}.m.hi = or i32 {h}.m.hi0, {h}.m.hi2\n{h}.sc = select i1 {t}.low.pair, i32 {h}.sc.lo, i32 {h}.sc.hi\n{h}.m = select i1 {t}.low.pair, i32 {h}.m.lo, i32 {h}.m.hi");
+				emit!("{h}.scf = uitofp i32 {h}.sc to float\n{h}.mf = uitofp i32 {h}.m to float\n{h}.step = fmul float {t}.d, {h}.scf\n{h}.base0 = fmul float {t}.dmin, {h}.mf\n{h}.base = fneg float {h}.base0");
+			}
+			emit!("{t}.bit.lo = shl i32 {t}.pair, 1\n{t}.bit.hi = add i32 {t}.bit.lo, 1\n{t}.slot = mul i32 {t}.cl, 68");
+			for m in 0..8 {
+				let (vector, lane) = if m < 4 { ("high0", m) } else { ("high1", m - 4) };
+				let (low_vector, low_lane) = if m < 4 { ("low0", m) } else { ("low1", m - 4) };
+				let q = format!("{t}.m{m}");
+				let mut decode = String::new();
+				code!(decode, "{q}.ql = extractelement <4 x i32> {t}.{low_vector}, i32 {low_lane}\n{q}.hi.n0 = lshr i32 {q}.ql, 4");
+				if w == SpanWeight::Q5K {
+					code!(decode, "{q}.qh = extractelement <4 x i32> {t}.{vector}, i32 {lane}");
+					code!(decode, "{q}.lo.n = and i32 {q}.ql, 252645135\n{q}.lo.h0 = lshr i32 {q}.qh, {t}.bit.lo\n{q}.lo.h1 = and i32 {q}.lo.h0, 16843009\n{q}.lo.h = shl i32 {q}.lo.h1, 4\n{q}.lo = or i32 {q}.lo.n, {q}.lo.h");
+					code!(decode, "{q}.hi.n = and i32 {q}.hi.n0, 252645135\n{q}.hi.h0 = lshr i32 {q}.qh, {t}.bit.hi\n{q}.hi.h1 = and i32 {q}.hi.h0, 16843009\n{q}.hi.h = shl i32 {q}.hi.h1, 4\n{q}.hi = or i32 {q}.hi.n, {q}.hi.h");
+				} else {
+					code!(decode, "{q}.lo = and i32 {q}.ql, 252645135\n{q}.hi = and i32 {q}.hi.n0, 252645135");
+				}
+				for (half, part) in [(0, "lo"), (1, "hi")] {
+					code!(decode, "{q}.{part}.o = add i32 {t}.slot, {}", 32 * half + 4 * m);
+					let codes = span_bytes(&mut decode, &format!("{q}.{part}c"), &format!("{q}.{part}"), 0);
+					let weights = std::array::from_fn(|b| {
+						let v = format!("{q}.{part}w{b}");
+						code!(decode, "{v} = call float @llvm.fmuladd.f32(float {}, float {t}.s{half}.step, float {t}.s{half}.base)", codes[b]);
+						v
+					});
+					quads.push(SpanQuad { decode: std::mem::take(&mut decode), weights, offset: format!("{q}.{part}.o"), group: 0 });
+				}
+			}
+			vec![None]
+		}
+		SpanWeight::Q6K => {
+			emit!("{t}.scale = fpext half {t}.scale.half to float\n{t}.sub = lshr i32 {t}.quarter, 1\n{t}.sub8 = shl i32 {t}.sub, 3\n{t}.sub8.far = add i32 {t}.sub8, 16");
+			let mut steps = Vec::new();
+			for (stripe, (word, shift)) in [("d.w0", "sub8"), ("d.w0", "sub8.far"), ("d.w1", "sub8"), ("d.w1", "sub8.far")].into_iter().enumerate() {
+				let q = format!("{t}.sc{stripe}");
+				emit!("{q}.shift = lshr i32 {t}.{word}, {t}.{shift}\n{q}.byte = and i32 {q}.shift, 255\n{q}.signed = xor i32 {q}.byte, 128\n{q}.bits = or i32 {q}.signed, 1258291200\n{q}.float = bitcast i32 {q}.bits to float\n{q}.value = fsub float {q}.float, {}\n{q}.step = fmul float {t}.scale, {q}.value", span_float(8388736.0));
+				steps.push(Some(format!("{q}.step")));
+			}
+			emit!("{t}.local.block = lshr i32 {t}.cl, 3\n{t}.local.base = shl i32 {t}.local.block, 8\n{t}.local.gap = shl i32 {t}.local.block, 3\n{t}.half128 = shl i32 {t}.half, 7\n{t}.half4 = shl i32 {t}.half, 2");
+			emit!("{t}.slot0 = add i32 {t}.local.base, {t}.local.gap\n{t}.slot1 = add i32 {t}.slot0, {t}.half128\n{t}.slot2 = add i32 {t}.slot1, {t}.half4\n{t}.slot = add i32 {t}.slot2, {t}.quarter8");
+			for m in 0..2 {
+				let q = format!("{t}.m{m}");
+				let (a, b, c) = (format!("{t}.a.w{m}"), format!("{t}.b.w{m}"), format!("{t}.c.w{m}"));
+				let mut decode = String::new();
+				code!(decode, "{q}.c4 = shl i32 {c}, 4\n{q}.c2 = shl i32 {c}, 2\n{q}.cr2 = lshr i32 {c}, 2\n{q}.h0 = and i32 {q}.c4, 808464432\n{q}.h1 = and i32 {q}.c2, 808464432\n{q}.h2 = and i32 {c}, 808464432\n{q}.h3 = and i32 {q}.cr2, 808464432");
+				code!(decode, "{q}.al = and i32 {a}, 252645135\n{q}.bl = and i32 {b}, 252645135\n{q}.ar = lshr i32 {a}, 4\n{q}.ah = and i32 {q}.ar, 252645135\n{q}.br = lshr i32 {b}, 4\n{q}.bh = and i32 {q}.br, 252645135");
+				code!(decode, "{q}.r0 = or i32 {q}.al, {q}.h0\n{q}.r1 = or i32 {q}.bl, {q}.h1\n{q}.r2 = or i32 {q}.ah, {q}.h2\n{q}.r3 = or i32 {q}.bh, {q}.h3");
+				for stripe in 0..4 {
+					code!(decode, "{q}.r{stripe}.o = add i32 {t}.slot, {}", 32 * stripe + 4 * m);
+					let weights = span_bytes(&mut decode, &format!("{q}.r{stripe}c"), &format!("{q}.r{stripe}"), 32);
+					quads.push(SpanQuad { decode: std::mem::take(&mut decode), weights, offset: format!("{q}.r{stripe}.o"), group: stripe });
+				}
+			}
+			steps
+		}
+	};
+	// Two alternating chains per group and position keep consecutive products independent.
+	let mut chains: Vec<Vec<[String; 2]>> = vec![vec![["0.0".to_owned(), "0.0".to_owned()]; positions]; scales.len()];
+	let mut counts = vec![0usize; scales.len()];
+	for (n, quad) in quads.iter().enumerate() {
+		// A compiler fence per quad keeps the optimizer from hoisting every staged load
+		// of the task ahead of its products, which would hold them all in registers.
+		emit!("call void asm sideeffect \"\", \"~{{memory}}\"()");
+		o.push_str(&quad.decode);
+		let chain = counts[quad.group] % 2;
+		counts[quad.group] += 1;
+		for position in 0..positions {
+			let x = span_activations(o, &format!("{t}.x{position}.{n}"), shared, stride, position, &quad.offset);
+			for (i, value) in x.iter().enumerate() {
+				let next = format!("{t}.f{position}.{n}.{i}");
+				emit!("{next} = call float @llvm.fmuladd.f32(float {}, float {value}, float {})", quad.weights[i], chains[quad.group][position][chain]);
+				chains[quad.group][position][chain] = next;
+			}
+		}
+	}
+	for position in 0..positions {
+		let mut total = "0.0".to_owned();
+		for (group, scale) in scales.iter().enumerate() {
+			let [first, second] = &chains[group][position];
+			let sum = format!("{t}.g{position}.{group}");
+			emit!("{sum} = fadd float {first}, {second}");
+			let next = format!("{t}.t{position}.{group}");
+			match scale {
+				Some(scale) => emit!("{next} = call float @llvm.fmuladd.f32(float {sum}, float {scale}, float {total})"),
+				None => emit!("{next} = fadd float {total}, {sum}"),
+			}
+			total = next;
+		}
+		emit!("{t}.d{position} = fadd float {total}, 0.0");
+	}
+}
+const _: () = assert!(SPAN_TILE_FLOATS * 4 == PackedMatvec::SHARED_BYTES);
+/// The row planes of a decode contraction the position-batched matvec reads, each
+/// with its byte offset in the node's weights and its first row, or `None` when the
+/// contraction's form or a plane's layout is outside it. RECIPE_SPAN_MATVEC=0 keeps
+/// every contraction on its previous kernels.
+fn span_matvec_parts(node: &Node, stored: Option<&StoredWeight>, packed: bool) -> Option<Vec<(SpanSpec, usize, usize)>> {
+	if std::env::var("RECIPE_SPAN_MATVEC").as_deref() == Ok("0") { return None; }
+	if node.block_kind == "split_dense" { return None; }
+	if node.op != Primitive::Contraction || node.argument[0] > 1.0 || node.input.length != node.output.length || node.input.channels == 0 || node.output.channels == 0
+		|| node.acc != Compute::FP32 || node.precision != Compute::FP32 || node.int_bits != 0 || !(node.argument[1] == 0.0 || node.argument[1] == 1.0) { return None; }
+	let (k, biased) = (node.input.channels, node.argument[2] == 0.0);
+	let plane = |weight, rows| SpanSpec { weight, k, rows, layout: SpanLayout::Tape { x: node.input.length, y: node.output.length }, bias: biased, relu: node.argument[1] == 1.0 };
+	if !packed { return None; }
+	let (mut parts, mut row, mut bytes) = (Vec::new(), 0, 0);
+	for (format, count) in stored?.format_segments() {
+		let spec = format.spec()?;
+		let weight = match spec.codec {
+			StorageCodec::F32 => SpanWeight::F32, StorageCodec::F16 => SpanWeight::F16, StorageCodec::BF16 => SpanWeight::BF16,
+			StorageCodec::Q8_0 => SpanWeight::Q8_0, StorageCodec::Q4K => SpanWeight::Q4K, StorageCodec::Q5K => SpanWeight::Q5K, StorageCodec::Q6K => SpanWeight::Q6K, _ => return None,
+		};
+		if biased || count % k != 0 || bytes % weight.alignment() != 0 { return None; }
+		let part = plane(weight, count / k);
+		if !part.valid() || part.row_bytes() * part.rows != count / spec.block * spec.stride { return None; }
+		parts.push((part, bytes, row));
+		row += count / k;
+		bytes += count / spec.block * spec.stride;
+	}
+	(row == node.output.channels).then_some(parts)
+}
+/// Context bytes one node's planes use in sequence, each plane's scratch on 16 bytes.
+fn span_matvec_scratch(parts: &[(SpanSpec, usize, usize)]) -> usize {
+	parts.iter().map(|(spec, _, _)| spec.scratch_bytes().next_multiple_of(16)).sum()
+}
+
 struct NodePlan {
 	node: Node,
 	value: usize,
@@ -4749,7 +5279,10 @@ impl NativeModelIr {
 						tile_n = tiles[1],
 						tile_k = tiles[2]
 					);
+					let span = self.span_matvec_planes(backend, plan);
+					if let Some(planes) = &span { self.emit_span_matvec_call(index, planes, &pointers, &window, &mut ir); }
 					if !self.emit_packed_contraction(backend,index,plan,&pointers,&window,&call,&mut ir)? { ir.push_str(&call); ir.push_str(barrier(backend)); }
+					if span.is_some() { ir.push_str(&format!("br label %n{index}.span.done\nn{index}.span.done:\n")); }
 					}
 				}
 				(false, Primitive::Gather) => {
@@ -7444,6 +7977,56 @@ impl NativeModelIr {
 		ir.push_str("call void asm sideeffect \"trap;\",\"~{memory}\"()\nunreachable\n");
 		Ok(())
 	}
+	/// The planes a decode contraction runs through the position-batched matvec,
+	/// each with its byte offset, first row and scratch offset in the context arena.
+	fn span_matvec_planes(&self, backend: Backend, plan: &NodePlan) -> Option<Vec<(SpanSpec, usize, usize, usize)>> {
+		if backend != Backend::Nvidia || !self.inference || self.rows != 1 { return None; }
+		if (self.schedule.shared_values as usize).saturating_mul(self.schedule.element.bytes()) < SPAN_TILE_FLOATS * 4 { return None; }
+		let (scratch, size) = self.layout.span_scratch?;
+		let parts = span_matvec_parts(&plan.node, plan.stored.as_ref(), plan.packed)?;
+		if span_matvec_scratch(&parts) > size { return None; }
+		let mut offset = scratch;
+		Some(parts.into_iter().map(|(spec, bytes, row)| {
+			let at = offset;
+			offset += spec.scratch_bytes().next_multiple_of(16);
+			(spec, bytes, row, at)
+		}).collect())
+	}
+	/// Run a window of at most `SPAN_POSITIONS` positions through the planes and
+	/// branch wider windows to `n{index}.span.other`, where the previous kernels follow.
+	fn emit_span_matvec_call(&self, index: usize, planes: &[(SpanSpec, usize, usize, usize)], pointers: &ModelPointers, window: &NodeWindow, ir: &mut String) {
+		let p = format!("n{index}.span");
+		ir.push_str(&format!("%{p}.fits = icmp ule i32 {span}, {SPAN_POSITIONS}\nbr i1 %{p}.fits, label %{p}.run, label %{p}.other\n{p}.run:\n", span = window.span));
+		for (part, (spec, bytes, row, scratch)) in planes.iter().enumerate() {
+			let q = format!("{p}.part{part}");
+			ir.push_str(&format!(
+				"%{q}.weights = getelementptr i8, ptr addrspace(1) {weights}, i64 {bytes}\n%{q}.output = getelementptr float, ptr addrspace(1) {value}, i64 {first}\n%{q}.scratch = getelementptr i8, ptr addrspace(1) %contexts, i64 {scratch}\ncall void @span_matvec.{key}(ptr addrspace(1) {source}, ptr addrspace(1) %{q}.weights, ptr addrspace(1) %{q}.output, ptr addrspace(1) %{q}.scratch, i32 {begin}, i32 {rows}, i32 {span})\n",
+				weights = pointers.weights, value = pointers.value, source = pointers.source, first = row * match spec.layout { SpanLayout::Tape { y, .. } => y, SpanLayout::Columns => 1 }, key = spec.key(), rows = spec.rows, begin = window.begin, span = window.span
+			));
+		}
+		// Planes write disjoint rows and use disjoint scratch: one barrier completes them all.
+		ir.push_str(barrier(Backend::Nvidia));
+		ir.push_str(&format!("br label %{p}.done\n{p}.other:\n"));
+	}
+	/// One position-batched matvec definition per distinct plane, with the intrinsics and metadata they use.
+	fn emit_span_matvecs(&self, backend: Backend, ir: &mut String) -> Result<()> {
+		let specs = self.plans.iter().filter_map(|plan| self.span_matvec_planes(backend, plan)).flatten().map(|(spec, ..)| spec).collect::<Vec<_>>();
+		if specs.is_empty() { return Ok(()); }
+		let shared = ir.match_indices("@contraction_tile").find_map(|(at, _)| {
+			let tail = &ir[at + 1..];
+			let name = tail.split_whitespace().next()?;
+			tail[name.len()..].starts_with(" = external addrspace(3)").then(|| name.to_owned())
+		}).ok_or_else(|| RecipeError::new("shared contraction storage is absent"))?;
+		let mut emitted = std::collections::HashSet::new();
+		let mut functions = String::new();
+		for spec in specs {
+			if emitted.insert(spec.key()) { functions.push_str(&span_matvec_function(&spec, &format!("span_matvec.{}", spec.key()), &shared)); }
+		}
+		ir.push_str(&span_matvec_declarations(ir));
+		ir.push_str(&functions);
+		if !ir.contains(&format!("\n{SPAN_INVARIANT} = ")) { ir.push_str(&format!("{SPAN_INVARIANT} = !{{}}\n")); }
+		Ok(())
+	}
 	fn emit_packed_contraction(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, direct: &str, ir: &mut String) -> Result<bool> {
 		if backend != Backend::Nvidia || !self.inference || self.rows != 1 { return Ok(false); }
 		let node = &plan.node;
@@ -8190,6 +8773,7 @@ impl NativeModelIr {
 		self.specialize_experts(backend, &mut ir)?;
 		self.emit_topk_shared(backend, &mut ir)?;
 		self.emit_delta_tiles(backend, &mut ir)?;
+		self.emit_span_matvecs(backend, &mut ir)?;
 		let mut ir = prune_internal_definitions(ir);
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
@@ -28485,6 +29069,8 @@ impl Gpu {
 			narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")?
 				as u32;
 		let packed_native = loss.is_none() && rows==1 && self.backend==Backend::Nvidia && graph.nodes.iter().enumerate().any(|(index,node)| packed_contraction_parts(node,graph.stored.get(index).and_then(Option::as_ref),packed_weight(graph,index,true).is_some()).is_some());
+		// The position-batched matvec stages its input chunks in the same 40 KiB.
+		let span_native = loss.is_none() && rows==1 && self.backend==Backend::Nvidia && graph.nodes.iter().enumerate().any(|(index,node)| span_matvec_parts(node,graph.stored.get(index).and_then(Option::as_ref),packed_weight(graph,index,true).is_some()).is_some());
 		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else if packed_native { vector_waves.max(8) } else { vector_waves };
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
@@ -28569,7 +29155,7 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(0);
-		let shared_values = contraction_shared_values.max(attention_shared_values).max(delta_shared_values).max(if packed_native { PackedMatvec::SHARED_BYTES.div_ceil(element.bytes()) as u32 } else { 0 });
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(delta_shared_values).max(if packed_native || span_native { PackedMatvec::SHARED_BYTES.div_ceil(element.bytes()) as u32 } else { 0 });
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
