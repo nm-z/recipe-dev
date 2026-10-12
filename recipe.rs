@@ -8376,7 +8376,7 @@ impl NativeModelIr {
 /// state so narrow or integer model encodings cannot clip it.
 fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { node.argument[1] as usize } else { node.argument[8] as usize } }
 fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
-	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
+	let block = if attention_blocks(node) != 0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
 		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		values = attention_value_heads(node),
@@ -22943,9 +22943,14 @@ fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalizati
 	Ok(())
 }
 /// Key blocks the indexer scores for a sequence of `length` positions.
+/// The indexer blocks an attention scores, or none when it is dense. An indexer
+/// that keeps at least every block its context holds selects them all, so the
+/// attention is dense and skips the indexer exactly.
 fn attention_blocks(node: &Node) -> usize {
 	let block = if node.argument[3] > 0.0 { node.argument[3] as usize } else { 0 };
-	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
+	if block == 0 { return 0; }
+	let blocks = node.output.length.div_ceil(block);
+	if node.argument[4] >= blocks as f64 { 0 } else { blocks }
 }
 /// The indexer carries raw keys, one causal representative for each position,
 /// and one filled count for each block. Scores precede these retained regions.
