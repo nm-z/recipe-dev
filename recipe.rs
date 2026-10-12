@@ -16474,11 +16474,14 @@ pub fn numeric_source(text: &str) -> Result<String> {
 	let (bytes, mut output, mut at) = (text.as_bytes(), String::with_capacity(text.len()), 0);
 	let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
 	while at < bytes.len() {
-		// Comments and string literals pass through untouched.
+		// Comments stay in the symbolic model: a comment line is dropped whole, and a
+		// trailing comment with the spaces before it. String literals pass through.
 		if text[at..].starts_with("//") {
 			let end = text[at..].find('\n').map_or(bytes.len(), |offset| at + offset);
-			output.push_str(&text[at..end]);
-			at = end;
+			let line = output.rfind('\n').map_or(0, |index| index + 1);
+			let alone = output[line..].trim().is_empty();
+			output.truncate(if alone { line } else { output.trim_end().len() });
+			at = if alone { (end + 1).min(bytes.len()) } else { end };
 			continue;
 		}
 		if bytes[at] == b'"' {
