@@ -12013,6 +12013,22 @@ mod bundle {
 		require(fields.next().is_none(), "activation has trailing fields")?;
 		Ok(activation)
 	}
+	fn gate_list_text(blocks: &[Block]) -> String {
+		text(&blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";"))
+	}
+	fn gate_list(value: &str, role: &str) -> Result<BlockList> {
+		Ok(untext(value, role)?.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, role).and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?.into())
+	}
+	fn gates_text(gates: &Gates) -> String {
+		format!("{},{},{}", gate_list_text(&gates.norm), gate_list_text(&gates.read), gate_list_text(&gates.write))
+	}
+	fn gates(fields: &mut std::str::Split<'_, char>) -> Result<Gates> {
+		Ok(Gates {
+			norm: gate_list(fields.next().unwrap_or(""), "mixer normalization")?,
+			read: gate_list(fields.next().unwrap_or(""), "mixer read gate")?,
+			write: gate_list(fields.next().unwrap_or(""), "mixer write gate")?,
+		})
+	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
 			Operation::Layer(width) => format!("layer,{width}"),
@@ -12051,6 +12067,7 @@ mod bundle {
 			Operation::Sum(left, right) => format!("sum,{},{}", product_branch_text(left), product_branch_text(right)),
 			Operation::Sequence(parts) => format!("sequence,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
+			Operation::Gated(lanes, gates, blocks) => format!("gated,{lanes},{},{}", gates_text(gates), gate_list_text(blocks)),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
@@ -12183,6 +12200,12 @@ mod bundle {
 				Ok(Operation::MoeBlocks(top_k, routing, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into()))
 			}
 			"join" => Ok(Operation::Join(value_at(Some(rest), "MTP joined lanes")?)),
+			"gated" => {
+				let mut fields = rest.split(',');
+				let lanes = value_at(fields.next(), "hyper-connection lanes")?;
+				let gates = gates(&mut fields)?;
+				Ok(Operation::Gated(lanes, gates, gate_list(fields.next().unwrap_or(""), "hyper-connection block")?))
+			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
 				require(fields.len() == 7, "MoE record requires seven fields")?;
@@ -12266,16 +12289,18 @@ mod bundle {
 			let value = match step.map {
 				ActivationMap::Scalar(value) => format!("a:{}", activation_text(value)),
 				ActivationMap::Normalize(value) => format!("n:{}", normalization_text(Some(value))),
+				ActivationMap::Grouped(value, groups) => format!("g{groups}:{}", normalization_text(Some(value))),
 			};
 			format!("{value}:{}", precision_token(step.precision))
 		}).collect::<Vec<_>>().join("/");
-		format!("{}|maps:{maps}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+		let fold = block.fold.as_ref().map_or_else(String::new, |gates| format!("|{}", escape(&gates_text(gates))));
+		format!("{}|maps:{maps}|{}|{}|{}|{}|{}|{}|{}|{}|{}{fold}",
 			operation_text(&block.operation), block.quantization, u8::from(block.profile), normalization_text(block.qk), u8::from(block.frozen),
 			precision_token(block.precision), precision_token(block.kv_precision), precision_token(block.blck_precision), precision_token(block.qk_precision), precision_token(block.rope_precision))
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(fields.len() == 11, "semantic model block has the wrong width")?;
+		require(fields.len() == 11 || fields.len() == 12, "semantic model block has the wrong width")?;
 		let encoded = fields[1].strip_prefix("maps:").ok_or_else(|| RecipeError::new("semantic model block has no ordered map list"))?;
 		let mut maps = Vec::new();
 		for token in encoded.split('/').filter(|_| !encoded.is_empty()) {
@@ -12284,6 +12309,11 @@ mod bundle {
 			let map = match parts[0] {
 				"a" => ActivationMap::Scalar(activation(parts[1])?),
 				"n" => ActivationMap::Normalize(normalization(Some(parts[1]), "map normalization")?.ok_or_else(|| RecipeError::new("normalization map has no mode"))?),
+				kind if kind.starts_with('g') => {
+					let groups = value_at(Some(&kind[1..]), "normalization groups")?;
+					require(groups != 0, "normalization groups must be positive")?;
+					ActivationMap::Grouped(normalization(Some(parts[1]), "map normalization")?.ok_or_else(|| RecipeError::new("normalization map has no mode"))?, groups)
+				}
 				_ => return Err(RecipeError::new("semantic map has an invalid kind")),
 			};
 			maps.push(ActivationStep { map, precision: precision_from_token(parts[2])? });
@@ -12294,6 +12324,7 @@ mod bundle {
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
 			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
+			fold: fields.get(11).map(|fold| gates(&mut unescape(fold)?.split(',')).map(Some)).transpose()?.flatten(),
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -12323,7 +12354,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, epsilon_explicit: true, exclusions, pending_frozen: false }))
+		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, epsilon_explicit: true, exclusions, pending_frozen: false, pending_fold: None }))
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -13532,6 +13563,16 @@ fn intern_ple(ple: PleBlock) -> &'static PleBlock {
 	definitions.push(stored);
 	stored
 }
+/// The gates of a stream mixer, declared from ordinary blocks. `norm` is the
+/// normalization of the stream (one block); `read` runs from that normalized
+/// stream to one gate value per stream channel, and `write` to one per lane. An
+/// empty `write` is the plain residual: every lane takes the branch as it is.
+#[derive(Clone, Debug, PartialEq)]
+struct Gates {
+	norm: BlockList,
+	read: BlockList,
+	write: BlockList,
+}
 #[derive(Clone, Debug, PartialEq)]
 enum Operation {
 	Join(usize),
@@ -13556,6 +13597,10 @@ enum Operation {
 	Perceptron(usize),
 	Embed(usize, usize),
 	Hyper(usize, usize, BlockList),
+	/// Hyper-connections whose gates are declared: `lanes` copies of the width
+	/// feed the branch through the read gate and take its output back through
+	/// the write gate.
+	Gated(usize, Gates, BlockList),
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(&'static PleBlock),
@@ -13732,6 +13777,10 @@ macro_rules! precision_methods {
 enum ActivationMap {
 	Scalar(Activation),
 	Normalize(BlockNormalization),
+	/// A normalization whose statistics are taken per group: the row splits into
+	/// that many equal groups, each normalized on its own under the one trainable
+	/// scale over the whole row.
+	Grouped(BlockNormalization, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivationStep {
@@ -13741,10 +13790,10 @@ struct ActivationStep {
 impl ActivationStep {
 	fn new(map: ActivationMap) -> Self { Self { map, precision: None } }
 	fn normalization(self) -> Option<BlockNormalization> {
-		match self.map { ActivationMap::Normalize(mode) => Some(mode), ActivationMap::Scalar(_) => None }
+		match self.map { ActivationMap::Normalize(mode) | ActivationMap::Grouped(mode, _) => Some(mode), ActivationMap::Scalar(_) => None }
 	}
 	fn name(self) -> &'static str {
-		match self.map { ActivationMap::Scalar(activation) => activation.name(), ActivationMap::Normalize(mode) => mode.name() }
+		match self.map { ActivationMap::Scalar(activation) => activation.name(), ActivationMap::Normalize(mode) | ActivationMap::Grouped(mode, _) => mode.name() }
 	}
 }
 #[derive(Clone, Debug)]
@@ -13770,6 +13819,9 @@ pub struct Block {
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
 
+	/// The gates under which this block folds the hyper-connection stream open
+	/// before it, when it declares them.
+	fold: Option<Gates>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -13815,6 +13867,7 @@ impl PartialEq for Block {
 			&& self.kv_precision == other.kv_precision
 			&& self.qk_precision == other.qk_precision
 			&& self.rope_precision == other.rope_precision
+			&& self.fold == other.fold
 	}
 }
 impl Eq for Block {}
@@ -13838,7 +13891,7 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, fold: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
@@ -13851,9 +13904,19 @@ impl Block {
 		self.maps.push(ActivationStep::new(ActivationMap::Normalize(normalization.normalization())));
 		self
 	}
+	/// Takes the statistics of the preceding `norm` per group: the row splits
+	/// into `groups` equal parts, each normalized on its own, under the one
+	/// trainable scale over the whole row. A stream of lanes normalizes per lane
+	/// with `.norm(rms).groups(lanes)`.
+	pub fn groups(mut self, groups: usize) -> Self {
+		assert!(groups != 0, "normalization groups must be positive");
+		let step = self.maps.last_mut().filter(|step| matches!(step.map, ActivationMap::Normalize(_))).expect("groups names the normalization before it");
+		step.map = ActivationMap::Grouped(step.normalization().expect("a normalization map"), groups);
+		self
+	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
 		let normalization = normalization.normalization();
-		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
+		assert!(matches!(self.operation, Operation::Attention(_)),"query and key normalization requires an attention block");
 		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
 		self.qk = Some(normalization);
 		self.suffix = Suffix::Qk;
@@ -13981,6 +14044,8 @@ pub struct ModelData {
 	epsilon_explicit: bool,
 	/// The qualifier pending for the next block.
 	pending_frozen: bool,
+	/// The gates under which the next block folds the open hyper-connection stream.
+	pending_fold: Option<Gates>,
 	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
 	exclusions: u8,
 }
@@ -14072,6 +14137,7 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		assert!(operation.weighted() || !self.pending_frozen, "{} owns no weights to qualify", operation.name());
+		assert!(self.pending_fold.is_none() || !matches!(operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Ple(_)), "a collapse precedes a block that reads the folded stream, and {} keeps the stream open", operation.name());
 		self.edit(|model| {
 			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
@@ -14086,6 +14152,7 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
+				fold: model.pending_fold.take(),
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14094,6 +14161,7 @@ impl Model {
 	/// Clones a model that a block suffix extends, so a pending qualifier cannot outlive its block.
 	fn suffix(&self) -> Self {
 		assert!(!self.pending_frozen, "block qualifier requires a following block");
+		assert!(self.pending_fold.is_none(), "a collapse requires a following block");
 		self.clone()
 	}
 	/// Excludes a default from this model. The exclusion applies to every weighted
@@ -14296,6 +14364,26 @@ impl Model {
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
 		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone().into()))
 	}
+	/// Hyper-connections with declared gates. `norm` normalizes the stream of
+	/// `lanes` copies of the width (`norm(rms).groups(lanes)` takes the statistics
+	/// per lane under one scale over the stream). `read` runs from that normalized
+	/// stream to one gate per stream channel, which the branch reads under; `write`
+	/// runs from it to one gate per lane, which the branch output is written back
+	/// under. An empty `write` adds the output to every lane as it is.
+	pub fn hyper_gated<const R: usize, const W: usize>(&self, lanes: usize, norm: Block, read: [Block; R], write: [Block; W], branch: &Model) -> Self {
+		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
+		assert!(lanes != 0 && R != 0, "hyper-connections need at least one lane and a read gate");
+		self.push(Operation::Gated(lanes, Gates { norm: [norm].into(), read: read.into(), write: write.into() }, branch.blocks.clone().into()))
+	}
+	/// Folds the lanes of a hyper-connection stream back to one before the next
+	/// block, which reads the result: the lanes read under the `read` gate computed
+	/// from the normalized stream, as a branch reads, and are averaged. A stream
+	/// that ends without one folds under its default gates.
+	pub fn collapse<const R: usize>(&self, norm: Block, read: [Block; R]) -> Self {
+		assert!(R != 0, "a collapse needs a read gate");
+		assert!(self.pending_fold.is_none(), "a collapse is already pending for the next block");
+		self.edit(|model| model.pending_fold = Some(Gates { norm: [norm].into(), read: read.into(), write: BlockList(Vec::new()) }))
+	}
 	/// Per-layer embedding: every token gathers `table`'s rows on the host, and the
 	/// block projects, gates and convolves them into the stream it sits on, at
 	/// whatever width the stream has there.
@@ -14361,7 +14449,7 @@ impl Model {
 			for block in &mut model.blocks {
 				let (parts, plain) = match &mut block.operation {
 					Operation::Residual(parts) => (parts, true),
-					Operation::Hyper(_, _, parts) => (parts, false),
+					Operation::Hyper(_, _, parts) | Operation::Gated(_, _, parts) => (parts, false),
 					_ => continue,
 				};
 				let attends = mixes(parts);
@@ -14382,6 +14470,8 @@ impl Model {
 					else { ActivationStep::new(ActivationMap::Normalize(BlockNormalization::Rms)) };
 				let mut scale = Block::of(Operation::Identity);
 				scale.maps.push(step);
+				// The fold closes the stream before the final scale reads it.
+				scale.fold = model.blocks[projection].fold.take();
 				model.blocks.insert(projection, scale);
 			}
 		})
@@ -14401,6 +14491,9 @@ impl Model {
 			return String::new();
 		}
 		self.blocks.iter().map(Self::describe_block).collect::<Vec<_>>().join("/")
+	}
+	fn describe_gates(gates: &Gates) -> String {
+		format!("{},[{}],[{}]", Self::describe_parts(&gates.norm), Self::describe_parts(&gates.read), Self::describe_parts(&gates.write))
 	}
 	fn describe_parts(parts: &[Block]) -> String {
 		parts.iter().map(Self::describe_block).collect::<Vec<_>>().join(",")
@@ -14427,6 +14520,7 @@ impl Model {
 			Operation::Perceptron(width) => format!("perc({width})"),
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
 			Operation::Hyper(lanes, rank, parts) => format!("hyper({lanes},{rank},[{}])", Self::describe_parts(parts)),
+			Operation::Gated(lanes, gates, parts) => format!("hyper_gated({lanes},{},[{}])", Self::describe_gates(gates), Self::describe_parts(parts)),
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
 			Operation::Delta(delta) => format!(
 				"delta({},{}).conv_activation({}).output_gate({}).qk({}).out_norm({}).write({}).decay({:?}).query_scale({:?})",
@@ -14440,6 +14534,9 @@ impl Model {
 			Operation::Last => "last()".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu({hidden},{})", activation.name()),
 		};
+		if let Some(gates) = &block.fold {
+			text.insert_str(0, &format!("collapse({}).", Self::describe_gates(gates)));
+		}
 		if block.frozen {
 			text.insert_str(0, "frozen.");
 		}
@@ -14458,6 +14555,7 @@ impl Model {
 				ActivationMap::Scalar(Activation::Scale(bits)) => format!("scale({})", f64::from_bits(bits)),
 				ActivationMap::Scalar(activation) => format!("{}()", activation.name()),
 				ActivationMap::Normalize(mode) => format!("norm({})", normalization(mode)),
+				ActivationMap::Grouped(mode, groups) => format!("norm({}).groups({groups})", normalization(mode)),
 			};
 			if !text.is_empty() { text.push('.'); }
 			text.push_str(&map);
@@ -15936,7 +16034,7 @@ impl Operation {
 			Self::Join(_) => "join",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
-			Self::Hyper(..) => "hyper",
+			Self::Hyper(..) | Self::Gated(..) => "hyper",
 			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
@@ -15953,6 +16051,7 @@ impl Operation {
 			Self::Product(left, right) | Self::Sum(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
 			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
+			Self::Gated(..) => true,
 			_ => true,
 		}
 	}
@@ -16380,7 +16479,7 @@ impl Recipe {
 	/// declares, or the Cargo default when no file is open.
 	pub fn model(&self) -> Model {
 		let epsilon = SCRIPT_FILE.get().and_then(|(_, file)| file.rms_epsilon()).unwrap_or_else(|| default_epsilon().unwrap_or_else(|error| panic!("{error}")));
-		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
+		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, pending_fold: None, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
@@ -18796,7 +18895,12 @@ fn with_last_projection(model: &Model) -> Model {
 	if let Some(index) = model.blocks.iter().rposition(|block| matches!(block.operation, Operation::Layer(width) if width == vocabulary))
 		&& !model.blocks[..index].iter().any(|block| matches!(block.operation, Operation::Last))
 	{
-		return model.edit(|model| model.blocks.insert(index, Block::of(Operation::Last)));
+		return model.edit(|model| {
+			// The fold closes the stream before the last position is kept.
+			let mut last = Block::of(Operation::Last);
+			last.fold = model.blocks[index].fold.take();
+			model.blocks.insert(index, last)
+		});
 	}
 	model
 }
@@ -18853,7 +18957,7 @@ fn visit_attention(blocks: &[Block], visit: &mut impl FnMut(&AttentionBlock)) {
 	for block in blocks {
 		match &block.operation {
 			Operation::Attention(attention) => visit(attention),
-			Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Hyper(_, _, parts) | Operation::Recur(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) => visit_attention(parts, visit),
+			Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Hyper(_, _, parts) | Operation::Gated(_, _, parts) | Operation::Recur(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) => visit_attention(parts, visit),
 			Operation::Product(left, right) | Operation::Sum(left, right) => { visit_attention(&left.blocks, visit); visit_attention(&right.blocks, visit); }
 			_ => {}
 		}
@@ -18915,14 +19019,25 @@ fn mixes(parts: &[Block]) -> bool {
 impl Builder<'_> {
 	/// Bind the user-declared model in the order lowering emits weighted nodes.
 	fn plan_model(&mut self, model: &Model) -> Result<()> {
+		require(model.pending_fold.is_none(), "a collapse requires a following block")?;
 		let embedding = self.tensor("token_embd.weight", "the embedding")?;
 		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-		let (mut layers, mut lanes, mut rank) = (0, 0, 0);
+		let (mut layers, mut lanes, mut rank, mut declared) = (0, 0, 0, false);
 		for block in &model.blocks {
-			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-				self.head_planes(lanes, rank, width)?;
-				lanes = 0;
+			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Ple(..)) {
+				match &block.fold {
+					Some(gates) => {
+						require(declared, "a declared collapse follows a stream of declared hyper-connections")?;
+						let stream = checked_mul(lanes, width, "head mixer stream")?;
+						self.declared_planes("the head mixer", stream, gates, &|suffix| format!("output_hc_{suffix}.weight"))?;
+					}
+					None => {
+						require(!declared, "a stream of declared hyper-connections is closed by a declared .collapse(norm, [read gate]) before the block that follows it")?;
+						self.head_planes(lanes, rank, width)?;
+					}
+				}
+				(lanes, declared) = (0, false);
 			}
 			match &block.operation {
 				Operation::Embed(rows, columns) => {
@@ -18934,15 +19049,26 @@ impl Builder<'_> {
 					require(**formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
 					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
-				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
+				Operation::Residual(parts) | Operation::Hyper(_, _, parts) | Operation::Gated(_, _, parts) => {
 					let attends = mixes(parts);
 					if attends { layers += 1; }
 					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
 					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
-					if let Operation::Hyper(count, bottleneck, _) = block.operation {
-						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
-						(lanes, rank) = (count, bottleneck);
-						self.mixer_planes(layer, part, lanes, rank, width)?;
+					match &block.operation {
+						Operation::Hyper(count, bottleneck, _) => {
+							require(lanes == 0 || lanes == *count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
+							require(!declared, "hyper-connections with default gates follow a stream with declared gates")?;
+							(lanes, rank) = (*count, *bottleneck);
+							self.mixer_planes(layer, part, lanes, rank, width)?;
+						}
+						Operation::Gated(count, gates, _) => {
+							require(lanes == 0 || lanes == *count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
+							require(lanes == 0 || declared, "hyper-connections with declared gates follow a stream with default gates")?;
+							(lanes, rank, declared) = (*count, 0, true);
+							let (role, stream) = (format!("block {layer} {part} mixer"), checked_mul(lanes, width, "hyper-connection stream")?);
+							self.declared_planes(&role, stream, gates, &|suffix| format!("blk.{layer}.hc_{part}_{suffix}.weight"))?;
+						}
+						_ => {}
 					}
 					self.plan_branch(parts, layer, part, width)?;
 				}
@@ -18961,7 +19087,39 @@ impl Builder<'_> {
 				self.norm_scale(name, width)?;
 			}
 		}
-		if lanes != 0 { self.head_planes(lanes, rank, width)?; }
+		if lanes != 0 {
+			require(!declared, "a stream of declared hyper-connections is closed by a declared .collapse(norm, [read gate]) before the block that follows it")?;
+			self.head_planes(lanes, rank, width)?;
+		}
+		Ok(())
+	}
+	/// Binds the planes of declared mixer gates in the order lowering emits them:
+	/// the normalization scale over the stream, then the read gate's layers
+	/// (`down`, `up`), then the write gate's (`inject`). Each layer's shape is the
+	/// declared one, checked against the file's.
+	fn declared_planes(&mut self, role: &str, stream: usize, gates: &Gates, name: &dyn Fn(&str) -> String) -> Result<()> {
+		for block in gates.norm.iter() {
+			require(matches!(block.operation, Operation::Identity), format!("{role} normalization is a norm block"))?;
+			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+				self.norm_scale(&name("norm"), stream)?;
+			}
+		}
+		for (blocks, suffixes) in [(&gates.read, &["down", "up"][..]), (&gates.write, &["inject"][..])] {
+			let (mut suffixes, mut inputs) = (suffixes.iter(), stream);
+			for block in blocks.iter() {
+				match &block.operation {
+					Operation::Layer(outputs) => {
+						let suffix = suffixes.next().ok_or_else(|| RecipeError::new(format!("{role} gate has more layers than its tensors")))?;
+						let tensor = self.projection(&name(suffix), role, inputs, *outputs)?;
+						self.mapped(vec![tensor]);
+						inputs = *outputs;
+					}
+					Operation::Identity => {}
+					other => return Err(RecipeError::new(format!("{role} gate has a {} block, which has no tensor naming convention", other.name()))),
+				}
+				require(!block.has_normalization(), format!("{role} gate normalizes inside a gate, which has no tensor name"))?;
+			}
+		}
 		Ok(())
 	}
 	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize) -> Result<()> {
@@ -21151,6 +21309,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		programs: graph.programs.clone(),
 		lanes: graph.lanes,
 		rank: graph.rank,
+		declared: graph.declared,
 		stored: graph.stored[start..end].to_vec(),
 		requantize: graph.requantize[start..end].to_vec(),
 		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
@@ -21989,6 +22148,8 @@ struct Graph {
 	block_kind: &'static str,
 	lanes: usize,
 	rank: usize,
+	/// The open stream's gates were declared, so its end must declare a collapse.
+	declared: bool,
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
@@ -22029,6 +22190,7 @@ impl Graph {
 			source: -1,
 			lanes: 0,
 			rank: 0,
+			declared: false,
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
@@ -22108,12 +22270,13 @@ fn sequential_operation(operation: &Operation) -> bool {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
 		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
-		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
+		Operation::Hyper(_, _, blocks) | Operation::Gated(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
 }
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
+	require(model.pending_fold.is_none(), "a collapse requires a following block")?;
 	if let Some((index, format)) = model.blocks.iter().enumerate().map(|(index, block)| (index, StorageFormat(block.quantization))).find(|(_, format)| format.0 != 0 && !format.valid()) {
 		return Err(RecipeError::new(format!("block {index} {}: {}", model.blocks[index].operation.name(), format.unavailable())));
 	}
@@ -22302,8 +22465,13 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	// A per-layer embedding adds into the lanes-wide stream itself, so it keeps
 	// the stream open as a hyper-connection block does.
-	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-		lower_collapse(graph, config)?;
+	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Ple(..)) {
+		match &block.fold {
+			Some(gates) => lower_declared_collapse(graph, gates, total, data, targets, rows, gpu, config)?,
+			None => lower_collapse(graph, config)?,
+		}
+	} else {
+		require(block.fold.is_none(), format!("{} declares a collapse, which folds an open hyper-connection stream before a block that reads one lane", block.operation.name()))?;
 	}
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
@@ -22338,7 +22506,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::MoeBlocks(top_k, routing, experts) => lower_moe_blocks(graph, *top_k, *routing, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Join(lanes) => lower_mtp_join(graph, *lanes)?,
-		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
+		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, None, blocks, total, data, targets, rows, gpu, config)?,
+		Operation::Gated(lanes, gates, blocks) => lower_hyper(graph, *lanes, 0, Some(gates), blocks, total, data, targets, rows, gpu, config)?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
@@ -22359,6 +22528,11 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			ActivationMap::Normalize(normalization) => {
 				let channels = graph.output.channels;
 				lower_normalize(graph, normalization, channels, channels)?;
+			}
+			ActivationMap::Grouped(normalization, groups) => {
+				let channels = graph.output.channels;
+				require(channels % groups == 0, format!("{channels} channels do not split into {groups} normalization groups"))?;
+				lower_normalize(graph, normalization, channels / groups, channels)?;
 			}
 		}
 		graph.block_precision = precision;
@@ -22745,8 +22919,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Scale(factor) => {
 			let factor = f64::from_bits(factor);
 			require(factor.is_finite(), "scale factor must be finite")?;
-			let factor = constant(&mut program, factor);
-			program.op(ScalarOpcode::Multiply, factor, x)
+			return lower_scale(graph, factor);
 		}
 		Activation::Linear => unreachable!(),
 	};
@@ -23386,7 +23559,7 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 impl Block {
 	/// The scalar activation among the block's maps, or the identity when it has none.
 	fn activation(&self) -> Activation {
-		self.maps.iter().find_map(|step| match step.map { ActivationMap::Scalar(activation) => Some(activation), ActivationMap::Normalize(_) => None }).unwrap_or(Activation::Linear)
+		self.maps.iter().find_map(|step| match step.map { ActivationMap::Scalar(activation) => Some(activation), ActivationMap::Normalize(_) | ActivationMap::Grouped(..) => None }).unwrap_or(Activation::Linear)
 	}
 	/// The precision named after the block's scalar activation, when present.
 	fn activation_precision(&self) -> Option<Compute> {
@@ -23656,7 +23829,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) | Operation::Hyper(_, _, parts) | Operation::Gated(_, _, parts) => parts.iter().map(estimator_count).sum(),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
@@ -23664,7 +23837,7 @@ fn estimator_count(block: &Block) -> usize {
 fn first_estimator(block: &Block) -> Option<&Estimator> {
 	match &block.operation {
 		Operation::Estimator(estimator) => Some(estimator),
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
+		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) | Operation::Hyper(_, _, parts) | Operation::Gated(_, _, parts) => parts.iter().find_map(first_estimator),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}
@@ -23770,7 +23943,7 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	require(graph.output == shape, "parallel branches require equal widths or one scalar per position")?;
 	binary(graph, left_source, graph.source, shape, opcode).map(drop)
 }
-fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, gates: Option<&Gates>, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
 	if graph.lanes == 0 {
 		let shape = graph.output;
@@ -23779,9 +23952,13 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	}
 	require(graph.lanes == lanes, format!("hyper-connections with {lanes} lanes follow a stream of {}", graph.lanes))?;
 	graph.rank = rank;
+	graph.declared = gates.is_some();
 	let (stream, shape) = (graph.source, graph.output);
 	let width = shape.channels / lanes;
-	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
+	let (source, read, write) = match gates {
+		None => lower_gates(graph, lanes, rank, true, config)?,
+		Some(gates) => lower_declared_gates(graph, lanes, gates, true, total, data, targets, rows, gpu, config)?,
+	};
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	graph.observe("hc_mixed", TENSOR_HYPER)?;
@@ -23796,6 +23973,7 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 		lower_collapse(graph, config)?;
 	}
 	(graph.block_frozen, graph.block_kind, graph.lanes) = (outer_frozen, outer_kind, lanes);
+	graph.declared = gates.is_some();
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), write)?;
 	let mut program = ScalarProgram(Vec::new());
@@ -23833,6 +24011,54 @@ fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config
 	lower_activation(graph, Activation::Sigmoid, config)?;
 	lower_scale(graph, 2.0)?;
 	Ok((normalized, read, graph.source))
+}
+/// The same gates as `lower_gates`, from declared blocks: the stream's `norm`
+/// block gives `xn`; the `read` blocks run on it to the read gate, one value per
+/// stream channel; and, when `write` is set, the `write` blocks run on it again
+/// to the write gate, one value per lane (no blocks leave every lane written as
+/// it is). The first write block is tapped as the injection. The gates are
+/// ordinary blocks over the stream, so it is not open as a hyper-connection
+/// stream while they lower, and no projection of a gate carries a bias. Returns the node the read consumes, the read gate,
+/// and the write gate.
+fn lower_declared_gates(graph: &mut Graph, lanes: usize, gates: &Gates, write: bool, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, i32, i32)> {
+	let (shape, biased) = (graph.output, graph.bias);
+	(graph.lanes, graph.bias) = (0, false);
+	let lower = |graph: &mut Graph, blocks: &[Block], tap: Option<&'static str>| -> Result<()> {
+		for (index, block) in blocks.iter().enumerate() {
+			lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+			if let Some(name) = tap.filter(|_| index == 0) { graph.observe(name, TENSOR_HYPER)?; }
+		}
+		Ok(())
+	};
+	lower(graph, &gates.norm, None)?;
+	require(graph.output == shape, "a mixer normalization keeps the shape of the stream")?;
+	let normalized = graph.source;
+	lower(graph, &gates.read, None)?;
+	require(graph.output == shape, "a mixer read gate has one value per stream channel")?;
+	let read = graph.source;
+	let mut written = -2;
+	if write && !gates.write.is_empty() {
+		reset(graph, normalized, shape);
+		lower(graph, &gates.write, Some("hc_inject"))?;
+		require(graph.output.channels == lanes && graph.output.length == shape.length, "a mixer write gate has one value per lane")?;
+		written = graph.source;
+	}
+	(graph.lanes, graph.bias) = (lanes, biased);
+	Ok((normalized, read, written))
+}
+/// The declared head read: the stream folds to the mean of its lanes under the
+/// read gate its declared blocks compute, and the stream is closed. It lowers
+/// before the block that declares it, as the default fold does.
+fn lower_declared_collapse(graph: &mut Graph, gates: &Gates, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let first = graph.nodes.len();
+	let (lanes, shape) = (graph.lanes, graph.output);
+	let (source, read, _) = lower_declared_gates(graph, lanes, gates, false, total, data, targets, rows, gpu, config)?;
+	reset(graph, source, shape);
+	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	graph.observe("hc_mixed", TENSOR_HYPER)?;
+	graph.lanes = 0;
+	graph.declared = false;
+	finalize_integer_nodes(graph, first, config)
 }
 /// Multiplies the graph output by `factor`.
 fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
@@ -23877,6 +24103,7 @@ fn lower_mtp_join(graph: &mut Graph, lanes: usize) -> Result<()> {
 }
 /// The head read collapses the stream to the mean of its lanes under its read gate.
 fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
+	require(!graph.declared, "a stream of declared hyper-connections is closed by a declared .collapse(norm, [read gate]) before the block that follows it")?;
 	let first = graph.nodes.len();
 	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
 	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;

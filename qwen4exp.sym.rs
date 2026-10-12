@@ -11,6 +11,15 @@ fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let width = qwen4exp.embedding_length;
 	let (lanes, rank) = (qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank);
+	let stream = lanes * width;
+	let mean = 1.0 / lanes as f64;
+	// The mixer gates. The stream normalizes per lane under one scale over all of it;
+	// the read gate passes it down to `rank` and back up to a value per stream channel;
+	// the write gate is a value per lane, twice a sigmoid, so a zero injection is the
+	// plain residual. Every hyper-connection and the head read share the read gate.
+	let stream_norm = || norm(rms).groups(lanes);
+	let read = || [layer(rank).scale(mean).silu(), layer(stream).sigmoid()];
+	let write = || [layer(lanes), linear().scale(mean).sigmoid().scale(2.0)];
 
 	let mut model = recipe.model()
 		.e(qwen4exp.attention.layer_norm_rms_epsilon)
@@ -21,7 +30,7 @@ fn main() {
 		if qwen4exp.ple.layers.contains(&block) { model = model.ple(&ngram); }
 
 		// Token mixing.
-		model = model.hyper(lanes, rank, &if (block + 1) % qwen4exp.full_attention_interval == 0 {
+		model = model.hyper_gated(lanes, stream_norm(), read(), write(), &if (block + 1) % qwen4exp.full_attention_interval == 0 {
 			recipe.model()
 				.attn(qwen4exp.attention.head_count)
 				.kv(qwen4exp.attention.head_count_kv)
@@ -69,7 +78,7 @@ fn main() {
 				layer(width),
 			]));
 		}
-		model = model.hyper(lanes, rank, &Model::from(
+		model = model.hyper_gated(lanes, stream_norm(), read(), write(), &Model::from(
 			moe(qwen4exp.expert_used_count, experts).scores(Scoring::Softmax).renormalize(true)
 			+ layer(1).sigmoid() * Block::from([
 				layer(qwen4exp.expert_shared_feed_forward_length).silu() * layer(qwen4exp.expert_shared_feed_forward_length),
@@ -78,9 +87,9 @@ fn main() {
 		).fp(32));
 	}
 
-	// Leaving the hyper stream folds its 4 lanes back to one through the head
-	// mixer (output_hc_norm, _down, _up) before the vocabulary projection.
-	let model = model.layer(tokenizer.ggml.tokens);
+	// Leaving the hyper stream folds its lanes back to one under the same read gate
+	// before the vocabulary projection.
+	let model = model.collapse(stream_norm(), read()).layer(tokenizer.ggml.tokens);
 
 	let mut infer = recipe.infer();
 	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }

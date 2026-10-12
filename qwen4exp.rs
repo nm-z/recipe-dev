@@ -8,6 +8,11 @@ fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let width = 2560;
 	let (lanes, rank) = (4, 320);
+	let stream = lanes * width;
+	let mean = 1.0 / lanes as f64;
+	let stream_norm = || norm(rms).groups(lanes);
+	let read = || [layer(rank).scale(mean).silu(), layer(stream).sigmoid()];
+	let write = || [layer(lanes), linear().scale(mean).sigmoid().scale(2.0)];
 
 	let mut model = recipe.model()
 		.e(9.999999974752427e-7)
@@ -16,7 +21,7 @@ fn main() {
 	for block in 0..48 {
 		if [1_usize].contains(&block) { model = model.ple(&ngram); }
 
-		model = model.hyper(lanes, rank, &if (block + 1) % 4 == 0 {
+		model = model.hyper_gated(lanes, stream_norm(), read(), write(), &if (block + 1) % 4 == 0 {
 			recipe.model()
 				.attn(24)
 				.kv(2)
@@ -53,7 +58,7 @@ fn main() {
 				layer(width),
 			]));
 		}
-		model = model.hyper(lanes, rank, &Model::from(
+		model = model.hyper_gated(lanes, stream_norm(), read(), write(), &Model::from(
 			moe(10, experts).scores(Scoring::Softmax).renormalize(true)
 			+ layer(1).sigmoid() * Block::from([
 				layer(640).silu() * layer(640),
@@ -62,7 +67,7 @@ fn main() {
 		).fp(32));
 	}
 
-	let model = model.layer(248320);
+	let model = model.collapse(stream_norm(), read()).layer(248320);
 
 	let mut infer = recipe.infer();
 	if let Ok(path) = std::env::var("MTP") { infer = infer.mtp(path); }
