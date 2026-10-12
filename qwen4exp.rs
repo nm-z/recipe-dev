@@ -45,7 +45,17 @@ pub fn model() -> Model {
 				.keys(16, 128)
 				.values(128)
 				.out(width)
-				.delta_activations(Activation::Silu, Activation::Sigmoid)
+				// Convolution, then SiLU; unit-length queries and keys per key head; decay
+				// exp(-exp(A) * softplus(alpha + dt_bias)) with sigmoid(beta) as the write
+				// strength and queries scaled by 1/sqrt(key width); the recurrence output is
+				// RMS-normalized per value head, then multiplied by a sigmoid output gate.
+				.conv_activation(Activation::Silu)
+				.qk(l2)
+				.decay(DeltaDecay::Softplus)
+				.write(Activation::Sigmoid)
+				.query_scale(DeltaScale::InverseRoot)
+				.out_norm(rms)
+				.output_gate(Activation::Sigmoid)
 		});
 
 		// Channel mixing: each position runs its top experts of 512, plus the
@@ -72,7 +82,7 @@ pub fn model() -> Model {
 	// mixer (output_hc_norm, _down, _up) before the vocabulary projection.
 	model.layer(248320)
 }
-
+#[rustfmt::skip]
 fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let model = model();

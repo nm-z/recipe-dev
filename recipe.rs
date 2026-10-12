@@ -12050,8 +12050,9 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,{},{},{},{},{},{},{},{}",
-					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
+				"delta,{},{},{},{},{},{},{},{},{},{},{},{},{}",
+					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code(),
+					normalization_text(Some(delta.qk)), normalization_text(Some(delta.out_norm)), delta.write.code(), delta.decay.code(), delta.query_scale.code()
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
@@ -12214,7 +12215,21 @@ mod bundle {
 				// Keep those defaults when the optional activation selectors are absent.
 				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
 				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
+				// Bundles before the declared math name none of it; each absent selector is
+				// the gated delta rule of Qwen3.5: L2 queries and keys, RMS output, sigmoid
+				// write, softplus decay and an inverse root query scale.
+				let qk = fields.next().map(|field| normalization(Some(field), "delta query and key normalization")).transpose()?.flatten().unwrap_or(BlockNormalization::L2);
+				let out_norm = fields.next().map(|field| normalization(Some(field), "delta output normalization")).transpose()?.flatten().unwrap_or(BlockNormalization::Rms);
+				let write = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
+				let decay = match fields.next().map(|field| value_at::<u8>(Some(field), "delta decay")).transpose()?.unwrap_or(0) {
+					0 => DeltaDecay::Softplus,
+					_ => return Err(RecipeError::new("invalid delta decay")),
+				};
+				let query_scale = match fields.next().map(|field| value_at::<u8>(Some(field), "delta query scale")).transpose()?.unwrap_or(0) {
+					0 => DeltaScale::InverseRoot,
+					_ => return Err(RecipeError::new("invalid delta query scale")),
+				};
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, qk, out_norm, write, decay, query_scale }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -13391,10 +13406,62 @@ struct DeltaBlock {
 	/// Activation applied to the output gate. Existing hand-built models
 	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
 	output_activation: Activation,
+	/// Normalization of every query and key head after the convolution.
+	qk: BlockNormalization,
+	/// Normalization of every value head of the recurrence output, before the
+	/// output gate multiplies it.
+	out_norm: BlockNormalization,
+	/// Activation of the write strength read from the second gate half.
+	write: Activation,
+	/// How the first gate half and the decay parameter set the state decay.
+	decay: DeltaDecay,
+	/// How the recurrence scales each query.
+	query_scale: DeltaScale,
+}
+/// The state decay of a gated delta rule from its gate input `g`, the per-head
+/// decay parameter `A` and the gate bias `b`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaDecay {
+	/// `exp(-exp(A) * softplus(g + b))`.
+	Softplus,
+}
+impl DeltaDecay {
+	const fn code(self) -> u8 {
+		match self {
+			Self::Softplus => 0,
+		}
+	}
+}
+/// The factor a gated delta rule multiplies each query by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaScale {
+	/// `1 / sqrt(key width)`.
+	InverseRoot,
+}
+impl DeltaScale {
+	const fn code(self) -> u8 {
+		match self {
+			Self::InverseRoot => 0,
+		}
+	}
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
+		Self {
+			heads,
+			kernel,
+			key_heads: 0,
+			key_width: 0,
+			value_width: 0,
+			output: 0,
+			conv_activation: Activation::Linear,
+			output_activation: Activation::Sigmoid,
+			qk: BlockNormalization::L2,
+			out_norm: BlockNormalization::Rms,
+			write: Activation::Sigmoid,
+			decay: DeltaDecay::Softplus,
+			query_scale: DeltaScale::InverseRoot,
+		}
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -14112,6 +14179,37 @@ impl Model {
 			delta.output_activation = output;
 		})
 	}
+	/// Activation after the causal convolution of the preceding `delta` block,
+	/// before the stream splits into queries, keys and values.
+	pub fn conv_activation(&self, activation: Activation) -> Self {
+		self.delta_block("conv_activation", |delta| delta.conv_activation = activation)
+	}
+	/// Activation of the output gate of the preceding `delta` block, whose
+	/// projection multiplies the normalized recurrence output.
+	pub fn output_gate(&self, activation: Activation) -> Self {
+		self.delta_block("output_gate", |delta| delta.output_activation = activation)
+	}
+	/// Normalization of each value head of the preceding `delta` block's
+	/// recurrence output, with one trainable scale per channel when it is `rms`.
+	pub fn out_norm(&self, normalization: impl NormalizationSelector) -> Self {
+		let normalization = normalization.normalization();
+		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "delta output normalization must be rms or l2");
+		self.delta_block("out_norm", |delta| delta.out_norm = normalization)
+	}
+	/// Activation of the write strength of the preceding `delta` block, read from
+	/// the second half of its gate projection. The recurrence writes with sigmoid.
+	pub fn write(&self, activation: Activation) -> Self {
+		assert!(activation == Activation::Sigmoid, "the delta recurrence writes with sigmoid");
+		self.delta_block("write", |delta| delta.write = activation)
+	}
+	/// State decay of the preceding `delta` block.
+	pub fn decay(&self, decay: DeltaDecay) -> Self {
+		self.delta_block("decay", |delta| delta.decay = decay)
+	}
+	/// Query scale of the preceding `delta` block.
+	pub fn query_scale(&self, scale: DeltaScale) -> Self {
+		self.delta_block("query_scale", |delta| delta.query_scale = scale)
+	}
 	/// Tap spacing of the preceding `dconv` block: tap `j` of a `kernel`-wide
 	/// convolution reads position `t - (kernel - 1 - j) * steps`, so the block
 	/// carries `(kernel - 1) * steps` positions of history. One is the plain form.
@@ -14219,6 +14317,11 @@ impl Model {
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
 	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
+		if matches!(self.blocks.last().map(|block| &block.operation), Some(Operation::Delta(_))) {
+			let normalization = normalization.normalization();
+			assert!(normalization == BlockNormalization::L2, "delta query and key normalization must be l2");
+			return self.delta_block("qk", |delta| delta.qk = normalization);
+		}
 		self.attention("qk", |block| block.qk(normalization))
 	}
 	/// The loss the model trains against, or the evaluator model a command-RAT
@@ -14320,7 +14423,10 @@ impl Model {
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
 			Operation::Hyper(lanes, rank, parts) => format!("hyper({lanes},{rank},[{}])", Self::describe_parts(parts)),
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
-			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
+			Operation::Delta(delta) => format!(
+				"delta({},{}).conv_activation({}).output_gate({}).qk({}).out_norm({}).write({}).decay({:?}).query_scale({:?})",
+				delta.heads, delta.kernel, delta.conv_activation.name(), delta.output_activation.name(), delta.qk.name(), delta.out_norm.name(), delta.write.name(), delta.decay, delta.query_scale
+			),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
 			Operation::Join(lanes) => format!("join({lanes})"),
 			Operation::Sequence(parts) => format!("seq([{}])", Self::describe_parts(parts)),
@@ -17781,7 +17887,7 @@ impl<'a> Builder<'a> {
 		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
 		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
 		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
-		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation, output_activation };
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation, output_activation, ..DeltaBlock::new(heads, kernel) };
 		self.delta_planes(layer, &delta, dimensions.width)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
@@ -17818,8 +17924,10 @@ impl<'a> Builder<'a> {
 		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
 		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let order = (0..value_width).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
-		self.slot(scales);
+		if delta.out_norm == BlockNormalization::Rms {
+			let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
+			self.slot(scales);
+		}
 		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
 		self.mapped(vec![gate]);
 		let output = self.projection(&name("ssm_out.weight"), &role, inner, output)?;
@@ -22899,6 +23007,8 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let inner = checked_mul(heads, value_width, "delta value width")?;
 	let recurrent = Shape { channels: inner, length: input.length };
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
+	require(delta.write == Activation::Sigmoid, "the delta recurrence writes with sigmoid")?;
+	require(delta.qk == BlockNormalization::L2, "delta query and key normalization must be l2")?;
 	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
 	let gates = graph.source;
 	reset(graph, source, input);
@@ -22911,11 +23021,14 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
+	lower_normalize(graph, delta.qk, key_width, checked_mul(2, keys, "delta query and key span")?)?;
 	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 1.0, 0.0, 0.0];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
-	// The recurrence kernel scales its query by the inverse root of the key width.
-	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
+	// The recurrence kernel decays its state by `exp(-exp(A) * softplus(alpha + bias))`
+	// and scales its query by the inverse root of the key width; the declared decay
+	// and scale name the only forms it computes.
+	let (DeltaDecay::Softplus, DeltaScale::InverseRoot) = (delta.decay, delta.query_scale);
+	lower_normalize(graph, delta.out_norm, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;

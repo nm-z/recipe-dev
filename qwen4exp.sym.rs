@@ -44,7 +44,17 @@ pub fn model() -> Model {
 				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size)
 				.values(qwen4exp.ssm.state_size)
 				.out(width)
-				.delta_activations(Activation::Silu, Activation::Sigmoid)
+				// Convolution, then SiLU; unit-length queries and keys per key head; decay
+				// exp(-exp(A) * softplus(alpha + dt_bias)) with sigmoid(beta) as the write
+				// strength and queries scaled by 1/sqrt(key width); the recurrence output is
+				// RMS-normalized per value head, then multiplied by a sigmoid output gate.
+				.conv_activation(Activation::Silu)
+				.qk(l2)
+				.decay(DeltaDecay::Softplus)
+				.write(Activation::Sigmoid)
+				.query_scale(DeltaScale::InverseRoot)
+				.out_norm(rms)
+				.output_gate(Activation::Sigmoid)
 		});
 
 		// Channel mixing: each position runs its top experts of 512, plus the
