@@ -9408,7 +9408,7 @@ mod gguf {
 		pointer: *const u8,
 		length: usize,
 		owned: Option<Vec<u8>>,
-		path: std::path::PathBuf,
+		pub(super) path: std::path::PathBuf,
 		/// The open file a row read goes through; reopened when its handle goes stale.
 		file: std::sync::Mutex<Option<std::fs::File>>,
 	}
@@ -9416,7 +9416,7 @@ mod gguf {
 	unsafe impl Sync for Mapping {}
 	impl Mapping {
 		#[cfg(unix)]
-		fn open(path: &Path) -> Result<Self> {
+		pub(super) fn open(path: &Path) -> Result<Self> {
 			use std::os::unix::io::AsRawFd;
 			let file = std::fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
 			let length = usize::try_from(file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len())
@@ -9427,7 +9427,7 @@ mod gguf {
 			Ok(Self { pointer: pointer.cast(), length, owned: None, path: path.to_path_buf(), file: std::sync::Mutex::new(Some(file)) })
 		}
 		#[cfg(not(unix))]
-		fn open(path: &Path) -> Result<Self> {
+		pub(super) fn open(path: &Path) -> Result<Self> {
 			let owned = std::fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 			require(!owned.is_empty(), format!("{} is empty", path.display()))?;
 			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned), path: path.to_path_buf(), file: std::sync::Mutex::new(None) })
@@ -14917,6 +14917,15 @@ impl StoredBytes {
 	fn absent(length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Absent(length)]))
 	}
+	/// Where each run comes from, for a layout key: a mapped run by file and range,
+	/// an owned run by a hash of its bytes.
+	fn identity(&self) -> Vec<(String, usize, usize)> {
+		self.0.iter().map(|run| match run {
+			StoredSegment::Mapped(mapping, at, length) => (mapping.path.display().to_string(), *at, *length),
+			StoredSegment::Owned(bytes) => (format!("{:016x}", resident_key(bytes)), 0, bytes.len()),
+			StoredSegment::Absent(length) => (String::new(), 0, *length),
+		}).collect()
+	}
 	/// Whether any run is written on the device rather than held on the host.
 	fn absent_runs(&self) -> bool {
 		self.0.iter().any(|run| matches!(run, StoredSegment::Absent(_)))
@@ -17905,17 +17914,18 @@ impl Infer {
 		Ok(memory)
 	}
 	/// Plan the exact lowered target/head working buffers without GPU allocation.
-	pub fn expert_plan(&self,model:&Model,data:&Data,positions:usize,mut budgets:[ExpertDieBudget;8])->Result<ExpertSplitPlan> {
+	pub fn expert_plan(&self,model:&Model,data:&Data,positions:usize,mut budgets:[ExpertDieBudget;DIES])->Result<ExpertSplitPlan> {
 		let file=data.file.as_ref().ok_or_else(||RecipeError::new("expert planning requires GGUF data"))?;
 		let head=self.mtp.as_ref().map(|path|MtpHead::open(path,file,model)).transpose()?;
 		let bound=explicit_bound(file,model,head.is_none())?;
 		let (target,other)=expert_graphs(&bound,head.as_ref(),positions,if head.is_some(){5}else{0},0,shared_cpu_device()?)?;
 		let head_file=head.as_ref().map(|head|&head.bound.file);
 		let working=split_working_reserve(&target,other.as_ref());for budget in &mut budgets {budget.reserve_bytes=budget.reserve_bytes.max(working);}
-		budgets[4].reserve_bytes=expert_main_reserve(&target,other.as_ref(),file,head_file,Config::load()?.precision)?.0;
+		let main=expert_main_die()?;
+		budgets[main].reserve_bytes=expert_main_reserve(&target,other.as_ref(),file,head_file,Config::load()?.precision)?.0;
 		budgets[0].free_bytes=budgets[0].free_bytes.min(6_186_598_400);
 		budgets[2].free_bytes=0;budgets[6].free_bytes=0;
-		let mut plan=ExpertSplitPlan::with_dense(file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets,&dense_names(&target,other.as_ref()))?;
+		let mut plan=ExpertSplitPlan::with_dense(file.tensors(),head_file.map_or(&[],Gguf::tensors),main,budgets,&dense_names(&target,other.as_ref()))?;
 		validate_dense_plan(&mut plan,&target,other.as_ref(),file,head_file)?;
 		Ok(plan)
 	}
@@ -18009,6 +18019,12 @@ impl Infer {
 		};
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
+		// A holder keeps only its exported weight arenas and waits for power loss.
+		if let Some(dir) = resident_dir("RECIPE_HOLD") {
+			drop(mtp);
+			drop(placed);
+			match hold_forever(&dir)? {}
+		}
 		let input = ChatInput::new(interactive)?;
 		let resident_memory = |placed: &Placed, mtp: Option<&MtpRuntime>| {
 			let mut memory = placed.memory();
@@ -19553,7 +19569,8 @@ fn dense_names(target:&Graph,head:Option<&Graph>)->std::collections::HashSet<(bo
 }
 
 fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, checkpoints: usize, observations: u8) -> Result<(Placed, Option<MtpRuntime>)> {
-	let main = device(Some("nv4"))?;
+	let main_die = expert_main_die()?;
+	let main = device(Some(&die_name(main_die)))?;
 	let (target_graph,head_graph)=expert_graphs(bound,head.as_ref(),positions,checkpoints,observations,main)?;
 	let precision=Config::load()?.precision;
 	// Validate and compile both native forwards before uploading resident weights.
@@ -19562,17 +19579,14 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	if let Some(graph)=&head_graph {drop(main.native_program(graph,1,precision,None,false)?);}
 	let head_file=head.as_ref().map(|head|&head.bound.file);
 	let (reserve,native_bytes,requests)=expert_main_reserve(&target_graph,head_graph.as_ref(),&bound.file,head_file,precision)?;
-	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:split_working_reserve(&target_graph,head_graph.as_ref())};8];
+	let mut budgets=[ExpertDieBudget {free_bytes:0,reserve_bytes:split_working_reserve(&target_graph,head_graph.as_ref())};DIES];
 	for gpu in selected_gpus()? {
 		let die=gpu.name.strip_prefix("nv").and_then(|value|value.parse::<usize>().ok()).ok_or_else(||RecipeError::new("expert startup requires physical local NVIDIA names"))?;
-		require(die<8 && die!=6,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
-		#[cfg(nvidia)] if die==2 && let Driver::Cuda(driver)=&gpu.driver {
-			gpu.activate()?; let (mut free,mut total)=(0,0); unsafe {gpu.status((driver.memory_info)(&mut free,&mut total),"capped expert memory")?;}
-			budgets[die].free_bytes=budgets[die].free_bytes.min(free.saturating_sub(total.saturating_sub(5_798_205_440)));
-		}
+		require(die<DIES,"expert startup selected an unavailable physical die")?; budgets[die].free_bytes=gpu.free_bytes()? as usize;
 	}
-	budgets[4].reserve_bytes=reserve;
-	let mut plan=ExpertSplitPlan::with_dense(bound.file.tensors(),head_file.map_or(&[],Gguf::tensors),4,budgets,&dense_names(&target_graph,head_graph.as_ref()))?;
+	budgets[main_die].reserve_bytes=reserve;
+	let budgets=resident_budgets(budgets)?;
+	let mut plan=ExpertSplitPlan::with_dense(bound.file.tensors(),head_file.map_or(&[],Gguf::tensors),main_die,budgets,&dense_names(&target_graph,head_graph.as_ref()))?;
 	validate_dense_plan(&mut plan,&target_graph,head_graph.as_ref(),&bound.file,head_file)?;
 	println!("{}",plan.table());
 	require(plan.fits(),format!("expert forward resident placement failed; canonical target/head buffers {native_bytes} bytes, five-slot request reserve {requests} bytes\n{}",plan.table()))?;
@@ -19730,11 +19744,22 @@ fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Res
 	for (local,layer) in graph.expert_layers.iter_mut().enumerate() {layer.global=first+local;graph.nodes[layer.node].argument[8]=(local+1) as f64;}
 	Ok(())
 }
+/// The most dies one expert split addresses: CUDA ordinals nv0 through nv7. Which of
+/// them take part, which is main and which are cold comes from `--device` and the
+/// device UUID settings in Cargo.toml, never from a die number in this file.
+const DIES: usize = 8;
+fn die_name(die: usize) -> String { format!("nv{die}") }
+/// The expert split's main die: the first die `--device` names.
+fn expert_main_die() -> Result<usize> {
+	let main = selected_gpus()?.first().ok_or_else(|| RecipeError::new("expert split needs a selected device"))?;
+	main.name.strip_prefix("nv").and_then(|die| die.parse::<usize>().ok()).filter(|die| *die < DIES).ok_or_else(|| RecipeError::new(format!("expert split main device {} is not a local NVIDIA die", main.name)))
+}
 fn expert_enabled(file: &Gguf, devices: &[&Gpu]) -> bool {
 	file.value("general.architecture").and_then(GgufValue::text) == Some("qwen4exp")
 		&& file.value("qwen4exp.expert_count").and_then(GgufValue::integer) == Some(512)
-		&& ["nv0","nv1","nv3","nv4","nv5","nv7"].iter().all(|name|devices.iter().any(|gpu|gpu.name==*name))
-		&& devices.iter().all(|gpu|matches!(gpu.name.as_str(),"nv0"|"nv1"|"nv2"|"nv3"|"nv4"|"nv5"|"nv7"))
+		// The first --device die is main; fences, caps and cold dies come from device UUIDs.
+		&& devices.len() > 1
+		&& devices.iter().all(|gpu|gpu.name.strip_prefix("nv").and_then(|die|die.parse::<usize>().ok()).is_some_and(|die|die<DIES))
 }
 struct ExpertModule { gpu: &'static Gpu, handle: usize, function: usize }
 impl ExpertModule {
@@ -19795,7 +19820,7 @@ impl ExpertExecution {
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
-		let main = device(Some("nv4"))?;
+		let main = device(Some(&format!("nv{}", plan.main_die)))?;
 		let source = Self::worker_source();
 		let key = native_artifact_key(&main.native_target, &source)?;
 		let directory = native_artifact_directory(&key)?;
@@ -19812,22 +19837,22 @@ impl ExpertExecution {
 			fs::write(directory.join("assembly.txt"),diagnostic).map_err(|error| RecipeError::new(format!("expert assembly receipt: {error}")))?;
 		}
 		let bytes = fs::read(&cubin).map_err(|error| RecipeError::new(format!("expert cubin read: {error}")))?;
-		let weights = ExpertSplitWeights::prepare(plan, ["nv0","nv1","nv2","nv3","nv4","nv5","nv6","nv7"])?;
+		let weights = ExpertSplitWeights::prepare(plan)?;
 		let control = Buffer::zeroed(main, 128)?;
 		let pick_counts=Buffer::zeroed(main,layers.len()*512*4)?;
 		let main_scratch = [5*10240*4, 5*16*4, 5*17*4, 5*10240*4].into_iter().map(|bytes| Buffer::zeroed(main,bytes)).collect::<Result<Vec<_>>>()?;
-		let main_sync=PeerPacket::new("nv4")?;
+		let main_sync=PeerPacket::new(&main.name)?;
 		control.write_bytes(32,&native_words(&[main_sync.completion_address(),main_sync.sequence_address()+4]))?;
 		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_LOG").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
 		let mut value = Self { pick_counts,pick_path,worker_path:cubin.clone(),failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
-		for die in [0,1,2,3,4,5,7].into_iter().filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
-			let gpu = device(Some(&format!("nv{die}")))?;
+		for die in (0..DIES).filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
+			let gpu = device(Some(&die_name(die)))?;
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
 			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
-			#[cfg(nvidia)] if die != 4 {module=Some(ExpertModule::load(gpu,&bytes)?);}
+			#[cfg(nvidia)] if die != value.weights.plan.main_die {module=Some(ExpertModule::load(gpu,&bytes)?);}
 
 			value.workers.push(ExpertWorker { read_bytes:Vec::new(), die, gpu, jobs, reports, scratch, module });
 		}
@@ -19880,7 +19905,7 @@ impl ExpertExecution {
 				value.channel_tables.push(table);
 			}
 			let channels=Buffer::upload(main,&channels)?;
-			let local=value.workers.iter().find(|worker|worker.die==4).unwrap();
+			let local=value.workers.iter().find(|worker|worker.die==value.weights.plan.main_die).unwrap();
 			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
 			let fields=[value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
 			let mut record=native_words(&fields);
@@ -19980,12 +20005,12 @@ pub struct ExpertWeightPlacement {
 /// their type and byte layout. Lookup tables remain in the caller's RAM mapping.
 #[derive(Clone, Debug)]
 pub struct ExpertSplitPlan {
-	pub dense_read_bytes:[[usize;8];2],
+	pub dense_read_bytes:[[usize;DIES];2],
 	pub spill_bytes: usize,
 	pub main_die: usize,
-	pub budgets: [ExpertDieBudget; 8],
-	pub weights: [usize; 8],
-	pub experts: [usize; 8],
+	pub budgets: [ExpertDieBudget; DIES],
+	pub weights: [usize; DIES],
+	pub experts: [usize; DIES],
 	pub unplaced_experts: usize,
 	pub unplaced_bytes: usize,
 	pub placements: Vec<ExpertWeightPlacement>,
@@ -19993,13 +20018,13 @@ pub struct ExpertSplitPlan {
 impl ExpertSplitPlan {
 	/// `head` contains unique MTP tensors; the holder decides whether its output
 	/// projection and token lookup share the target's quantized representation.
-	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; 8]) -> Result<Self> {
+	pub fn new(target: &[GgufTensor], head: &[GgufTensor], main_die: usize, budgets: [ExpertDieBudget; DIES]) -> Result<Self> {
 		Self::with_dense(target,head,main_die,budgets,&std::collections::HashSet::new())
 	}
-	fn with_dense(target:&[GgufTensor],head:&[GgufTensor],main_die:usize,budgets:[ExpertDieBudget;8],dense:&std::collections::HashSet<(bool,String)>)->Result<Self> {
-		require(matches!(main_die,3|4), "expert split main die must be physical Archy die 3 or 4")?;
-		let mut budgets=budgets;budgets[2].free_bytes=0;budgets[6].free_bytes=0;for budget in &mut budgets {if budget.free_bytes==0 {budget.reserve_bytes=0;}}
-		let mut plan = Self { dense_read_bytes:[[0;8];2],spill_bytes:0, main_die, budgets, weights: [0; 8], experts: [0; 8], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
+	fn with_dense(target:&[GgufTensor],head:&[GgufTensor],main_die:usize,budgets:[ExpertDieBudget;DIES],dense:&std::collections::HashSet<(bool,String)>)->Result<Self> {
+		require(main_die < DIES && budgets[main_die].free_bytes != 0 && !device_cold(&die_name(main_die)), "expert split main die must be a selected die on a fast link")?;
+		let mut budgets=budgets;for budget in &mut budgets {if budget.free_bytes==0 {budget.reserve_bytes=0;}}
+		let mut plan = Self { dense_read_bytes:[[0;DIES];2],spill_bytes:0, main_die, budgets, weights: [0; DIES], experts: [0; DIES], unplaced_experts: 0, unplaced_bytes: 0, placements: Vec::new() };
 		let mut layers: std::collections::BTreeMap<(bool, usize), Vec<&GgufTensor>> = std::collections::BTreeMap::new();
 		let mut names = std::collections::HashSet::new();
 		let frequencies=expert_pick_seed()?;
@@ -20011,7 +20036,7 @@ impl ExpertSplitPlan {
 				if matches!(tensor.name.as_str(), "token_embd.weight" | "per_layer_token_embd.weight") { continue; }
 				if dense.contains(&(mtp,tensor.name.clone())) {
 					require(tensor.shape.len()==2,"dense row placement needs a matrix")?;
-					let dies=(0..8).filter(|die|budgets[*die].free_bytes!=0).collect::<Vec<_>>();
+					let dies=(0..DIES).filter(|die|budgets[*die].free_bytes!=0 && !device_cold(&die_name(*die))).collect::<Vec<_>>();
 					let rows=tensor.shape[1] as usize;
 					for (rank,die) in dies.iter().copied().enumerate() {
 						let first=rows*rank/dies.len();let end=rows*(rank+1)/dies.len();if end==first {continue;}
@@ -20044,22 +20069,26 @@ impl ExpertSplitPlan {
 		}
 		bundles.sort_by_key(|(mtp,layer,expert,_)| {let picks=frequencies.get(&(*mtp,*layer,*expert as u32)).copied();let cold=!*mtp && *layer!=47 && picks==Some(0);(cold,std::cmp::Reverse(picks.unwrap_or(0)),*layer,*expert)});
 		for (mtp,layer,expert,slices) in bundles {
-				let die = (0..8).filter(|die| *die != main_die && *die != 2 && *die != 6).filter_map(|die| {
+				let fits = |die: usize, plan: &Self| -> Option<usize> {
 					let mut end = plan.weights[die];
 					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
 					let available = budgets[die].free_bytes.saturating_sub(budgets[die].reserve_bytes);
-					(end <= available).then(|| (die, available - end))
-				}).max_by_key(|(die, remaining)| (*remaining, std::cmp::Reverse(*die))).map(|(die, _)| die).or_else(|| {
-					let mut end = plan.weights[main_die];
-					for slice in &slices { end = Self::end(end, slice.bytes).ok()?.1; }
-					(end <= budgets[main_die].free_bytes.saturating_sub(budgets[main_die].reserve_bytes)).then_some(main_die)
-				});
+					(end <= available).then(|| available - end)
+				};
+				// Hot dies first, then the main die, then the slow-link dies, then pinned RAM.
+				// Bundles arrive hottest first, so the slow links get only the coldest.
+				let cold = |die: usize| device_cold(&die_name(die));
+				let roomiest = |dies: Vec<usize>| dies.into_iter().filter_map(|die| fits(die, &plan).map(|remaining| (die, remaining)))
+					.max_by_key(|(die, remaining)| (*remaining, std::cmp::Reverse(*die))).map(|(die, _)| die);
+				let die = roomiest((0..DIES).filter(|die| *die != main_die && budgets[*die].free_bytes != 0 && !cold(*die)).collect())
+					.or_else(|| fits(main_die, &plan).map(|_| main_die))
+					.or_else(|| roomiest((0..DIES).filter(|die| *die != main_die && budgets[*die].free_bytes != 0 && cold(*die)).collect()));
 				if let Some(die) = die {
 					for slice in slices { plan.append(slice, Some(expert as u32), die, mtp)?; }
 					plan.experts[die] += 1;
 				} else {
 					require(!mtp && layer!=47 && frequencies.get(&(mtp,layer,expert as u32)).copied()==Some(0),"resident capacity cannot keep a selected or MTP expert; cold spill requires a zero-pick target expert")?;
-					let die=[3,4,5].into_iter().min_by_key(|die|plan.experts[*die]).unwrap();
+					let die=(0..DIES).filter(|die|budgets[*die].free_bytes!=0 && !device_cold(&die_name(*die))).min_by_key(|die|plan.experts[*die]).ok_or_else(||RecipeError::new("expert spill has no fast-link die"))?;
 					for tensor in slices {
 						let (offset,end)=Self::end(plan.spill_bytes,tensor.bytes)?; plan.spill_bytes=end;
 						plan.placements.push(ExpertWeightPlacement {row_start:None,spilled:true,tensor,expert:Some(expert as u32),die,offset,mtp});
@@ -20080,19 +20109,18 @@ impl ExpertSplitPlan {
 		Ok(())
 	}
 	pub fn fits(&self) -> bool {
-		self.unplaced_experts == 0 && (0..8).all(|die| self.weights[die] <= self.budgets[die].free_bytes.saturating_sub(self.budgets[die].reserve_bytes))
+		self.unplaced_experts == 0 && (0..DIES).all(|die| self.weights[die] <= self.budgets[die].free_bytes.saturating_sub(self.budgets[die].reserve_bytes))
 	}
 	pub fn table(&self) -> String {
 		let mut text = String::from("| Physical die | Role | Free bytes | KV/scratch reserve | Assigned weight bytes | Expert bundles | Remaining bytes |\n|---:|---|---:|---:|---:|---:|---:|\n");
-		for die in 0..8 {
-			if die == 2 || die == 6 { continue; }
+		for die in 0..DIES {
 			let budget = self.budgets[die];
 			let remaining = budget.free_bytes as i128 - budget.reserve_bytes as i128 - self.weights[die] as i128;
 			text.push_str(&format!("| {die} | {} | {} | {} | {} | {} | {remaining} |\n", if budget.free_bytes==0 {"excluded"} else if die == self.main_die { "main" } else { "experts" }, budget.free_bytes, budget.reserve_bytes, self.weights[die], self.experts[die]));
 		}
 		text.push_str("\n| Physical die | Target dense read bytes/position | MTP dense read bytes/position | Resident expert bytes | RAM expert bytes | RAM bundles | Reference selected expert bytes, all recorded picks |\n|---:|---:|---:|---:|---:|---:|---:|\n");
 		let frequencies=expert_pick_seed().unwrap_or_default();
-		for die in 0..8 {
+		for die in 0..DIES {
 			if self.budgets[die].free_bytes==0 {continue;}
 			let dense=[self.dense_read_bytes[0][die],self.dense_read_bytes[1][die]];let mut resident=0;let mut spill=0;let mut cold=std::collections::HashSet::new();let mut reads=0u128;
 			for item in self.placements.iter().filter(|item|item.die==die) {
@@ -20127,35 +20155,85 @@ impl ExpertSplitPlan {
 	}
 }
 
-/// Retain this object in cx-flash's holder. Creation is transactional: capacity
-/// failure returns before weight allocation; upload failure drops new buffers.
-/// Module replacement leaves these allocations and peer sequences unchanged.
-struct ExpertPinned { gpu: &'static Gpu, pointer: usize, mapped: [u64;8] }
+/// Pinned machine RAM every expert die reads cold bundles from. With
+/// `RECIPE_HOST_HOLD=<dir on tmpfs>` it is a file there, registered with CUDA, so
+/// it outlives this process and the next process maps the same bytes; the second
+/// value says those bytes are already written, the third names the marker to
+/// write once they are.
+struct ExpertPinned { gpu: &'static Gpu, pointer: usize, mapped: [u64;DIES], file_bytes: Option<usize> }
 impl ExpertPinned {
-	fn new(gpu: &'static Gpu, bytes: usize, devices: &[Option<&'static Gpu>]) -> Result<Self> {
+	fn new(gpu: &'static Gpu, bytes: usize, devices: &[Option<&'static Gpu>], layout: u64) -> Result<(Self, bool, Option<PathBuf>)> {
 		#[cfg(nvidia)] {
 			let Driver::Cuda(driver)=&gpu.driver else {return Err(RecipeError::new("expert spill requires CUDA mapped RAM"));};
 			gpu.activate()?; let mut pointer=ptr::null_mut();
-			unsafe {gpu.status((driver.host_alloc)(&mut pointer,bytes,3),"expert pinned RAM allocation")?;}
-			let mut value=Self {gpu,pointer:pointer as usize,mapped:[0;8]};
+			let (mut ready, mut marker, mut file_bytes) = (false, None, None);
+			if let Some(dir) = resident_dir("RECIPE_HOST_HOLD") {
+				use std::os::unix::io::AsRawFd;
+				let path = dir.join(format!("spill-{layout:016x}-{bytes}.bin"));
+				let ready_path = path.with_extension("ready");
+				ready = ready_path.exists();
+				let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+				file.set_len(bytes as u64).map_err(|error| RecipeError::new(format!("cannot size {}: {error}", path.display())))?;
+				// PROT_READ|PROT_WRITE and MAP_SHARED, so writes land in the file.
+				pointer = unsafe { mmap(ptr::null_mut(), bytes, 3, 1, file.as_raw_fd(), 0) };
+				require(pointer as isize != -1, format!("cannot map {}: {}", path.display(), std::io::Error::last_os_error()))?;
+				let register: unsafe extern "C" fn(Ptr, usize, u32) -> i32 = driver._runtime.function(b"cuMemHostRegister_v2\0")?;
+				// CU_MEMHOSTREGISTER_PORTABLE|DEVICEMAP: every die maps the same pages.
+				unsafe {gpu.status(register(pointer,bytes,3),"expert pinned RAM registration")?;}
+				(marker, file_bytes) = (Some(ready_path), Some(bytes));
+			} else {
+				unsafe {gpu.status((driver.host_alloc)(&mut pointer,bytes,3),"expert pinned RAM allocation")?;}
+			}
+			let mut value=Self {gpu,pointer:pointer as usize,mapped:[0;DIES],file_bytes};
 			for (die,device) in devices.iter().enumerate().filter_map(|(die,gpu)|gpu.map(|gpu|(die,gpu))) {
 				let Driver::Cuda(driver)=&device.driver else {return Err(RecipeError::new("expert spill compute die is not CUDA"));};
 				device.activate()?;
 				unsafe {device.status((driver.host_device_pointer)(&mut value.mapped[die],pointer,0),"expert mapped RAM address")?;}
 			}
-			Ok(value)
+			Ok((value, ready, marker))
 		}
-		#[cfg(not(nvidia))] {let _=(gpu,bytes,devices);Err(RecipeError::new("expert spill requires CUDA"))}
+		#[cfg(not(nvidia))] {let _=(gpu,bytes,devices,layout);Err(RecipeError::new("expert spill requires CUDA"))}
 	}
 }
 impl Drop for ExpertPinned {
-	fn drop(&mut self) { #[cfg(nvidia)] if let Driver::Cuda(driver)=&self.gpu.driver {let _=self.gpu.activate(); unsafe {(driver.host_free)(self.pointer as Ptr);}} }
+	fn drop(&mut self) {
+		#[cfg(nvidia)] if let Driver::Cuda(driver)=&self.gpu.driver {
+			let _=self.gpu.activate();
+			if let Some(bytes) = self.file_bytes {
+				if let Ok(unregister) = driver._runtime.function::<unsafe extern "C" fn(Ptr) -> i32>(b"cuMemHostUnregister\0") { unsafe { unregister(self.pointer as Ptr); } }
+				unsafe { munmap(self.pointer as Ptr, bytes); }
+			} else {
+				unsafe {(driver.host_free)(self.pointer as Ptr);}
+			}
+		}
+	}
+}
+/// A holder saves the die budgets it planned with, and an attaching runtime plans
+/// with the same ones: the holder's arenas already fill the dies it would measure.
+fn resident_budgets(measured: [ExpertDieBudget; DIES]) -> Result<[ExpertDieBudget; DIES]> {
+	if let Some(dir) = resident_dir("RECIPE_ATTACH") && let Ok(text) = fs::read_to_string(dir.join("budgets")) {
+		let values = text.split_whitespace().map(|word| word.parse::<usize>().map_err(|_| RecipeError::new("resident budgets are malformed"))).collect::<Result<Vec<_>>>()?;
+		require(values.len() == 16, "resident budgets must list 8 dies")?;
+		let mut budgets = measured;
+		for (die, budget) in budgets.iter_mut().enumerate() { (budget.free_bytes, budget.reserve_bytes) = (values[2 * die], values[2 * die + 1]); }
+		return Ok(budgets);
+	}
+	if let Some(dir) = resident_dir("RECIPE_HOLD") {
+		fs::create_dir_all(&dir).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", dir.display())))?;
+		let text = measured.iter().map(|budget| format!("{} {}\n", budget.free_bytes, budget.reserve_bytes)).collect::<String>();
+		fs::write(dir.join("budgets"), text).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", dir.join("budgets").display())))?;
+	}
+	Ok(measured)
 }
 
 pub struct ExpertSplitWeights {
 	dense_bindings:std::collections::HashMap<(bool,String,usize),(u64,usize,u32,usize)>,
 	bindings: std::collections::HashMap<(bool,String),Vec<Option<(usize,u64,usize,u32)>>>,
 	spill: Option<ExpertPinned>,
+	/// True where the holder already filled the arena or pinned RAM, so upload skips it.
+	spill_ready: bool,
+	spill_marker: Option<PathBuf>,
+	attached: [bool; DIES],
 	plan: ExpertSplitPlan,
 	buffers: Vec<Option<Buffer>>,
 	requests: Vec<PeerPacket>,
@@ -20167,37 +20245,43 @@ pub struct ExpertSplitWeights {
 impl ExpertSplitWeights {
 	/// Names use physical Archy ordinal order. Dies 2 and 6 have no context or buffer.
 	/// Keep CUDA_VISIBLE_DEVICES unset so the manifest cap names physical die 0.
-	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, names: [&str;8]) -> Result<Self> {
-		let value=Self::prepare(plan,names)?;
+	pub fn load(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>) -> Result<Self> {
+		let value=Self::prepare(plan)?;
 		value.upload(target,head)?;
 		Ok(value)
 	}
-	fn prepare(mut plan: ExpertSplitPlan, names: [&str; 8]) -> Result<Self> {
+	fn prepare(mut plan: ExpertSplitPlan) -> Result<Self> {
 		require(plan.fits(), format!("expert split does not fit resident VRAM\n{}", plan.table()))?;
-		require(names == ["nv0", "nv1", "nv2", "nv3", "nv4", "nv5", "nv6", "nv7"], "expert split requires physical Archy ordinal names")?;
-		require(local_host()? == "archy" && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split requires unmapped physical Archy ordinals")?;
-		require(plan.budgets.iter().enumerate().all(|(die, budget)| budget.free_bytes == 0 || die == 2 || die == 6 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
-		let devices = names.iter().enumerate().map(|(die, name)| if die == 2 || die == 6 || plan.budgets[die].free_bytes==0 { Ok(None) } else { device(Some(name)).map(Some) }).collect::<Result<Vec<_>>>()?;
+		require(std::env::var_os("CUDA_VISIBLE_DEVICES").is_none(), "expert split addresses physical CUDA ordinals, so CUDA_VISIBLE_DEVICES must be unset")?;
+		require(plan.budgets.iter().enumerate().all(|(die, budget)| budget.free_bytes == 0 || budget.reserve_bytes >= 4 << 20), "expert split reserves must cover peer packets and routing tables")?;
+		let devices = (0..DIES).map(|die| if plan.budgets[die].free_bytes==0 { Ok(None) } else { device(Some(&die_name(die))).map(Some) }).collect::<Result<Vec<_>>>()?;
 		for (die, gpu) in devices.iter().enumerate().filter_map(|(die, gpu)| gpu.map(|gpu| (die, gpu))) {
 			#[cfg(nvidia)]
 			require(matches!(gpu.driver, Driver::Cuda(_)), "expert split requires local NVIDIA dies")?;
 			#[cfg(not(nvidia))]
 			return Err(RecipeError::new("expert split requires the NVIDIA backend"));
 			#[allow(unreachable_code)]
-			require(gpu.free_bytes()? >= checked_add(plan.weights[die], plan.budgets[die].reserve_bytes, "expert split reserve")? as u64,
+			// An attaching runtime finds the holder's arenas already on the die.
+			require(resident_dir("RECIPE_ATTACH").is_some() || gpu.free_bytes()? >= checked_add(plan.weights[die], plan.budgets[die].reserve_bytes, "expert split reserve")? as u64,
 				format!("physical die {die} free VRAM changed before resident loading"))?;
 		}
 		let main = devices[plan.main_die].expect("main die is permitted");
-		for die in 0..8 {
+		for die in 0..DIES {
 			if devices[die].is_none() { continue; } if die != plan.main_die { require(main.reaches(&[main, devices[die].unwrap()]) && devices[die].unwrap().reaches(&[main, devices[die].unwrap()]), "expert split requires bidirectional direct CUDA peer access")?; } }
 		// Ordinary tapes own norms and unmapped operations. This pool holds row slices and experts.
-		let mut expert_bytes = [0;8];
+		let mut expert_bytes = [0;DIES];
 		for item in plan.placements.iter_mut().filter(|item| (item.expert.is_some() || item.row_start.is_some()) && !item.spilled) {
 			let (offset,end)=ExpertSplitPlan::end(expert_bytes[item.die],item.tensor.bytes)?; item.offset=offset; expert_bytes[item.die]=end;
 		}
-		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
-		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
-		let response_table = Buffer::reserve(main, 6 * 16)?;
+		let mut attached = [false; DIES];
+		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| {
+			let layout = plan.placements.iter().filter(|item| item.die == die && !item.spilled && (item.expert.is_some() || item.row_start.is_some()))
+				.map(|item| (item.mtp, item.tensor.name.as_str(), item.tensor.shard, item.tensor.offset, item.tensor.bytes, item.expert, item.row_start, item.offset)).collect::<Vec<_>>();
+			resident_arena(gpu, resident_key(("experts", die, expert_bytes[die], layout)), expert_bytes[die], |_| Ok(())).map(|(buffer, held)| { attached[die] = held; buffer })
+		}).transpose()).collect::<Result<Vec<_>>>()?;
+		let spill_layout = resident_key(plan.placements.iter().filter(|item| item.spilled).map(|item| (item.mtp, item.tensor.name.as_str(), item.tensor.offset, item.tensor.bytes, item.expert, item.die, item.offset)).collect::<Vec<_>>());
+		let (spill, spill_ready, spill_marker) = if plan.spill_bytes>0 {let (pinned, ready, marker) = ExpertPinned::new(main,plan.spill_bytes,&devices,spill_layout)?; (Some(pinned), ready, marker)} else {(None, false, None)};
+		let response_table = Buffer::reserve(main, devices.iter().flatten().count() * 16)?;
 		let mut bindings=std::collections::HashMap::new();
 		for item in plan.placements.iter().filter(|item|item.expert.is_some()) {
 			let entries=bindings.entry((item.mtp,item.tensor.name.clone())).or_insert_with(Vec::new);
@@ -20209,7 +20293,7 @@ impl ExpertSplitWeights {
 		for item in plan.placements.iter().filter(|item|item.row_start.is_some()) {
 			dense_bindings.insert((item.mtp,item.tensor.name.clone(),item.die),(buffers[item.die].as_ref().unwrap().pointer+item.offset as u64,item.tensor.bytes,item.tensor.kind,item.row_start.unwrap()));
 		}
-		let mut value = Self { dense_bindings,bindings,spill,plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
+		let mut value = Self { dense_bindings,bindings,spill,spill_ready,spill_marker,attached,plan, buffers, requests: Vec::new(), responses: Vec::new(), routes: Vec::new(), owners: Vec::new(), response_table };
 		let mut layers = std::collections::BTreeMap::new();
 		for item in &value.plan.placements {
 			if item.tensor.name.ends_with("ffn_up_exps.weight") {
@@ -20224,10 +20308,10 @@ impl ExpertSplitWeights {
 			require(owners.iter().all(|owner| *owner != u32::MAX), "resident expert owner table has a hole")?;
 			value.owners.push((layer, Buffer::upload(main, &owners)?));
 		}
-		for die in 0..8 {
+		for die in 0..DIES {
 			if devices[die].is_none() { continue; }
-			let request = PeerPacket::with_payload(names[die], 5 * 10240 * 4)?;
-			let response = PeerPacket::with_payload(names[value.plan.main_die], 5 * 10240 * 4)?;
+			let request = PeerPacket::with_payload(&die_name(die), 5 * 10240 * 4)?;
+			let response = PeerPacket::with_payload(&die_name(value.plan.main_die), 5 * 10240 * 4)?;
 			if die != value.plan.main_die { request.enable_sender(&response)?; response.enable_sender(&request)?; }
 			value.requests.push(request);
 			value.responses.push(response);
@@ -20247,10 +20331,19 @@ impl ExpertSplitWeights {
 			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
 			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
 			require(tensor == item.tensor, format!("packed tensor {} changed after placement", tensor.name))?;
+			// The holder already wrote what an attached arena or ready pinned RAM holds.
+			if if item.spilled {self.spill_ready} else {self.attached[item.die]} { continue; }
 			if item.spilled {
 				let spill=self.spill.as_ref().expect("spill allocation is present");
 				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
-			} else {self.buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
+			} else {
+				let buffer=self.buffers[item.die].as_ref().expect("assigned die is permitted");
+				buffer.write_bytes(item.offset, model.data(&tensor))?;
+				// A slow-link die may sit beside bad VRAM: read every byte back once.
+				if device_cold(&format!("nv{}",item.die)) {
+					require(buffer.download_completed_bytes(item.offset,tensor.bytes)?==model.data(&tensor),format!("{} on nv{} reads back different bytes",tensor.name,item.die))?;
+				}
+			}
 			uploaded=checked_add(uploaded,tensor.bytes,"uploaded packed weight bytes")?;
 			let now=Instant::now();
 			if now.duration_since(upload_reported).as_secs_f64()>=1.0 {
@@ -20259,6 +20352,7 @@ impl ExpertSplitWeights {
 			}
 		}
 		println!("resident weights {} bytes  average rate {:.4} GB/s",uploaded,uploaded as f64/upload_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
+		if let Some(marker)=&self.spill_marker && !self.spill_ready {fs::write(marker,b"").map_err(|error|RecipeError::new(format!("cannot write {}: {error}",marker.display())))?;}
 		Ok(())
 	}
 	pub fn plan(&self) -> &ExpertSplitPlan { &self.plan }
@@ -24793,13 +24887,16 @@ impl NativeTape {
 			(TapeInput::Values(values), true) => Buffer::upload(gpu, &values.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?,
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
-		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
+		let (weight_offsets, weight_bytes) = native_weight_arena(graph, precision.model, inference)?;
+		let weight_key = weight_arena_key(gpu, graph, precision.model, inference, &weight_offsets, weight_bytes);
+		let (weights, attached) = resident_arena(gpu, weight_key, weight_bytes, |weights| weights.fill_weights(graph, precision.model, inference))?;
 		if let Some(execution) = &graph.expert_execution {
 			let execution = execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))?;
 			let (offsets, _) = native_weight_arena(graph, precision.model, true)?;
 			for layer in &graph.expert_layers { weights.write_bytes(offsets[layer.node], &execution.main_descriptors[layer.global].pointer.to_ne_bytes())?; }
 		}
-		if program.model_load.is_some() {
+		// An attached arena already holds what the load kernel writes.
+		if program.model_load.is_some() && !attached {
 			let image = &program.artifact.storage;
 			require(!image.is_empty(), "native model-load storage is empty")?;
 			// One node at a time through one scratch the size of the largest
@@ -24851,7 +24948,7 @@ impl NativeTape {
 		let (mut lookups, positions) = (Vec::new(), graph_positions(graph));
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if inference && node.op == Primitive::Gather {
-				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?.clone();
+				let table = hold_host_table(graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?.clone())?;
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: None, table, width: node.argument[1] as usize, length: node.output.length });
 			} else if node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
@@ -24862,7 +24959,7 @@ impl NativeTape {
 				}
 			}
 			if node.op == Primitive::Lookup {
-				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				let table = hold_host_table(graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone())?;
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
@@ -26664,6 +26761,121 @@ struct Buffer {
 	pointer: u64,
 	bytes: usize,
 }
+/// Weight arenas shared across processes. `RECIPE_HOLD=<dir>` exports a CUDA IPC
+/// handle for every weight arena this process fills, keeps those arenas when
+/// everything else is freed, and then waits for power loss. `RECIPE_ATTACH=<dir>`
+/// opens the holder's arena with the same key instead of filling a new one, so a
+/// runtime starts without reading weights. A key names an arena's layout, never its bytes.
+#[derive(Default)]
+struct ResidentArenas {
+	held: std::collections::HashSet<u64>,
+	attached: std::collections::HashSet<u64>,
+}
+static RESIDENT: OnceLock<Mutex<ResidentArenas>> = OnceLock::new();
+fn resident_arenas() -> Result<std::sync::MutexGuard<'static, ResidentArenas>> {
+	RESIDENT.get_or_init(Default::default).lock().map_err(|_| RecipeError::new("resident arena registry is poisoned"))
+}
+fn resident_dir(name: &str) -> Option<PathBuf> {
+	std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IpcHandle([u8; 64]);
+fn resident_key(parts: impl std::hash::Hash) -> u64 {
+	use std::hash::Hasher;
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	parts.hash(&mut hasher);
+	hasher.finish()
+}
+/// A weight arena of `bytes` on `gpu`: the holder's arena under `key` when one is
+/// exported, otherwise a new arena that `fill` writes. True when attached, so the
+/// caller skips every write the holder already made.
+fn resident_arena(gpu: &'static Gpu, key: u64, bytes: usize, fill: impl FnOnce(&Buffer) -> Result<()>) -> Result<(Buffer, bool)> {
+	let bytes = bytes.max(1);
+	let record_path = |dir: &Path| dir.join(format!("{}-{key:016x}.ipc", gpu.name));
+	#[cfg(nvidia)]
+	if let Some(dir) = resident_dir("RECIPE_ATTACH") && let Driver::Cuda(driver) = &gpu.driver && let Ok(record) = fs::read(record_path(&dir)) {
+		require(record.len() == 72, format!("resident arena record {} is malformed", record_path(&dir).display()))?;
+		let held = u64::from_le_bytes(record[64..72].try_into().unwrap()) as usize;
+		require(held == bytes, format!("resident arena {key:016x} on {} holds {held} bytes; this placement needs {bytes}", gpu.name))?;
+		let open: unsafe extern "C" fn(*mut u64, IpcHandle, u32) -> i32 = driver._runtime.function(b"cuIpcOpenMemHandle_v2\0").or_else(|_| driver._runtime.function(b"cuIpcOpenMemHandle\0"))?;
+		gpu.activate()?;
+		let mut pointer = 0;
+		// Flag 1 enables peer access lazily, so other dies read the arena as before.
+		gpu.status(unsafe { open(&mut pointer, IpcHandle(record[..64].try_into().unwrap()), 1) }, "resident arena attach")?;
+		resident_arenas()?.attached.insert(pointer);
+		return Ok((Buffer { runtime: gpu, pointer, bytes }, true));
+	}
+	let buffer = Buffer::reserve(gpu, bytes)?;
+	fill(&buffer)?;
+	#[cfg(nvidia)]
+	if let Some(dir) = resident_dir("RECIPE_HOLD") && let Driver::Cuda(driver) = &gpu.driver {
+		let export: unsafe extern "C" fn(*mut IpcHandle, u64) -> i32 = driver._runtime.function(b"cuIpcGetMemHandle\0")?;
+		gpu.activate()?;
+		let mut handle = IpcHandle([0; 64]);
+		gpu.status(unsafe { export(&mut handle, buffer.pointer) }, "resident arena export")?;
+		let mut record = handle.0.to_vec();
+		record.extend_from_slice(&(bytes as u64).to_le_bytes());
+		fs::create_dir_all(&dir).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", dir.display())))?;
+		let path = record_path(&dir);
+		let part = path.with_extension("part");
+		fs::write(&part, &record).and_then(|()| fs::rename(&part, &path)).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))?;
+		resident_arenas()?.held.insert(buffer.pointer);
+	}
+	Ok((buffer, false))
+}
+/// The layout key of a tape's weight arena: its offsets, formats, where its stored
+/// bytes come from, and its encoded parameters. Packed weight bytes are not read.
+fn weight_arena_key(gpu: &Gpu, graph: &Graph, precision: Compute, inference: bool, offsets: &[usize], bytes: usize) -> u64 {
+	let nodes = graph.nodes.iter().enumerate().map(|(index, node)| {
+		let stored = graph.stored.get(index).and_then(Option::as_ref).map(|weight| (weight.format.0, weight.count, weight.bytes.identity()));
+		let values = graph.parameters.get(node.offset..node.offset + node.parameters).map(|values| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()).unwrap_or_default();
+		(node.op as i32, node.offset, node.parameters, node.packed, format!("{:?}", node.precision), stored, values)
+	}).collect::<Vec<_>>();
+	resident_key((gpu.name.as_str(), "tape", format!("{precision:?}"), inference, offsets, bytes, nodes))
+}
+/// `RECIPE_HOST_HOLD=<dir on tmpfs>` keeps a mapped table in a file there, so it
+/// stays in RAM until power loss whichever processes come and go, and its rows
+/// never cross a network mount. The first process to need it writes it once.
+fn hold_host_table(mut table: StoredWeight) -> Result<StoredWeight> {
+	let Some(dir) = resident_dir("RECIPE_HOST_HOLD") else { return Ok(table) };
+	let (mapping, at, length) = match table.bytes.0.as_slice() {
+		[StoredSegment::Mapped(mapping, at, length)] => (mapping.clone(), *at, *length),
+		_ => return Ok(table),
+	};
+	let name = mapping.path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+	let path = dir.join(format!("{name}-{at}-{length}.bin"));
+	if fs::metadata(&path).map(|meta| meta.len()).ok() != Some(length as u64) {
+		let part = path.with_extension("part");
+		let mut file = fs::File::create(&part).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", part.display())))?;
+		let mut chunk = vec![0_u8; 64 << 20];
+		let mut done = 0;
+		while done < length {
+			let size = chunk.len().min(length - done);
+			mapping.read_at(at + done, &mut chunk[..size])?;
+			std::io::Write::write_all(&mut file, &chunk[..size]).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", part.display())))?;
+			done += size;
+		}
+		drop(file);
+		fs::rename(&part, &path).map_err(|error| RecipeError::new(format!("cannot place {}: {error}", path.display())))?;
+	}
+	table.bytes = StoredBytes::mapped(&Arc::new(gguf::Mapping::open(&path)?), 0, length);
+	Ok(table)
+}
+/// The holder's end state: every non-weight allocation is already freed, the
+/// exported arenas stay, and nothing but power loss ends the process.
+fn hold_forever(dir: &Path) -> Result<std::convert::Infallible> {
+	#[cfg(unix)]
+	unsafe {
+		extern "C" fn ignore(_: i32) {}
+		// SIGHUP, SIGINT and SIGTERM end nothing here.
+		for number in [1, 2, 15] { signal(number, ignore); }
+	}
+	let ready = dir.join("READY");
+	fs::write(&ready, format!("{}\n", std::process::id())).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", ready.display())))?;
+	println!("holding {} resident arenas in {}", resident_arenas()?.held.len(), dir.display());
+	loop { std::thread::park(); }
+}
 /// The largest host buffer a zero fill stages at once, so an arena of any size
 /// clears without a host copy of its own size.
 const ZERO_FILL_BYTES: usize = 64 << 20;
@@ -26751,9 +26963,15 @@ impl Buffer {
 	/// stored weight the model-load kernel expands is left to that kernel, and
 	/// every other node's parameters are encoded and written in place.
 	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<Self> {
-		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
-		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let (_, bytes) = native_weight_arena(graph, precision, inference)?;
+		let buffer = Self::reserve(runtime, bytes)?;
+		buffer.fill_weights(graph, precision, inference)?;
+		Ok(buffer)
+	}
+	/// Write the weight arena `upload_weights` allocates into this buffer.
+	fn fill_weights(&self, graph: &Graph, precision: Compute, inference: bool) -> Result<()> {
+		let (offsets, _) = native_weight_arena(graph, precision, inference)?;
+		let buffer = self;
 		let mut written = std::collections::BTreeSet::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if inference && external_expert(node) { continue; }
@@ -26767,7 +26985,7 @@ impl Buffer {
 				buffer.write_bytes(offsets[index], &encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], node.precision))?;
 			}
 		}
-		Ok(buffer)
+		Ok(())
 	}
 	fn write_float_bytes(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
 		let bytes = precision.bytes();
@@ -27585,6 +27803,14 @@ impl Gpu {
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					(driver.set)(driver.context);
+					// A held arena outlives its owner; an attached one is the holder's to free.
+					if let Some(registry) = RESIDENT.get() && let Ok(mut registry) = registry.lock() {
+						if registry.held.contains(&pointer) { return; }
+						if registry.attached.remove(&pointer) {
+							if let Ok(close) = driver._runtime.function::<unsafe extern "C" fn(u64) -> i32>(b"cuIpcCloseMemHandle\0") { close(pointer); }
+							return;
+						}
+					}
 					(driver.free)(pointer);
 				}
 				#[cfg(amd)]
@@ -27901,6 +28127,12 @@ static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Dots chain devices under the most recent host prefix. Commas are invalid.
 /// `cpu` names the available CPU pool, not a physical socket.
 /// The first name is the primary device.
+/// Local devices on a slow link (`device-cold-uuids`): they hold only rarely read
+/// weights and never sit on a token's critical path.
+static COLD_DEVICES: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+fn device_cold(name: &str) -> bool {
+	COLD_DEVICES.get().and_then(|set| set.lock().ok()).is_some_and(|set| set.contains(name))
+}
 fn device_usable_bytes(name: &str) -> Result<Option<u64>> {
 	let device = format!("{}:{name}", local_host()?);
 	env!("RECIPE_DEVICE_USABLE_BYTES").split(';').filter_map(|entry| entry.split_once('=')).find(|(entry, _)| *entry == device)
@@ -28927,6 +29159,9 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			check(get_uuid(&mut uuid, device), "device UUID")?;
 			let uuid = uuid.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 			if env!("RECIPE_DEVICE_FENCED_UUIDS").split(';').any(|fenced| fenced == uuid) { continue; }
+			if env!("RECIPE_DEVICE_COLD_UUIDS").split(';').any(|cold| cold == uuid) {
+				COLD_DEVICES.get_or_init(Default::default).lock().map_err(|_| RecipeError::new("cold device set is poisoned"))?.insert(name.clone());
+			}
 			let identity = format!("GPU-{}-{}-{}-{}-{}", &uuid[..8], &uuid[8..12], &uuid[12..16], &uuid[16..20], &uuid[20..]);
 			let usable_bytes = device_usable_bytes(&identity)?.or(if std::env::var_os("CUDA_VISIBLE_DEVICES").is_none() { device_usable_bytes(&name)? } else { None });
 			if usable_bytes == Some(0) { continue; }
