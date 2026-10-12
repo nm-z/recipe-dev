@@ -11,23 +11,53 @@ fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let width = qwen4exp.embedding_length;
 	let (lanes, rank) = (qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank);
-	let stream = lanes * width;
+	let channels = lanes * width;
 	let mean = 1.0 / lanes as f64;
 	// The mixer gates. The stream normalizes per lane under one scale over all of it;
 	// the read gate passes it down to `rank` and back up to a value per stream channel;
 	// the write gate is a value per lane, twice a sigmoid, so a zero injection is the
 	// plain residual. Every hyper-connection and the head read share the read gate.
-	let stream_norm = || norm(rms).groups(lanes);
-	let read = || [layer(rank).scale(mean).silu(), layer(stream).sigmoid()];
+	let stream_norm = || norm(rms).per(width);
+	let read = || [layer(rank).scale(mean).silu(), layer(channels).sigmoid()];
 	let write = || [layer(lanes), linear().scale(mean).sigmoid().scale(2.0)];
+
+	// Hashed n-gram embeddings (Engram-style) add into the stream before the blocks
+	// that read them. Each token hashes with its predecessors, cut at the end id,
+	// into one row per head of every order from two to ngram_size, from ranges of
+	// the host table that the file names; the rows never reach the device whole.
+	let rows = ngrams(qwen4exp.ple.ngram_size)
+		.heads(qwen4exp.ple.heads_per_ngram)
+		.multipliers(&qwen4exp.ple.layer_multipliers)
+		.ranges(&qwen4exp.ple.head_offsets, &qwen4exp.ple.head_vocab_sizes)
+		.ends(&[qwen4exp.ple.eos_token_id])
+		.absent(qwen4exp.ple.eos_token_id)
+		.image(qwen4exp.ple.image_token_id)
+		.table("per_layer_token_embd.weight");
+	// One scalar per lane gates the rows' value: the key the rows project to
+	// and the stream, each RMS-normalized per lane, agree by their dot product over
+	// the root of the lane width, squashed as sigmoid(sign(s) * sqrt(|s|)).
+	let gate = [
+		layer(channels).norm(rms).per(width) * stream().norm(rms).per(width),
+		fold(width),
+		scalar(|s| {
+			let s = s * (1.0 / (width as f64).sqrt());
+			(s.sign() * s.abs().max(1e-6).sqrt()).sigmoid()
+		}),
+	];
+	// The gated value joins the stream with its own normalized, silu-activated
+	// causal convolution, whose taps sit ngram_size positions apart.
+	let ple = [
+		rows,
+		outer(gate, layer(width)),
+		identity() + [norm(rms).per(width), dconv(qwen4exp.ple.conv_kernel).dilation(qwen4exp.ple.ngram_size).silu()],
+	];
 
 	let mut model = recipe.model()
 		.e(qwen4exp.attention.layer_norm_rms_epsilon)
 		.embed(tokenizer.ggml.tokens, width);
 
 	for block in 0..qwen4exp.block_count {
-		// Hashed n-gram embeddings join the stream before the blocks that read them.
-		if qwen4exp.ple.layers.contains(&block) { model = model.ple(&ngram); }
+		if qwen4exp.ple.layers.contains(&block) { model = model.inject(ple.clone()); }
 
 		// Token mixing.
 		model = model.hyper_gated(lanes, stream_norm(), read(), write(), &if (block + 1) % qwen4exp.full_attention_interval == 0 {

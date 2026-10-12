@@ -11782,11 +11782,30 @@ mod ngram {
 		pub fn rows(&self, ids: &[u32], position: usize) -> Vec<usize> {
 			self.hash.rows_at(ids, position)
 		}
-		/// The per-layer embedding block this table feeds: `heads` rows of `width`
-		/// per token, a `kernel`-wide depthwise convolution dilated by the n-gram
-		/// size, and the table's row count.
-		pub(super) fn block(&self) -> PleBlock {
-			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone() }
+		/// The lookup this table describes: its name, its rows, their width, and the
+		/// hash that addresses them.
+		pub(super) fn lookup_block(&self) -> NgramLookup {
+			NgramLookup { hash: self.hash.clone(), table: self.table.name.clone(), rows: self.rows, width: self.width }
+		}
+		/// The branch a per-layer embedding injects into the stream, declared with
+		/// the same blocks a model file writes: the hashed rows; the gate that the
+		/// stream and the rows' key agree on, one scalar per lane, scaling the
+		/// rows' value broadcast over the lanes; and that product plus its own
+		/// normalized, dilated depthwise convolution.
+		pub(super) fn branch(&self) -> Result<Vec<Block>> {
+			let architecture = self.model.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
+			let width = self.model.integer_at(&format!("{architecture}.embedding_length"))?;
+			let lanes = self.model.value(&format!("{architecture}.hyper_connection.count")).and_then(GgufValue::integer).map_or(1, |count| (count as usize).max(1));
+			let lookup = Block::of(Operation::Ngram(intern_ngram(self.lookup_block())));
+			let gate = Block::from([
+				layer(lanes * width).norm(rms).per(width) * stream().norm(rms).per(width),
+				fold(width),
+				scalar(|score| {
+					let score = score * (1.0 / (width as f64).sqrt());
+					(score.sign() * score.abs().max(1e-6).sqrt()).sigmoid()
+				}),
+			]);
+			Ok(vec![lookup, outer(gate, layer(width)), identity() + [norm(rms).per(width), dconv(self.kernel).dilation(self.hash.ngram).silu()]])
 		}
 		/// The rows one token addresses, concatenated, decoded from their own bytes.
 		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
@@ -12076,7 +12095,12 @@ mod bundle {
 					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code(),
 					normalization_text(Some(delta.qk)), normalization_text(Some(delta.out_norm)), delta.write.code(), delta.decay.code(), delta.query_scale.code()
 			),
-			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Ngram(lookup) => format!("ngrams,{},{},{},{}", lookup.rows, lookup.width, lookup.table, lookup.hash.text()),
+			Operation::Inject(parts) => format!("inject,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Stream => "stream".to_owned(),
+			Operation::Fold(group) => format!("fold,{group}"),
+			Operation::Expression(words) => format!("expression,{}", words.iter().map(|word| word.to_bits().to_string()).collect::<Vec<_>>().join(":")),
+			Operation::Outer(left, right) => format!("outer,{},{}", product_branch_text(left), product_branch_text(right)),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
@@ -12182,11 +12206,11 @@ mod bundle {
 			"residual" => Ok(Operation::Residual(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
 			"sequence" => Ok(Operation::Sequence(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
 			"ensemble" => Ok(Operation::Ensemble(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
-			"product" | "sum" => {
+			"product" | "sum" | "outer" => {
 				let branches = split_escaped(rest, ',');
 				require(branches.len() == 2, "parallel composition must contain two branches")?;
 				let (left, right) = (product_branch(&branches[0])?, product_branch(&branches[1])?);
-				Ok(if name == "sum" { Operation::Sum(left, right) } else { Operation::Product(left, right) })
+				Ok(match name { "sum" => Operation::Sum(left, right), "outer" => Operation::Outer(left, right), _ => Operation::Product(left, right) })
 			}
 			"moe_blocks" => {
 				let (head, experts) = rest.split_once(',').unwrap_or((rest, ""));
@@ -12259,14 +12283,16 @@ mod bundle {
 				};
 				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, qk, out_norm, write, decay, query_scale }))
 			}
-			"ple" => {
-				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
-				let (rows, kernel) = (value_at(fields.next(), "per-layer embedding rows")?, value_at(fields.next(), "per-layer embedding kernel")?);
-				let dilation = value_at(fields.next(), "per-layer embedding dilation")?;
+			"ngrams" => {
+				let (rows, width) = (value_at(fields.next(), "n-gram table rows")?, value_at(fields.next(), "n-gram table width")?);
+				let table = fields.next().ok_or_else(|| RecipeError::new("n-gram table name is absent"))?.to_owned();
 				let hash = RowHash::parse(&mut fields)?;
-				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
-				Ok(Operation::Ple(intern_ple(PleBlock { heads, width, rows, kernel, dilation, hash })))
+				Ok(Operation::Ngram(intern_ngram(NgramLookup { hash, table, rows, width })))
 			}
+			"inject" => Ok(Operation::Inject(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into())),
+			"stream" => Ok(Operation::Stream),
+			"fold" => Ok(Operation::Fold(value_at(Some(rest), "fold group")?)),
+			"expression" => Ok(Operation::Expression(rest.split(':').map(|word| value_at::<u64>(Some(word), "scalar program word").map(f64::from_bits)).collect::<Result<Vec<_>>>()?)),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -12289,12 +12315,12 @@ mod bundle {
 			let value = match step.map {
 				ActivationMap::Scalar(value) => format!("a:{}", activation_text(value)),
 				ActivationMap::Normalize(value) => format!("n:{}", normalization_text(Some(value))),
-				ActivationMap::Grouped(value, groups) => format!("g{groups}:{}", normalization_text(Some(value))),
+				ActivationMap::Grouped(value, group) => format!("g:{}x{group}", normalization_text(Some(value))),
 			};
 			format!("{value}:{}", precision_token(step.precision))
 		}).collect::<Vec<_>>().join("/");
-		let fold = block.fold.as_ref().map_or_else(String::new, |gates| format!("|{}", escape(&gates_text(gates))));
-		format!("{}|maps:{maps}|{}|{}|{}|{}|{}|{}|{}|{}|{}{fold}",
+		let collapse = block.collapse.as_ref().map_or_else(String::new, |gates| format!("|{}", escape(&gates_text(gates))));
+		format!("{}|maps:{maps}|{}|{}|{}|{}|{}|{}|{}|{}|{}{collapse}",
 			operation_text(&block.operation), block.quantization, u8::from(block.profile), normalization_text(block.qk), u8::from(block.frozen),
 			precision_token(block.precision), precision_token(block.kv_precision), precision_token(block.blck_precision), precision_token(block.qk_precision), precision_token(block.rope_precision))
 	}
@@ -12309,10 +12335,9 @@ mod bundle {
 			let map = match parts[0] {
 				"a" => ActivationMap::Scalar(activation(parts[1])?),
 				"n" => ActivationMap::Normalize(normalization(Some(parts[1]), "map normalization")?.ok_or_else(|| RecipeError::new("normalization map has no mode"))?),
-				kind if kind.starts_with('g') => {
-					let groups = value_at(Some(&kind[1..]), "normalization groups")?;
-					require(groups != 0, "normalization groups must be positive")?;
-					ActivationMap::Grouped(normalization(Some(parts[1]), "map normalization")?.ok_or_else(|| RecipeError::new("normalization map has no mode"))?, groups)
+				"g" => {
+					let (mode, group) = parts[1].split_once('x').ok_or_else(|| RecipeError::new("grouped normalization map has no group"))?;
+					ActivationMap::Grouped(normalization(Some(mode), "map normalization")?.ok_or_else(|| RecipeError::new("normalization map has no mode"))?, value_at(Some(group), "normalization group")?)
 				}
 				_ => return Err(RecipeError::new("semantic map has an invalid kind")),
 			};
@@ -12324,7 +12349,7 @@ mod bundle {
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
 			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
-			fold: fields.get(11).map(|fold| gates(&mut unescape(fold)?.split(',')).map(Some)).transpose()?.flatten(),
+			collapse: fields.get(11).map(|collapse| gates(&mut unescape(collapse)?.split(',')).map(Some)).transpose()?.flatten(),
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -12354,7 +12379,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, epsilon_explicit: true, exclusions, pending_frozen: false, pending_fold: None }))
+		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, epsilon_explicit: true, exclusions, pending_frozen: false, pending_collapse: None }))
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -12511,7 +12536,7 @@ mod bundle {
 			// parameter span for the frozen mask to cover.
 			let tables = model.blocks.iter().filter_map(|block| match &block.operation {
 				Operation::Embed(vocabulary, width) => Some(vocabulary.saturating_mul(*width)),
-				Operation::Ple(ple) => Some(ple.table()),
+				Operation::Inject(parts) => Some(parts.iter().map(|part| match &part.operation { Operation::Ngram(lookup) => lookup.table_values(), _ => 0 }).sum()),
 				_ => None,
 			});
 			require(self.frozen.len().saturating_add(tables.sum::<usize>()) == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
@@ -13344,6 +13369,137 @@ fn branch<const N: usize>(blocks: [Block; N]) -> BlockList {
 pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 	Block::of(Operation::Residual(branch(parts)))
 }
+/// A branch added into the stream it sits on, which stays whatever width and
+/// lanes it is. The first block of the branch reads no activation (`ngrams`) or
+/// the stream; `stream()` inside it reads the stream wherever it is needed.
+pub fn inject<const N: usize>(parts: [Block; N]) -> Block {
+	Block::of(Operation::Inject(branch(parts)))
+}
+/// Hashed rows of a host-resident GGUF table, one row per head of each order from
+/// two to `size`: each token and its `size - 1` predecessors hash into row ranges
+/// that `.heads(..)`, `.multipliers(..)` or `.seeds(..)`, `.ranges(..)`, `.ends(..)`,
+/// `.absent(..)`, `.image(..)` and `.table(..)` describe. Reads token ids, not an
+/// activation, and outputs the rows side by side.
+pub fn ngrams(size: usize) -> Block {
+	let hash = RowHash { ngram: size, per_order: 0, multipliers: Vec::new(), seeds: Vec::new(), offsets: Vec::new(), vocabularies: Vec::new(), ends: Vec::new(), absent: 0, image: 0 };
+	Block::of(Operation::Ngram(intern_ngram(NgramLookup { hash, table: String::new(), rows: 0, width: 0 })))
+}
+/// The stream an enclosing `inject` adds into, read where the branch needs it.
+pub fn stream() -> Block {
+	Block::of(Operation::Stream)
+}
+/// Sums every group of `group` channels into one.
+pub fn fold(group: usize) -> Block {
+	assert!(group != 0, "a fold group must be positive");
+	Block::of(Operation::Fold(group))
+}
+/// Passes its input through unchanged, so a sum can add a branch to it.
+pub fn identity() -> Block {
+	Block::of(Operation::Identity)
+}
+/// A depthwise convolution of `kernel` taps over each channel's own positions;
+/// `.dilation(n)` spaces the taps.
+pub fn dconv(kernel: usize) -> Block {
+	Block::of(Operation::Dconv(kernel, 1))
+}
+/// The outer product of `scalars`, one value per lane, with `vector`: one scaled
+/// copy of the vector per scalar, side by side.
+pub fn outer(scalars: impl Into<Block>, vector: impl Into<Block>) -> Block {
+	Block::of(Operation::Outer(
+		ProductBranch { blocks: [scalars.into()].into(), exclusions: 0 },
+		ProductBranch { blocks: [vector.into()].into(), exclusions: 0 },
+	))
+}
+/// One elementwise function of its input, written as an expression:
+/// `scalar(|x| (x * 0.5).sigmoid())`.
+pub fn scalar(function: impl FnOnce(Scalar) -> Scalar) -> Block {
+	let result = function(Scalar(std::rc::Rc::new(ScalarNode::Input)));
+	let mut program = ScalarProgram(Vec::new());
+	result.compile(&mut program, &mut std::collections::HashMap::new());
+	assert!(!program.0.is_empty(), "a scalar function must compute something");
+	Block::of(Operation::Expression(program.0))
+}
+/// A value in a `scalar` expression, which is built once and lowers to one
+/// elementwise node.
+#[derive(Clone)]
+pub struct Scalar(std::rc::Rc<ScalarNode>);
+enum ScalarNode {
+	Input,
+	Constant(f64),
+	Unary(ScalarOpcode, Scalar),
+	Binary(ScalarOpcode, Scalar, Scalar),
+	Sign(Scalar),
+	Max(Scalar, Scalar),
+	Sigmoid(Scalar),
+}
+impl Scalar {
+	fn node(node: ScalarNode) -> Self { Self(std::rc::Rc::new(node)) }
+	pub fn abs(&self) -> Self { Self::node(ScalarNode::Unary(ScalarOpcode::Absolute, self.clone())) }
+	pub fn sqrt(&self) -> Self { Self::node(ScalarNode::Unary(ScalarOpcode::SquareRoot, self.clone())) }
+	pub fn exp(&self) -> Self { Self::node(ScalarNode::Unary(ScalarOpcode::Exp, self.clone())) }
+	/// One for a positive value, minus one for a negative one, zero at zero.
+	pub fn sign(&self) -> Self { Self::node(ScalarNode::Sign(self.clone())) }
+	/// The larger of this value and `other`.
+	pub fn max(&self, other: impl Into<Scalar>) -> Self { Self::node(ScalarNode::Max(self.clone(), other.into())) }
+	/// `1 / (1 + exp(-x))`.
+	pub fn sigmoid(&self) -> Self { Self::node(ScalarNode::Sigmoid(self.clone())) }
+	/// Appends the instructions that compute this value, once per shared
+	/// subexpression, and returns its operand.
+	fn compile(&self, program: &mut ScalarProgram, done: &mut std::collections::HashMap<*const ScalarNode, f64>) -> f64 {
+		let key = std::rc::Rc::as_ptr(&self.0);
+		if let Some(operand) = done.get(&key) {
+			return *operand;
+		}
+		let operand = match &*self.0 {
+			ScalarNode::Input => -1.0,
+			ScalarNode::Constant(value) => program.constant(*value),
+			ScalarNode::Unary(opcode, value) => {
+				let value = value.compile(program, done);
+				program.unary(*opcode, value)
+			}
+			ScalarNode::Binary(opcode, left, right) => {
+				let (left, right) = (left.compile(program, done), right.compile(program, done));
+				program.op(*opcode, left, right)
+			}
+			ScalarNode::Sign(value) => {
+				let value = value.compile(program, done);
+				let zero = program.constant(0.0);
+				let positive = program.op(ScalarOpcode::Greater, value, zero);
+				let negative = program.op(ScalarOpcode::Greater, zero, value);
+				program.op(ScalarOpcode::Subtract, positive, negative)
+			}
+			ScalarNode::Max(left, right) => {
+				let (left, right) = (left.compile(program, done), right.compile(program, done));
+				let above = program.op(ScalarOpcode::Greater, left, right);
+				program.choose(above, left, right)
+			}
+			ScalarNode::Sigmoid(value) => {
+				let value = value.compile(program, done);
+				let (zero, one) = (program.constant(0.0), program.constant(1.0));
+				let negated = program.op(ScalarOpcode::Subtract, zero, value);
+				let exponential = program.unary(ScalarOpcode::Exp, negated);
+				let denominator = program.op(ScalarOpcode::Add, one, exponential);
+				program.op(ScalarOpcode::Divide, one, denominator)
+			}
+		};
+		done.insert(key, operand);
+		operand
+	}
+}
+impl From<f64> for Scalar {
+	fn from(value: f64) -> Self { Self::node(ScalarNode::Constant(value)) }
+}
+macro_rules! scalar_operators { ($($trait:ident $method:ident = $opcode:ident;)+) => {$(
+	impl std::ops::$trait for Scalar {
+		type Output = Scalar;
+		fn $method(self, right: Scalar) -> Scalar { Scalar::node(ScalarNode::Binary(ScalarOpcode::$opcode, self, right)) }
+	}
+	impl std::ops::$trait<f64> for Scalar {
+		type Output = Scalar;
+		fn $method(self, right: f64) -> Scalar { Scalar::node(ScalarNode::Binary(ScalarOpcode::$opcode, self, right.into())) }
+	}
+)+}; }
+scalar_operators! { Add add = Add; Sub sub = Subtract; Mul mul = Multiply; Div div = Divide; }
 /// The equal-weight mean of members that read the same input and produce the same shape.
 pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
 	Block::of(Operation::Ensemble(branch(members)))
@@ -13516,22 +13672,19 @@ impl DeltaBlock {
 		Ok((keys, key, value, if self.output == 0 { channels } else { self.output }))
 	}
 }
-/// One per-layer embedding block: every token gathers `heads` rows of `width`
-/// from a host-resident table of `rows` rows, addressed by `hash`, and the block
-/// projects, gates, convolves and adds them into the stream it sits on. The
-/// depthwise convolution is `kernel` wide and dilated by `dilation` positions.
+/// A hashed lookup into a host-resident table: every token gathers `hash.heads()`
+/// rows of `width` from the `rows` rows of the GGUF tensor `table`, addressed by
+/// `hash`, and the block outputs them side by side.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PleBlock {
-	heads: usize,
-	width: usize,
-	rows: usize,
-	kernel: usize,
-	dilation: usize,
+struct NgramLookup {
 	hash: RowHash,
+	table: String,
+	rows: usize,
+	width: usize,
 }
-impl PleBlock {
+impl NgramLookup {
 	/// Values the table holds: its rows of the head width.
-	fn table(&self) -> usize {
+	fn table_values(&self) -> usize {
 		self.rows.saturating_mul(self.width)
 	}
 }
@@ -13555,11 +13708,11 @@ impl From<Vec<Block>> for BlockList {
 impl<const N: usize> From<[Block; N]> for BlockList {
 	fn from(blocks: [Block; N]) -> Self { Vec::from(blocks).into() }
 }
-fn intern_ple(ple: PleBlock) -> &'static PleBlock {
-	static DEFINITIONS: Mutex<Vec<&'static PleBlock>> = Mutex::new(Vec::new());
+fn intern_ngram(lookup: NgramLookup) -> &'static NgramLookup {
+	static DEFINITIONS: Mutex<Vec<&'static NgramLookup>> = Mutex::new(Vec::new());
 	let mut definitions = DEFINITIONS.lock().unwrap();
-	if let Some(previous) = definitions.iter().find(|previous| ***previous == ple) { return previous; }
-	let stored = Box::leak(Box::new(ple));
+	if let Some(previous) = definitions.iter().find(|previous| ***previous == lookup) { return previous; }
+	let stored = Box::leak(Box::new(lookup));
 	definitions.push(stored);
 	stored
 }
@@ -13603,7 +13756,22 @@ enum Operation {
 	Gated(usize, Gates, BlockList),
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
-	Ple(&'static PleBlock),
+	/// Rows of a host-resident table, addressed by hashing each token with its
+	/// predecessors. It reads no activation, only the token ids.
+	Ngram(&'static NgramLookup),
+	/// A branch added into the stream it sits on. The stream stays open around
+	/// it, the branch reads whatever its first block reads, and `Stream` inside it
+	/// reads the stream itself.
+	Inject(BlockList),
+	/// The stream an enclosing `Inject` adds into.
+	Stream,
+	/// Every group of this many channels summed into one.
+	Fold(usize),
+	/// One elementwise function of the input, as scalar program words.
+	Expression(Vec<f64>),
+	/// The outer product of a branch of per-lane scalars and a branch of vectors:
+	/// the vector scaled by each scalar in turn, one block of channels per scalar.
+	Outer(ProductBranch, ProductBranch),
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
 	/// Computes nothing. It carries a step that is only an activation or only
@@ -13777,9 +13945,8 @@ macro_rules! precision_methods {
 enum ActivationMap {
 	Scalar(Activation),
 	Normalize(BlockNormalization),
-	/// A normalization whose statistics are taken per group: the row splits into
-	/// that many equal groups, each normalized on its own under the one trainable
-	/// scale over the whole row.
+	/// A normalization of each group of this many channels on its own, under one
+	/// scale over the whole span.
 	Grouped(BlockNormalization, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13821,7 +13988,7 @@ pub struct Block {
 
 	/// The gates under which this block folds the hyper-connection stream open
 	/// before it, when it declares them.
-	fold: Option<Gates>,
+	collapse: Option<Gates>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -13867,7 +14034,7 @@ impl PartialEq for Block {
 			&& self.kv_precision == other.kv_precision
 			&& self.qk_precision == other.qk_precision
 			&& self.rope_precision == other.rope_precision
-			&& self.fold == other.fold
+			&& self.collapse == other.collapse
 	}
 }
 impl Eq for Block {}
@@ -13891,7 +14058,7 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, fold: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, collapse: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
@@ -13904,15 +14071,72 @@ impl Block {
 		self.maps.push(ActivationStep::new(ActivationMap::Normalize(normalization.normalization())));
 		self
 	}
-	/// Takes the statistics of the preceding `norm` per group: the row splits
-	/// into `groups` equal parts, each normalized on its own, under the one
-	/// trainable scale over the whole row. A stream of lanes normalizes per lane
-	/// with `.norm(rms).groups(lanes)`.
-	pub fn groups(mut self, groups: usize) -> Self {
-		assert!(groups != 0, "normalization groups must be positive");
-		let step = self.maps.last_mut().filter(|step| matches!(step.map, ActivationMap::Normalize(_))).expect("groups names the normalization before it");
-		step.map = ActivationMap::Grouped(step.normalization().expect("a normalization map"), groups);
+	/// Normalizes each group of `group` channels on its own, under one scale over
+	/// the whole width: `norm(rms).per(width)` on a stream of several lanes.
+	pub fn per(mut self, group: usize) -> Self {
+		assert!(group != 0, "a normalization group must be positive");
+		let step = self.maps.last_mut().filter(|step| step.normalization().is_some()).expect("per(...) requires a preceding norm(...)");
+		step.map = ActivationMap::Grouped(step.normalization().unwrap(), group);
 		self
+	}
+	/// The taps of this `dconv` block sit `positions` positions apart.
+	pub fn dilation(mut self, positions: usize) -> Self {
+		assert!(positions != 0, "depthwise convolution dilation must be positive");
+		match &mut self.operation {
+			Operation::Dconv(_, dilation) => *dilation = positions,
+			_ => panic!("dilation requires a preceding dconv block"),
+		}
+		self
+	}
+	fn lookup(mut self, selector: &str, apply: impl FnOnce(&mut NgramLookup)) -> Self {
+		match &self.operation {
+			Operation::Ngram(lookup) => {
+				let mut edited = (**lookup).clone();
+				apply(&mut edited);
+				self.operation = Operation::Ngram(intern_ngram(edited));
+			}
+			_ => panic!("{selector} requires a preceding ngrams block"),
+		}
+		self
+	}
+	/// Heads per n-gram order of this `ngrams` block: each order hashes its leading
+	/// ids once per head.
+	pub fn heads(self, per_order: usize) -> Self {
+		self.lookup("heads", |lookup| lookup.hash.per_order = per_order)
+	}
+	/// The fold of this `ngrams` block: each id of the context times its multiplier,
+	/// xored together.
+	pub fn multipliers(self, multipliers: &[usize]) -> Self {
+		self.lookup("multipliers", |lookup| lookup.hash.multipliers = multipliers.iter().map(|value| *value as u64).collect())
+	}
+	/// The fold of this `ngrams` block as one seed per head, mixing each id into it.
+	pub fn seeds(self, seeds: &[usize]) -> Self {
+		self.lookup("seeds", |lookup| lookup.hash.seeds = seeds.iter().map(|value| *value as u64).collect())
+	}
+	/// The rows each head of this `ngrams` block lands in: head `h` addresses
+	/// `offsets[h] + hash % vocabularies[h]`.
+	pub fn ranges(self, offsets: &[usize], vocabularies: &[usize]) -> Self {
+		self.lookup("ranges", |lookup| (lookup.hash.offsets, lookup.hash.vocabularies) = (offsets.iter().map(|value| *value as u64).collect(), vocabularies.iter().map(|value| *value as u64).collect()))
+	}
+	/// The ids that end the context of this `ngrams` block: a predecessor at or
+	/// behind one reads as absent.
+	pub fn ends(self, ids: &[usize]) -> Self {
+		self.lookup("ends", |lookup| lookup.hash.ends = ids.iter().map(|id| u32::try_from(*id).expect("an end id fits u32")).collect())
+	}
+	/// The id a predecessor outside the context of this `ngrams` block hashes as.
+	pub fn absent(self, id: usize) -> Self {
+		self.lookup("absent", |lookup| lookup.hash.absent = id as u64)
+	}
+	/// The id a position without a token hashes as in this `ngrams` block.
+	pub fn image(self, id: usize) -> Self {
+		self.lookup("image", |lookup| lookup.hash.image = id as u64)
+	}
+	/// The GGUF tensor this `ngrams` block reads rows of, `[width, rows]`.
+	pub fn table(self, name: &str) -> Self {
+		let tensor = script_file().tensor(name).unwrap_or_else(|| panic!("n-gram table {name:?} is absent"));
+		assert!(tensor.shape.len() == 2, "n-gram table {name:?} must be [width, rows]");
+		let (width, rows) = (tensor.shape[0] as usize, tensor.shape[1] as usize);
+		self.lookup("table", |lookup| (lookup.table, lookup.width, lookup.rows) = (name.to_owned(), width, rows))
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
 		let normalization = normalization.normalization();
@@ -14045,7 +14269,7 @@ pub struct ModelData {
 	/// The qualifier pending for the next block.
 	pending_frozen: bool,
 	/// The gates under which the next block folds the open hyper-connection stream.
-	pending_fold: Option<Gates>,
+	pending_collapse: Option<Gates>,
 	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
 	exclusions: u8,
 }
@@ -14137,7 +14361,7 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		assert!(operation.weighted() || !self.pending_frozen, "{} owns no weights to qualify", operation.name());
-		assert!(self.pending_fold.is_none() || !matches!(operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Ple(_)), "a collapse precedes a block that reads the folded stream, and {} keeps the stream open", operation.name());
+		assert!(self.pending_collapse.is_none() || !matches!(operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Inject(..)), "a collapse precedes a block that reads the folded stream, and {} keeps the stream open", operation.name());
 		self.edit(|model| {
 			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
@@ -14152,7 +14376,7 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
-				fold: model.pending_fold.take(),
+				collapse: model.pending_collapse.take(),
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14161,7 +14385,7 @@ impl Model {
 	/// Clones a model that a block suffix extends, so a pending qualifier cannot outlive its block.
 	fn suffix(&self) -> Self {
 		assert!(!self.pending_frozen, "block qualifier requires a following block");
-		assert!(self.pending_fold.is_none(), "a collapse requires a following block");
+		assert!(self.pending_collapse.is_none(), "a collapse requires a following block");
 		self.clone()
 	}
 	/// Excludes a default from this model. The exclusion applies to every weighted
@@ -14365,7 +14589,7 @@ impl Model {
 		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone().into()))
 	}
 	/// Hyper-connections with declared gates. `norm` normalizes the stream of
-	/// `lanes` copies of the width (`norm(rms).groups(lanes)` takes the statistics
+	/// `lanes` copies of the width (`norm(rms).per(width)` takes the statistics
 	/// per lane under one scale over the stream). `read` runs from that normalized
 	/// stream to one gate per stream channel, which the branch reads under; `write`
 	/// runs from it to one gate per lane, which the branch output is written back
@@ -14381,14 +14605,19 @@ impl Model {
 	/// that ends without one folds under its default gates.
 	pub fn collapse<const R: usize>(&self, norm: Block, read: [Block; R]) -> Self {
 		assert!(R != 0, "a collapse needs a read gate");
-		assert!(self.pending_fold.is_none(), "a collapse is already pending for the next block");
-		self.edit(|model| model.pending_fold = Some(Gates { norm: [norm].into(), read: read.into(), write: BlockList(Vec::new()) }))
+		assert!(self.pending_collapse.is_none(), "a collapse is already pending for the next block");
+		self.edit(|model| model.pending_collapse = Some(Gates { norm: [norm].into(), read: read.into(), write: BlockList(Vec::new()) }))
+	}
+	/// A branch added into the stream: `inject([ngrams(..), ..])`.
+	pub fn inject<const N: usize>(&self, parts: [Block; N]) -> Self {
+		self.push(Operation::Inject(branch(parts)))
 	}
 	/// Per-layer embedding: every token gathers `table`'s rows on the host, and the
-	/// block projects, gates and convolves them into the stream it sits on, at
-	/// whatever width the stream has there.
+	/// block projects, gates and convolves them into the stream it sits on. It is
+	/// the `inject` of the blocks `table` declares, which a model file may write
+	/// out itself.
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
-		self.push(Operation::Ple(intern_ple(table.block())))
+		self.push(Operation::Inject(table.branch().unwrap_or_else(|error| panic!("{error}")).into()))
 	}
 	/// Normalizes the preceding block's output. Leading a model, it normalizes
 	/// the model input before the first block, which is the pre-normalization
@@ -14471,7 +14700,7 @@ impl Model {
 				let mut scale = Block::of(Operation::Identity);
 				scale.maps.push(step);
 				// The fold closes the stream before the final scale reads it.
-				scale.fold = model.blocks[projection].fold.take();
+				scale.collapse = model.blocks[projection].collapse.take();
 				model.blocks.insert(projection, scale);
 			}
 		})
@@ -14526,7 +14755,12 @@ impl Model {
 				"delta({},{}).conv_activation({}).output_gate({}).qk({}).out_norm({}).write({}).decay({:?}).query_scale({:?})",
 				delta.heads, delta.kernel, delta.conv_activation.name(), delta.output_activation.name(), delta.qk.name(), delta.out_norm.name(), delta.write.name(), delta.decay, delta.query_scale
 			),
-			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
+			Operation::Ngram(lookup) => format!("ngrams({}).heads({}).table({:?})", lookup.hash.ngram, lookup.hash.per_order, lookup.table),
+			Operation::Inject(parts) => format!("inject([{}])", Self::describe_parts(parts)),
+			Operation::Stream => "stream()".to_owned(),
+			Operation::Fold(group) => format!("fold({group})"),
+			Operation::Expression(words) => format!("scalar({} ops)", words.len() / 3),
+			Operation::Outer(left, right) => format!("outer([{}], [{}])", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
 			Operation::Join(lanes) => format!("join({lanes})"),
 			Operation::Sequence(parts) => format!("seq([{}])", Self::describe_parts(parts)),
 			Operation::Sum(left, right) => format!("({} + {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
@@ -14534,7 +14768,7 @@ impl Model {
 			Operation::Last => "last()".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu({hidden},{})", activation.name()),
 		};
-		if let Some(gates) = &block.fold {
+		if let Some(gates) = &block.collapse {
 			text.insert_str(0, &format!("collapse({}).", Self::describe_gates(gates)));
 		}
 		if block.frozen {
@@ -14555,7 +14789,7 @@ impl Model {
 				ActivationMap::Scalar(Activation::Scale(bits)) => format!("scale({})", f64::from_bits(bits)),
 				ActivationMap::Scalar(activation) => format!("{}()", activation.name()),
 				ActivationMap::Normalize(mode) => format!("norm({})", normalization(mode)),
-				ActivationMap::Grouped(mode, groups) => format!("norm({}).groups({groups})", normalization(mode)),
+				ActivationMap::Grouped(mode, group) => format!("norm({}).per({group})", normalization(mode)),
 			};
 			if !text.is_empty() { text.push('.'); }
 			text.push_str(&map);
@@ -16037,7 +16271,12 @@ impl Operation {
 			Self::Hyper(..) | Self::Gated(..) => "hyper",
 			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
-			Self::Ple(_) => "ple",
+			Self::Ngram(_) => "ngrams",
+			Self::Inject(_) => "inject",
+			Self::Stream => "stream",
+			Self::Fold(_) => "fold",
+			Self::Expression(_) => "expression",
+			Self::Outer(..) => "outer",
 			Self::Glu(..) => "glu",
 		}
 	}
@@ -16049,6 +16288,9 @@ impl Operation {
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
 			Self::Residual(parts) | Self::Sequence(parts) | Self::MoeBlocks(_, _, parts) => weighted_parts(parts),
 			Self::Product(left, right) | Self::Sum(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
+			Self::Outer(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
+			Self::Inject(parts) => weighted_parts(parts),
+			Self::Stream | Self::Fold(_) | Self::Expression(_) => false,
 			Self::Identity => false,
 			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
 			Self::Gated(..) => true,
@@ -16479,7 +16721,7 @@ impl Recipe {
 	/// declares, or the Cargo default when no file is open.
 	pub fn model(&self) -> Model {
 		let epsilon = SCRIPT_FILE.get().and_then(|(_, file)| file.rms_epsilon()).unwrap_or_else(|| default_epsilon().unwrap_or_else(|error| panic!("{error}")));
-		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, pending_fold: None, exclusions: 0 })
+		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, pending_collapse: None, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
@@ -18227,6 +18469,11 @@ pub struct PleKeys {
 	pub conv_kernel: usize,
 	pub eos_token_id: usize,
 	pub image_token_id: usize,
+	/// The multiplier each id of the hashed context is folded with.
+	pub layer_multipliers: Vec<u64>,
+	/// The first row of each head's range of the table, and the rows in it.
+	pub head_offsets: Vec<u64>,
+	pub head_vocab_sizes: Vec<u64>,
 }
 pub struct AttentionKeys {
 	pub compress_ratios: Vec<usize>,
@@ -18271,6 +18518,7 @@ impl ArchitectureKeys {
 		let count = |key: &str| file.value(&format!("{prefix}.{key}")).and_then(GgufValue::integer).map_or(0, |value| value as usize);
 		let real = |key: &str, default: f64| file.value(&format!("{prefix}.{key}")).and_then(GgufValue::float).unwrap_or(default);
 		let or = |value: usize, default: usize| if value == 0 { default } else { value };
+		let list = |key: &str| if file.value(&format!("{prefix}.{key}")).is_some() { file.integers_at(&format!("{prefix}.{key}")).unwrap_or_else(|error| panic!("{error}")) } else { Vec::new() };
 		let (embedding_length, head_count) = (count("embedding_length"), count("attention.head_count"));
 		let key_length = or(count("attention.key_length"), embedding_length / head_count.max(1));
 		let compress_ratios = match file.value(&format!("{prefix}.attention.compress_ratios")) {
@@ -18305,6 +18553,9 @@ impl ArchitectureKeys {
 				conv_kernel: count("ple.conv_kernel"),
 				eos_token_id: count("ple.eos_token_id"),
 				image_token_id: count("ple.image_token_id"),
+				layer_multipliers: list("ple.layer_multipliers"),
+				head_offsets: list("ple.head_offsets"),
+				head_vocab_sizes: list("ple.head_vocab_sizes"),
 			},
 			attention: AttentionKeys {
 				compress_ratios,
@@ -18898,7 +19149,7 @@ fn with_last_projection(model: &Model) -> Model {
 		return model.edit(|model| {
 			// The fold closes the stream before the last position is kept.
 			let mut last = Block::of(Operation::Last);
-			last.fold = model.blocks[index].fold.take();
+			last.collapse = model.blocks[index].collapse.take();
 			model.blocks.insert(index, last)
 		});
 	}
@@ -19016,17 +19267,57 @@ fn mixes(parts: &[Block]) -> bool {
 	})
 }
 
+/// What a declared per-layer embedding binds, in the order lowering emits it:
+/// its table lookup, a projection to its width, the scale of a normalization
+/// (its group width), the taps of a depthwise convolution (kernel, dilation).
+#[derive(Debug, PartialEq, Eq)]
+enum PleStep {
+	Table(NgramLookup),
+	Project(usize),
+	Scale(usize),
+	Taps(usize, usize),
+}
+/// The weighted steps of an injected branch, in lowering order.
+fn declared_ple(parts: &[Block]) -> Result<Vec<PleStep>> {
+	fn visit(blocks: &[Block], steps: &mut Vec<PleStep>) -> Result<()> {
+		for block in blocks {
+			match &block.operation {
+				Operation::Ngram(lookup) => steps.push(PleStep::Table((**lookup).clone())),
+				Operation::Layer(outputs) => steps.push(PleStep::Project(*outputs)),
+				Operation::Dconv(kernel, dilation) => steps.push(PleStep::Taps(*kernel, *dilation)),
+				Operation::Sequence(parts) | Operation::Inject(parts) => visit(parts, steps)?,
+				Operation::Product(left, right) | Operation::Sum(left, right) | Operation::Outer(left, right) => {
+					visit(&left.blocks, steps)?;
+					visit(&right.blocks, steps)?;
+				}
+				Operation::Identity | Operation::Stream | Operation::Fold(_) | Operation::Expression(_) => {}
+				other => return Err(RecipeError::new(format!("{} inside a per-layer embedding has no tensor naming convention", other.name()))),
+			}
+			for step in &block.maps {
+				match step.map {
+					ActivationMap::Normalize(BlockNormalization::Rms) => steps.push(PleStep::Scale(0)),
+					ActivationMap::Grouped(BlockNormalization::Rms, group) => steps.push(PleStep::Scale(group)),
+					_ => {}
+				}
+			}
+		}
+		Ok(())
+	}
+	let mut steps = Vec::new();
+	visit(parts, &mut steps)?;
+	Ok(steps)
+}
 impl Builder<'_> {
 	/// Bind the user-declared model in the order lowering emits weighted nodes.
 	fn plan_model(&mut self, model: &Model) -> Result<()> {
-		require(model.pending_fold.is_none(), "a collapse requires a following block")?;
+		require(model.pending_collapse.is_none(), "a collapse requires a following block")?;
 		let embedding = self.tensor("token_embd.weight", "the embedding")?;
 		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
 		let (mut layers, mut lanes, mut rank, mut declared) = (0, 0, 0, false);
 		for block in &model.blocks {
-			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Ple(..)) {
-				match &block.fold {
+			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Inject(..)) {
+				match &block.collapse {
 					Some(gates) => {
 						require(declared, "a declared collapse follows a stream of declared hyper-connections")?;
 						let stream = checked_mul(lanes, width, "head mixer stream")?;
@@ -19044,10 +19335,20 @@ impl Builder<'_> {
 					require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
 					self.mapped(vec![embedding.clone()]);
 				}
-				Operation::Ple(formula) => {
+				// An injection of hashed rows binds the GGUF per-layer embedding tensors
+				// of the block it precedes; what it declares must be what the file's
+				// metadata and tensors describe.
+				Operation::Inject(parts) => {
 					let table = Ngram::new(self.file)?;
-					require(**formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
-					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
+					let declared = declared_ple(parts)?;
+					let (Some(PleStep::Table(lookup)), rest) = (declared.first(), declared.get(1..).unwrap_or(&[])) else {
+						return Err(RecipeError::new("an injection binds GGUF tensors only as a per-layer embedding, which starts with its ngrams(..) rows"));
+					};
+					require(*lookup == table.lookup_block(), "per-layer embedding definition differs from the GGUF table metadata")?;
+					let stream = checked_mul(lanes.max(1), width, "per-layer embedding stream")?;
+					let expected = [PleStep::Project(stream), PleStep::Scale(width), PleStep::Scale(width), PleStep::Project(width), PleStep::Scale(width), PleStep::Taps(table.kernel(), table.hash().ngram)];
+					require(rest == expected, format!("per-layer embedding declares {rest:?}; the GGUF metadata binds {expected:?}"))?;
+					self.ple_planes(layers, &table, width, lanes.max(1))?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts) | Operation::Gated(_, _, parts) => {
 					let attends = mixes(parts);
@@ -21310,6 +21611,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		lanes: graph.lanes,
 		rank: graph.rank,
 		declared: graph.declared,
+		streams: Vec::new(),
 		stored: graph.stored[start..end].to_vec(),
 		requantize: graph.requantize[start..end].to_vec(),
 		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
@@ -22150,6 +22452,9 @@ struct Graph {
 	rank: usize,
 	/// The open stream's gates were declared, so its end must declare a collapse.
 	declared: bool,
+	/// The streams the injections being lowered add into, innermost last: the node
+	/// holding each and its shape.
+	streams: Vec<(i32, Shape)>,
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
@@ -22191,6 +22496,7 @@ impl Graph {
 			lanes: 0,
 			rank: 0,
 			declared: false,
+			streams: Vec::new(),
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
@@ -22267,16 +22573,17 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 }
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
-		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
+		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ngram(..) | Operation::Inject(..) | Operation::Last | Operation::Recur(..) => true,
 		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
+		Operation::Outer(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(_, _, blocks) | Operation::Gated(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
 }
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
-	require(model.pending_fold.is_none(), "a collapse requires a following block")?;
+	require(model.pending_collapse.is_none(), "a collapse requires a following block")?;
 	if let Some((index, format)) = model.blocks.iter().enumerate().map(|(index, block)| (index, StorageFormat(block.quantization))).find(|(_, format)| format.0 != 0 && !format.valid()) {
 		return Err(RecipeError::new(format!("block {index} {}: {}", model.blocks[index].operation.name(), format.unavailable())));
 	}
@@ -22463,15 +22770,15 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	Ok(graph.source)
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
-	// A per-layer embedding adds into the lanes-wide stream itself, so it keeps
+	// An injection adds into the lanes-wide stream itself, so it keeps
 	// the stream open as a hyper-connection block does.
-	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Ple(..)) {
-		match &block.fold {
+	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Gated(..) | Operation::Inject(..)) {
+		match &block.collapse {
 			Some(gates) => lower_declared_collapse(graph, gates, total, data, targets, rows, gpu, config)?,
 			None => lower_collapse(graph, config)?,
 		}
 	} else {
-		require(block.fold.is_none(), format!("{} declares a collapse, which folds an open hyper-connection stream before a block that reads one lane", block.operation.name()))?;
+		require(block.collapse.is_none(), format!("{} declares a collapse, which folds an open hyper-connection stream before a block that reads one lane", block.operation.name()))?;
 	}
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
@@ -22492,7 +22799,12 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
-		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
+		Operation::Ngram(lookup) => lower_ngram(graph, lookup)?,
+		Operation::Inject(parts) => lower_inject(graph, parts, total, data, targets, rows, gpu, config)?,
+		Operation::Stream => lower_stream(graph)?,
+		Operation::Fold(group) => lower_fold(graph, *group)?,
+		Operation::Expression(words) => push_program(graph, -2, &[], ScalarProgram(words.clone()))?,
+		Operation::Outer(left, right) => lower_outer(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -22529,10 +22841,10 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 				let channels = graph.output.channels;
 				lower_normalize(graph, normalization, channels, channels)?;
 			}
-			ActivationMap::Grouped(normalization, groups) => {
+			ActivationMap::Grouped(normalization, group) => {
 				let channels = graph.output.channels;
-				require(channels % groups == 0, format!("{channels} channels do not split into {groups} normalization groups"))?;
-				lower_normalize(graph, normalization, channels / groups, channels)?;
+				require(channels % group == 0, format!("{channels} channels do not split into normalization groups of {group}"))?;
+				lower_normalize(graph, normalization, group, channels)?;
 			}
 		}
 		graph.block_precision = precision;
@@ -23057,76 +23369,88 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 	require(kernel != 0 && dilation != 0, "depthwise convolution kernel and dilation must be positive")?;
 	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, dilation as f64), -2)
 }
-/// A per-layer embedding. The rows one token addresses are gathered on the host
-/// and staged for the device, which projects them to a key and a value without
-/// a bias. The key and the stream take grouped root-mean-square norms over one
-/// lane with a scale over every lane; their per-lane dot product over the root of
-/// the lane width, through a signed square root and a sigmoid, gates the value
-/// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
-/// dilated by the n-gram size and a SiLU form the second term, and both add into
-/// the stream, which keeps its width.
-fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
-	let (stream, shape) = (graph.source, graph.output);
-	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
-	require(ple.heads != 0 && ple.width != 0 && ple.kernel != 0 && ple.dilation != 0, "per-layer embedding dimensions must be positive")?;
-	ple.hash.validate()?;
-	require(ple.hash.heads() == ple.heads, format!("per-layer embedding names {} heads, its hash addresses {}", ple.heads, ple.hash.heads()))?;
-	require(ple.hash.rows() <= ple.rows, format!("per-layer embedding table holds {} rows, its hash reaches row {}", ple.rows, ple.hash.rows()))?;
-	let lanes = graph.lanes.max(1);
-	require(shape.channels != 0 && shape.channels % lanes == 0, format!("per-layer embedding stream of {} does not split into {lanes} lanes", shape.channels))?;
-	let channels = shape.channels / lanes;
-	let gathered = Shape { channels: checked_mul(ple.heads, ple.width, "per-layer embedding width")?, length: shape.length };
-	// The lookup reads the ids on the host, so it names no device source; the
-	// hash rides beside the node as program words.
-	let (program_offset, words) = (graph.programs.len(), ple.hash.words());
+/// Rows hashed from the token ids and gathered on the host, staged for the
+/// device as one vector per position. The node reads no device activation; the
+/// hash rides beside it as program words.
+fn lower_ngram(graph: &mut Graph, lookup: &NgramLookup) -> Result<()> {
+	let length = graph.output.length;
+	let heads = lookup.hash.heads();
+	require(heads != 0 && lookup.width != 0 && lookup.rows != 0, format!("n-gram lookup {:?} names no table rows; ngrams(..) takes .heads(..) and .table(..)", lookup.table))?;
+	lookup.hash.validate()?;
+	require(lookup.hash.rows() <= lookup.rows, format!("n-gram table holds {} rows, its hash reaches row {}", lookup.rows, lookup.hash.rows()))?;
+	let gathered = Shape { channels: checked_mul(heads, lookup.width, "n-gram lookup width")?, length };
+	let (program_offset, words) = (graph.programs.len(), lookup.hash.words());
 	let program_count = words.len().div_ceil(3);
 	graph.programs.extend(words);
 	graph.programs.resize(program_offset + program_count * 3, 0.0);
-	reset(graph, -2, Shape { channels: 1, length: shape.length });
-	let argument = [ple.heads as f64, ple.width as f64, ple.rows as f64, ple.kernel as f64, ple.dilation as f64, 0.0, 0.0, 0.0, 0.0];
+	reset(graph, -2, Shape { channels: 1, length });
+	let argument = [heads as f64, lookup.width as f64, lookup.rows as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 	push_node(graph, Primitive::Lookup, gathered, 0, argument, -2)?;
 	if let Some(node) = graph.nodes.last_mut() {
 		(node.program_offset, node.program_count) = (program_offset, program_count);
 	}
-	let rows = graph.source;
-	lower_project(graph, shape.channels)?;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
-	let key = graph.source;
-	reset(graph, stream, shape);
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
-	let query = graph.source;
-	binary(graph, key, query, shape, ScalarOpcode::Multiply)?;
-	push_node(graph, Primitive::Fold, Shape { channels: lanes, length: shape.length }, 0, arguments(channels as f64, 0.0), -2)?;
-	// gate = sigmoid(sign(s) * sqrt(max(|s|, 1e-6))) for s the scaled dot product.
-	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
-	let scale = program.constant(1.0 / (channels as f64).sqrt());
-	let s = program.op(ScalarOpcode::Multiply, x, scale);
-	let (zero, one) = (program.constant(0.0), program.constant(1.0));
-	let magnitude = program.unary(ScalarOpcode::Absolute, s);
-	let floor = program.constant(1e-6);
-	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
-	let clamped = program.choose(above, magnitude, floor);
-	let root = program.unary(ScalarOpcode::SquareRoot, clamped);
-	let positive = program.op(ScalarOpcode::Greater, s, zero);
-	let negative = program.op(ScalarOpcode::Greater, zero, s);
-	let sign = program.op(ScalarOpcode::Subtract, positive, negative);
-	let signed = program.op(ScalarOpcode::Multiply, sign, root);
-	let negated = program.op(ScalarOpcode::Subtract, zero, signed);
-	let exponential = program.unary(ScalarOpcode::Exp, negated);
-	let denominator = program.op(ScalarOpcode::Add, one, exponential);
-	program.op(ScalarOpcode::Divide, one, denominator);
-	push_program(graph, -2, &[], program)?;
-	let gate = graph.source;
-	reset(graph, rows, gathered);
-	lower_project(graph, channels)?;
-	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), gate)?;
-	let gated = graph.source;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
-	lower_dconv(graph, ple.kernel, ple.dilation)?;
-	lower_activation(graph, Activation::Silu, config)?;
-	let convolved = graph.source;
-	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
-	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
+	Ok(())
+}
+/// Adds a branch into the stream the block sits on, which stays open with its
+/// lanes. The branch lowers with no lanes of its own and reads the stream
+/// through `stream()`; the sum is the stream first, then the branch.
+fn lower_inject(graph: &mut Graph, parts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let (stream, shape) = (graph.source, graph.output);
+	require(stream >= 0, "an injection follows the block whose stream it adds into")?;
+	require(!parts.is_empty(), "an injection must contain a block")?;
+	let (outer_frozen, outer_kind, lanes) = (graph.block_frozen, graph.block_kind, graph.lanes);
+	graph.lanes = 0;
+	graph.streams.push((stream, shape));
+	for part in parts {
+		graph.block_frozen = outer_frozen || part.frozen;
+		graph.block_kind = part.operation.name();
+		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
+	}
+	graph.streams.pop();
+	(graph.block_frozen, graph.block_kind, graph.lanes) = (outer_frozen, outer_kind, lanes);
+	require(graph.output == shape, format!("an injected branch outputs {}x{}, the stream it adds into is {}x{}", graph.output.channels, graph.output.length, shape.channels, shape.length))?;
+	let branch = graph.source;
+	binary(graph, stream, branch, shape, ScalarOpcode::Add).map(drop)
+}
+/// Reads the stream of the enclosing injection.
+fn lower_stream(graph: &mut Graph) -> Result<()> {
+	let (source, shape) = *graph.streams.last().ok_or_else(|| RecipeError::new("stream() reads the stream of an enclosing inject"))?;
+	reset(graph, source, shape);
+	Ok(())
+}
+/// Sums every group of `group` channels into one.
+fn lower_fold(graph: &mut Graph, group: usize) -> Result<()> {
+	let shape = graph.output;
+	require(group != 0 && shape.channels % group == 0, format!("fold({group}) does not divide {} channels", shape.channels))?;
+	push_node(graph, Primitive::Fold, Shape { channels: shape.channels / group, length: shape.length }, 0, arguments(group as f64, 0.0), -2)
+}
+/// Lowers two fragments from the same input. The left outputs one scalar per
+/// group and the right a vector; the result holds the vector scaled by each
+/// scalar in turn, so it is as wide as the two together.
+fn lower_outer(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "an outer product branch must contain an operation")?;
+	let (source, input) = (graph.source, graph.output);
+	let inherited_bias = graph.bias;
+	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
+	graph.bias = inherited_bias && left.exclusions & bias.mask() == 0;
+	for block in &left.blocks {
+		graph.block_frozen = outer_frozen || block.frozen;
+		graph.block_kind = block.operation.name();
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
+	let (scalars, scalar_shape) = (graph.source, graph.output);
+	reset(graph, source, input);
+	graph.bias = inherited_bias && right.exclusions & bias.mask() == 0;
+	for block in &right.blocks {
+		graph.block_frozen = outer_frozen || block.frozen;
+		graph.block_kind = block.operation.name();
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
+	graph.bias = inherited_bias;
+	(graph.block_frozen, graph.block_kind) = (outer_frozen, outer_kind);
+	require(graph.output.length == scalar_shape.length, "outer product branches must have the same position count")?;
+	let output = Shape { channels: checked_mul(scalar_shape.channels, graph.output.channels, "outer product width")?, length: graph.output.length };
+	push_node(graph, Primitive::Outer, output, 0, arguments(scalar_shape.channels as f64, 0.0), scalars)
 }
 fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64, chain: bool) -> Result<(f64, f64, f64)> {
 	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;

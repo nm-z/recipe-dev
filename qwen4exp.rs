@@ -8,18 +8,40 @@ fn main() {
 	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
 	let width = 2560;
 	let (lanes, rank) = (4, 320);
-	let stream = lanes * width;
+	let channels = lanes * width;
 	let mean = 1.0 / lanes as f64;
-	let stream_norm = || norm(rms).groups(lanes);
-	let read = || [layer(rank).scale(mean).silu(), layer(stream).sigmoid()];
+	let stream_norm = || norm(rms).per(width);
+	let read = || [layer(rank).scale(mean).silu(), layer(channels).sigmoid()];
 	let write = || [layer(lanes), linear().scale(mean).sigmoid().scale(2.0)];
+
+	let rows = ngrams(3)
+		.heads(8)
+		.multipliers(&[23703573157769_usize, 20109073645365, 8052911324071])
+		.ranges(&[0_usize, 20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297, 160000374, 180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275], &[20000003_usize, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077, 20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171])
+		.ends(&[248044])
+		.absent(248044)
+		.image(248056)
+		.table("per_layer_token_embd.weight");
+	let gate = [
+		layer(channels).norm(rms).per(width) * stream().norm(rms).per(width),
+		fold(width),
+		scalar(|s| {
+			let s = s * (1.0 / (width as f64).sqrt());
+			(s.sign() * s.abs().max(1e-6).sqrt()).sigmoid()
+		}),
+	];
+	let ple = [
+		rows,
+		outer(gate, layer(width)),
+		identity() + [norm(rms).per(width), dconv(4).dilation(3).silu()],
+	];
 
 	let mut model = recipe.model()
 		.e(9.999999974752427e-7)
 		.embed(248320, width);
 
 	for block in 0..48 {
-		if [1_usize].contains(&block) { model = model.ple(&ngram); }
+		if [1_usize].contains(&block) { model = model.inject(ple.clone()); }
 
 		model = model.hyper_gated(lanes, stream_norm(), read(), write(), &if (block + 1) % 4 == 0 {
 			recipe.model()
