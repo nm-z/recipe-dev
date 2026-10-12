@@ -16915,8 +16915,8 @@ impl<const N: usize> IntoMetrics for [Metric; N] {
 	}
 }
 fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
-	const ALL: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
-	const DEV: [Metric; 4] = [tile, Score, Choices, Window];
+	const ALL: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, Score, Choices, Window];
+	const DEV: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window];
 	const ORDER: [Metric; 16] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug, hc_values, log::metadata, log::tensors, log::ngram];
 	let mut selected = Vec::new();
 	for metric in metrics {

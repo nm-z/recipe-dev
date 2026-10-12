@@ -212,9 +212,9 @@ train()
 	.log([run, time, epoch, r2, loss, blck, tile, score, choices, window]|all|dev)
 	.run(&model, &data)
 all:
-	run, time, epoch, r2, loss, blck
+	run, time, epoch, r2, loss, blck, score, choices, window
 dev:
-	tile, score, choices, window
+	all, tile
 ```
 
 ## **RAT**
