@@ -8916,7 +8916,12 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 /// is where the resource-usage remarks below arrive.
 fn native_command(mut command: Command, role: &str, key: &str) -> Result<String> {
 	trace(&format!("native compiler key={key} role={role} command={command:?}"))?;
+	let started = std::time::Instant::now();
 	let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
+	// RECIPE_COMPILE_TIMES prints how long each native compiler stage ran.
+	let seconds = started.elapsed().as_secs_f64();
+	trace(&format!("native compiler key={key} role={role} seconds={seconds:.3}"))?;
+	if std::env::var_os("RECIPE_COMPILE_TIMES").is_some() { eprintln!("compile {role} {seconds:.3} s"); }
 	let mut diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
 	if !output.stdout.is_empty() {
 		if !diagnostic.is_empty() {
