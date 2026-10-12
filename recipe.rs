@@ -9408,6 +9408,9 @@ mod gguf {
 		pointer: *const u8,
 		length: usize,
 		owned: Option<Vec<u8>>,
+		path: std::path::PathBuf,
+		/// The open file a row read goes through; reopened when its handle goes stale.
+		file: std::sync::Mutex<Option<std::fs::File>>,
 	}
 	unsafe impl Send for Mapping {}
 	unsafe impl Sync for Mapping {}
@@ -9421,13 +9424,40 @@ mod gguf {
 			require(length != 0, format!("{} is empty", path.display()))?;
 			let pointer = unsafe { super::mmap(std::ptr::null_mut(), length, 1, 2, file.as_raw_fd(), 0) };
 			require(pointer as isize != -1, format!("cannot map {}: {}", path.display(), std::io::Error::last_os_error()))?;
-			Ok(Self { pointer: pointer.cast(), length, owned: None })
+			Ok(Self { pointer: pointer.cast(), length, owned: None, path: path.to_path_buf(), file: std::sync::Mutex::new(Some(file)) })
 		}
 		#[cfg(not(unix))]
 		fn open(path: &Path) -> Result<Self> {
 			let owned = std::fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 			require(!owned.is_empty(), format!("{} is empty", path.display()))?;
-			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned) })
+			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned), path: path.to_path_buf(), file: std::sync::Mutex::new(None) })
+		}
+		/// Read `out.len()` bytes at `at` through the file rather than the mapping, so
+		/// a file server that goes away fails this read instead of killing the process
+		/// with a fault. A stale handle is reopened by path and the read retried.
+		#[cfg(unix)]
+		pub(super) fn read_at(&self, at: usize, out: &mut [u8]) -> Result<()> {
+			use std::os::unix::fs::FileExt;
+			let mut file = self.file.lock().map_err(|_| RecipeError::new("mapped file handle is poisoned"))?;
+			let mut last = None;
+			for _ in 0..3 {
+				if file.is_none() {
+					match std::fs::File::open(&self.path) {
+						Ok(opened) => *file = Some(opened),
+						Err(error) => { last = Some(error); continue; }
+					}
+				}
+				match file.as_ref().unwrap().read_exact_at(out, at as u64) {
+					Ok(()) => return Ok(()),
+					Err(error) => { *file = None; last = Some(error); }
+				}
+			}
+			Err(RecipeError::new(format!("cannot read {} bytes at {at} of {}: {}", out.len(), self.path.display(), last.map_or_else(String::new, |error| error.to_string()))))
+		}
+		#[cfg(not(unix))]
+		pub(super) fn read_at(&self, at: usize, out: &mut [u8]) -> Result<()> {
+			out.copy_from_slice(self.bytes().get(at..at + out.len()).ok_or_else(|| RecipeError::new("read is outside the mapping"))?);
+			Ok(())
 		}
 		pub(super) fn bytes(&self) -> &[u8] {
 			unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
@@ -14913,13 +14943,22 @@ impl StoredBytes {
 		require(at.checked_add(length).is_some_and(|end| end <= self.len()), format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))?;
 		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
 		let (mut out, mut skipped) = (Vec::with_capacity(length), 0);
-		for (_, run) in self.runs() {
-			let start = (at.max(skipped) - skipped).min(run.len());
-			let end = ((at + length).saturating_sub(skipped)).min(run.len());
+		for run in self.0.iter() {
+			let size = run.length();
+			let start = (at.max(skipped) - skipped).min(size);
+			let end = ((at + length).saturating_sub(skipped)).min(size);
 			if start < end {
-				out.extend_from_slice(&run[start..end]);
+				match run {
+					// Mapped rows go through the file, so a lost file server fails the read.
+					StoredSegment::Mapped(mapping, offset, _) => {
+						let filled = out.len();
+						out.resize(filled + end - start, 0);
+						mapping.read_at(offset + start, &mut out[filled..])?;
+					}
+					_ => out.extend_from_slice(&run[start..end]),
+				}
 			}
-			skipped += run.len();
+			skipped += size;
 		}
 		Ok(out)
 	}
@@ -16841,6 +16880,7 @@ impl MtpRuntime {
 		for (slot, id) in samples.iter_mut().zip(prompt) { *slot = f64::from(*id); }
 		if cached < prompt.len() {
 			let predictions = main.run_window_observed(&samples, cached as u32, prompt.len() as u32, progress)?;
+			main.record_logits(&predictions, cached as u32, prompt.len() as u32)?;
 			self.logits = main.last_logits(&predictions, cached as u32, prompt.len() as u32)?;
 			self.hidden.resize_with(prompt.len(), Vec::new);
 			for (slot, hidden) in self.hidden[cached..prompt.len()].iter_mut().zip(mtp_hidden(main, cached, prompt.len())?) { *slot = hidden; }
@@ -16905,6 +16945,7 @@ impl MtpRuntime {
 			let draft_seconds = draft_started.elapsed().as_secs_f64();
 			let verify_started = Instant::now();
 			let predictions = main.run_window(&samples, base as u32, end as u32)?;
+			main.record_logits(&predictions, base as u32, end as u32)?;
 			generation.mtp.drafted += proposed.len() - 1;
 			generation.mtp.verifications += 1;
 			self.hidden.resize_with(end, Vec::new);
@@ -18142,8 +18183,18 @@ impl Infer {
 			};
 			let mut sampler = recipe.sampler().temperature(0.0);
 			let generation = match &mut mtp {
-				Some(mtp) => mtp.decode(&placed, &prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit)?,
-				None => placed.decode_observed(&prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit)?,
+				Some(mtp) => mtp.decode(&placed, &prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit),
+				None => placed.decode_observed(&prompt, &mut sampler, &stop, budget, progress.as_ref(), &mut emit),
+			};
+			// A resident model stays loaded through a failed request; only /exit unloads it.
+			let generation = match generation {
+				Ok(generation) => generation,
+				Err(error) if interactive => {
+					eprintln!("request failed: {error}");
+					conversation.pop();
+					continue;
+				}
+				Err(error) => return Err(error),
 			};
 			let seconds = progress.as_ref().map_or_else(|| request_started.elapsed().as_secs_f64(), InferenceLive::finish);
 			memory = resident_memory(&placed, mtp.as_ref());
@@ -18153,8 +18204,8 @@ impl Infer {
 			let reply = coder.decode(&ids);
 			let mut operations = placed.take_operations("main");
 			if let Some(mtp) = &mtp { operations.extend(mtp.placed.take_operations("mtp")); }
-			let tensors = placed.take_tensors()?;
-			print_tensor_observations(&tensors)?;
+			let tensors = placed.take_tensors().unwrap_or_else(|error| { eprintln!("cannot read tensor observations: {error}"); Default::default() });
+			if let Err(error) = print_tensor_observations(&tensors) { eprintln!("cannot print tensor observations: {error}"); }
 			request_history.push(Arc::new(InferenceRequest {
 				time: DurationReport(seconds),
 				input: prompt.len(), out: ids.len(), cached: generation.cached, reply_limit: budget,
@@ -18177,7 +18228,7 @@ impl Infer {
 		};
 		Ok(InferenceReport {
 			llvm: placed.llvm_report(),
-			path: data.report_path()?,
+			path: data.report_path().unwrap_or_else(|error| { eprintln!("{error}"); data.sources.first().cloned().unwrap_or_default() }),
 			formats: placement_report(Placed::format_report)?,
 			memory: placement_report(Placed::memory_report)?,
 			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
@@ -20975,6 +21026,7 @@ impl Placed {
 		}
 		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
 			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None })?;
+			self.record_logits(&predictions, settled, reached)?;
 			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
 				for id in suppressed {
@@ -20991,6 +21043,10 @@ impl Placed {
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		tape.last_logits(predictions, begin, end)
+	}
+	fn record_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<()> {
+		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		tape.record_logits(predictions, begin, end)
 	}
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
@@ -25274,6 +25330,22 @@ impl NativeTape {
 	}
 	fn request_bytes(&self) -> (usize, usize) {
 		self.request.lock().unwrap().as_ref().map_or((0, 0), |request| (request.input.bytes, request.output.bytes + request.hidden.bytes + request.lookups.iter().map(|buffer| buffer.bytes).sum::<usize>()))
+	}
+	/// `RECIPE_ALL_LOGITS=<path>` appends every output position this window kept:
+	/// a u32 position, then the vocabulary's logits as f32, all little-endian.
+	/// Positions whose rows the request layout no longer holds are skipped.
+	fn record_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<()> {
+		static PATH: OnceLock<Option<String>> = OnceLock::new();
+		let Some(path) = PATH.get_or_init(|| std::env::var("RECIPE_ALL_LOGITS").ok().filter(|path| !path.is_empty())) else { return Ok(()) };
+		let (first, reached) = self.output_window(begin, end)?;
+		let mut bytes = Vec::new();
+		for position in first..reached {
+			let Ok(logits) = self.logits_at(predictions, position as usize) else { continue };
+			bytes.extend_from_slice(&position.to_le_bytes());
+			for value in logits { bytes.extend_from_slice(&(value as f32).to_le_bytes()); }
+		}
+		let mut file = fs::OpenOptions::new().create(true).append(true).open(path).map_err(|error| RecipeError::new(format!("cannot open {path}: {error}")))?;
+		std::io::Write::write_all(&mut file, &bytes).map_err(|error| RecipeError::new(format!("cannot write {path}: {error}")))
 	}
 	/// The logits of the last reached position, using the current request's output layout.
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
