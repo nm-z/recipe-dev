@@ -28,10 +28,10 @@ pub fn model() -> Model {
 				.head(qwen4exp.attention.key_length)
 				.gate()
 				.qk(rms)
-				// M-RoPE sections [11, 11, 10] split the 32 rotary pairs over time, height and
-				// width positions; text gives all three the token position, so this is
-				// plain rotation of the first 64 channels. Images would need the sections.
-				.rope(neox, qwen4exp.rope.dimension_count, qwen4exp.rope.freq_base)
+				// Interleaved M-RoPE: the 32 rotary pairs alternate over time, height and
+				// width positions by the file's sections. Text gives every axis the token
+				// position.
+				.rope(interleaved(&qwen4exp.rope.dimension_sections), qwen4exp.rope.dimension_count, qwen4exp.rope.freq_base)
 				.index_tokens(
 					qwen4exp.attention.indexer.head_count,
 					qwen4exp.attention.indexer.key_length,

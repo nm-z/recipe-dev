@@ -13211,11 +13211,11 @@ impl RopeSelector for Neox {
 /// A sectioned rotary layout: `sections([16, 24, 24])` blocks the pairs by axis
 /// in order, `interleaved([24, 20, 20, 0])` alternates the axes pair by pair.
 pub struct Sections(RopeLayout);
-pub fn sections<const N: usize>(sizes: [usize; N]) -> Sections {
-	Sections(RopeLayout::sections(&sizes.map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))), false).unwrap_or_else(|error| panic!("{error}")))
+pub fn sections(sizes: impl AsRef<[usize]>) -> Sections {
+	Sections(RopeLayout::sections(&sizes.as_ref().iter().copied().map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))).collect::<Vec<_>>(), false).unwrap_or_else(|error| panic!("{error}")))
 }
-pub fn interleaved<const N: usize>(sizes: [usize; N]) -> Sections {
-	Sections(RopeLayout::sections(&sizes.map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))), true).unwrap_or_else(|error| panic!("{error}")))
+pub fn interleaved(sizes: impl AsRef<[usize]>) -> Sections {
+	Sections(RopeLayout::sections(&sizes.as_ref().iter().copied().map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))).collect::<Vec<_>>(), true).unwrap_or_else(|error| panic!("{error}")))
 }
 impl RopeSelector for Sections {
 	fn layout(self) -> RopeLayout {
@@ -17959,6 +17959,8 @@ pub struct SsmKeys {
 pub struct RopeKeys {
 	pub freq_base: f64,
 	pub dimension_count: usize,
+	/// The rotary pairs per position axis of a multi-axis rotary, empty when plain.
+	pub dimension_sections: Vec<usize>,
 	pub scaling: RopeScalingKeys,
 }
 pub struct RopeScalingKeys {
@@ -18019,6 +18021,10 @@ impl ArchitectureKeys {
 			rope: RopeKeys {
 				freq_base: real("rope.freq_base", 10000.0),
 				dimension_count: or(count("rope.dimension_count"), key_length),
+				dimension_sections: match file.value(&format!("{prefix}.rope.dimension_sections")) {
+					Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| usize::try_from(value).ok()).expect("rope.dimension_sections contains an invalid count")).collect(),
+					_ => Vec::new(),
+				},
 				scaling: RopeScalingKeys {
 					factor: real("rope.scaling.factor", 1.0),
 					original_context_length: count("rope.scaling.original_context_length"),
