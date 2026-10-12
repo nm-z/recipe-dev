@@ -12057,7 +12057,7 @@ mod bundle {
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
-			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::MoeBlocks(top_k, routing, experts) => format!("moe_blocks,{top_k}:{}:{},{}", routing.scoring as u8, u8::from(routing.renormalize), experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared)),
 			Operation::Join(lanes) => format!("join,{lanes}"),
 		}
@@ -12166,8 +12166,15 @@ mod bundle {
 				Ok(if name == "sum" { Operation::Sum(left, right) } else { Operation::Product(left, right) })
 			}
 			"moe_blocks" => {
-				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into()))
+				let (head, experts) = rest.split_once(',').unwrap_or((rest, ""));
+				let mut fields = head.split(':');
+				let top_k = value_at(fields.next(), "MoE top-k")?;
+				let mut routing = Routing::default();
+				if let Some(scoring) = fields.next() {
+					routing.scoring = match value_at::<u8>(Some(scoring), "MoE scoring")? { 0 => Scoring::Softmax, 1 => Scoring::Sigmoid, _ => return Err(RecipeError::new("MoE scoring is invalid")) };
+					routing.renormalize = bool_value(fields.next().unwrap_or("1"), "MoE renormalization")?;
+				}
+				Ok(Operation::MoeBlocks(top_k, routing, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into()))
 			}
 			"join" => Ok(Operation::Join(value_at(Some(rest), "MTP joined lanes")?)),
 			"moe" => {
@@ -13290,8 +13297,13 @@ pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
 	Block::of(Operation::Ensemble(branch(members)))
 }
-pub fn moe<const N: usize, E: Into<Block>>(top_k: usize, experts: [E; N]) -> Block {
-	Block::of(Operation::MoeBlocks(top_k, branch(experts.map(Into::into))))
+/// A mixture of experts: a router scores every expert, and each position runs
+/// its top-k. The experts may come from a loop; `.scores(...)` and
+/// `.renormalize(...)` set how router outputs become weights.
+pub fn moe<E: Into<Block>>(top_k: usize, experts: impl IntoIterator<Item = E>) -> Block {
+	let experts = experts.into_iter().map(Into::into).collect::<Vec<_>>();
+	assert!(!experts.is_empty(), "a mixture of experts must contain an expert");
+	Block::of(Operation::MoeBlocks(top_k, Routing::default(), experts.into()))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -13468,7 +13480,7 @@ enum Operation {
 	Ensemble(BlockList),
 	Sum(ProductBranch, ProductBranch),
 	Product(ProductBranch, ProductBranch),
-	MoeBlocks(usize, BlockList),
+	MoeBlocks(usize, Routing, BlockList),
 	Perceptron(usize),
 	Embed(usize, usize),
 	Hyper(usize, usize, BlockList),
@@ -13539,6 +13551,13 @@ impl Activation {
 pub enum Scoring {
 	Softmax,
 	Sigmoid,
+}
+/// How a mixture of experts turns router outputs into the weights of its top-k:
+/// the scoring map, and whether the kept weights are renormalized to sum to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Routing { pub scoring: Scoring, pub renormalize: bool }
+impl Default for Routing {
+	fn default() -> Self { Self { scoring: Scoring::Softmax, renormalize: true } }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -13832,6 +13851,18 @@ impl Block {
 	pub fn gate(self) -> Self {
 		self.attention("gate", |attention| attention.gate = true)
 	}
+	/// How this `moe` block's router outputs become expert weights.
+	pub fn scores(mut self, scoring: Scoring) -> Self {
+		let Operation::MoeBlocks(_, routing, _) = &mut self.operation else { panic!("scores(...) requires a moe(...) block") };
+		routing.scoring = scoring;
+		self
+	}
+	/// Whether this `moe` block rescales its kept expert weights to sum to one.
+	pub fn renormalize(mut self, renormalize: bool) -> Self {
+		let Operation::MoeBlocks(_, routing, _) = &mut self.operation else { panic!("renormalize(...) requires a moe(...) block") };
+		routing.renormalize = renormalize;
+		self
+	}
 	block_activations! {
 		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn sqrt = Sqrt; fn huber = Huber;
 		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
@@ -14049,8 +14080,8 @@ impl Model {
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
 		self.push(Operation::Ensemble(branch(members)))
 	}
-	pub fn moe<const N: usize, E: Into<Block>>(&self, top_k: usize, experts: [E; N]) -> Self {
-		self.push(Operation::MoeBlocks(top_k, branch(experts.map(Into::into))))
+	pub fn moe<E: Into<Block>>(&self, top_k: usize, experts: impl IntoIterator<Item = E>) -> Self {
+		self.edit(|model| model.blocks.push(moe(top_k, experts)))
 	}
 	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
 	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
@@ -14284,7 +14315,7 @@ impl Model {
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
 				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared})", activation.name())
 			}
-			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
+			Operation::MoeBlocks(top_k, routing, parts) => format!("moe({top_k},[{}]).scores({:?}).renormalize({})", Self::describe_parts(parts), routing.scoring, routing.renormalize),
 			Operation::Perceptron(width) => format!("perc({width})"),
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
 			Operation::Hyper(lanes, rank, parts) => format!("hyper({lanes},{rank},[{}])", Self::describe_parts(parts)),
@@ -15807,7 +15838,7 @@ impl Operation {
 		match self {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
-			Self::Residual(parts) | Self::Sequence(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
+			Self::Residual(parts) | Self::Sequence(parts) | Self::MoeBlocks(_, _, parts) => weighted_parts(parts),
 			Self::Product(left, right) | Self::Sum(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
 			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
@@ -17728,11 +17759,11 @@ impl<'a> Builder<'a> {
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
 		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
 		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
-		self.expert_planes(layer, count, hidden, shared, dimensions.width)?;
+		self.expert_planes(layer, count, hidden, shared.then_some(hidden), dimensions.width)?;
 		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, width: usize) -> Result<()> {
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: Option<usize>, width: usize) -> Result<()> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
@@ -17745,13 +17776,13 @@ impl<'a> Builder<'a> {
 			)?;
 			self.mapped(vec![table]);
 		}
-		if shared {
+		if let Some(shared) = shared {
 			let shared_role = format!("block {layer} shared expert");
 			// The per-position gate is the first weighted node in the shared path.
 			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
 			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
 			self.mapped(vec![gate]);
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, hidden), ("ffn_up_shexp.weight", width, hidden), ("ffn_down_shexp.weight", hidden, width)] {
+			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, shared), ("ffn_up_shexp.weight", width, shared), ("ffn_down_shexp.weight", shared, width)] {
 				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
 				self.mapped(vec![tensor]);
 			}
@@ -18160,6 +18191,7 @@ impl Infer {
 			retain_mtp_hidden(&mut graph)?;
 			for node in &mut graph.nodes { if node.op == Primitive::Delta { node.argument[5] = 5.0; } }
 		}
+		dump_graph("memory", &graph)?;
 		let precision = Config::load()?.precision;
 		let mut target = part_memory(&graph, precision)?;
 		target.device = device_label(gpu)?;
@@ -18617,7 +18649,7 @@ fn visit_attention(blocks: &[Block], visit: &mut impl FnMut(&AttentionBlock)) {
 	for block in blocks {
 		match &block.operation {
 			Operation::Attention(attention) => visit(attention),
-			Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Hyper(_, _, parts) | Operation::Recur(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => visit_attention(parts, visit),
+			Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Hyper(_, _, parts) | Operation::Recur(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) => visit_attention(parts, visit),
 			Operation::Product(left, right) | Operation::Sum(left, right) => { visit_attention(&left.blocks, visit); visit_attention(&right.blocks, visit); }
 			_ => {}
 		}
@@ -18766,7 +18798,21 @@ impl Builder<'_> {
 					weighted = true;
 				}
 				Operation::Moe(count, _, hidden_width, _, _, _, shared) => {
-					self.expert_planes(layer, *count, *hidden_width, *shared, width)?;
+					self.expert_planes(layer, *count, *hidden_width, shared.then_some(*hidden_width), width)?;
+					weighted = true;
+				}
+				// A declared mixture names the GGUF router and expert tables; a sum with a
+				// scalar-gated feed-forward beside it names the shared expert, gate first,
+				// in the order lowering emits them.
+				Operation::MoeBlocks(..) => {
+					let (count, hidden) = declared_experts(step).ok_or_else(|| RecipeError::new(format!("block {layer} moe binds GGUF expert tables, so its experts are identical gated feed-forwards")))?;
+					self.expert_planes(layer, count, hidden, None, width)?;
+					weighted = true;
+				}
+				Operation::Sum(left, right) if left.blocks.len() == 1 && right.blocks.len() == 1 && declared_experts(&left.blocks[0]).is_some() => {
+					let (count, hidden) = declared_experts(&left.blocks[0]).unwrap();
+					let shared = declared_shared_expert(&right.blocks[0]).ok_or_else(|| RecipeError::new(format!("block {layer} adds a branch to its experts; GGUF names it only as a shared expert, layer(1).sigmoid() * a gated feed-forward")))?;
+					self.expert_planes(layer, count, hidden, Some(shared), width)?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
@@ -21856,7 +21902,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
+		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
@@ -22085,7 +22131,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Sequence(parts) => { for part in parts { lower_block(graph, part, total, data, targets, rows, gpu, config)?; } }
 		Operation::Product(left, right) => lower_product(graph, left, right, ScalarOpcode::Multiply, total, data, targets, rows, gpu, config)?,
 		Operation::Sum(left, right) => lower_product(graph, left, right, ScalarOpcode::Add, total, data, targets, rows, gpu, config)?,
-		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
+		Operation::MoeBlocks(top_k, routing, experts) => lower_moe_blocks(graph, *top_k, *routing, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Join(lanes) => lower_mtp_join(graph, *lanes)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
@@ -23142,6 +23188,24 @@ impl Block {
 		self.maps.iter().find_map(|step| step.normalization())
 	}
 }
+/// The expert count and hidden width of a mixture whose experts are identical
+/// gated feed-forwards back to the input width.
+fn declared_experts(block: &Block) -> Option<(usize, usize)> {
+	let Operation::MoeBlocks(_, _, experts) = &block.operation else { return None };
+	if !experts.iter().all(|expert| expert == &experts[0]) { return None; }
+	let (gate, _, _) = gated_expert(&experts[0])?;
+	let Operation::Layer(hidden) = gate.operation else { return None };
+	Some((experts.len(), hidden))
+}
+/// The hidden width of `layer(1).sigmoid() * gated feed-forward`, the shared
+/// expert beside a mixture: its scalar gate lowers first.
+fn declared_shared_expert(block: &Block) -> Option<usize> {
+	let Operation::Product(gate, expert) = &block.operation else { return None };
+	if gate.blocks.len() != 1 || expert.blocks.len() != 1 || gate.blocks[0].operation != Operation::Layer(1) || gate.blocks[0].activation() != Activation::Sigmoid { return None; }
+	let (inner, _, _) = gated_expert(&expert.blocks[0])?;
+	let Operation::Layer(hidden) = inner.operation else { return None };
+	Some(hidden)
+}
 fn gated_expert(value: &Block) -> Option<(Block, Block, Block)> {
 	let Operation::Sequence(parts) = &value.operation else { return None };
 	if parts.len() != 2 || value.activation() != Activation::Linear || value.normalization().is_some() { return None; }
@@ -23239,7 +23303,7 @@ fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize
 	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
 	Ok(())
 }
-fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_moe_blocks(graph: &mut Graph, top_k: usize, routing: Routing, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
@@ -23248,12 +23312,13 @@ fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: u
 			let Operation::Layer(hidden) = gate.operation else { unreachable!() };
 			if down.operation == Operation::Layer(input.channels) {
 				lower_project(graph, experts.len())?;
-				push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+				push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(routing.scoring as u8), f64::from(u8::from(routing.renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 				let routing = graph.source;
 				return lower_experts(graph, source, input, routing, experts.len(), top_k, hidden, [gate, up, down], config);
 			}
 		}
 	}
+	require(routing == Routing::default(), "a mixture of differing experts scores them by softmax and renormalizes; other routing needs identical gated experts")?;
 	let mut output = None;
 	for value in experts {
 		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
@@ -23382,7 +23447,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
@@ -23390,7 +23455,7 @@ fn estimator_count(block: &Block) -> usize {
 fn first_estimator(block: &Block) -> Option<&Estimator> {
 	match &block.operation {
 		Operation::Estimator(estimator) => Some(estimator),
-		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
+		Operation::Residual(parts) | Operation::Sequence(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, _, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
 		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}

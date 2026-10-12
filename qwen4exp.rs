@@ -3,28 +3,67 @@ use recipe::infer::{cached, input, mtp, out, pp, tg, time};
 
 const GGUF: &str = "/mnt/sentry-nfs/flash-next-q2/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf";
 
+// Qwen3.8 Flash-Next: 48 blocks over a 4-lane hyper-connection stream. Every
+// block mixes tokens (full attention every fourth block, a gated delta rule
+// otherwise), then mixes channels with 512 routed experts and one shared expert.
+#[rustfmt::skip]
 pub fn model() -> Model {
-	let (width, vocabulary) = (qwen4exp.embedding_length, tokenizer.ggml.tokens.len());
-	let mut model = recipe.model().embed(vocabulary, width);
-	for layer in 0..qwen4exp.block_count {
-		if qwen4exp.ple.layers.contains(&layer) { model = model.ple(&ngram); }
-		let attention = if (layer + 1) % qwen4exp.full_attention_interval == 0 {
-			let group = qwen4exp.attention.compress_ratios[layer].max(1);
-			recipe.model().attn(qwen4exp.attention.head_count).kv(qwen4exp.attention.head_count_kv).head(qwen4exp.attention.key_length)
+	let width = qwen4exp.embedding_length;
+	let (lanes, rank) = (qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank);
+	let scoring = match qwen4exp.expert_gating_func { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, value => panic!("unknown expert gating function {value}") };
+
+	let mut model = recipe.model()
+		.e(qwen4exp.attention.layer_norm_rms_epsilon)
+		.embed(tokenizer.ggml.tokens, width);
+
+	for block in 0..qwen4exp.block_count {
+		// Hashed n-gram embeddings join the stream before the blocks that read them.
+		if qwen4exp.ple.layers.contains(&block) { model = model.ple(&ngram); }
+
+		// Token mixing.
+		model = model.hyper(lanes, rank, &if (block + 1) % qwen4exp.full_attention_interval == 0 {
+			recipe.model()
+				.attn(qwen4exp.attention.head_count)
+				.kv(qwen4exp.attention.head_count_kv)
+				.head(qwen4exp.attention.key_length)
+				// M-RoPE sections [11, 11, 10] split the 32 rotary pairs over time, height and
+				// width positions; text gives all three the token position, so this is
+				// plain rotation of the first 64 channels. Images would need the sections.
 				.rope(neox, qwen4exp.rope.dimension_count, qwen4exp.rope.freq_base)
-				.index_tokens(qwen4exp.attention.indexer.head_count, qwen4exp.attention.indexer.key_length, group, qwen4exp.attention.indexer.top_k)
+				.index_tokens(
+					qwen4exp.attention.indexer.head_count,
+					qwen4exp.attention.indexer.key_length,
+					qwen4exp.attention.compress_ratios[block].max(1),
+					qwen4exp.attention.indexer.top_k
+				)
 		} else {
-			recipe.model().delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
-				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
+			recipe.model()
+				.delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
+				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size)
+				.values(qwen4exp.ssm.state_size)
+				.out(width)
 				.delta_activations(Activation::Silu, Activation::Sigmoid)
-		};
-		model = model.hyper(qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank, &attention);
-		let scoring = match qwen4exp.expert_gating_func { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, value => panic!("unknown expert gating function {value}") };
-		let experts = recipe.model().gguf_moe(qwen4exp.expert_count, qwen4exp.expert_used_count, qwen4exp.expert_feed_forward_length,
-			Activation::Silu, scoring, qwen4exp.expert_weights_norm, qwen4exp.expert_shared_feed_forward_length != 0).fp(32);
-		model = model.hyper(qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank, &experts);
+		});
+
+		// Channel mixing: each position runs its top experts of 512, plus the
+		// shared expert behind a per-position sigmoid gate.
+		let mut experts = Vec::new();
+		for _ in 0..qwen4exp.expert_count {
+			experts.push(Block::from([
+				layer(qwen4exp.expert_feed_forward_length).silu() * layer(qwen4exp.expert_feed_forward_length),
+				layer(width),
+			]));
+		}
+		model = model.hyper(lanes, rank, &Model::from(
+			moe(qwen4exp.expert_used_count, experts).scores(scoring).renormalize(qwen4exp.expert_weights_norm)
+			+ layer(1).sigmoid() * Block::from([
+				layer(qwen4exp.expert_shared_feed_forward_length).silu() * layer(qwen4exp.expert_shared_feed_forward_length),
+				layer(width),
+			])
+		).fp(32));
 	}
-	model.layer(vocabulary)
+
+	model.layer(tokenizer.ggml.tokens)
 }
 
 fn main() {
