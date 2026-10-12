@@ -2866,7 +2866,14 @@ impl NativeModelIr {
 			let shared = format!("topk_forward_shared_body{v}");
 			let (start, end) = definition_span(ir, &original).ok_or_else(|| RecipeError::new("top-K body is absent"))?;
 			let definition = ir[start..end].replacen(&format!("@{original}("), &format!("@{shared}("), 1).replace("ptr addrspace(1)", "ptr");
+			// The same body entered at its normalization: the group has already
+			// cleared every mark and set 1.0 on each selected expert.
+			let normalize = format!("topk_forward_normalize_body{v}");
+			require(definition.contains("br label %clear.loop") && definition.contains("normalize.entry:"), "top-K body lacks its clear and normalize blocks")?;
+			let normalizing = definition.replacen(&format!("@{shared}("), &format!("@{normalize}("), 1).replacen("br label %clear.loop", "br i1 true, label %normalize.entry, label %clear.loop", 1);
 			ir.push_str(&definition);
+			ir.push_str(&normalizing);
+			if !ir.contains("@llvm.nvvm.barrier0.or(") { ir.push_str("\ndeclare i32 @llvm.nvvm.barrier0.or(i32)\n"); }
 			let native = self.node_precision(&plan.node);
 			let ty = native.model_type;
 			let element = native.model.bytes();
@@ -2937,6 +2944,250 @@ store {ty} %stage.value, ptr addrspace(3) %stage.to, align {element}
 br label %stage.loop
 stage.done:
 call void @llvm.nvvm.barrier0()
+br label %clear.loop
+; Every thread clears its experts' marks and looks for unordered scores. Without
+; one, the whole group picks the top experts by repeated argmax (ties keep the
+; lower expert, as the serial scan does) and the leader only normalizes.
+clear.loop:
+%clear.e = phi i32 [ %lid, %stage.done ], [ %clear.e.next, %clear.body ]
+%clear.nan = phi i1 [ false, %stage.done ], [ %clear.nan.next, %clear.body ]
+%clear.more = icmp ult i32 %clear.e, %experts
+br i1 %clear.more, label %clear.body, label %clear.done
+clear.body:
+%clear.wide = zext i32 %clear.e to i64
+%clear.score.at = getelementptr {ty}, ptr addrspace(3) %shared.scores, i64 %clear.wide
+%clear.score = load {ty}, ptr addrspace(3) %clear.score.at, align {element}
+%clear.unordered = fcmp uno {ty} %clear.score, %clear.score
+%clear.nan.next = or i1 %clear.nan, %clear.unordered
+%clear.weight.at = getelementptr {ty}, ptr addrspace(3) %shared.weights, i64 %clear.wide
+store {ty} 0.0, ptr addrspace(3) %clear.weight.at, align {element}
+%clear.e.next = add i32 %clear.e, %width
+br label %clear.loop
+clear.done:
+%clear.flag = zext i1 %clear.nan to i32
+%any.nan = call i32 @llvm.nvvm.barrier0.or(i32 %clear.flag)
+%width.less = sub i32 %width, 1
+%width.bits = and i32 %width, %width.less
+%width.pow2 = icmp eq i32 %width.bits, 0
+%width.wide = zext i32 %width to i64
+%red.start = add i64 %required, 7
+%red.scores.offset = and i64 %red.start, -8
+%red.scores.bytes = mul i64 %width.wide, 8
+%red.ids.offset = add i64 %red.scores.offset, %red.scores.bytes
+%red.ids.bytes = mul i64 %width.wide, 4
+%red.end = add i64 %red.ids.offset, %red.ids.bytes
+; Winners, then a compact copy of their scores, marks and selection for normalizing.
+%win.offset = add i64 %red.end, 0
+%win.bytes = mul i64 %top.wide, 4
+%compact.start = add i64 %win.offset, %win.bytes
+%compact.scores.offset.raw = add i64 %compact.start, 7
+%compact.scores.offset = and i64 %compact.scores.offset.raw, -8
+%compact.values.bytes = mul i64 %top.wide, 8
+%compact.weights.offset = add i64 %compact.scores.offset, %compact.values.bytes
+%compact.selected.offset = add i64 %compact.weights.offset, %compact.values.bytes
+%compact.end = add i64 %compact.selected.offset, %selected.bytes
+%red.fits = icmp ule i64 %compact.end, %tile.wide
+%win = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %win.offset
+%compact.scores = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %compact.scores.offset
+%compact.weights = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %compact.weights.offset
+%compact.selected = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %compact.selected.offset
+%compact.generic.scores = addrspacecast ptr addrspace(3) %compact.scores to ptr
+%compact.generic.weights = addrspacecast ptr addrspace(3) %compact.weights to ptr
+%compact.generic.selected = addrspacecast ptr addrspace(3) %compact.selected to ptr
+%no.nan = icmp eq i32 %any.nan, 0
+%parallel.a = and i1 %no.nan, %width.pow2
+%parallel = and i1 %parallel.a, %red.fits
+%red.scores = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %red.scores.offset
+%red.ids = getelementptr i8, ptr addrspace(3) %shared.scores, i64 %red.ids.offset
+%lid.wide = zext i32 %lid to i64
+%red.score.mine = getelementptr {ty}, ptr addrspace(3) %red.scores, i64 %lid.wide
+%red.id.mine = getelementptr i32, ptr addrspace(3) %red.ids, i64 %lid.wide
+%stride.first = lshr i32 %width, 1
+br i1 %parallel, label %round.loop, label %serial
+round.loop:
+%round = phi i32 [ 0, %clear.done ], [ %round.next, %round.marked ]
+%round.more = icmp ult i32 %round, %top
+br i1 %round.more, label %local.loop, label %normalize.run
+local.loop:
+%local.e = phi i32 [ %lid, %round.loop ], [ %local.e.next, %local.step ]
+%local.best = phi i32 [ -1, %round.loop ], [ %local.best.next, %local.step ]
+%local.score = phi {ty} [ 0.0, %round.loop ], [ %local.score.next, %local.step ]
+%local.more = icmp ult i32 %local.e, %experts
+br i1 %local.more, label %local.step, label %local.done
+local.step:
+%local.wide = zext i32 %local.e to i64
+%local.mark.at = getelementptr {ty}, ptr addrspace(3) %shared.weights, i64 %local.wide
+%local.mark = load {ty}, ptr addrspace(3) %local.mark.at, align {element}
+%local.free = fcmp oeq {ty} %local.mark, 0.0
+%local.at = getelementptr {ty}, ptr addrspace(3) %shared.scores, i64 %local.wide
+%local.value = load {ty}, ptr addrspace(3) %local.at, align {element}
+%local.none = icmp slt i32 %local.best, 0
+%local.higher = fcmp ogt {ty} %local.value, %local.score
+%local.better = or i1 %local.none, %local.higher
+%local.take = and i1 %local.free, %local.better
+%local.best.next = select i1 %local.take, i32 %local.e, i32 %local.best
+%local.score.next = select i1 %local.take, {ty} %local.value, {ty} %local.score
+%local.e.next = add i32 %local.e, %width
+br label %local.loop
+local.done:
+store {ty} %local.score, ptr addrspace(3) %red.score.mine, align {element}
+store i32 %local.best, ptr addrspace(3) %red.id.mine, align 4
+call void @llvm.nvvm.barrier0()
+br label %reduce.loop
+reduce.loop:
+%stride = phi i32 [ %stride.first, %local.done ], [ %stride.next, %reduce.next ]
+%reduce.more = icmp ugt i32 %stride, 0
+br i1 %reduce.more, label %reduce.body, label %reduce.done
+reduce.body:
+%reduce.active = icmp ult i32 %lid, %stride
+br i1 %reduce.active, label %reduce.compare, label %reduce.next
+reduce.compare:
+%other = add i32 %lid, %stride
+%other.wide = zext i32 %other to i64
+%other.score.at = getelementptr {ty}, ptr addrspace(3) %red.scores, i64 %other.wide
+%other.id.at = getelementptr i32, ptr addrspace(3) %red.ids, i64 %other.wide
+%other.score = load {ty}, ptr addrspace(3) %other.score.at, align {element}
+%other.id = load i32, ptr addrspace(3) %other.id.at, align 4
+%mine.score = load {ty}, ptr addrspace(3) %red.score.mine, align {element}
+%mine.id = load i32, ptr addrspace(3) %red.id.mine, align 4
+%other.valid = icmp sge i32 %other.id, 0
+%mine.none = icmp slt i32 %mine.id, 0
+%other.higher = fcmp ogt {ty} %other.score, %mine.score
+%other.equal = fcmp oeq {ty} %other.score, %mine.score
+%other.lower = icmp slt i32 %other.id, %mine.id
+%other.tie = and i1 %other.equal, %other.lower
+%other.beats = or i1 %other.higher, %other.tie
+%other.wins.any = or i1 %mine.none, %other.beats
+%other.wins = and i1 %other.valid, %other.wins.any
+br i1 %other.wins, label %reduce.take, label %reduce.next
+reduce.take:
+store {ty} %other.score, ptr addrspace(3) %red.score.mine, align {element}
+store i32 %other.id, ptr addrspace(3) %red.id.mine, align 4
+br label %reduce.next
+reduce.next:
+call void @llvm.nvvm.barrier0()
+%stride.next = lshr i32 %stride, 1
+br label %reduce.loop
+reduce.done:
+br i1 %leader, label %round.mark, label %round.marked
+round.mark:
+%winner = load i32, ptr addrspace(3) %red.ids, align 4
+%round.wide = zext i32 %round to i64
+%win.slot = getelementptr i32, ptr addrspace(3) %win, i64 %round.wide
+store i32 %winner, ptr addrspace(3) %win.slot, align 4
+%winner.valid = icmp sge i32 %winner, 0
+%winner.wide = zext i32 %winner to i64
+%winner.at = getelementptr {ty}, ptr addrspace(3) %shared.weights, i64 %winner.wide
+br i1 %winner.valid, label %round.store, label %round.marked
+round.store:
+store {ty} 1.0, ptr addrspace(3) %winner.at, align {element}
+br label %round.marked
+round.marked:
+call void @llvm.nvvm.barrier0()
+%round.next = add i32 %round, 1
+br label %round.loop
+normalize.run:
+%renormalized = icmp ne i32 %renormalize, 0
+br i1 %leader, label %normalize.choose, label %selection.done
+normalize.choose:
+br i1 %renormalized, label %sort.outer, label %normalize.call
+; Weights renormalized over the chosen experts need only those experts: sort the
+; winners by expert, normalize a compact copy with the same body, and map back.
+sort.outer:
+%sort.i = phi i32 [ 1, %normalize.choose ], [ %sort.i.next, %sort.placed ]
+%sort.more = icmp ult i32 %sort.i, %top
+br i1 %sort.more, label %sort.take, label %compact.loop
+sort.take:
+%sort.i.wide = zext i32 %sort.i to i64
+%sort.i.at = getelementptr i32, ptr addrspace(3) %win, i64 %sort.i.wide
+%sort.key = load i32, ptr addrspace(3) %sort.i.at, align 4
+br label %sort.inner
+sort.inner:
+%sort.j = phi i32 [ %sort.i, %sort.take ], [ %sort.j.prior, %sort.shift ]
+%sort.j.positive = icmp ugt i32 %sort.j, 0
+br i1 %sort.j.positive, label %sort.compare, label %sort.placed
+sort.compare:
+%sort.j.prior = sub i32 %sort.j, 1
+%sort.j.prior.wide = zext i32 %sort.j.prior to i64
+%sort.prior.at = getelementptr i32, ptr addrspace(3) %win, i64 %sort.j.prior.wide
+%sort.prior = load i32, ptr addrspace(3) %sort.prior.at, align 4
+%sort.key.unsigned = add i32 %sort.key, 0
+%sort.greater = icmp ugt i32 %sort.prior, %sort.key.unsigned
+br i1 %sort.greater, label %sort.shift, label %sort.placed
+sort.shift:
+%sort.j.wide = zext i32 %sort.j to i64
+%sort.j.at = getelementptr i32, ptr addrspace(3) %win, i64 %sort.j.wide
+store i32 %sort.prior, ptr addrspace(3) %sort.j.at, align 4
+br label %sort.inner
+sort.placed:
+%sort.final = phi i32 [ %sort.j, %sort.inner ], [ %sort.j, %sort.compare ]
+%sort.final.wide = zext i32 %sort.final to i64
+%sort.final.at = getelementptr i32, ptr addrspace(3) %win, i64 %sort.final.wide
+store i32 %sort.key, ptr addrspace(3) %sort.final.at, align 4
+%sort.i.next = add i32 %sort.i, 1
+br label %sort.outer
+; Unsigned order puts unfilled (-1) slots last; count the filled ones.
+compact.loop:
+%compact.i = phi i32 [ 0, %sort.outer ], [ %compact.i.next, %compact.copy ]
+%compact.more = icmp ult i32 %compact.i, %top
+br i1 %compact.more, label %compact.check, label %compact.done
+compact.check:
+%compact.i.wide = zext i32 %compact.i to i64
+%compact.win.at = getelementptr i32, ptr addrspace(3) %win, i64 %compact.i.wide
+%compact.expert = load i32, ptr addrspace(3) %compact.win.at, align 4
+%compact.valid = icmp sge i32 %compact.expert, 0
+br i1 %compact.valid, label %compact.copy, label %compact.done
+compact.copy:
+%compact.expert.wide = zext i32 %compact.expert to i64
+%compact.from = getelementptr {ty}, ptr addrspace(3) %shared.scores, i64 %compact.expert.wide
+%compact.value = load {ty}, ptr addrspace(3) %compact.from, align {element}
+%compact.score.to = getelementptr {ty}, ptr addrspace(3) %compact.scores, i64 %compact.i.wide
+store {ty} %compact.value, ptr addrspace(3) %compact.score.to, align {element}
+%compact.weight.to = getelementptr {ty}, ptr addrspace(3) %compact.weights, i64 %compact.i.wide
+store {ty} 1.0, ptr addrspace(3) %compact.weight.to, align {element}
+%compact.i.next = add i32 %compact.i, 1
+br label %compact.loop
+compact.done:
+%compact.count = phi i32 [ %compact.i, %compact.loop ], [ %compact.i, %compact.check ]
+call void @{normalize}(ptr %compact.generic.scores, ptr %compact.generic.weights, ptr %compact.generic.selected, i64 0, i32 %compact.count, i32 1, i32 %top, i32 %scoring, i32 %renormalize)
+%mapped.count = load i32, ptr addrspace(3) %compact.selected, align 4
+store i32 %mapped.count, ptr addrspace(3) %shared.selected, align 4
+br label %map.weights
+map.weights:
+%map.w = phi i32 [ 0, %compact.done ], [ %map.w.next, %map.weights.body ]
+%map.w.more = icmp ult i32 %map.w, %compact.count
+br i1 %map.w.more, label %map.weights.body, label %map.selected
+map.weights.body:
+%map.w.wide = zext i32 %map.w to i64
+%map.w.expert.at = getelementptr i32, ptr addrspace(3) %win, i64 %map.w.wide
+%map.w.expert = load i32, ptr addrspace(3) %map.w.expert.at, align 4
+%map.w.expert.wide = zext i32 %map.w.expert to i64
+%map.w.from = getelementptr {ty}, ptr addrspace(3) %compact.weights, i64 %map.w.wide
+%map.w.value = load {ty}, ptr addrspace(3) %map.w.from, align {element}
+%map.w.to = getelementptr {ty}, ptr addrspace(3) %shared.weights, i64 %map.w.expert.wide
+store {ty} %map.w.value, ptr addrspace(3) %map.w.to, align {element}
+%map.w.next = add i32 %map.w, 1
+br label %map.weights
+map.selected:
+%map.s = phi i32 [ 0, %map.weights ], [ %map.s.next, %map.selected.body ]
+%map.s.more = icmp ult i32 %map.s, %mapped.count
+br i1 %map.s.more, label %map.selected.body, label %selection.done
+map.selected.body:
+%map.s.slot = add i32 %map.s, 1
+%map.s.slot.wide = zext i32 %map.s.slot to i64
+%map.s.compact.at = getelementptr i32, ptr addrspace(3) %compact.selected, i64 %map.s.slot.wide
+%map.s.compact = load i32, ptr addrspace(3) %map.s.compact.at, align 4
+%map.s.compact.wide = zext i32 %map.s.compact to i64
+%map.s.expert.at = getelementptr i32, ptr addrspace(3) %win, i64 %map.s.compact.wide
+%map.s.expert = load i32, ptr addrspace(3) %map.s.expert.at, align 4
+%map.s.to = getelementptr i32, ptr addrspace(3) %shared.selected, i64 %map.s.slot.wide
+store i32 %map.s.expert, ptr addrspace(3) %map.s.to, align 4
+%map.s.next = add i32 %map.s, 1
+br label %map.selected
+normalize.call:
+call void @{normalize}(ptr %generic.scores, ptr %generic.weights, ptr %generic.selected, i64 0, i32 %experts, i32 1, i32 %top, i32 %scoring, i32 %renormalize)
+br label %selection.done
+serial:
 br i1 %leader, label %select, label %selection.done
 select:
 call void @{shared}(ptr %generic.scores, ptr %generic.weights, ptr %generic.selected, i64 0, i32 %experts, i32 1, i32 %top, i32 %scoring, i32 %renormalize)
@@ -8614,6 +8865,11 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	Ok(home_directory()?.join(".cache").join("recipe").join("native").join(key))
 }
 
+/// RECIPE_MAXRREG caps registers per thread in the NVIDIA modules ptxas builds, so a
+/// wider block fits each SM; it is part of every NVIDIA artifact's identity.
+fn native_nvidia_maxrreg() -> Option<u32> {
+	std::env::var("RECIPE_MAXRREG").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| (32..=255).contains(value))
+}
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
 	let version = match target {
@@ -8627,7 +8883,7 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 			format!("target={target};cpu={cpu};features={features}")
 		}
 		BackendTarget::Amd { .. } => native_target_label(target).to_owned(),
-		BackendTarget::Nvidia { architecture } => format!("{architecture};ptx={}", native_nvidia_ptx_version(architecture)?),
+		BackendTarget::Nvidia { architecture } => format!("{architecture};ptx={}{}", native_nvidia_ptx_version(architecture)?, native_nvidia_maxrreg().map_or_else(String::new, |count| format!(";maxrreg={count}"))),
 	};
 	let producer = match target {
 		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
@@ -9045,6 +9301,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				let separate = expert_calls || packed_calls;
 				let object=output.with_extension("device.cubin");
 				if separate {command.args(["-c", "--disable-optimizer-constants"]);}
+				if let Some(count) = native_nvidia_maxrreg() {command.arg(format!("--maxrregcount={count}"));}
 				command.arg(format!("-arch={architecture}")).args([if separate {"-O1"} else {"-O3"}, "-o"]).arg(if separate {&object} else {output}).arg(&ptx);
 				let assembled = native_command(command, "NVIDIA PTX assembler", key);
 				assembled?;
@@ -19572,6 +19829,8 @@ fn place_expert_pair(bound: &Bound, head: Option<MtpHead>, positions: usize, che
 	let main_die = expert_main_die()?;
 	let main = device(Some(&die_name(main_die)))?;
 	let (target_graph,head_graph)=expert_graphs(bound,head.as_ref(),positions,checkpoints,observations,main)?;
+	dump_graph("target",&target_graph)?;
+	if let Some(graph)=&head_graph {dump_graph("mtp",graph)?;}
 	let precision=Config::load()?.precision;
 	// Validate and compile both native forwards before uploading resident weights.
 	// The later tapes reuse these artifacts with the same graph layout.
@@ -19749,6 +20008,28 @@ fn wire_dense_graph(graph:&mut Graph,binding:&Binding,mtp:bool,first:usize)->Res
 /// device UUID settings in Cargo.toml, never from a die number in this file.
 const DIES: usize = 8;
 fn die_name(die: usize) -> String { format!("nv{die}") }
+/// `RECIPE_GRAPH_DUMP=<dir>` writes each placed graph as a DAG, one row per node in
+/// execution order: what it computes, which nodes it reads, its shapes, its weight
+/// bytes, and the cross-die work it hands out. Written at compile, before any load.
+fn dump_graph(name: &str, graph: &Graph) -> Result<()> {
+	let Some(dir) = resident_dir("RECIPE_GRAPH_DUMP") else { return Ok(()) };
+	use std::fmt::Write as _;
+	let split = graph.expert_layers.iter().map(|layer| (layer.node, layer)).collect::<std::collections::HashMap<_, _>>();
+	let mut text = String::from("node\top\tblock\tblock_kind\treads\tinput\toutput\tprecision\tpacked\tweight_bytes\tsplit\tsplit_tensors\n");
+	for (index, node) in graph.nodes.iter().enumerate() {
+		let reads = [node.source, node.second].into_iter().filter(|input| *input >= 0).map(|input| input.to_string()).collect::<Vec<_>>().join(",");
+		let weight = graph.stored.get(index).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len());
+		let (kind, tensors) = split.get(&index).map_or(("", String::new()), |layer| match &layer.work {
+			SplitWork::Expert(tensors) => ("experts", tensors.iter().map(|tensor| tensor.name.as_str()).collect::<Vec<_>>().join(",")),
+			SplitWork::Dense(tensors) => ("dense rows", tensors.iter().map(|tensor| tensor.name.as_str()).collect::<Vec<_>>().join(",")),
+		});
+		writeln!(text, "{index}\t{}\t{}\t{}\t{reads}\t{}x{}\t{}x{}\t{:?}\t{}\t{weight}\t{kind}\t{tensors}", node.primitive_name(), node.block_index, node.block_kind,
+			node.input.channels, node.input.length, node.output.channels, node.output.length, node.precision, node.packed)?;
+	}
+	fs::create_dir_all(&dir).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", dir.display())))?;
+	let path = dir.join(format!("{name}.tsv"));
+	fs::write(&path, text).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
+}
 /// The expert split's main die: the first die `--device` names.
 fn expert_main_die() -> Result<usize> {
 	let main = selected_gpus()?.first().ok_or_else(|| RecipeError::new("expert split needs a selected device"))?;
@@ -19822,7 +20103,9 @@ impl ExpertExecution {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
 		let main = device(Some(&format!("nv{}", plan.main_die)))?;
 		let source = Self::worker_source();
-		let key = native_artifact_key(&main.native_target, &source)?;
+		// RECIPE_WORKER_MAXRREG caps worker registers so more threads fit per SM; it is part of the cubin's identity.
+		let maxrreg = std::env::var("RECIPE_WORKER_MAXRREG").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| (32..=255).contains(value));
+		let key = native_artifact_key(&main.native_target, &format!("{source}\n// maxrregcount {maxrreg:?}\n"))?;
 		let directory = native_artifact_directory(&key)?;
 		fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("expert artifact directory: {error}")))?;
 		let ptx = directory.join("expert-worker.ptx"); let cubin = directory.join("expert-worker.cubin");
@@ -19830,7 +20113,7 @@ impl ExpertExecution {
 			fs::write(&ptx, source).map_err(|error| RecipeError::new(format!("expert PTX write: {error}")))?;
 			let assembler = native_nvidia_assembler("sm_52").ok_or_else(|| RecipeError::new("expert worker requires the NVIDIA PTX assembler"))?;
 			let object=directory.join("expert-worker-device.cubin");
-			let mut command = Command::new(&assembler); command.args(["-c","-arch=sm_52","-O1","-v","-o"]).arg(&object).arg(&ptx);
+			let mut command = Command::new(&assembler); command.args(["-c","-arch=sm_52","-O1","-v"]); if let Some(count) = maxrreg { command.arg(format!("--maxrregcount={count}")); } command.arg("-o").arg(&object).arg(&ptx);
 			let diagnostic = native_command(command,"expert worker PTX assembler",&key)?;
 			let mut command=Command::new(Path::new(&assembler).with_file_name("nvlink")); command.args(["-arch=sm_52","--kernels-used","expert_split_worker","-o"]).arg(&cubin).arg(&object);
 			native_command(command,"expert worker device linker",&key)?;
@@ -19858,9 +20141,9 @@ impl ExpertExecution {
 		}
 		for layer in &value.layers {
 			let mut channels=Vec::new();
+			let mut responses=Vec::<u64>::new();
 			for (channel,worker) in value.workers.iter_mut().enumerate() {
 				let (request,response,route)=value.weights.channel(channel).ok_or_else(||RecipeError::new("split channel is absent"))?;
-				channels.extend([request.address(),route,route+512,response.completion_address(),request.sequence_address(),worker.die as u64]);
 				let mut matrices=Vec::new();let mut read_bytes=0;let mut slices=0;
 				match &layer.work {
 					SplitWork::Expert(tensors)=> {
@@ -19891,6 +20174,11 @@ impl ExpertExecution {
 						}
 					},
 				}
+				// A dense layer messages only the dies holding its rows; the rest skip it.
+				if !layer.dense() || slices>0 {
+					channels.extend([request.address(),route,route+512,response.completion_address(),request.sequence_address(),worker.die as u64]);
+					responses.extend([response.address(),response.sequence_address()]);
+				}
 				if matrices.is_empty() {matrices.push(0);}
 				let table=Buffer::upload(worker.gpu,&matrices)?;
 				worker.read_bytes.push(read_bytes);
@@ -19899,20 +20187,23 @@ impl ExpertExecution {
 				let mut record=native_words(&fields);
 				for dimension in [layer.input_width() as u32,layer.hidden() as u32,if layer.dense(){slices}else{layer.expert_count() as u32},10] {record.extend(dimension.to_ne_bytes());}
 				for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
-				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),layer.input_width().max(4096) as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
+				for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),if layer.dense() {(layer.input_width()+3)&!3} else {layer.input_width().max(4096)} as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
 				record.extend(u32::from(layer.terminal).to_ne_bytes());
 				record.resize(192,0);worker.jobs.write_bytes(layer.global*192,&record)?;
 				value.channel_tables.push(table);
 			}
+			let participants=channels.len()/6;
 			let channels=Buffer::upload(main,&channels)?;
+			let layer_responses=if layer.dense() {Some(Buffer::upload(main,&responses)?)} else {None};
 			let local=value.workers.iter().find(|worker|worker.die==value.weights.plan.main_die).unwrap();
 			let owner=if layer.dense(){0}else{value.weights.owner_address(layer.layer).ok_or_else(||RecipeError::new("expert owner map is absent"))?.0};
-			let fields=[value.control.pointer,channels.pointer,value.weights.response_table_address(),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
+			let fields=[value.control.pointer,channels.pointer,layer_responses.as_ref().map_or(value.weights.response_table_address(),|table|table.pointer),owner,value.main_scratch[0].pointer,value.main_scratch[1].pointer,value.main_scratch[2].pointer,value.main_scratch[3].pointer,local.jobs.pointer+layer.global as u64*192];
 			let mut record=native_words(&fields);
-			for dimension in [layer.global as u32,value.workers.len() as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
+			for dimension in [layer.global as u32,participants as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
 			record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
 			record.extend(u32::from(layer.dense()).to_ne_bytes());
 			value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
+			if let Some(table)=layer_responses {value.channel_tables.push(table);}
 		}
 		Ok(value)
 	}
@@ -19924,12 +20215,16 @@ impl ExpertExecution {
 		require(base.checked_add(phases as u32).and_then(|sequence|sequence.checked_mul(64)).is_some(),"expert completion sequence exhausted")?;
 		let mut control=Vec::new(); for word in [base,begin,capacity,layers as u32,first as u32,end-begin,0,0] {control.extend(word.to_ne_bytes());}
 		self.control.write_bytes(0,&control)?;
+		// RECIPE_WORKER_CTAS_PER_SM: resident 256-thread blocks per SM on each worker die; two fit in shared memory.
+		let per_sm=std::env::var("RECIPE_WORKER_CTAS_PER_SM").ok().and_then(|value|value.parse::<u32>().ok()).filter(|value|(1..=2).contains(value)).unwrap_or(1);
+		// RECIPE_WORKER_THREADS: threads per worker block, 256 by default; one block per SM either way, so the grid barrier still counts SMs.
+		let block=std::env::var("RECIPE_WORKER_THREADS").ok().and_then(|value|value.parse::<u32>().ok()).filter(|value|matches!(value,256|512|1024)).unwrap_or(256);
 		for worker in &self.workers {
 			#[cfg(nvidia)] if let Some(module)=&worker.module {
 				let Driver::Cuda(driver)=&worker.gpu.driver else {unreachable!()}; worker.gpu.activate()?;
 				let (first,layers,tokens)=(first as u32,layers as u32,end-begin);
 				let mut call=ptrs![worker.jobs.pointer,first,layers,base,tokens,capacity];
-				unsafe {worker.gpu.status((driver.launch)(module.function,driver.cus,1,1,256,1,1,40960,ptr::null_mut(),call.as_mut_ptr().cast(),ptr::null_mut()),"expert worker launch")?;}
+				unsafe {worker.gpu.status((driver.launch)(module.function,driver.cus*per_sm,1,1,block,1,1,40960,ptr::null_mut(),call.as_mut_ptr().cast(),ptr::null_mut()),"expert worker launch")?;}
 			}
 		}
 		Ok(())
@@ -26826,13 +27121,29 @@ fn resident_arena(gpu: &'static Gpu, key: u64, bytes: usize, fill: impl FnOnce(&
 }
 /// The layout key of a tape's weight arena: its offsets, formats, where its stored
 /// bytes come from, and its encoded parameters. Packed weight bytes are not read.
+/// It hashes as a stream, so no copy of the parameters is made; the result equals
+/// hashing the tuple (name, "tape", precision, inference, offsets, bytes, nodes)
+/// with each node's values collected as a `Vec<u64>` of their bits.
 fn weight_arena_key(gpu: &Gpu, graph: &Graph, precision: Compute, inference: bool, offsets: &[usize], bytes: usize) -> u64 {
-	let nodes = graph.nodes.iter().enumerate().map(|(index, node)| {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	(gpu.name.as_str(), "tape", format!("{precision:?}"), inference, offsets, bytes).hash(&mut hasher);
+	// A Vec hashes as its length, then each element in turn.
+	hasher.write_usize(graph.nodes.len());
+	let mut chunk = Vec::with_capacity(8 << 16);
+	for (index, node) in graph.nodes.iter().enumerate() {
 		let stored = graph.stored.get(index).and_then(Option::as_ref).map(|weight| (weight.format.0, weight.count, weight.bytes.identity()));
-		let values = graph.parameters.get(node.offset..node.offset + node.parameters).map(|values| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()).unwrap_or_default();
-		(node.op as i32, node.offset, node.parameters, node.packed, format!("{:?}", node.precision), stored, values)
-	}).collect::<Vec<_>>();
-	resident_key((gpu.name.as_str(), "tape", format!("{precision:?}"), inference, offsets, bytes, nodes))
+		(node.op as i32, node.offset, node.parameters, node.packed, format!("{:?}", node.precision), stored).hash(&mut hasher);
+		let values = graph.parameters.get(node.offset..node.offset + node.parameters).unwrap_or(&[]);
+		hasher.write_usize(values.len());
+		// A slice of u64 hashes as its bytes in one write; the hasher streams, so chunks give the same result.
+		for part in values.chunks(1 << 16) {
+			chunk.clear();
+			chunk.extend(part.iter().flat_map(|value| value.to_bits().to_ne_bytes()));
+			hasher.write(&chunk);
+		}
+	}
+	hasher.finish()
 }
 /// `RECIPE_HOST_HOLD=<dir on tmpfs>` keeps a mapped table in a file there, so it
 /// stays in RAM until power loss whichever processes come and go, and its rows
@@ -27565,7 +27876,8 @@ impl Gpu {
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if self.backend==Backend::Nvidia && !graph.expert_layers.is_empty() {
-			8
+			// RECIPE_EXPERT_WAVES: warps per block for the expert-split model, 8 (256 threads) or 16 (512); 16 needs RECIPE_MAXRREG <= 128.
+			std::env::var("RECIPE_EXPERT_WAVES").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| matches!(value, 8 | 16)).unwrap_or(8)
 		} else if cpu {
 			1
 		} else {
@@ -35798,6 +36110,10 @@ dt_shuffle:
 	mov.u32 r5,%tid.x; mov.u32 r6,%ctaid.x; mov.u32 r7,%ntid.x; mov.u32 r8,%nctaid.x; mad.lo.u32 r9,r6,r7,r5; mul.lo.u32 r10,r7,r8;
 	setp.eq.u32 p0,r9,0; mov.u32 r11,1; mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2],a14; add.u64 a15,a14,5000000000;
 	mov.u32 r12,0; @p0 st.global.v4.u32 [a2+32],{r12,r12,r12,r12}; @p0 st.global.u32 [a2+48],r12;
+	// A die holding none of this layer's rows receives no packet and sends no reply.
+	setp.ne.u32 p1,r3,0; @p1 bra dl_has_rows;
+	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+8],a14; @p0 st.global.u64 [a2+16],a14; bra dl_done;
+dl_has_rows:
 	{ .param .u64 fl,dl; .param .u32 sq,ok; st.param.u64 [fl],a4; st.param.u64 [dl],a15; st.param.u32 [sq],r0; call.uni (ok),p2p_wait,(fl,sq,dl); ld.param.u32 r12,[ok]; }
 	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,401; @p1 bra dl_done;
 	mov.u64 a14,%globaltimer; @p0 st.global.u64 [a2+8],a14;
@@ -35876,7 +36192,7 @@ dl_done:
 	setp.eq.u32 p1,r5,0; mul.wide.u32 a17,r6,4; add.u64 a18,a2,a17; @p1 st.global.u32 [a18+64],r11; st.param.u32 [result],r11; ret;
 }
 .func (.param .u32 result) split_dense_forward(.param .u64 desc0,.param .u64 source0,.param .u64 output0,.param .u32 length0,.param .u32 begin0,.param .u32 cols0,.param .u32 absolute0,.param .u64 sh0) {
-	.reg .b64 a<25>; .reg .b32 r<27>; .reg .pred p<4>; .reg .f32 f;
+	.reg .b64 a<25>; .reg .b32 r<27>; .reg .pred p<4>; .reg .f32 f; .reg .f32 v<4>;
 	ld.param.u64 a0,[desc0]; ld.param.u64 a1,[source0]; ld.param.u64 a2,[output0]; ld.param.u32 r0,[length0]; ld.param.u32 r1,[begin0]; ld.param.u32 r2,[cols0]; ld.param.u32 r3,[absolute0]; ld.param.u64 a3,[sh0];
 	ld.global.u64 a4,[a0]; ld.global.u64 a5,[a0+8]; ld.global.u64 a6,[a0+32]; ld.global.u64 a7,[a0+64]; ld.global.u32 r4,[a0+72]; ld.global.u32 r5,[a0+76]; ld.global.u32 r6,[a0+80];
 	ld.global.u64 a8,[a4+32]; ld.global.u64 a9,[a4+40]; ld.volatile.global.u32 r7,[a4]; ld.volatile.global.u32 r8,[a4+4]; ld.volatile.global.u32 r9,[a4+8]; ld.volatile.global.u32 r10,[a4+12]; ld.volatile.global.u32 r11,[a4+16];
@@ -35890,10 +36206,19 @@ df_gather:
 df_ready:
 	mul.lo.u32 r25,r19,64;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a8; st.param.u64 [fl],a9; st.param.u64 [dl],a11; st.param.u32 [sq],r25; call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r26,[ok]; }
-	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,411; @p1 bra df_failed; mov.u32 r20,0; max.u32 r24,r6,4096;
+	setp.eq.u32 p1,r26,0; @p1 mov.u32 r26,411; @p1 bra df_failed; mov.u32 r20,0; add.u32 r24,r6,3; and.b32 r24,r24,-4;
 df_send:
 	setp.ge.u32 p1,r20,r5; @p1 bra df_local; mul.wide.u32 a12,r20,48; add.u64 a13,a5,a12; ld.global.u64 a14,[a13]; ld.global.u64 a15,[a13+8]; ld.global.u64 a16,[a13+24]; ld.global.u64 a17,[a13+32];
 	@p0 st.volatile.global.u64 [a15],a2; @p0 st.volatile.global.u32 [a15+8],r0; @p0 st.volatile.global.u32 [a15+12],r1;
+	// Real values only, as 16-byte stores when the width and both buffers allow it.
+	and.b32 r12,r6,3; setp.ne.u32 p3,r12,0; @p3 bra df_packet_scalar; or.b64 a12,a6,a14; and.b64 a12,a12,15; setp.ne.u64 p3,a12,0; @p3 bra df_packet_scalar;
+	shr.u32 r12,r6,2; mov.u32 r21,r16; mul.lo.u32 r22,r12,r2;
+df_packet_quad:
+	setp.ge.u32 p1,r21,r22; @p1 bra df_publish; div.u32 r13,r21,r12; rem.u32 r14,r21,r12; shl.b32 r14,r14,2;
+	mad.lo.u32 r15,r13,r6,r14; mul.wide.u32 a12,r15,4; add.u64 a13,a6,a12; ld.global.v4.f32 {v0,v1,v2,v3},[a13];
+	mad.lo.u32 r15,r13,r24,r14; mul.wide.u32 a12,r15,4; add.u64 a13,a14,a12; st.volatile.global.v4.f32 [a13],{v0,v1,v2,v3};
+	add.u32 r21,r21,r17; bra df_packet_quad;
+df_packet_scalar:
 	mov.u32 r21,r16; mul.lo.u32 r22,r24,r2;
 df_packet:
 	setp.ge.u32 p1,r21,r22; @p1 bra df_publish; div.u32 r23,r21,r24; rem.u32 r25,r21,r24; setp.lt.u32 p2,r25,r6; mov.f32 f,0f00000000;
