@@ -1492,6 +1492,48 @@ fn fp8_encoder(name: &str, format: FloatFormat) -> String {
 	}
 	ir
 }
+/// The FP8 decode of `fp8_codec` with each case selected rather than branched
+/// to, inlined into a loop that decodes many cache values at once.
+fn fp8_decode_inline(format: FloatFormat, name: &str) -> String {
+	let (man, exp) = (format.arithmetic.man, format.arithmetic.exp);
+	let bias = (1u32 << (exp - 1)) - 1;
+	let special = if format == FloatFormat::FP8 {
+		"%special = icmp eq i32 %magnitude, 127\n%special.bits = or i32 %float.sign, 2143289344".to_owned()
+	} else {
+		"%special = icmp uge i32 %magnitude, 124\n%special.base = or i32 %float.sign, 2139095040\n%special.bits = or i32 %special.base, %float.mantissa".to_owned()
+	};
+	let subnormal = f64::from(2.0_f32.powi(1 - bias as i32 - man as i32)).to_bits();
+	format!(
+		"define internal float @{name}(i8 %value) #1 {{
+entry:
+%wide = zext i8 %value to i32
+%magnitude = and i32 %wide, 127
+%sign = and i32 %wide, 128
+%float.sign = shl i32 %sign, 24
+%exponent = lshr i32 %magnitude, {man}
+%mantissa = and i32 %wide, {mask}
+%float.mantissa = shl i32 %mantissa, {shift}
+%zero.exponent = icmp eq i32 %exponent, 0
+%mantissa.float = uitofp i32 %mantissa to float
+%scaled = fmul float %mantissa.float, 0x{subnormal:016X}
+%sub.bits = bitcast float %scaled to i32
+%sub.signed = or i32 %sub.bits, %float.sign
+%biased = add i32 %exponent, {offset}
+%exponent.bits = shl i32 %biased, 23
+%normal.base = or i32 %float.sign, %exponent.bits
+%normal.bits = or i32 %normal.base, %float.mantissa
+{special}
+%finite.bits = select i1 %zero.exponent, i32 %sub.signed, i32 %normal.bits
+%bits = select i1 %special, i32 %special.bits, i32 %finite.bits
+%result = bitcast i32 %bits to float
+ret float %result
+}}
+",
+		mask = (1u32 << man) - 1,
+		shift = 23 - man,
+		offset = 127 - bias
+	)
+}
 fn fp8_codec(format: FloatFormat) -> String {
 	let (man, exp) = (format.arithmetic.man, format.arithmetic.exp);
 	let bias = (1u32 << (exp - 1)) - 1;
@@ -1759,7 +1801,7 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, fp8: Option<FloatFormat>) -
 	};
 	// The cache in the model's own type: the bytes pass through untouched.
 	if kv == model && fp8.is_none() {
-		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.decode({model} %value)\nret {arithmetic} %result\n}}\ndefine internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n%result = call {model} @recipe.encode({arithmetic} %value)\nret {kv} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
+		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.decode({model} %value)\nret {arithmetic} %result\n}}\ndefine internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n%result = call {model} @recipe.encode({arithmetic} %value)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state.inline({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.kv.to.state({kv} %value)\nret {arithmetic} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
 	}
 	let mut ir = fp8.map(|format| fp8_codec(format).replace("@recipe.", "@recipe.kv.storage.")).unwrap_or_default();
 	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret {kv} %result\n}}\n", from_state("result", "state")));
@@ -1768,6 +1810,14 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, fp8: Option<FloatFormat>) -
 	ir.push_str(&format!("define internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}ret {kv} %result\n}}\n", from_float("result", "wide")));
 	ir.push_str(&format!("define internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n{}{}ret {arithmetic} %result\n}}\n", to_float("wide", "value"), widen("result", "wide")));
 	ir.push_str(&format!("define internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n{}ret {kv} %result\n}}\n", from_state("result", "value")));
+	// The same widening for a loop that decodes many cache values: an FP8
+	// cache decodes in line rather than through a call for each value.
+	if let Some(format) = fp8 {
+		ir.push_str(&fp8_decode_inline(format, "recipe.kv.storage.decode.inline"));
+		ir.push_str(&format!("define internal {arithmetic} @recipe.kv.to.state.inline({kv} %value) #1 {{\nentry:\n%wide = call float @recipe.kv.storage.decode.inline(i8 %value)\n{}ret {arithmetic} %result\n}}\n", widen("result", "wide")));
+	} else {
+		ir.push_str(&format!("define internal {arithmetic} @recipe.kv.to.state.inline({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.kv.to.state({kv} %value)\nret {arithmetic} %result\n}}\n"));
+	}
 	ir
 }
 /// Every template source: one per model precision with the cache in the model
@@ -1776,7 +1826,10 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, fp8: Option<FloatFormat>) -
 fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<Vec<(String, String)>> {
 	let mut sources = Vec::new();
 	for (suffix, contents, model, arithmetic, bytes) in precision_bases(ir, schedule)? {
-		let cache = |kv: &str, kv_bytes: usize, fp8| contents.replace("RECIPE_KV_ALIGN", &kv_bytes.to_string()).replace("RECIPE_KV", kv) + "\n" + &kv_codec(model, arithmetic, kv, fp8);
+		// A cache load of four adjacent positions is aligned to all four.
+		let cache = |kv: &str, kv_bytes: usize, fp8| {
+			contents.replace("RECIPE_KV_QUAD_ALIGN", &(kv_bytes * 4).to_string()).replace("RECIPE_KV_ALIGN", &kv_bytes.to_string()).replace("RECIPE_KV", kv) + "\n" + &kv_codec(model, arithmetic, kv, fp8)
+		};
 		sources.push((suffix.clone(), cache(model, bytes, None)));
 		for (name, kv, kv_bytes) in [("f16", "half", 2), ("bf16", "i16", 2), ("f32", "float", 4)] {
 			if kv == model && !(name == "f32" && suffix.starts_with("-tf32")) {

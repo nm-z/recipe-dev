@@ -2872,6 +2872,21 @@ define internal <3 x RECIPE_STATE> @delta_parameters(ptr addrspace(1) %gates, i6
 %result.d = insertelement <3 x RECIPE_STATE> %result.q, RECIPE_STATE %decay, i32 1
 %result.w = insertelement <3 x RECIPE_STATE> %result.d, RECIPE_STATE %write, i32 2
 ret <3 x RECIPE_STATE> %result.w }
+; The model-typed element at %index, widened, and its narrowing store: the
+; generated state-tile decode reads its inputs and writes its output through these.
+define internal RECIPE_STATE @delta_model_load(ptr addrspace(1) %base, i64 %index) #1 { entry:
+%pointer = getelementptr inbounds double, ptr addrspace(1) %base, i64 %index
+%model = load double, ptr addrspace(1) %pointer, align 8
+%value = call RECIPE_STATE @recipe.decode(double %model) ret RECIPE_STATE %value }
+define internal void @delta_model_store(ptr addrspace(1) %base, i64 %index, RECIPE_STATE %value) #1 { entry:
+%model = call double @recipe.encode(RECIPE_STATE %value)
+%pointer = getelementptr inbounds double, ptr addrspace(1) %base, i64 %index
+store double %model, ptr addrspace(1) %pointer, align 8 ret void }
+; exp(A) of one value head, the scale its softplus decay input is multiplied by.
+define internal RECIPE_STATE @delta_decay_scale(ptr addrspace(1) %weights, i64 %head, i32 %decode) #1 { entry:
+%parameter = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %head, i32 %decode)
+%parameter.wide = call RECIPE_STATE @recipe.decode(double %parameter)
+%scale = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %parameter.wide) ret RECIPE_STATE %scale }
 ; One head prepares its gates once for the live window. Columns read these
 ; scalars after the existing compiled unit's grid barrier.
 define internal void @delta_prepare_body(ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %prepared,
@@ -4551,6 +4566,1060 @@ output.channel.done:
 br label %output.channel.loop
 output.stats.owner:
 br label %exit
+exit:
+ret void
+}
+; Inference attention for a few query positions on one cached sequence: one
+; workgroup per row and query head takes every query of the window, so the
+; key and value planes it reads serve all of them. The window's own keys and
+; values enter the cache first in the cache type and are read back from it,
+; so they meet the same rounding as the settled history. Each wave folds a
+; slice of the head's channels for four keys a lane at a time and four
+; queries at once; the waves' partial scores meet in the shared tile, each
+; wave turns one query's scores into probabilities, and each thread folds the
+; value channel it owns over every key.
+define internal void @attention_decode_store(ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture writeonly %output, i1 %active, RECIPE_STATE %value,
+i64 %output.row, i64 %gate.row, i32 %channel, i32 %position, i32 %length, i32 %buffer.length, i32 %buffer.origin, i1 %gate) #1 {
+entry:
+br i1 %active, label %store, label %done
+store:
+%channel.wide = zext i32 %channel to i64
+%length.wide = zext i32 %length to i64
+%channel.base = mul i64 %channel.wide, %length.wide
+%position.wide = zext i32 %position to i64
+%local = add i64 %channel.base, %position.wide
+br i1 %gate, label %gated, label %write
+gated:
+%gate.index = add i64 %gate.row, %local
+%gate.phys = call i64 @recipe.window.index(i64 %gate.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %gate.phys
+%gate.model = load double, ptr addrspace(1) %gate.ptr, align 8
+%gate.state = call RECIPE_STATE @recipe.state.from.model(double %gate.model)
+%gate.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %gate.state)
+%gate.exp = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %gate.negative)
+%gate.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%gate.denominator = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %gate.one, RECIPE_STATE %gate.exp)
+%gate.factor = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %gate.one, RECIPE_STATE %gate.denominator)
+%gated.value = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %gate.factor)
+br label %write
+write:
+%result = phi RECIPE_STATE [ %value, %store ], [ %gated.value, %gated ]
+%output.index = add i64 %output.row, %local
+%output.phys = call i64 @recipe.window.index(i64 %output.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.phys
+%model = call double @recipe.model.from.state(RECIPE_STATE %result)
+store double %model, ptr addrspace(1) %output.ptr, align 8
+br label %done
+done:
+ret void
+}
+define internal void @attention_decode_body(
+ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %kv.context,
+i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %kv.heads, i32 %value.heads,
+i1 %gate, i1 %unscaled, i32 %threads, i32 %buffer.length, i32 %buffer.origin) #3 {
+entry:
+%lid = call i32 @recipe.local.id.x()
+%group = call i32 @recipe.group.id.x()
+%block = call i32 @recipe.workgroup.size.x()
+%groups = udiv i32 %threads, %block
+%wave.width = call i32 @recipe.wavefront.width()
+%wave = udiv i32 %lid, %wave.width
+%lane = urem i32 %lid, %wave.width
+%waves = udiv i32 %block, %wave.width
+%wave.half = lshr i32 %wave.width, 1
+%length = udiv i32 %from, %channels
+%width = udiv i32 %channels, %heads
+%kv.group = udiv i32 %heads, %kv.heads
+%value.group = udiv i32 %heads, %value.heads
+%kv.channels = mul i32 %kv.heads, %width
+%kv.plane = mul i32 %kv.channels, %length
+%value.channels = mul i32 %value.heads, %width
+%value.plane = mul i32 %value.channels, %length
+%kv.planes = add i32 %kv.plane, %value.plane
+%value.source = add i32 %from, %kv.plane
+%gate.base = add i32 %from, %kv.planes
+%gate.plane = select i1 %gate, i32 %from, i32 0
+%row.stride = add i32 %gate.base, %gate.plane
+%row.stride.wide = zext i32 %row.stride to i64
+%from.wide = zext i32 %from to i64
+%kv.planes.wide = zext i32 %kv.planes to i64
+%gate.base.wide = zext i32 %gate.base to i64
+%reached = add i32 %query.begin, %query.span
+%quads.round = add i32 %reached, 3
+%quads = udiv i32 %quads.round, 4
+%keys = mul i32 %quads, 4
+%slice = udiv i32 %width, %waves
+%slice.begin = mul i32 %wave, %slice
+%slice.end = add i32 %slice.begin, %slice
+%query.values = mul i32 %query.span, %width
+%stage.total = mul i32 %query.values, 3
+%partial.per.wave = mul i32 %keys, 4
+%partial.values = mul i32 %partial.per.wave, %waves
+%score.base = add i32 %query.values, %partial.values
+%last.query = sub i32 %query.span, 1
+%keys.1 = mul i32 %keys, 1
+%keys.2 = mul i32 %keys, 2
+%keys.3 = mul i32 %keys, 3
+%one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%minus.one = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %one)
+; Below every score: minus infinity from the state's own division.
+%floor = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %minus.one, RECIPE_STATE %zero)
+%width.state = call RECIPE_STATE @recipe.state.from.u32(i32 %width)
+%root = call RECIPE_STATE @recipe.state.sqrt(RECIPE_STATE %width.state)
+%scale = select i1 %unscaled, RECIPE_STATE %one, RECIPE_STATE %root
+%jobs = mul i32 %rows, %heads
+br label %job.loop
+job.loop:
+%job = phi i32 [ %group, %entry ], [ %job.next, %output.done ]
+%job.more = icmp ult i32 %job, %jobs
+br i1 %job.more, label %job.start, label %exit
+job.start:
+%head = urem i32 %job, %heads
+%row = udiv i32 %job, %heads
+%kv.head = udiv i32 %head, %kv.group
+%value.head = udiv i32 %head, %value.group
+%row.wide = zext i32 %row to i64
+%row.base = mul i64 %row.wide, %row.stride.wide
+%output.row = mul i64 %row.wide, %from.wide
+%cache.row = mul i64 %row.wide, %kv.planes.wide
+%gate.row = add i64 %row.base, %gate.base.wide
+%head.channel = mul i32 %head, %width
+%key.channel = mul i32 %kv.head, %width
+%value.channel = mul i32 %value.head, %width
+%key.offset = mul i32 %key.channel, %length
+%value.channel.offset = mul i32 %value.channel, %length
+%value.offset = add i32 %kv.plane, %value.channel.offset
+br label %stage.loop
+; The window's queries enter the tile in the state type; its keys and values
+; enter the cache. Every head of a key-value group writes the same bytes.
+stage.loop:
+%stage = phi i32 [ %lid, %job.start ], [ %stage.next, %stage.advance ]
+%stage.more = icmp ult i32 %stage, %stage.total
+br i1 %stage.more, label %stage.step, label %stage.done
+stage.step:
+%stage.part = udiv i32 %stage, %query.values
+%stage.within = urem i32 %stage, %query.values
+%stage.query = udiv i32 %stage.within, %width
+%stage.lane.channel = urem i32 %stage.within, %width
+%stage.position = add i32 %query.begin, %stage.query
+%stage.is.query = icmp eq i32 %stage.part, 0
+%stage.is.key = icmp eq i32 %stage.part, 1
+%stage.cache.channel = select i1 %stage.is.key, i32 %key.channel, i32 %value.channel
+%stage.head.channel = select i1 %stage.is.query, i32 %head.channel, i32 %stage.cache.channel
+%stage.channel = add i32 %stage.head.channel, %stage.lane.channel
+%stage.cache.plane = select i1 %stage.is.key, i32 %from, i32 %value.source
+%stage.plane = select i1 %stage.is.query, i32 0, i32 %stage.cache.plane
+%stage.channel.base = mul i32 %stage.channel, %length
+%stage.local = add i32 %stage.channel.base, %stage.position
+%stage.source.local = add i32 %stage.plane, %stage.local
+%stage.source.local.wide = zext i32 %stage.source.local to i64
+%stage.source = add i64 %row.base, %stage.source.local.wide
+%stage.source.phys = call i64 @recipe.window.index(i64 %stage.source, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%stage.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %stage.source.phys
+%stage.value = load double, ptr addrspace(1) %stage.source.ptr, align 8
+br i1 %stage.is.query, label %stage.query.store, label %stage.cache.store
+stage.query.store:
+%stage.query.state = call RECIPE_STATE @recipe.state.from.model(double %stage.value)
+%stage.query.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %stage.within
+store RECIPE_STATE %stage.query.state, ptr addrspace(3) %stage.query.ptr, align RECIPE_STATE_ALIGN
+br label %stage.advance
+stage.cache.store:
+%stage.cache.base = select i1 %stage.is.key, i32 0, i32 %kv.plane
+%stage.cache.local = add i32 %stage.cache.base, %stage.local
+%stage.cache.local.wide = zext i32 %stage.cache.local to i64
+%stage.cache.index = add i64 %cache.row, %stage.cache.local.wide
+%stage.cache.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %stage.cache.index
+%stage.encoded = call RECIPE_KV @recipe.kv.encode(double %stage.value)
+store RECIPE_KV %stage.encoded, ptr addrspace(1) %stage.cache.ptr, align RECIPE_KV_ALIGN
+br label %stage.advance
+stage.advance:
+%stage.next = add i32 %stage, %block
+br label %stage.loop
+stage.done:
+call void @recipe.local.barrier()
+br label %chunk.loop
+; Scores, four queries at a time. A lane owns four adjacent keys, which sit
+; next to each other in every channel row of the cache.
+chunk.loop:
+%chunk = phi i32 [ 0, %stage.done ], [ %chunk.next, %reduce.done ]
+%chunk.more = icmp ult i32 %chunk, %query.span
+br i1 %chunk.more, label %chunk.start, label %softmax.start
+chunk.start:
+%chunk.q0 = add i32 %chunk, 0
+%chunk.q0.over = icmp ugt i32 %chunk.q0, %last.query
+%chunk.q0.safe = select i1 %chunk.q0.over, i32 %last.query, i32 %chunk.q0
+%chunk.q0.row = mul i32 %chunk.q0.safe, %width
+%chunk.q1 = add i32 %chunk, 1
+%chunk.q1.over = icmp ugt i32 %chunk.q1, %last.query
+%chunk.q1.safe = select i1 %chunk.q1.over, i32 %last.query, i32 %chunk.q1
+%chunk.q1.row = mul i32 %chunk.q1.safe, %width
+%chunk.q2 = add i32 %chunk, 2
+%chunk.q2.over = icmp ugt i32 %chunk.q2, %last.query
+%chunk.q2.safe = select i1 %chunk.q2.over, i32 %last.query, i32 %chunk.q2
+%chunk.q2.row = mul i32 %chunk.q2.safe, %width
+%chunk.q3 = add i32 %chunk, 3
+%chunk.q3.over = icmp ugt i32 %chunk.q3, %last.query
+%chunk.q3.safe = select i1 %chunk.q3.over, i32 %last.query, i32 %chunk.q3
+%chunk.q3.row = mul i32 %chunk.q3.safe, %width
+%partial.wave = mul i32 %wave, %partial.per.wave
+%partial.wave.base = add i32 %query.values, %partial.wave
+br label %quad.loop
+quad.loop:
+%quad = phi i32 [ %lane, %chunk.start ], [ %quad.next, %quad.store ]
+%quad.more = icmp ult i32 %quad, %quads
+br i1 %quad.more, label %quad.start, label %quad.done
+quad.start:
+%quad.key = mul i32 %quad, 4
+%quad.base = add i32 %key.offset, %quad.key
+br label %dot.loop
+dot.loop:
+%dot.channel = phi i32 [ %slice.begin, %quad.start ], [ %dot.channel.next, %dot.step ]
+%dot.0.0 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.0.0.u3, %dot.step ]
+%dot.0.1 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.0.1.u3, %dot.step ]
+%dot.0.2 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.0.2.u3, %dot.step ]
+%dot.0.3 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.0.3.u3, %dot.step ]
+%dot.1.0 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.1.0.u3, %dot.step ]
+%dot.1.1 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.1.1.u3, %dot.step ]
+%dot.1.2 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.1.2.u3, %dot.step ]
+%dot.1.3 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.1.3.u3, %dot.step ]
+%dot.2.0 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.2.0.u3, %dot.step ]
+%dot.2.1 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.2.1.u3, %dot.step ]
+%dot.2.2 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.2.2.u3, %dot.step ]
+%dot.2.3 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.2.3.u3, %dot.step ]
+%dot.3.0 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.3.0.u3, %dot.step ]
+%dot.3.1 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.3.1.u3, %dot.step ]
+%dot.3.2 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.3.2.u3, %dot.step ]
+%dot.3.3 = phi RECIPE_STATE [ %zero, %quad.start ], [ %dot.3.3.u3, %dot.step ]
+%dot.more = icmp ult i32 %dot.channel, %slice.end
+br i1 %dot.more, label %dot.step, label %quad.store
+dot.step:
+%dot.c0 = add i32 %dot.channel, 0
+%dot.c0.offset = mul i32 %dot.c0, %length
+%dot.c0.local = add i32 %quad.base, %dot.c0.offset
+%dot.c0.wide = zext i32 %dot.c0.local to i64
+%dot.c0.index = add i64 %cache.row, %dot.c0.wide
+%dot.c0.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %dot.c0.index
+%dot.c0.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %dot.c0.ptr, align RECIPE_KV_QUAD_ALIGN
+%dot.c0.k0.kv = extractelement <4 x RECIPE_KV> %dot.c0.raw, i32 0
+%dot.c0.k0 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c0.k0.kv)
+%dot.c0.k1.kv = extractelement <4 x RECIPE_KV> %dot.c0.raw, i32 1
+%dot.c0.k1 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c0.k1.kv)
+%dot.c0.k2.kv = extractelement <4 x RECIPE_KV> %dot.c0.raw, i32 2
+%dot.c0.k2 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c0.k2.kv)
+%dot.c0.k3.kv = extractelement <4 x RECIPE_KV> %dot.c0.raw, i32 3
+%dot.c0.k3 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c0.k3.kv)
+%dot.c0.q0.index = add i32 %chunk.q0.row, %dot.c0
+%dot.c0.q0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c0.q0.index
+%dot.c0.q0 = load RECIPE_STATE, ptr addrspace(3) %dot.c0.q0.ptr, align RECIPE_STATE_ALIGN
+%dot.c0.q1.index = add i32 %chunk.q1.row, %dot.c0
+%dot.c0.q1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c0.q1.index
+%dot.c0.q1 = load RECIPE_STATE, ptr addrspace(3) %dot.c0.q1.ptr, align RECIPE_STATE_ALIGN
+%dot.c0.q2.index = add i32 %chunk.q2.row, %dot.c0
+%dot.c0.q2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c0.q2.index
+%dot.c0.q2 = load RECIPE_STATE, ptr addrspace(3) %dot.c0.q2.ptr, align RECIPE_STATE_ALIGN
+%dot.c0.q3.index = add i32 %chunk.q3.row, %dot.c0
+%dot.c0.q3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c0.q3.index
+%dot.c0.q3 = load RECIPE_STATE, ptr addrspace(3) %dot.c0.q3.ptr, align RECIPE_STATE_ALIGN
+%dot.0.0.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.0, RECIPE_STATE %dot.c0.q0, RECIPE_STATE %dot.c0.k0)
+%dot.0.1.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.1, RECIPE_STATE %dot.c0.q0, RECIPE_STATE %dot.c0.k1)
+%dot.0.2.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.2, RECIPE_STATE %dot.c0.q0, RECIPE_STATE %dot.c0.k2)
+%dot.0.3.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.3, RECIPE_STATE %dot.c0.q0, RECIPE_STATE %dot.c0.k3)
+%dot.1.0.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.0, RECIPE_STATE %dot.c0.q1, RECIPE_STATE %dot.c0.k0)
+%dot.1.1.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.1, RECIPE_STATE %dot.c0.q1, RECIPE_STATE %dot.c0.k1)
+%dot.1.2.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.2, RECIPE_STATE %dot.c0.q1, RECIPE_STATE %dot.c0.k2)
+%dot.1.3.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.3, RECIPE_STATE %dot.c0.q1, RECIPE_STATE %dot.c0.k3)
+%dot.2.0.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.0, RECIPE_STATE %dot.c0.q2, RECIPE_STATE %dot.c0.k0)
+%dot.2.1.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.1, RECIPE_STATE %dot.c0.q2, RECIPE_STATE %dot.c0.k1)
+%dot.2.2.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.2, RECIPE_STATE %dot.c0.q2, RECIPE_STATE %dot.c0.k2)
+%dot.2.3.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.3, RECIPE_STATE %dot.c0.q2, RECIPE_STATE %dot.c0.k3)
+%dot.3.0.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.0, RECIPE_STATE %dot.c0.q3, RECIPE_STATE %dot.c0.k0)
+%dot.3.1.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.1, RECIPE_STATE %dot.c0.q3, RECIPE_STATE %dot.c0.k1)
+%dot.3.2.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.2, RECIPE_STATE %dot.c0.q3, RECIPE_STATE %dot.c0.k2)
+%dot.3.3.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.3, RECIPE_STATE %dot.c0.q3, RECIPE_STATE %dot.c0.k3)
+%dot.c1 = add i32 %dot.channel, 1
+%dot.c1.offset = mul i32 %dot.c1, %length
+%dot.c1.local = add i32 %quad.base, %dot.c1.offset
+%dot.c1.wide = zext i32 %dot.c1.local to i64
+%dot.c1.index = add i64 %cache.row, %dot.c1.wide
+%dot.c1.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %dot.c1.index
+%dot.c1.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %dot.c1.ptr, align RECIPE_KV_QUAD_ALIGN
+%dot.c1.k0.kv = extractelement <4 x RECIPE_KV> %dot.c1.raw, i32 0
+%dot.c1.k0 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c1.k0.kv)
+%dot.c1.k1.kv = extractelement <4 x RECIPE_KV> %dot.c1.raw, i32 1
+%dot.c1.k1 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c1.k1.kv)
+%dot.c1.k2.kv = extractelement <4 x RECIPE_KV> %dot.c1.raw, i32 2
+%dot.c1.k2 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c1.k2.kv)
+%dot.c1.k3.kv = extractelement <4 x RECIPE_KV> %dot.c1.raw, i32 3
+%dot.c1.k3 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c1.k3.kv)
+%dot.c1.q0.index = add i32 %chunk.q0.row, %dot.c1
+%dot.c1.q0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c1.q0.index
+%dot.c1.q0 = load RECIPE_STATE, ptr addrspace(3) %dot.c1.q0.ptr, align RECIPE_STATE_ALIGN
+%dot.c1.q1.index = add i32 %chunk.q1.row, %dot.c1
+%dot.c1.q1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c1.q1.index
+%dot.c1.q1 = load RECIPE_STATE, ptr addrspace(3) %dot.c1.q1.ptr, align RECIPE_STATE_ALIGN
+%dot.c1.q2.index = add i32 %chunk.q2.row, %dot.c1
+%dot.c1.q2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c1.q2.index
+%dot.c1.q2 = load RECIPE_STATE, ptr addrspace(3) %dot.c1.q2.ptr, align RECIPE_STATE_ALIGN
+%dot.c1.q3.index = add i32 %chunk.q3.row, %dot.c1
+%dot.c1.q3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c1.q3.index
+%dot.c1.q3 = load RECIPE_STATE, ptr addrspace(3) %dot.c1.q3.ptr, align RECIPE_STATE_ALIGN
+%dot.0.0.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.0.u0, RECIPE_STATE %dot.c1.q0, RECIPE_STATE %dot.c1.k0)
+%dot.0.1.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.1.u0, RECIPE_STATE %dot.c1.q0, RECIPE_STATE %dot.c1.k1)
+%dot.0.2.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.2.u0, RECIPE_STATE %dot.c1.q0, RECIPE_STATE %dot.c1.k2)
+%dot.0.3.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.3.u0, RECIPE_STATE %dot.c1.q0, RECIPE_STATE %dot.c1.k3)
+%dot.1.0.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.0.u0, RECIPE_STATE %dot.c1.q1, RECIPE_STATE %dot.c1.k0)
+%dot.1.1.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.1.u0, RECIPE_STATE %dot.c1.q1, RECIPE_STATE %dot.c1.k1)
+%dot.1.2.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.2.u0, RECIPE_STATE %dot.c1.q1, RECIPE_STATE %dot.c1.k2)
+%dot.1.3.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.3.u0, RECIPE_STATE %dot.c1.q1, RECIPE_STATE %dot.c1.k3)
+%dot.2.0.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.0.u0, RECIPE_STATE %dot.c1.q2, RECIPE_STATE %dot.c1.k0)
+%dot.2.1.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.1.u0, RECIPE_STATE %dot.c1.q2, RECIPE_STATE %dot.c1.k1)
+%dot.2.2.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.2.u0, RECIPE_STATE %dot.c1.q2, RECIPE_STATE %dot.c1.k2)
+%dot.2.3.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.3.u0, RECIPE_STATE %dot.c1.q2, RECIPE_STATE %dot.c1.k3)
+%dot.3.0.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.0.u0, RECIPE_STATE %dot.c1.q3, RECIPE_STATE %dot.c1.k0)
+%dot.3.1.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.1.u0, RECIPE_STATE %dot.c1.q3, RECIPE_STATE %dot.c1.k1)
+%dot.3.2.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.2.u0, RECIPE_STATE %dot.c1.q3, RECIPE_STATE %dot.c1.k2)
+%dot.3.3.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.3.u0, RECIPE_STATE %dot.c1.q3, RECIPE_STATE %dot.c1.k3)
+%dot.c2 = add i32 %dot.channel, 2
+%dot.c2.offset = mul i32 %dot.c2, %length
+%dot.c2.local = add i32 %quad.base, %dot.c2.offset
+%dot.c2.wide = zext i32 %dot.c2.local to i64
+%dot.c2.index = add i64 %cache.row, %dot.c2.wide
+%dot.c2.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %dot.c2.index
+%dot.c2.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %dot.c2.ptr, align RECIPE_KV_QUAD_ALIGN
+%dot.c2.k0.kv = extractelement <4 x RECIPE_KV> %dot.c2.raw, i32 0
+%dot.c2.k0 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c2.k0.kv)
+%dot.c2.k1.kv = extractelement <4 x RECIPE_KV> %dot.c2.raw, i32 1
+%dot.c2.k1 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c2.k1.kv)
+%dot.c2.k2.kv = extractelement <4 x RECIPE_KV> %dot.c2.raw, i32 2
+%dot.c2.k2 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c2.k2.kv)
+%dot.c2.k3.kv = extractelement <4 x RECIPE_KV> %dot.c2.raw, i32 3
+%dot.c2.k3 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c2.k3.kv)
+%dot.c2.q0.index = add i32 %chunk.q0.row, %dot.c2
+%dot.c2.q0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c2.q0.index
+%dot.c2.q0 = load RECIPE_STATE, ptr addrspace(3) %dot.c2.q0.ptr, align RECIPE_STATE_ALIGN
+%dot.c2.q1.index = add i32 %chunk.q1.row, %dot.c2
+%dot.c2.q1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c2.q1.index
+%dot.c2.q1 = load RECIPE_STATE, ptr addrspace(3) %dot.c2.q1.ptr, align RECIPE_STATE_ALIGN
+%dot.c2.q2.index = add i32 %chunk.q2.row, %dot.c2
+%dot.c2.q2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c2.q2.index
+%dot.c2.q2 = load RECIPE_STATE, ptr addrspace(3) %dot.c2.q2.ptr, align RECIPE_STATE_ALIGN
+%dot.c2.q3.index = add i32 %chunk.q3.row, %dot.c2
+%dot.c2.q3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c2.q3.index
+%dot.c2.q3 = load RECIPE_STATE, ptr addrspace(3) %dot.c2.q3.ptr, align RECIPE_STATE_ALIGN
+%dot.0.0.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.0.u1, RECIPE_STATE %dot.c2.q0, RECIPE_STATE %dot.c2.k0)
+%dot.0.1.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.1.u1, RECIPE_STATE %dot.c2.q0, RECIPE_STATE %dot.c2.k1)
+%dot.0.2.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.2.u1, RECIPE_STATE %dot.c2.q0, RECIPE_STATE %dot.c2.k2)
+%dot.0.3.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.3.u1, RECIPE_STATE %dot.c2.q0, RECIPE_STATE %dot.c2.k3)
+%dot.1.0.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.0.u1, RECIPE_STATE %dot.c2.q1, RECIPE_STATE %dot.c2.k0)
+%dot.1.1.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.1.u1, RECIPE_STATE %dot.c2.q1, RECIPE_STATE %dot.c2.k1)
+%dot.1.2.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.2.u1, RECIPE_STATE %dot.c2.q1, RECIPE_STATE %dot.c2.k2)
+%dot.1.3.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.3.u1, RECIPE_STATE %dot.c2.q1, RECIPE_STATE %dot.c2.k3)
+%dot.2.0.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.0.u1, RECIPE_STATE %dot.c2.q2, RECIPE_STATE %dot.c2.k0)
+%dot.2.1.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.1.u1, RECIPE_STATE %dot.c2.q2, RECIPE_STATE %dot.c2.k1)
+%dot.2.2.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.2.u1, RECIPE_STATE %dot.c2.q2, RECIPE_STATE %dot.c2.k2)
+%dot.2.3.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.3.u1, RECIPE_STATE %dot.c2.q2, RECIPE_STATE %dot.c2.k3)
+%dot.3.0.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.0.u1, RECIPE_STATE %dot.c2.q3, RECIPE_STATE %dot.c2.k0)
+%dot.3.1.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.1.u1, RECIPE_STATE %dot.c2.q3, RECIPE_STATE %dot.c2.k1)
+%dot.3.2.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.2.u1, RECIPE_STATE %dot.c2.q3, RECIPE_STATE %dot.c2.k2)
+%dot.3.3.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.3.u1, RECIPE_STATE %dot.c2.q3, RECIPE_STATE %dot.c2.k3)
+%dot.c3 = add i32 %dot.channel, 3
+%dot.c3.offset = mul i32 %dot.c3, %length
+%dot.c3.local = add i32 %quad.base, %dot.c3.offset
+%dot.c3.wide = zext i32 %dot.c3.local to i64
+%dot.c3.index = add i64 %cache.row, %dot.c3.wide
+%dot.c3.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %dot.c3.index
+%dot.c3.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %dot.c3.ptr, align RECIPE_KV_QUAD_ALIGN
+%dot.c3.k0.kv = extractelement <4 x RECIPE_KV> %dot.c3.raw, i32 0
+%dot.c3.k0 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c3.k0.kv)
+%dot.c3.k1.kv = extractelement <4 x RECIPE_KV> %dot.c3.raw, i32 1
+%dot.c3.k1 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c3.k1.kv)
+%dot.c3.k2.kv = extractelement <4 x RECIPE_KV> %dot.c3.raw, i32 2
+%dot.c3.k2 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c3.k2.kv)
+%dot.c3.k3.kv = extractelement <4 x RECIPE_KV> %dot.c3.raw, i32 3
+%dot.c3.k3 = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %dot.c3.k3.kv)
+%dot.c3.q0.index = add i32 %chunk.q0.row, %dot.c3
+%dot.c3.q0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c3.q0.index
+%dot.c3.q0 = load RECIPE_STATE, ptr addrspace(3) %dot.c3.q0.ptr, align RECIPE_STATE_ALIGN
+%dot.c3.q1.index = add i32 %chunk.q1.row, %dot.c3
+%dot.c3.q1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c3.q1.index
+%dot.c3.q1 = load RECIPE_STATE, ptr addrspace(3) %dot.c3.q1.ptr, align RECIPE_STATE_ALIGN
+%dot.c3.q2.index = add i32 %chunk.q2.row, %dot.c3
+%dot.c3.q2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c3.q2.index
+%dot.c3.q2 = load RECIPE_STATE, ptr addrspace(3) %dot.c3.q2.ptr, align RECIPE_STATE_ALIGN
+%dot.c3.q3.index = add i32 %chunk.q3.row, %dot.c3
+%dot.c3.q3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %dot.c3.q3.index
+%dot.c3.q3 = load RECIPE_STATE, ptr addrspace(3) %dot.c3.q3.ptr, align RECIPE_STATE_ALIGN
+%dot.0.0.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.0.u2, RECIPE_STATE %dot.c3.q0, RECIPE_STATE %dot.c3.k0)
+%dot.0.1.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.1.u2, RECIPE_STATE %dot.c3.q0, RECIPE_STATE %dot.c3.k1)
+%dot.0.2.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.2.u2, RECIPE_STATE %dot.c3.q0, RECIPE_STATE %dot.c3.k2)
+%dot.0.3.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.0.3.u2, RECIPE_STATE %dot.c3.q0, RECIPE_STATE %dot.c3.k3)
+%dot.1.0.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.0.u2, RECIPE_STATE %dot.c3.q1, RECIPE_STATE %dot.c3.k0)
+%dot.1.1.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.1.u2, RECIPE_STATE %dot.c3.q1, RECIPE_STATE %dot.c3.k1)
+%dot.1.2.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.2.u2, RECIPE_STATE %dot.c3.q1, RECIPE_STATE %dot.c3.k2)
+%dot.1.3.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.1.3.u2, RECIPE_STATE %dot.c3.q1, RECIPE_STATE %dot.c3.k3)
+%dot.2.0.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.0.u2, RECIPE_STATE %dot.c3.q2, RECIPE_STATE %dot.c3.k0)
+%dot.2.1.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.1.u2, RECIPE_STATE %dot.c3.q2, RECIPE_STATE %dot.c3.k1)
+%dot.2.2.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.2.u2, RECIPE_STATE %dot.c3.q2, RECIPE_STATE %dot.c3.k2)
+%dot.2.3.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.2.3.u2, RECIPE_STATE %dot.c3.q2, RECIPE_STATE %dot.c3.k3)
+%dot.3.0.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.0.u2, RECIPE_STATE %dot.c3.q3, RECIPE_STATE %dot.c3.k0)
+%dot.3.1.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.1.u2, RECIPE_STATE %dot.c3.q3, RECIPE_STATE %dot.c3.k1)
+%dot.3.2.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.2.u2, RECIPE_STATE %dot.c3.q3, RECIPE_STATE %dot.c3.k2)
+%dot.3.3.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %dot.3.3.u2, RECIPE_STATE %dot.c3.q3, RECIPE_STATE %dot.c3.k3)
+%dot.channel.next = add i32 %dot.channel, 4
+br label %dot.loop
+quad.store:
+%quad.row.0 = add i32 %partial.wave.base, 0
+%quad.slot.0 = add i32 %quad.row.0, %quad.key
+%quad.slot.0.0 = add i32 %quad.slot.0, 0
+%quad.ptr.0.0 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.0.0
+store RECIPE_STATE %dot.0.0, ptr addrspace(3) %quad.ptr.0.0, align RECIPE_STATE_ALIGN
+%quad.slot.0.1 = add i32 %quad.slot.0, 1
+%quad.ptr.0.1 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.0.1
+store RECIPE_STATE %dot.0.1, ptr addrspace(3) %quad.ptr.0.1, align RECIPE_STATE_ALIGN
+%quad.slot.0.2 = add i32 %quad.slot.0, 2
+%quad.ptr.0.2 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.0.2
+store RECIPE_STATE %dot.0.2, ptr addrspace(3) %quad.ptr.0.2, align RECIPE_STATE_ALIGN
+%quad.slot.0.3 = add i32 %quad.slot.0, 3
+%quad.ptr.0.3 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.0.3
+store RECIPE_STATE %dot.0.3, ptr addrspace(3) %quad.ptr.0.3, align RECIPE_STATE_ALIGN
+%quad.row.1 = add i32 %partial.wave.base, %keys.1
+%quad.slot.1 = add i32 %quad.row.1, %quad.key
+%quad.slot.1.0 = add i32 %quad.slot.1, 0
+%quad.ptr.1.0 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.1.0
+store RECIPE_STATE %dot.1.0, ptr addrspace(3) %quad.ptr.1.0, align RECIPE_STATE_ALIGN
+%quad.slot.1.1 = add i32 %quad.slot.1, 1
+%quad.ptr.1.1 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.1.1
+store RECIPE_STATE %dot.1.1, ptr addrspace(3) %quad.ptr.1.1, align RECIPE_STATE_ALIGN
+%quad.slot.1.2 = add i32 %quad.slot.1, 2
+%quad.ptr.1.2 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.1.2
+store RECIPE_STATE %dot.1.2, ptr addrspace(3) %quad.ptr.1.2, align RECIPE_STATE_ALIGN
+%quad.slot.1.3 = add i32 %quad.slot.1, 3
+%quad.ptr.1.3 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.1.3
+store RECIPE_STATE %dot.1.3, ptr addrspace(3) %quad.ptr.1.3, align RECIPE_STATE_ALIGN
+%quad.row.2 = add i32 %partial.wave.base, %keys.2
+%quad.slot.2 = add i32 %quad.row.2, %quad.key
+%quad.slot.2.0 = add i32 %quad.slot.2, 0
+%quad.ptr.2.0 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.2.0
+store RECIPE_STATE %dot.2.0, ptr addrspace(3) %quad.ptr.2.0, align RECIPE_STATE_ALIGN
+%quad.slot.2.1 = add i32 %quad.slot.2, 1
+%quad.ptr.2.1 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.2.1
+store RECIPE_STATE %dot.2.1, ptr addrspace(3) %quad.ptr.2.1, align RECIPE_STATE_ALIGN
+%quad.slot.2.2 = add i32 %quad.slot.2, 2
+%quad.ptr.2.2 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.2.2
+store RECIPE_STATE %dot.2.2, ptr addrspace(3) %quad.ptr.2.2, align RECIPE_STATE_ALIGN
+%quad.slot.2.3 = add i32 %quad.slot.2, 3
+%quad.ptr.2.3 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.2.3
+store RECIPE_STATE %dot.2.3, ptr addrspace(3) %quad.ptr.2.3, align RECIPE_STATE_ALIGN
+%quad.row.3 = add i32 %partial.wave.base, %keys.3
+%quad.slot.3 = add i32 %quad.row.3, %quad.key
+%quad.slot.3.0 = add i32 %quad.slot.3, 0
+%quad.ptr.3.0 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.3.0
+store RECIPE_STATE %dot.3.0, ptr addrspace(3) %quad.ptr.3.0, align RECIPE_STATE_ALIGN
+%quad.slot.3.1 = add i32 %quad.slot.3, 1
+%quad.ptr.3.1 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.3.1
+store RECIPE_STATE %dot.3.1, ptr addrspace(3) %quad.ptr.3.1, align RECIPE_STATE_ALIGN
+%quad.slot.3.2 = add i32 %quad.slot.3, 2
+%quad.ptr.3.2 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.3.2
+store RECIPE_STATE %dot.3.2, ptr addrspace(3) %quad.ptr.3.2, align RECIPE_STATE_ALIGN
+%quad.slot.3.3 = add i32 %quad.slot.3, 3
+%quad.ptr.3.3 = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %quad.slot.3.3
+store RECIPE_STATE %dot.3.3, ptr addrspace(3) %quad.ptr.3.3, align RECIPE_STATE_ALIGN
+%quad.next = add i32 %quad, %wave.width
+br label %quad.loop
+quad.done:
+call void @recipe.local.barrier()
+br label %reduce.loop
+reduce.loop:
+%reduce = phi i32 [ %lid, %quad.done ], [ %reduce.next, %reduce.advance ]
+%reduce.more = icmp ult i32 %reduce, %partial.per.wave
+br i1 %reduce.more, label %reduce.step, label %reduce.done
+reduce.step:
+%reduce.query.local = udiv i32 %reduce, %keys
+%reduce.key = urem i32 %reduce, %keys
+%reduce.query = add i32 %chunk, %reduce.query.local
+%reduce.valid = icmp ult i32 %reduce.query, %query.span
+br i1 %reduce.valid, label %reduce.sum.loop, label %reduce.advance
+reduce.sum.loop:
+%reduce.wave = phi i32 [ 0, %reduce.step ], [ %reduce.wave.next, %reduce.sum.step ]
+%reduce.sum = phi RECIPE_STATE [ %zero, %reduce.step ], [ %reduce.sum.next, %reduce.sum.step ]
+%reduce.wave.more = icmp ult i32 %reduce.wave, %waves
+br i1 %reduce.wave.more, label %reduce.sum.step, label %reduce.store
+reduce.sum.step:
+%reduce.wave.base = mul i32 %reduce.wave, %partial.per.wave
+%reduce.slot.base = add i32 %query.values, %reduce.wave.base
+%reduce.slot = add i32 %reduce.slot.base, %reduce
+%reduce.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %reduce.slot
+%reduce.partial = load RECIPE_STATE, ptr addrspace(3) %reduce.ptr, align RECIPE_STATE_ALIGN
+%reduce.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %reduce.sum, RECIPE_STATE %reduce.partial)
+%reduce.wave.next = add i32 %reduce.wave, 1
+br label %reduce.sum.loop
+reduce.store:
+%reduce.score = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %reduce.sum, RECIPE_STATE %scale)
+%reduce.last = add i32 %query.begin, %reduce.query
+%reduce.visible = icmp ule i32 %reduce.key, %reduce.last
+%reduce.value = select i1 %reduce.visible, RECIPE_STATE %reduce.score, RECIPE_STATE %floor
+%reduce.row = mul i32 %reduce.query, %keys
+%reduce.local = add i32 %reduce.row, %reduce.key
+%reduce.out = add i32 %score.base, %reduce.local
+%reduce.out.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %reduce.out
+store RECIPE_STATE %reduce.value, ptr addrspace(3) %reduce.out.ptr, align RECIPE_STATE_ALIGN
+br label %reduce.advance
+reduce.advance:
+%reduce.next = add i32 %reduce, %block
+br label %reduce.loop
+reduce.done:
+call void @recipe.local.barrier()
+%chunk.next = add i32 %chunk, 4
+br label %chunk.loop
+; One wave turns one query's scores into probabilities; every lane of the
+; wave runs each exchange.
+softmax.start:
+br label %softmax.loop
+softmax.loop:
+%softmax.query = phi i32 [ %wave, %softmax.start ], [ %softmax.query.next, %normalize.done ]
+%softmax.more = icmp ult i32 %softmax.query, %query.span
+br i1 %softmax.more, label %softmax.prepare, label %softmax.done
+softmax.prepare:
+%softmax.row.local = mul i32 %softmax.query, %keys
+%softmax.row = add i32 %score.base, %softmax.row.local
+%softmax.last = add i32 %query.begin, %softmax.query
+%softmax.limit = add i32 %softmax.last, 1
+br label %maximum.loop
+maximum.loop:
+%maximum.key = phi i32 [ %lane, %softmax.prepare ], [ %maximum.key.next, %maximum.step ]
+%maximum.value = phi RECIPE_STATE [ %floor, %softmax.prepare ], [ %maximum.next, %maximum.step ]
+%maximum.more = icmp ult i32 %maximum.key, %softmax.limit
+br i1 %maximum.more, label %maximum.step, label %maximum.wave.loop
+maximum.step:
+%maximum.slot = add i32 %softmax.row, %maximum.key
+%maximum.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %maximum.slot
+%maximum.score = load RECIPE_STATE, ptr addrspace(3) %maximum.ptr, align RECIPE_STATE_ALIGN
+%maximum.larger = call i1 @recipe.state.ogt(RECIPE_STATE %maximum.score, RECIPE_STATE %maximum.value)
+%maximum.next = select i1 %maximum.larger, RECIPE_STATE %maximum.score, RECIPE_STATE %maximum.value
+%maximum.key.next = add i32 %maximum.key, %wave.width
+br label %maximum.loop
+maximum.wave.loop:
+%maximum.offset = phi i32 [ %wave.half, %maximum.loop ], [ %maximum.offset.next, %maximum.wave.step ]
+%maximum.wave = phi RECIPE_STATE [ %maximum.value, %maximum.loop ], [ %maximum.wave.next, %maximum.wave.step ]
+%maximum.wave.more = icmp ne i32 %maximum.offset, 0
+br i1 %maximum.wave.more, label %maximum.wave.step, label %exponent.loop
+maximum.wave.step:
+%maximum.partner.lane = xor i32 %lane, %maximum.offset
+%maximum.partner.index = mul i32 %maximum.partner.lane, 4
+%maximum.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %maximum.wave, i32 %maximum.partner.index)
+%maximum.partner.larger = call i1 @recipe.state.ogt(RECIPE_STATE %maximum.partner, RECIPE_STATE %maximum.wave)
+%maximum.wave.next = select i1 %maximum.partner.larger, RECIPE_STATE %maximum.partner, RECIPE_STATE %maximum.wave
+%maximum.offset.next = lshr i32 %maximum.offset, 1
+br label %maximum.wave.loop
+exponent.loop:
+%exponent.key = phi i32 [ %lane, %maximum.wave.loop ], [ %exponent.key.next, %exponent.step ]
+%exponent.sum = phi RECIPE_STATE [ %zero, %maximum.wave.loop ], [ %exponent.sum.next, %exponent.step ]
+%exponent.more = icmp ult i32 %exponent.key, %keys
+br i1 %exponent.more, label %exponent.step, label %sum.wave.loop
+exponent.step:
+%exponent.slot = add i32 %softmax.row, %exponent.key
+%exponent.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %exponent.slot
+%exponent.score = load RECIPE_STATE, ptr addrspace(3) %exponent.ptr, align RECIPE_STATE_ALIGN
+%exponent.centered = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %exponent.score, RECIPE_STATE %maximum.wave)
+%exponent.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent.centered)
+%exponent.visible = icmp ult i32 %exponent.key, %softmax.limit
+%exponent.value = select i1 %exponent.visible, RECIPE_STATE %exponent.raw, RECIPE_STATE %zero
+store RECIPE_STATE %exponent.value, ptr addrspace(3) %exponent.ptr, align RECIPE_STATE_ALIGN
+%exponent.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exponent.sum, RECIPE_STATE %exponent.value)
+%exponent.key.next = add i32 %exponent.key, %wave.width
+br label %exponent.loop
+sum.wave.loop:
+%sum.offset = phi i32 [ %wave.half, %exponent.loop ], [ %sum.offset.next, %sum.wave.step ]
+%sum.wave = phi RECIPE_STATE [ %exponent.sum, %exponent.loop ], [ %sum.wave.next, %sum.wave.step ]
+%sum.wave.more = icmp ne i32 %sum.offset, 0
+br i1 %sum.wave.more, label %sum.wave.step, label %normalize.start
+sum.wave.step:
+%sum.partner.lane = xor i32 %lane, %sum.offset
+%sum.partner.index = mul i32 %sum.partner.lane, 4
+%sum.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %sum.wave, i32 %sum.partner.index)
+%sum.wave.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.wave, RECIPE_STATE %sum.partner)
+%sum.offset.next = lshr i32 %sum.offset, 1
+br label %sum.wave.loop
+normalize.start:
+%normalize.inverse = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %sum.wave)
+br label %normalize.loop
+normalize.loop:
+%normalize.key = phi i32 [ %lane, %normalize.start ], [ %normalize.key.next, %normalize.step ]
+%normalize.more = icmp ult i32 %normalize.key, %keys
+br i1 %normalize.more, label %normalize.step, label %normalize.done
+normalize.step:
+%normalize.slot = add i32 %softmax.row, %normalize.key
+%normalize.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %normalize.slot
+%normalize.value = load RECIPE_STATE, ptr addrspace(3) %normalize.ptr, align RECIPE_STATE_ALIGN
+%normalize.probability = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %normalize.value, RECIPE_STATE %normalize.inverse)
+store RECIPE_STATE %normalize.probability, ptr addrspace(3) %normalize.ptr, align RECIPE_STATE_ALIGN
+%normalize.key.next = add i32 %normalize.key, %wave.width
+br label %normalize.loop
+normalize.done:
+%softmax.query.next = add i32 %softmax.query, %waves
+br label %softmax.loop
+softmax.done:
+call void @recipe.local.barrier()
+br label %output.loop
+; Each thread owns one value channel of the head and folds it over every key
+; for four queries at a time, four keys a load.
+output.loop:
+%output.channel = phi i32 [ %lid, %softmax.done ], [ %output.channel.next, %output.chunk.done ]
+%output.more = icmp ult i32 %output.channel, %width
+br i1 %output.more, label %output.prepare, label %output.done
+output.prepare:
+%output.value.channel = mul i32 %output.channel, %length
+%output.value.local = add i32 %value.offset, %output.value.channel
+%output.head.channel = add i32 %head.channel, %output.channel
+br label %output.chunk.loop
+output.chunk.loop:
+%output.chunk = phi i32 [ 0, %output.prepare ], [ %output.chunk.next, %output.store ]
+%output.chunk.more = icmp ult i32 %output.chunk, %query.span
+br i1 %output.chunk.more, label %output.chunk.start, label %output.chunk.done
+output.chunk.start:
+%output.q0 = add i32 %output.chunk, 0
+%output.q0.over = icmp ugt i32 %output.q0, %last.query
+%output.q0.safe = select i1 %output.q0.over, i32 %last.query, i32 %output.q0
+%output.q0.row.local = mul i32 %output.q0.safe, %keys
+%output.q0.row = add i32 %score.base, %output.q0.row.local
+%output.q1 = add i32 %output.chunk, 1
+%output.q1.over = icmp ugt i32 %output.q1, %last.query
+%output.q1.safe = select i1 %output.q1.over, i32 %last.query, i32 %output.q1
+%output.q1.row.local = mul i32 %output.q1.safe, %keys
+%output.q1.row = add i32 %score.base, %output.q1.row.local
+%output.q2 = add i32 %output.chunk, 2
+%output.q2.over = icmp ugt i32 %output.q2, %last.query
+%output.q2.safe = select i1 %output.q2.over, i32 %last.query, i32 %output.q2
+%output.q2.row.local = mul i32 %output.q2.safe, %keys
+%output.q2.row = add i32 %score.base, %output.q2.row.local
+%output.q3 = add i32 %output.chunk, 3
+%output.q3.over = icmp ugt i32 %output.q3, %last.query
+%output.q3.safe = select i1 %output.q3.over, i32 %last.query, i32 %output.q3
+%output.q3.row.local = mul i32 %output.q3.safe, %keys
+%output.q3.row = add i32 %score.base, %output.q3.row.local
+br label %output.key.loop
+output.key.loop:
+%output.quad = phi i32 [ 0, %output.chunk.start ], [ %output.quad.next, %output.key.step ]
+%output.sum.0 = phi RECIPE_STATE [ %zero, %output.chunk.start ], [ %output.sum.0.u3, %output.key.step ]
+%output.sum.1 = phi RECIPE_STATE [ %zero, %output.chunk.start ], [ %output.sum.1.u3, %output.key.step ]
+%output.sum.2 = phi RECIPE_STATE [ %zero, %output.chunk.start ], [ %output.sum.2.u3, %output.key.step ]
+%output.sum.3 = phi RECIPE_STATE [ %zero, %output.chunk.start ], [ %output.sum.3.u3, %output.key.step ]
+%output.quad.more = icmp ult i32 %output.quad, %quads
+br i1 %output.quad.more, label %output.key.step, label %output.store
+output.key.step:
+%output.u0.quad = add i32 %output.quad, 0
+%output.u0.active = icmp ult i32 %output.u0.quad, %quads
+%output.u0.safe = select i1 %output.u0.active, i32 %output.u0.quad, i32 0
+%output.u0.key = mul i32 %output.u0.safe, 4
+%output.u0.local = add i32 %output.value.local, %output.u0.key
+%output.u0.wide = zext i32 %output.u0.local to i64
+%output.u0.index = add i64 %cache.row, %output.u0.wide
+%output.u0.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.u0.index
+%output.u0.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %output.u0.ptr, align RECIPE_KV_QUAD_ALIGN
+%output.u0.k0 = add i32 %output.u0.key, 0
+%output.u0.k0.reached = icmp ult i32 %output.u0.k0, %reached
+%output.u0.k0.visible = and i1 %output.u0.active, %output.u0.k0.reached
+%output.u0.k0.kv = extractelement <4 x RECIPE_KV> %output.u0.raw, i32 0
+%output.u0.k0.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u0.k0.kv)
+%output.u0.v0 = select i1 %output.u0.k0.visible, RECIPE_STATE %output.u0.k0.state, RECIPE_STATE %zero
+%output.u0.p0.0.slot = add i32 %output.q0.row, %output.u0.k0
+%output.u0.p0.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p0.0.slot
+%output.u0.p0.0 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p0.0.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s0.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.0, RECIPE_STATE %output.u0.p0.0, RECIPE_STATE %output.u0.v0)
+%output.u0.p1.0.slot = add i32 %output.q1.row, %output.u0.k0
+%output.u0.p1.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p1.0.slot
+%output.u0.p1.0 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p1.0.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s1.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.1, RECIPE_STATE %output.u0.p1.0, RECIPE_STATE %output.u0.v0)
+%output.u0.p2.0.slot = add i32 %output.q2.row, %output.u0.k0
+%output.u0.p2.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p2.0.slot
+%output.u0.p2.0 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p2.0.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s2.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.2, RECIPE_STATE %output.u0.p2.0, RECIPE_STATE %output.u0.v0)
+%output.u0.p3.0.slot = add i32 %output.q3.row, %output.u0.k0
+%output.u0.p3.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p3.0.slot
+%output.u0.p3.0 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p3.0.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s3.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.3, RECIPE_STATE %output.u0.p3.0, RECIPE_STATE %output.u0.v0)
+%output.u0.k1 = add i32 %output.u0.key, 1
+%output.u0.k1.reached = icmp ult i32 %output.u0.k1, %reached
+%output.u0.k1.visible = and i1 %output.u0.active, %output.u0.k1.reached
+%output.u0.k1.kv = extractelement <4 x RECIPE_KV> %output.u0.raw, i32 1
+%output.u0.k1.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u0.k1.kv)
+%output.u0.v1 = select i1 %output.u0.k1.visible, RECIPE_STATE %output.u0.k1.state, RECIPE_STATE %zero
+%output.u0.p0.1.slot = add i32 %output.q0.row, %output.u0.k1
+%output.u0.p0.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p0.1.slot
+%output.u0.p0.1 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p0.1.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s0.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s0.0, RECIPE_STATE %output.u0.p0.1, RECIPE_STATE %output.u0.v1)
+%output.u0.p1.1.slot = add i32 %output.q1.row, %output.u0.k1
+%output.u0.p1.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p1.1.slot
+%output.u0.p1.1 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p1.1.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s1.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s1.0, RECIPE_STATE %output.u0.p1.1, RECIPE_STATE %output.u0.v1)
+%output.u0.p2.1.slot = add i32 %output.q2.row, %output.u0.k1
+%output.u0.p2.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p2.1.slot
+%output.u0.p2.1 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p2.1.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s2.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s2.0, RECIPE_STATE %output.u0.p2.1, RECIPE_STATE %output.u0.v1)
+%output.u0.p3.1.slot = add i32 %output.q3.row, %output.u0.k1
+%output.u0.p3.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p3.1.slot
+%output.u0.p3.1 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p3.1.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s3.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s3.0, RECIPE_STATE %output.u0.p3.1, RECIPE_STATE %output.u0.v1)
+%output.u0.k2 = add i32 %output.u0.key, 2
+%output.u0.k2.reached = icmp ult i32 %output.u0.k2, %reached
+%output.u0.k2.visible = and i1 %output.u0.active, %output.u0.k2.reached
+%output.u0.k2.kv = extractelement <4 x RECIPE_KV> %output.u0.raw, i32 2
+%output.u0.k2.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u0.k2.kv)
+%output.u0.v2 = select i1 %output.u0.k2.visible, RECIPE_STATE %output.u0.k2.state, RECIPE_STATE %zero
+%output.u0.p0.2.slot = add i32 %output.q0.row, %output.u0.k2
+%output.u0.p0.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p0.2.slot
+%output.u0.p0.2 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p0.2.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s0.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s0.1, RECIPE_STATE %output.u0.p0.2, RECIPE_STATE %output.u0.v2)
+%output.u0.p1.2.slot = add i32 %output.q1.row, %output.u0.k2
+%output.u0.p1.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p1.2.slot
+%output.u0.p1.2 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p1.2.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s1.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s1.1, RECIPE_STATE %output.u0.p1.2, RECIPE_STATE %output.u0.v2)
+%output.u0.p2.2.slot = add i32 %output.q2.row, %output.u0.k2
+%output.u0.p2.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p2.2.slot
+%output.u0.p2.2 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p2.2.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s2.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s2.1, RECIPE_STATE %output.u0.p2.2, RECIPE_STATE %output.u0.v2)
+%output.u0.p3.2.slot = add i32 %output.q3.row, %output.u0.k2
+%output.u0.p3.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p3.2.slot
+%output.u0.p3.2 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p3.2.ptr, align RECIPE_STATE_ALIGN
+%output.u0.s3.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s3.1, RECIPE_STATE %output.u0.p3.2, RECIPE_STATE %output.u0.v2)
+%output.u0.k3 = add i32 %output.u0.key, 3
+%output.u0.k3.reached = icmp ult i32 %output.u0.k3, %reached
+%output.u0.k3.visible = and i1 %output.u0.active, %output.u0.k3.reached
+%output.u0.k3.kv = extractelement <4 x RECIPE_KV> %output.u0.raw, i32 3
+%output.u0.k3.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u0.k3.kv)
+%output.u0.v3 = select i1 %output.u0.k3.visible, RECIPE_STATE %output.u0.k3.state, RECIPE_STATE %zero
+%output.u0.p0.3.slot = add i32 %output.q0.row, %output.u0.k3
+%output.u0.p0.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p0.3.slot
+%output.u0.p0.3 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p0.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.0.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s0.2, RECIPE_STATE %output.u0.p0.3, RECIPE_STATE %output.u0.v3)
+%output.u0.p1.3.slot = add i32 %output.q1.row, %output.u0.k3
+%output.u0.p1.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p1.3.slot
+%output.u0.p1.3 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p1.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.1.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s1.2, RECIPE_STATE %output.u0.p1.3, RECIPE_STATE %output.u0.v3)
+%output.u0.p2.3.slot = add i32 %output.q2.row, %output.u0.k3
+%output.u0.p2.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p2.3.slot
+%output.u0.p2.3 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p2.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.2.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s2.2, RECIPE_STATE %output.u0.p2.3, RECIPE_STATE %output.u0.v3)
+%output.u0.p3.3.slot = add i32 %output.q3.row, %output.u0.k3
+%output.u0.p3.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u0.p3.3.slot
+%output.u0.p3.3 = load RECIPE_STATE, ptr addrspace(3) %output.u0.p3.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.3.u0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u0.s3.2, RECIPE_STATE %output.u0.p3.3, RECIPE_STATE %output.u0.v3)
+%output.u1.quad = add i32 %output.quad, 1
+%output.u1.active = icmp ult i32 %output.u1.quad, %quads
+%output.u1.safe = select i1 %output.u1.active, i32 %output.u1.quad, i32 0
+%output.u1.key = mul i32 %output.u1.safe, 4
+%output.u1.local = add i32 %output.value.local, %output.u1.key
+%output.u1.wide = zext i32 %output.u1.local to i64
+%output.u1.index = add i64 %cache.row, %output.u1.wide
+%output.u1.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.u1.index
+%output.u1.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %output.u1.ptr, align RECIPE_KV_QUAD_ALIGN
+%output.u1.k0 = add i32 %output.u1.key, 0
+%output.u1.k0.reached = icmp ult i32 %output.u1.k0, %reached
+%output.u1.k0.visible = and i1 %output.u1.active, %output.u1.k0.reached
+%output.u1.k0.kv = extractelement <4 x RECIPE_KV> %output.u1.raw, i32 0
+%output.u1.k0.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u1.k0.kv)
+%output.u1.v0 = select i1 %output.u1.k0.visible, RECIPE_STATE %output.u1.k0.state, RECIPE_STATE %zero
+%output.u1.p0.0.slot = add i32 %output.q0.row, %output.u1.k0
+%output.u1.p0.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p0.0.slot
+%output.u1.p0.0 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p0.0.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s0.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.0.u0, RECIPE_STATE %output.u1.p0.0, RECIPE_STATE %output.u1.v0)
+%output.u1.p1.0.slot = add i32 %output.q1.row, %output.u1.k0
+%output.u1.p1.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p1.0.slot
+%output.u1.p1.0 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p1.0.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s1.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.1.u0, RECIPE_STATE %output.u1.p1.0, RECIPE_STATE %output.u1.v0)
+%output.u1.p2.0.slot = add i32 %output.q2.row, %output.u1.k0
+%output.u1.p2.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p2.0.slot
+%output.u1.p2.0 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p2.0.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s2.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.2.u0, RECIPE_STATE %output.u1.p2.0, RECIPE_STATE %output.u1.v0)
+%output.u1.p3.0.slot = add i32 %output.q3.row, %output.u1.k0
+%output.u1.p3.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p3.0.slot
+%output.u1.p3.0 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p3.0.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s3.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.3.u0, RECIPE_STATE %output.u1.p3.0, RECIPE_STATE %output.u1.v0)
+%output.u1.k1 = add i32 %output.u1.key, 1
+%output.u1.k1.reached = icmp ult i32 %output.u1.k1, %reached
+%output.u1.k1.visible = and i1 %output.u1.active, %output.u1.k1.reached
+%output.u1.k1.kv = extractelement <4 x RECIPE_KV> %output.u1.raw, i32 1
+%output.u1.k1.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u1.k1.kv)
+%output.u1.v1 = select i1 %output.u1.k1.visible, RECIPE_STATE %output.u1.k1.state, RECIPE_STATE %zero
+%output.u1.p0.1.slot = add i32 %output.q0.row, %output.u1.k1
+%output.u1.p0.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p0.1.slot
+%output.u1.p0.1 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p0.1.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s0.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s0.0, RECIPE_STATE %output.u1.p0.1, RECIPE_STATE %output.u1.v1)
+%output.u1.p1.1.slot = add i32 %output.q1.row, %output.u1.k1
+%output.u1.p1.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p1.1.slot
+%output.u1.p1.1 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p1.1.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s1.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s1.0, RECIPE_STATE %output.u1.p1.1, RECIPE_STATE %output.u1.v1)
+%output.u1.p2.1.slot = add i32 %output.q2.row, %output.u1.k1
+%output.u1.p2.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p2.1.slot
+%output.u1.p2.1 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p2.1.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s2.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s2.0, RECIPE_STATE %output.u1.p2.1, RECIPE_STATE %output.u1.v1)
+%output.u1.p3.1.slot = add i32 %output.q3.row, %output.u1.k1
+%output.u1.p3.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p3.1.slot
+%output.u1.p3.1 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p3.1.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s3.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s3.0, RECIPE_STATE %output.u1.p3.1, RECIPE_STATE %output.u1.v1)
+%output.u1.k2 = add i32 %output.u1.key, 2
+%output.u1.k2.reached = icmp ult i32 %output.u1.k2, %reached
+%output.u1.k2.visible = and i1 %output.u1.active, %output.u1.k2.reached
+%output.u1.k2.kv = extractelement <4 x RECIPE_KV> %output.u1.raw, i32 2
+%output.u1.k2.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u1.k2.kv)
+%output.u1.v2 = select i1 %output.u1.k2.visible, RECIPE_STATE %output.u1.k2.state, RECIPE_STATE %zero
+%output.u1.p0.2.slot = add i32 %output.q0.row, %output.u1.k2
+%output.u1.p0.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p0.2.slot
+%output.u1.p0.2 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p0.2.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s0.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s0.1, RECIPE_STATE %output.u1.p0.2, RECIPE_STATE %output.u1.v2)
+%output.u1.p1.2.slot = add i32 %output.q1.row, %output.u1.k2
+%output.u1.p1.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p1.2.slot
+%output.u1.p1.2 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p1.2.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s1.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s1.1, RECIPE_STATE %output.u1.p1.2, RECIPE_STATE %output.u1.v2)
+%output.u1.p2.2.slot = add i32 %output.q2.row, %output.u1.k2
+%output.u1.p2.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p2.2.slot
+%output.u1.p2.2 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p2.2.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s2.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s2.1, RECIPE_STATE %output.u1.p2.2, RECIPE_STATE %output.u1.v2)
+%output.u1.p3.2.slot = add i32 %output.q3.row, %output.u1.k2
+%output.u1.p3.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p3.2.slot
+%output.u1.p3.2 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p3.2.ptr, align RECIPE_STATE_ALIGN
+%output.u1.s3.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s3.1, RECIPE_STATE %output.u1.p3.2, RECIPE_STATE %output.u1.v2)
+%output.u1.k3 = add i32 %output.u1.key, 3
+%output.u1.k3.reached = icmp ult i32 %output.u1.k3, %reached
+%output.u1.k3.visible = and i1 %output.u1.active, %output.u1.k3.reached
+%output.u1.k3.kv = extractelement <4 x RECIPE_KV> %output.u1.raw, i32 3
+%output.u1.k3.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u1.k3.kv)
+%output.u1.v3 = select i1 %output.u1.k3.visible, RECIPE_STATE %output.u1.k3.state, RECIPE_STATE %zero
+%output.u1.p0.3.slot = add i32 %output.q0.row, %output.u1.k3
+%output.u1.p0.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p0.3.slot
+%output.u1.p0.3 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p0.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.0.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s0.2, RECIPE_STATE %output.u1.p0.3, RECIPE_STATE %output.u1.v3)
+%output.u1.p1.3.slot = add i32 %output.q1.row, %output.u1.k3
+%output.u1.p1.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p1.3.slot
+%output.u1.p1.3 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p1.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.1.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s1.2, RECIPE_STATE %output.u1.p1.3, RECIPE_STATE %output.u1.v3)
+%output.u1.p2.3.slot = add i32 %output.q2.row, %output.u1.k3
+%output.u1.p2.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p2.3.slot
+%output.u1.p2.3 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p2.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.2.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s2.2, RECIPE_STATE %output.u1.p2.3, RECIPE_STATE %output.u1.v3)
+%output.u1.p3.3.slot = add i32 %output.q3.row, %output.u1.k3
+%output.u1.p3.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u1.p3.3.slot
+%output.u1.p3.3 = load RECIPE_STATE, ptr addrspace(3) %output.u1.p3.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.3.u1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u1.s3.2, RECIPE_STATE %output.u1.p3.3, RECIPE_STATE %output.u1.v3)
+%output.u2.quad = add i32 %output.quad, 2
+%output.u2.active = icmp ult i32 %output.u2.quad, %quads
+%output.u2.safe = select i1 %output.u2.active, i32 %output.u2.quad, i32 0
+%output.u2.key = mul i32 %output.u2.safe, 4
+%output.u2.local = add i32 %output.value.local, %output.u2.key
+%output.u2.wide = zext i32 %output.u2.local to i64
+%output.u2.index = add i64 %cache.row, %output.u2.wide
+%output.u2.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.u2.index
+%output.u2.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %output.u2.ptr, align RECIPE_KV_QUAD_ALIGN
+%output.u2.k0 = add i32 %output.u2.key, 0
+%output.u2.k0.reached = icmp ult i32 %output.u2.k0, %reached
+%output.u2.k0.visible = and i1 %output.u2.active, %output.u2.k0.reached
+%output.u2.k0.kv = extractelement <4 x RECIPE_KV> %output.u2.raw, i32 0
+%output.u2.k0.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u2.k0.kv)
+%output.u2.v0 = select i1 %output.u2.k0.visible, RECIPE_STATE %output.u2.k0.state, RECIPE_STATE %zero
+%output.u2.p0.0.slot = add i32 %output.q0.row, %output.u2.k0
+%output.u2.p0.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p0.0.slot
+%output.u2.p0.0 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p0.0.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s0.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.0.u1, RECIPE_STATE %output.u2.p0.0, RECIPE_STATE %output.u2.v0)
+%output.u2.p1.0.slot = add i32 %output.q1.row, %output.u2.k0
+%output.u2.p1.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p1.0.slot
+%output.u2.p1.0 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p1.0.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s1.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.1.u1, RECIPE_STATE %output.u2.p1.0, RECIPE_STATE %output.u2.v0)
+%output.u2.p2.0.slot = add i32 %output.q2.row, %output.u2.k0
+%output.u2.p2.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p2.0.slot
+%output.u2.p2.0 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p2.0.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s2.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.2.u1, RECIPE_STATE %output.u2.p2.0, RECIPE_STATE %output.u2.v0)
+%output.u2.p3.0.slot = add i32 %output.q3.row, %output.u2.k0
+%output.u2.p3.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p3.0.slot
+%output.u2.p3.0 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p3.0.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s3.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.3.u1, RECIPE_STATE %output.u2.p3.0, RECIPE_STATE %output.u2.v0)
+%output.u2.k1 = add i32 %output.u2.key, 1
+%output.u2.k1.reached = icmp ult i32 %output.u2.k1, %reached
+%output.u2.k1.visible = and i1 %output.u2.active, %output.u2.k1.reached
+%output.u2.k1.kv = extractelement <4 x RECIPE_KV> %output.u2.raw, i32 1
+%output.u2.k1.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u2.k1.kv)
+%output.u2.v1 = select i1 %output.u2.k1.visible, RECIPE_STATE %output.u2.k1.state, RECIPE_STATE %zero
+%output.u2.p0.1.slot = add i32 %output.q0.row, %output.u2.k1
+%output.u2.p0.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p0.1.slot
+%output.u2.p0.1 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p0.1.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s0.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s0.0, RECIPE_STATE %output.u2.p0.1, RECIPE_STATE %output.u2.v1)
+%output.u2.p1.1.slot = add i32 %output.q1.row, %output.u2.k1
+%output.u2.p1.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p1.1.slot
+%output.u2.p1.1 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p1.1.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s1.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s1.0, RECIPE_STATE %output.u2.p1.1, RECIPE_STATE %output.u2.v1)
+%output.u2.p2.1.slot = add i32 %output.q2.row, %output.u2.k1
+%output.u2.p2.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p2.1.slot
+%output.u2.p2.1 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p2.1.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s2.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s2.0, RECIPE_STATE %output.u2.p2.1, RECIPE_STATE %output.u2.v1)
+%output.u2.p3.1.slot = add i32 %output.q3.row, %output.u2.k1
+%output.u2.p3.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p3.1.slot
+%output.u2.p3.1 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p3.1.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s3.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s3.0, RECIPE_STATE %output.u2.p3.1, RECIPE_STATE %output.u2.v1)
+%output.u2.k2 = add i32 %output.u2.key, 2
+%output.u2.k2.reached = icmp ult i32 %output.u2.k2, %reached
+%output.u2.k2.visible = and i1 %output.u2.active, %output.u2.k2.reached
+%output.u2.k2.kv = extractelement <4 x RECIPE_KV> %output.u2.raw, i32 2
+%output.u2.k2.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u2.k2.kv)
+%output.u2.v2 = select i1 %output.u2.k2.visible, RECIPE_STATE %output.u2.k2.state, RECIPE_STATE %zero
+%output.u2.p0.2.slot = add i32 %output.q0.row, %output.u2.k2
+%output.u2.p0.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p0.2.slot
+%output.u2.p0.2 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p0.2.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s0.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s0.1, RECIPE_STATE %output.u2.p0.2, RECIPE_STATE %output.u2.v2)
+%output.u2.p1.2.slot = add i32 %output.q1.row, %output.u2.k2
+%output.u2.p1.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p1.2.slot
+%output.u2.p1.2 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p1.2.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s1.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s1.1, RECIPE_STATE %output.u2.p1.2, RECIPE_STATE %output.u2.v2)
+%output.u2.p2.2.slot = add i32 %output.q2.row, %output.u2.k2
+%output.u2.p2.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p2.2.slot
+%output.u2.p2.2 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p2.2.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s2.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s2.1, RECIPE_STATE %output.u2.p2.2, RECIPE_STATE %output.u2.v2)
+%output.u2.p3.2.slot = add i32 %output.q3.row, %output.u2.k2
+%output.u2.p3.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p3.2.slot
+%output.u2.p3.2 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p3.2.ptr, align RECIPE_STATE_ALIGN
+%output.u2.s3.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s3.1, RECIPE_STATE %output.u2.p3.2, RECIPE_STATE %output.u2.v2)
+%output.u2.k3 = add i32 %output.u2.key, 3
+%output.u2.k3.reached = icmp ult i32 %output.u2.k3, %reached
+%output.u2.k3.visible = and i1 %output.u2.active, %output.u2.k3.reached
+%output.u2.k3.kv = extractelement <4 x RECIPE_KV> %output.u2.raw, i32 3
+%output.u2.k3.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u2.k3.kv)
+%output.u2.v3 = select i1 %output.u2.k3.visible, RECIPE_STATE %output.u2.k3.state, RECIPE_STATE %zero
+%output.u2.p0.3.slot = add i32 %output.q0.row, %output.u2.k3
+%output.u2.p0.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p0.3.slot
+%output.u2.p0.3 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p0.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.0.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s0.2, RECIPE_STATE %output.u2.p0.3, RECIPE_STATE %output.u2.v3)
+%output.u2.p1.3.slot = add i32 %output.q1.row, %output.u2.k3
+%output.u2.p1.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p1.3.slot
+%output.u2.p1.3 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p1.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.1.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s1.2, RECIPE_STATE %output.u2.p1.3, RECIPE_STATE %output.u2.v3)
+%output.u2.p2.3.slot = add i32 %output.q2.row, %output.u2.k3
+%output.u2.p2.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p2.3.slot
+%output.u2.p2.3 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p2.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.2.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s2.2, RECIPE_STATE %output.u2.p2.3, RECIPE_STATE %output.u2.v3)
+%output.u2.p3.3.slot = add i32 %output.q3.row, %output.u2.k3
+%output.u2.p3.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u2.p3.3.slot
+%output.u2.p3.3 = load RECIPE_STATE, ptr addrspace(3) %output.u2.p3.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.3.u2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u2.s3.2, RECIPE_STATE %output.u2.p3.3, RECIPE_STATE %output.u2.v3)
+%output.u3.quad = add i32 %output.quad, 3
+%output.u3.active = icmp ult i32 %output.u3.quad, %quads
+%output.u3.safe = select i1 %output.u3.active, i32 %output.u3.quad, i32 0
+%output.u3.key = mul i32 %output.u3.safe, 4
+%output.u3.local = add i32 %output.value.local, %output.u3.key
+%output.u3.wide = zext i32 %output.u3.local to i64
+%output.u3.index = add i64 %cache.row, %output.u3.wide
+%output.u3.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.u3.index
+%output.u3.raw = load <4 x RECIPE_KV>, ptr addrspace(1) %output.u3.ptr, align RECIPE_KV_QUAD_ALIGN
+%output.u3.k0 = add i32 %output.u3.key, 0
+%output.u3.k0.reached = icmp ult i32 %output.u3.k0, %reached
+%output.u3.k0.visible = and i1 %output.u3.active, %output.u3.k0.reached
+%output.u3.k0.kv = extractelement <4 x RECIPE_KV> %output.u3.raw, i32 0
+%output.u3.k0.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u3.k0.kv)
+%output.u3.v0 = select i1 %output.u3.k0.visible, RECIPE_STATE %output.u3.k0.state, RECIPE_STATE %zero
+%output.u3.p0.0.slot = add i32 %output.q0.row, %output.u3.k0
+%output.u3.p0.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p0.0.slot
+%output.u3.p0.0 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p0.0.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s0.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.0.u2, RECIPE_STATE %output.u3.p0.0, RECIPE_STATE %output.u3.v0)
+%output.u3.p1.0.slot = add i32 %output.q1.row, %output.u3.k0
+%output.u3.p1.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p1.0.slot
+%output.u3.p1.0 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p1.0.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s1.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.1.u2, RECIPE_STATE %output.u3.p1.0, RECIPE_STATE %output.u3.v0)
+%output.u3.p2.0.slot = add i32 %output.q2.row, %output.u3.k0
+%output.u3.p2.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p2.0.slot
+%output.u3.p2.0 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p2.0.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s2.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.2.u2, RECIPE_STATE %output.u3.p2.0, RECIPE_STATE %output.u3.v0)
+%output.u3.p3.0.slot = add i32 %output.q3.row, %output.u3.k0
+%output.u3.p3.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p3.0.slot
+%output.u3.p3.0 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p3.0.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s3.0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.3.u2, RECIPE_STATE %output.u3.p3.0, RECIPE_STATE %output.u3.v0)
+%output.u3.k1 = add i32 %output.u3.key, 1
+%output.u3.k1.reached = icmp ult i32 %output.u3.k1, %reached
+%output.u3.k1.visible = and i1 %output.u3.active, %output.u3.k1.reached
+%output.u3.k1.kv = extractelement <4 x RECIPE_KV> %output.u3.raw, i32 1
+%output.u3.k1.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u3.k1.kv)
+%output.u3.v1 = select i1 %output.u3.k1.visible, RECIPE_STATE %output.u3.k1.state, RECIPE_STATE %zero
+%output.u3.p0.1.slot = add i32 %output.q0.row, %output.u3.k1
+%output.u3.p0.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p0.1.slot
+%output.u3.p0.1 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p0.1.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s0.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s0.0, RECIPE_STATE %output.u3.p0.1, RECIPE_STATE %output.u3.v1)
+%output.u3.p1.1.slot = add i32 %output.q1.row, %output.u3.k1
+%output.u3.p1.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p1.1.slot
+%output.u3.p1.1 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p1.1.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s1.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s1.0, RECIPE_STATE %output.u3.p1.1, RECIPE_STATE %output.u3.v1)
+%output.u3.p2.1.slot = add i32 %output.q2.row, %output.u3.k1
+%output.u3.p2.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p2.1.slot
+%output.u3.p2.1 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p2.1.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s2.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s2.0, RECIPE_STATE %output.u3.p2.1, RECIPE_STATE %output.u3.v1)
+%output.u3.p3.1.slot = add i32 %output.q3.row, %output.u3.k1
+%output.u3.p3.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p3.1.slot
+%output.u3.p3.1 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p3.1.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s3.1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s3.0, RECIPE_STATE %output.u3.p3.1, RECIPE_STATE %output.u3.v1)
+%output.u3.k2 = add i32 %output.u3.key, 2
+%output.u3.k2.reached = icmp ult i32 %output.u3.k2, %reached
+%output.u3.k2.visible = and i1 %output.u3.active, %output.u3.k2.reached
+%output.u3.k2.kv = extractelement <4 x RECIPE_KV> %output.u3.raw, i32 2
+%output.u3.k2.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u3.k2.kv)
+%output.u3.v2 = select i1 %output.u3.k2.visible, RECIPE_STATE %output.u3.k2.state, RECIPE_STATE %zero
+%output.u3.p0.2.slot = add i32 %output.q0.row, %output.u3.k2
+%output.u3.p0.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p0.2.slot
+%output.u3.p0.2 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p0.2.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s0.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s0.1, RECIPE_STATE %output.u3.p0.2, RECIPE_STATE %output.u3.v2)
+%output.u3.p1.2.slot = add i32 %output.q1.row, %output.u3.k2
+%output.u3.p1.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p1.2.slot
+%output.u3.p1.2 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p1.2.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s1.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s1.1, RECIPE_STATE %output.u3.p1.2, RECIPE_STATE %output.u3.v2)
+%output.u3.p2.2.slot = add i32 %output.q2.row, %output.u3.k2
+%output.u3.p2.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p2.2.slot
+%output.u3.p2.2 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p2.2.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s2.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s2.1, RECIPE_STATE %output.u3.p2.2, RECIPE_STATE %output.u3.v2)
+%output.u3.p3.2.slot = add i32 %output.q3.row, %output.u3.k2
+%output.u3.p3.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p3.2.slot
+%output.u3.p3.2 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p3.2.ptr, align RECIPE_STATE_ALIGN
+%output.u3.s3.2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s3.1, RECIPE_STATE %output.u3.p3.2, RECIPE_STATE %output.u3.v2)
+%output.u3.k3 = add i32 %output.u3.key, 3
+%output.u3.k3.reached = icmp ult i32 %output.u3.k3, %reached
+%output.u3.k3.visible = and i1 %output.u3.active, %output.u3.k3.reached
+%output.u3.k3.kv = extractelement <4 x RECIPE_KV> %output.u3.raw, i32 3
+%output.u3.k3.state = call RECIPE_STATE @recipe.kv.to.state.inline(RECIPE_KV %output.u3.k3.kv)
+%output.u3.v3 = select i1 %output.u3.k3.visible, RECIPE_STATE %output.u3.k3.state, RECIPE_STATE %zero
+%output.u3.p0.3.slot = add i32 %output.q0.row, %output.u3.k3
+%output.u3.p0.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p0.3.slot
+%output.u3.p0.3 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p0.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.0.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s0.2, RECIPE_STATE %output.u3.p0.3, RECIPE_STATE %output.u3.v3)
+%output.u3.p1.3.slot = add i32 %output.q1.row, %output.u3.k3
+%output.u3.p1.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p1.3.slot
+%output.u3.p1.3 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p1.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.1.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s1.2, RECIPE_STATE %output.u3.p1.3, RECIPE_STATE %output.u3.v3)
+%output.u3.p2.3.slot = add i32 %output.q2.row, %output.u3.k3
+%output.u3.p2.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p2.3.slot
+%output.u3.p2.3 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p2.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.2.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s2.2, RECIPE_STATE %output.u3.p2.3, RECIPE_STATE %output.u3.v3)
+%output.u3.p3.3.slot = add i32 %output.q3.row, %output.u3.k3
+%output.u3.p3.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %output.u3.p3.3.slot
+%output.u3.p3.3 = load RECIPE_STATE, ptr addrspace(3) %output.u3.p3.3.ptr, align RECIPE_STATE_ALIGN
+%output.sum.3.u3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.u3.s3.2, RECIPE_STATE %output.u3.p3.3, RECIPE_STATE %output.u3.v3)
+%output.quad.next = add i32 %output.quad, 4
+br label %output.key.loop
+output.store:
+%output.q0.position = add i32 %query.begin, %output.q0
+%output.q0.active = icmp ult i32 %output.q0, %query.span
+call void @attention_decode_store(ptr addrspace(1) %input, ptr addrspace(1) %output, i1 %output.q0.active, RECIPE_STATE %output.sum.0, i64 %output.row, i64 %gate.row, i32 %output.head.channel, i32 %output.q0.position, i32 %length, i32 %buffer.length, i32 %buffer.origin, i1 %gate)
+%output.q1.position = add i32 %query.begin, %output.q1
+%output.q1.active = icmp ult i32 %output.q1, %query.span
+call void @attention_decode_store(ptr addrspace(1) %input, ptr addrspace(1) %output, i1 %output.q1.active, RECIPE_STATE %output.sum.1, i64 %output.row, i64 %gate.row, i32 %output.head.channel, i32 %output.q1.position, i32 %length, i32 %buffer.length, i32 %buffer.origin, i1 %gate)
+%output.q2.position = add i32 %query.begin, %output.q2
+%output.q2.active = icmp ult i32 %output.q2, %query.span
+call void @attention_decode_store(ptr addrspace(1) %input, ptr addrspace(1) %output, i1 %output.q2.active, RECIPE_STATE %output.sum.2, i64 %output.row, i64 %gate.row, i32 %output.head.channel, i32 %output.q2.position, i32 %length, i32 %buffer.length, i32 %buffer.origin, i1 %gate)
+%output.q3.position = add i32 %query.begin, %output.q3
+%output.q3.active = icmp ult i32 %output.q3, %query.span
+call void @attention_decode_store(ptr addrspace(1) %input, ptr addrspace(1) %output, i1 %output.q3.active, RECIPE_STATE %output.sum.3, i64 %output.row, i64 %gate.row, i32 %output.head.channel, i32 %output.q3.position, i32 %length, i32 %buffer.length, i32 %buffer.origin, i1 %gate)
+%output.chunk.next = add i32 %output.chunk, 4
+br label %output.chunk.loop
+output.chunk.done:
+%output.channel.next = add i32 %output.channel, %block
+br label %output.loop
+output.done:
+call void @recipe.local.barrier()
+%job.next = add i32 %job, %groups
+br label %job.loop
 exit:
 ret void
 }
