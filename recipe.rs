@@ -8956,6 +8956,60 @@ fn native_command(mut command: Command, role: &str, key: &str) -> Result<String>
 	Err(RecipeError::new(format!("{role} failed: {diagnostic}{kept}")))
 }
 
+/// Compile LLVM IR with the NVIDIA clang and llc stages for sm_52 and return its functions as PTX text.
+/// The caller's module supplies the header, so the output drops LLVM's module header, comments, and
+/// `.extern .func` declarations, which name functions that the appended module defines before use.
+/// The text is cached under the native artifact directory by the hash of `name`, the PTX version, and the IR.
+fn native_nvidia_functions(name: &str, ir: &str) -> Result<String> {
+	let architecture = "sm_52";
+	let feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
+	let parts: [&[u8]; 4] = [name.as_bytes(), architecture.as_bytes(), feature.as_bytes(), ir.as_bytes()];
+	let key = format!("recipe-{name}-{:016x}", native_fnv1a(&parts));
+	let directory = native_artifact_directory(&key)?;
+	let path = directory.join(format!("{name}.ptx"));
+	if let Ok(cached) = fs::read_to_string(&path) {
+		return Ok(cached);
+	}
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create {name} PTX directory {}: {error}", directory.display())))?;
+	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+	let stem = format!(".recipe-{name}-{}-{serial}", std::process::id());
+	let source = directory.join(format!("{stem}.ll"));
+	let bitcode = directory.join(format!("{stem}.bc"));
+	let lowered = directory.join(format!("{stem}.ptx"));
+	let staged = directory.join(format!("{stem}.cache"));
+	let _temporary = NativeTemporaryFiles { paths: vec![source.clone(), bitcode.clone(), lowered.clone(), staged.clone()] };
+	fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write {name} LLVM IR: {error}")))?;
+	let mut command = Command::new(native_nvidia_compiler()?);
+	command
+		.args(["-target", "nvptx64-nvidia-cuda"])
+		.arg(format!("-march={architecture}"))
+		.arg(format!("--cuda-feature={feature}"))
+		.args(["-O2", "-emit-llvm", "-c", "-x", "ir"])
+		.arg(&source)
+		.arg("-o")
+		.arg(&bitcode);
+	let diagnostic = native_command(command, &format!("{name} LLVM IR compiler"), &key)?;
+	validate_nvidia_ptx_feature(&feature, &diagnostic)?;
+	let mut command = Command::new(native_nvidia_codegen()?);
+	command.arg("-mtriple=nvptx64-nvidia-cuda").arg(format!("-mcpu={architecture}")).arg(format!("-mattr={feature}")).args(["-O2", "-o"]).arg(&lowered).arg(&bitcode);
+	let diagnostic = native_command(command, &format!("{name} PTX code generator"), &key)?;
+	validate_nvidia_ptx_feature(&feature, &diagnostic)?;
+	let mut text = String::new();
+	let mut declaring = false;
+	for line in fs::read_to_string(&lowered).map_err(|error| RecipeError::new(format!("cannot read {name} PTX: {error}")))?.lines() {
+		let trimmed = line.trim();
+		if declaring || trimmed.starts_with(".extern .func") {
+			declaring = !trimmed.ends_with(';');
+		} else if !(trimmed.starts_with("//") || trimmed.starts_with(".version") || trimmed.starts_with(".target") || trimmed.starts_with(".address_size")) {
+			text.push_str(line);
+			text.push('\n');
+		}
+	}
+	fs::write(&staged, &text).map_err(|error| RecipeError::new(format!("cannot write {name} PTX {}: {error}", staged.display())))?;
+	fs::rename(&staged, &path).map_err(|error| RecipeError::new(format!("cannot publish {name} PTX {}: {error}", path.display())))?;
+	Ok(text)
+}
+
 /// What the AMD backend reports about a compiled kernel. `occupancy` is the
 /// number of waves the register allocation leaves resident per SIMD, so zero
 /// means the kernel cannot be resident at the requested workgroup size and a
@@ -9305,7 +9359,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			ptx_source.push_str(&expert_split_functions()?);
 			ptx_source.push_str(PackedMatvec::ptx());
 			if packed_calls {ptx_source.push_str(&PackedMatvec::tape_ptx()?);}
-			if expert_calls {ptx_source.push_str(&expert_forward_ptx()?);}
+			if expert_calls {ptx_source.push_str(&native_nvidia_functions("expert-forward", &expert_forward::expert_forward_ir())?);}
 			let entries = ptx_source.lines().filter_map(|line| {
 				let words = line.split_whitespace().collect::<Vec<_>>();
 				let at = words.iter().position(|word| *word == ".entry")?;
@@ -17507,8 +17561,6 @@ impl MtpCheckpoint {
 const MTP_WARP: usize = 32;
 /// Bits in one routing nibble: a source position, the inactive marker, or a selected slot.
 const MTP_NIBBLE_BITS: usize = 4;
-/// Positions in one speculative target batch: one bit each in the position mask.
-const MTP_POSITIONS: usize = 5;
 /// Count word that leads each selected-expert record.
 const MTP_RECORD_HEADER: usize = 1;
 /// One token position and its selected-expert slot in a speculative target batch.
@@ -17537,7 +17589,7 @@ impl MtpBatch {
 	/// Selected records are `[count, expert IDs...]` with stride `top_k + 1`.
 	/// Router coefficients are FP32 `[expert * positions + position]`.
 	pub fn from_selected(selected: &[i32], coefficients: &[f32], positions: usize, top_k: usize, experts: usize) -> Result<Self> {
-		require((1..=MTP_POSITIONS).contains(&positions), format!("MTP target batch requires 1..={MTP_POSITIONS} positions"))?;
+		require((1..=SPECULATIVE_POSITIONS).contains(&positions), format!("MTP target batch requires 1..={SPECULATIVE_POSITIONS} positions"))?;
 		require(top_k > 0 && top_k <= experts && top_k <= 1 << MTP_NIBBLE_BITS, "MTP selected-expert count is invalid")?;
 		let stride = checked_add(top_k, MTP_RECORD_HEADER, "MTP selected-expert stride")?;
 		require(selected.len() == checked_mul(positions, stride, "MTP selected-expert records")?, "MTP selected-expert record size differs")?;
@@ -17568,7 +17620,7 @@ impl MtpBatch {
 		let warp = MTP_WARP as u32;
 		let lane = warp - 1;
 		let header = MTP_RECORD_HEADER as u32;
-		let positions = MTP_POSITIONS as u32;
+		let positions = SPECULATIVE_POSITIONS as u32;
 		let width = 1_u32 << positions;
 		let position_mask = width - 1;
 		let nibble = MTP_NIBBLE_BITS as u32;
@@ -17806,54 +17858,8 @@ entry:
 "#
 		)
 	}
-	/// Linkable device functions, without a second PTX module header. The helpers are
-	/// compiled from `ir` and cached under the native directory by the hash of that IR.
-	pub fn ptx() -> Result<String> {
-		let ir = Self::ir();
-		let mut hash = 14695981039346656037_u64;
-		for byte in ir.bytes() {
-			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
-		}
-		let key = format!("mtp-{hash:016x}");
-		let directory = native_artifact_directory(&key)?;
-		let path = directory.join("functions.ptx");
-		if !path.is_file() {
-			fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create MTP native directory {}: {error}", directory.display())))?;
-			let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
-			let stem = format!(".recipe-mtp-{}-{serial}", std::process::id());
-			let source = directory.join(format!("{stem}.ll"));
-			let bitcode = directory.join(format!("{stem}.bc"));
-			let output = directory.join(format!("{stem}.ptx"));
-			let temporary = NativeTemporaryFiles { paths: vec![source.clone(), bitcode.clone(), output.clone()] };
-			fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write MTP LLVM IR: {error}")))?;
-			// The helpers link into the sm_52 module, so they compile for that target only.
-			let feature = format!("+ptx{}", native_nvidia_ptx_version("sm_52")?);
-			let mut compiler = Command::new(native_nvidia_compiler()?);
-			compiler
-				.args(["-target", "nvptx64-nvidia-cuda"])
-				.arg("-march=sm_52")
-				.arg(format!("--cuda-feature={feature}"))
-				.args(["-O2", "-emit-llvm", "-c", "-x", "ir"])
-				.arg(&source)
-				.arg("-o")
-				.arg(&bitcode);
-			let diagnostic = native_command(compiler, "MTP LLVM IR compiler", &key)?;
-			validate_nvidia_ptx_feature(&feature, &diagnostic)?;
-			let mut codegen = Command::new(native_nvidia_codegen()?);
-			codegen.arg("-mtriple=nvptx64-nvidia-cuda").arg("-mcpu=sm_52").arg(format!("-mattr={feature}")).args(["-O2", "-o"]).arg(&output).arg(&bitcode);
-			let generated = native_command(codegen, "MTP PTX code generator", &key)?;
-			validate_nvidia_ptx_feature(&feature, &generated)?;
-			fs::rename(&output, &path).map_err(|error| RecipeError::new(format!("cannot publish MTP PTX {}: {error}", path.display())))?;
-			drop(temporary);
-		}
-		let text = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read MTP PTX {}: {error}", path.display())))?;
-		let body = text
-			.lines()
-			.filter(|line| !matches!(line.split_whitespace().next(), Some(".version" | ".target" | ".address_size")))
-			.collect::<Vec<_>>()
-			.join("\n");
-		Ok(format!("{body}\n"))
-	}
+	/// Linkable device functions, without a second PTX module header.
+	pub fn ptx() -> Result<String> { native_nvidia_functions("mtp", &Self::ir()) }
 }
 impl MtpExpertGroup {
 	/// Low word: original-position mask. High word: selected-slot nibbles by position.
@@ -20694,10 +20700,10 @@ enum PlacedSource {
 /// Device functions for a persistent Flash-Next token kernel. Append this text
 /// after the caller's PTX header and call `p2p_wait` and `p2p_publish` in that kernel.
 /// Every payload writer must call publication; launch no more than one CTA per SM.
-pub fn p2p_functions() -> Result<String> { native_p2p_ptx(P2pScope::Peer) }
+pub fn p2p_functions() -> Result<String> { native_nvidia_functions("p2p", &p2p_ir(P2pScope::Peer)) }
 /// The die-local copy of the same protocol: completion addresses of the executing
 /// die need GPU-scope fences rather than system-scope ones.
-fn local_p2p_functions() -> Result<String> { native_p2p_ptx(P2pScope::Local) }
+fn local_p2p_functions() -> Result<String> { native_nvidia_functions("p2p", &p2p_ir(P2pScope::Local)) }
 
 /// The two copies of the publication protocol. They differ only in the fence that
 /// orders a publisher's payload before its slot, and in the symbols they define.
@@ -20860,50 +20866,6 @@ entry:
 	)
 }
 
-/// Compile one scope's publication functions with the NVIDIA clang and llc stages,
-/// for sm_52 as the owned block was. The PTX is cached by the hash of its IR.
-fn native_p2p_ptx(scope: P2pScope) -> Result<String> {
-	let architecture = "sm_52";
-	let ptx_feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
-	let ir = p2p_ir(scope);
-	let parts: [&[u8]; 4] = [b"recipe-native-p2p-v1", architecture.as_bytes(), ptx_feature.as_bytes(), ir.as_bytes()];
-	let key = format!("recipe-native-p2p-{:016x}", native_fnv1a(&parts));
-	let directory = native_artifact_directory(&key)?;
-	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native P2P directory: {error}")))?;
-	let output = directory.join("p2p.ptx");
-	if !output.is_file() {
-		let source = directory.join("p2p.ll");
-		let bitcode = directory.join("p2p.bc");
-		let staged = directory.join("p2p.staged.ptx");
-		fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write native P2P IR: {error}")))?;
-		let mut command = Command::new(native_nvidia_compiler()?);
-		command
-			.args(["-target", "nvptx64-nvidia-cuda"])
-			.arg(format!("-march={architecture}"))
-			.arg(format!("--cuda-feature={ptx_feature}"))
-			.args(["-O2", "-emit-llvm", "-c", "-x", "ir"])
-			.arg(&source)
-			.arg("-o")
-			.arg(&bitcode);
-		let diagnostic = native_command(command, "P2P LLVM IR compiler", &key)?;
-		validate_nvidia_ptx_feature(&ptx_feature, &diagnostic)?;
-		let mut command = Command::new(native_nvidia_codegen()?);
-		command
-			.args(["-mtriple=nvptx64-nvidia-cuda"])
-			.arg(format!("-mcpu={architecture}"))
-			.arg(format!("-mattr={ptx_feature}"))
-			.args(["-O2", "-o"])
-			.arg(&staged)
-			.arg(&bitcode);
-		let generated = native_command(command, "P2P PTX code generator", &key);
-		fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native P2P bitcode: {error}")))?;
-		validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
-		fs::rename(&staged, &output).map_err(|error| RecipeError::new(format!("cannot store native P2P PTX: {error}")))?;
-	}
-	let ptx = fs::read_to_string(&output).map_err(|error| RecipeError::new(format!("cannot read native P2P PTX: {error}")))?;
-	// The caller's module supplies the header, so only the functions and symbols are kept.
-	Ok(ptx.lines().filter(|line| !line.starts_with("//") && !line.starts_with(".version") && !line.starts_with(".target") && !line.starts_with(".address_size")).map(|line| format!("{line}\n")).collect())
-}
 /// A receiving die's resident peer packet and local CTA completion slots.
 /// Allocate alongside the weight holder and retain across tokens. Before reuse
 /// or destruction, finish both dies' previous token. Sequence zero means empty.
@@ -21024,7 +20986,7 @@ fn expert_request_bytes(graph:&Graph,precision:Compute)->Result<usize> {
 fn split_working_reserve(target:&Graph,head:Option<&Graph>)->usize {
 	let jobs=target.expert_layers.iter().chain(head.into_iter().flat_map(|graph|&graph.expert_layers)).collect::<Vec<_>>();
 	let rows=jobs.iter().filter(|job|job.dense()).flat_map(|job|job.tensors()).map(|tensor|(tensor.shape[1] as usize).div_ceil(6)).max().unwrap_or(0).max(10240);
-	let scratch=[EXPERT_SPLIT_PAYLOAD_BYTES,8*10240*2,8*10240/32*8,EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4,5*rows*4,16*expert_grid::GROUP_SCRATCH_BYTES,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
+	let scratch=[EXPERT_SPLIT_PAYLOAD_BYTES,8*10240*2,8*10240/32*8,SPECULATIVE_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4,SPECULATIVE_POSITIONS*rows*4,16*expert_grid::GROUP_SCRATCH_BYTES,16*8*640*4,16*8*640*2,16*8*640/32*8].iter().sum::<usize>();
 	let tables=jobs.iter().map(|job|if job.dense(){job.tensors().len()*32}else{512*40}).sum::<usize>();
 	let positions=target.input.length.max(head.map_or(0,|graph|graph.input.length));
 	let reports=positions*jobs.len()*128;
@@ -21323,7 +21285,7 @@ impl ExpertExecution {
 	fn worker_source() -> Result<String> {
 		let peer = p2p_functions()?;
 		let local = local_p2p_functions()?;
-		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx()?, PackedMatvec::ptx(), expert_forward_ptx()?))
+		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx()?, PackedMatvec::ptx(), native_nvidia_functions("expert-forward", &expert_forward::expert_forward_ir())?))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
@@ -21359,7 +21321,7 @@ impl ExpertExecution {
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*expert_job::BYTES)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
-			let scratch = [EXPERT_SPLIT_PAYLOAD_BYTES, 8*10240*2, 8*10240/32*8, EXPERT_SPLIT_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4, 5*dense_rows*4, 32*expert_grid::GROUP_SCRATCH_BYTES,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
+			let scratch = [EXPERT_SPLIT_PAYLOAD_BYTES, 8*10240*2, 8*10240/32*8, SPECULATIVE_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4, SPECULATIVE_POSITIONS*dense_rows*4, 32*expert_grid::GROUP_SCRATCH_BYTES,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
 			#[cfg(nvidia)] if die != value.weights.plan.main_die {module=Some(ExpertModule::load(gpu,&bytes)?);}
 
@@ -21435,7 +21397,7 @@ impl ExpertExecution {
 	}
 	fn start(&mut self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<()> {
 		require(!self.failed,"expert execution failed previously; retain its trace and replace the failed execution before another request")?;
-		require(capacity>0 && capacity<=expert_grid::POSITIONS as u32 && end>=begin,"expert request has an unsupported position capacity")?;
+		require(capacity>0 && capacity<=SPECULATIVE_POSITIONS as u32 && end>=begin,"expert request has an unsupported position capacity")?;
 		let phases = (end-begin).div_ceil(capacity) as usize * layers;
 		let base = self.weights.reserve_sequences(u32::try_from(phases).map_err(|_| RecipeError::new("expert phase count overflows"))?)?;
 		require(base.checked_add(phases as u32).and_then(|sequence|sequence.checked_mul(64)).is_some(),"expert completion sequence exhausted")?;
@@ -21900,14 +21862,15 @@ impl ExpertSplitWeights {
 	}
 }
 
+/// Positions in one speculative target batch: the MTP position mask holds one bit each, and one split phase has this capacity.
+const SPECULATIVE_POSITIONS: usize = 5;
 /// Expert split transport geometry. The host allocates each expert channel packet
 /// from these constants, and the transport IR below reads the same values.
-const EXPERT_SPLIT_POSITIONS: usize = 5;
 const EXPERT_SPLIT_PACKET_ROWS: usize = 10240;
 const EXPERT_SPLIT_MIN_PACKET_ROWS: usize = 4096;
 const EXPERT_SPLIT_MAX_TOP_K: usize = 16;
 /// Each packet holds one f32 row of `EXPERT_SPLIT_PACKET_ROWS` values per position.
-const EXPERT_SPLIT_PAYLOAD_BYTES: usize = EXPERT_SPLIT_POSITIONS * EXPERT_SPLIT_PACKET_ROWS * 4;
+const EXPERT_SPLIT_PAYLOAD_BYTES: usize = SPECULATIVE_POSITIONS * EXPERT_SPLIT_PACKET_ROWS * 4;
 /// A return publishes `sequence * 64 + 63` as its local tag, independent of the peer sequence.
 pub(crate) const EXPERT_SPLIT_RETURN_TAG_STRIDE: u32 = 64;
 const EXPERT_SPLIT_RETURN_TAG_OFFSET: u32 = 63;
@@ -21961,7 +21924,7 @@ entry:
 	%bad.rows.zero = icmp eq i32 %rows, 0
 	%bad.rows = icmp ugt i32 %rows, %packet_rows
 	%bad.positions.zero = icmp eq i32 %positions, 0
-	%bad.positions = icmp ugt i32 %positions, {EXPERT_SPLIT_POSITIONS}
+	%bad.positions = icmp ugt i32 %positions, {SPECULATIVE_POSITIONS}
 	%bad.die = icmp uge i32 %die, {DIES}
 	%bad.0 = or i1 %bad.top.zero, %bad.top
 	%bad.1 = or i1 %bad.0, %bad.packet.high
@@ -22253,64 +22216,10 @@ fn expert_split_ir() -> String {
 	[EXPERT_SPLIT_DECLARATIONS.to_owned(), expert_split_send_ir(), expert_split_local_combine_ir(), expert_split_return_ir(), expert_split_combine_ir(), "!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.disable\"}\n".to_owned()].concat()
 }
 
-/// Keeps the functions from LLVM's output. LLVM's module header and declarations of
-/// the peer functions are dropped, since the appended module defines them.
-fn expert_split_text(lowered: &str) -> String {
-	let mut text = String::new();
-	let mut declaring = false;
-	for line in lowered.lines() {
-		let trimmed = line.trim();
-		if declaring || trimmed.starts_with(".extern") {
-			declaring = !trimmed.ends_with(';');
-			continue;
-		}
-		if trimmed.starts_with(".version") || trimmed.starts_with(".target") || trimmed.starts_with(".address_size") { continue; }
-		text.push_str(line);
-		text.push('\n');
-	}
-	text
-}
-
-/// Key for the cached transport PTX: the IR and the PTX version it is lowered for.
-fn expert_split_key(ir: &str, feature: &str) -> String {
-	let mut hash = 14695981039346656037_u64;
-	for byte in b"recipe-expert-split-v1".iter().chain(feature.as_bytes()).chain(ir.as_bytes()) {
-		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
-	}
-	format!("recipe-expert-split-{hash:016x}")
-}
-
 /// Append callable expert transport functions after p2p_functions() in the
 /// holder's persistent step module. The source has no separate entry or launch.
 /// The PTX is compiled from `expert_split_ir` once per IR and cached on disk.
-pub fn expert_split_functions() -> Result<String> {
-	let ir = expert_split_ir();
-	let feature = format!("+ptx{}", native_nvidia_ptx_version("sm_52")?);
-	let key = expert_split_key(&ir, &feature);
-	let directory = native_artifact_directory(&key)?;
-	let path = directory.join("expert-split.ptx");
-	if path.is_file() {
-		return fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read expert split PTX {}: {error}", path.display())));
-	}
-	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create expert split PTX directory: {error}")))?;
-	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
-	let stem = format!(".recipe-expert-split-{}-{serial}", std::process::id());
-	let source = directory.join(format!("{stem}.ll"));
-	let bitcode = directory.join(format!("{stem}.bc"));
-	let lowered = directory.join(format!("{stem}.ptx"));
-	let _temporary = NativeTemporaryFiles { paths: vec![source.clone(), bitcode.clone(), lowered.clone()] };
-	fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write expert split LLVM IR: {error}")))?;
-	let mut command = Command::new(native_nvidia_compiler()?);
-	command.args(["-target", "nvptx64-nvidia-cuda", "-march=sm_52"]).arg(format!("--cuda-feature={feature}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(&source).arg("-o").arg(&bitcode);
-	native_command(command, "expert split LLVM IR compiler", &key)?;
-	let mut command = Command::new(native_nvidia_codegen()?);
-	command.arg("-mtriple=nvptx64-nvidia-cuda").arg("-mcpu=sm_52").arg(format!("-mattr={feature}")).args(["-O2", "-o"]).arg(&lowered).arg(&bitcode);
-	native_command(command, "expert split PTX code generator", &key)?;
-	let lowered_text = fs::read_to_string(&lowered).map_err(|error| RecipeError::new(format!("cannot read expert split PTX: {error}")))?;
-	let text = expert_split_text(&lowered_text);
-	fs::write(&path, &text).map_err(|error| RecipeError::new(format!("cannot write expert split PTX {}: {error}", path.display())))?;
-	Ok(text)
-}
+pub fn expert_split_functions() -> Result<String> { native_nvidia_functions("expert-split", &expert_split_ir()) }
 
 /// A model placed across the selected devices: contiguous block ranges, each
 /// held by one persistent tape on its own device, run in sequence with the
@@ -37606,6 +37515,13 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 /// Owned worker module text for preassembly without allocating model weights.
 pub fn expert_worker_ptx() -> Result<String> { ExpertExecution::worker_source() }
 mod expert_forward {
+use super::{EXPERT_SPLIT_MIN_PACKET_ROWS, EXPERT_SPLIT_RETURN_TAG_OFFSET, EXPERT_SPLIT_RETURN_TAG_STRIDE};
+
+/// The first local completion tag of a sequence: each sequence owns a stride of tags, and its return tag is the last.
+fn sequence_base(ir: &mut Ir) -> String {
+	ir.value(format!("mul i32 %seq, {EXPERT_SPLIT_RETURN_TAG_STRIDE}"))
+}
+
 /// Byte layout of the 192-byte per-layer job descriptor. The host writes it in `ExpertWorker::new` and
 /// the device IR in `expert_forward_ir` reads it, so both take every offset from here.
 pub mod expert_job {
@@ -37662,10 +37578,6 @@ pub mod expert_job {
 pub mod expert_grid {
 	/// Scratch bytes per row-split group in the worker's gate/up product buffer.
 	pub const GROUP_SCRATCH_BYTES: usize = 163840;
-	/// Position capacity of one split phase.
-	pub const POSITIONS: usize = 5;
-	/// Row stride of the padded expert packet, in floats.
-	pub const ROW_STRIDE: usize = 4096;
 }
 
 /// One measured expert tuple override: when the type matches and the operand equals (or is at most)
@@ -38152,7 +38064,7 @@ fn split_dense_layer() -> String {
 			ir.set("r15", I32, &next);
 		},
 	);
-	let grid_seq = ir.value("mul i32 %seq, 64");
+	let grid_seq = sequence_base(&mut ir);
 	ir.set("r20", I32, &grid_seq);
 	let published = grid(&mut ir, &a11, &a12, &grid_seq, &deadline);
 	leave_unless(&mut ir, &published, 402, "r11", "dl.done");
@@ -38318,8 +38230,8 @@ fn split_dense_layer() -> String {
 			ir.set("r21", I32, &advanced);
 		},
 	);
-	let tag_base = ir.value("mul i32 %seq, 64");
-	let tag = ir.value(format!("add i32 {tag_base}, 63"));
+	let tag_base = sequence_base(&mut ir);
+	let tag = ir.value(format!("add i32 {tag_base}, {EXPERT_SPLIT_RETURN_TAG_OFFSET}"));
 	let tagged = ir.value(format!("call i32 @p2p_publish_tagged(ptr addrspace(1) {a11}, ptr addrspace(1) {a13}, i32 {tag}, i32 %seq, i64 {deadline})"));
 	leave_unless(&mut ir, &tagged, 407, "r11", "dl.done");
 	ir.inst("br label %dl.done");
@@ -38882,7 +38794,7 @@ fn split_main_forward() -> String {
 			let fl = word_address(ir, &entry, 32, false);
 			let die = field(ir, &entry, 40, I32);
 			let sent = ir.value(format!(
-				"call i32 @split_send(ptr addrspace(1) {x}, ptr addrspace(1) {ids}, ptr addrspace(1) {co}, ptr addrspace(1) {owner}, ptr addrspace(1) {request}, ptr addrspace(1) {rec}, ptr addrspace(1) {routing}, ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline}, i32 {die}, i32 {r7}, i32 {r8}, i32 {r6}, i32 %cols, i32 4096)"
+				"call i32 @split_send(ptr addrspace(1) {x}, ptr addrspace(1) {ids}, ptr addrspace(1) {co}, ptr addrspace(1) {owner}, ptr addrspace(1) {request}, ptr addrspace(1) {rec}, ptr addrspace(1) {routing}, ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline}, i32 {die}, i32 {r7}, i32 {r8}, i32 {r6}, i32 %cols, i32 {EXPERT_SPLIT_MIN_PACKET_ROWS})"
 			));
 			leave_unless(ir, &sent, 302, "r30", "main.failed");
 			let next = ir.value(format!("add i32 {peer}, 1"));
@@ -38900,7 +38812,7 @@ fn split_main_forward() -> String {
 	jump_if(&mut ir, &local_bad, "main.failed");
 	let combine_seq = ir.get("r15", I32);
 	let combined = ir.value(format!(
-		"call i32 @split_combine(ptr addrspace(1) {responses}, ptr addrspace(1) {table}, i32 {combine_seq}, i64 {deadline}, i32 {r6}, i32 {r5}, i32 %cols, i32 4096)"
+		"call i32 @split_combine(ptr addrspace(1) {responses}, ptr addrspace(1) {table}, i32 {combine_seq}, i64 {deadline}, i32 {r6}, i32 {r5}, i32 %cols, i32 {EXPERT_SPLIT_MIN_PACKET_ROWS})"
 	));
 	leave_unless(&mut ir, &combined, 303, "r30", "main.failed");
 	// Scatter the combined rows to the output.
@@ -38991,7 +38903,6 @@ fn route_count(ir: &mut Ir, rank: &str, field: usize, receipt: &str) {
 /// One expert layer on one die: copy the padded packet, run the grouped gate/up and down products into the
 /// combine planes, and reduce. Status 1 means every stage completed; other codes name the failing stage.
 fn split_expert_layer() -> String {
-	use expert_grid::ROW_STRIDE;
 	use expert_job::*;
 	let mut ir = Ir::new();
 	let a3 = word_address(&mut ir, "%desc", pointer(P_REQUEST), false);
@@ -39053,7 +38964,7 @@ fn split_expert_layer() -> String {
 			let index = ir.get("r15", I32);
 			let row = ir.value(format!("udiv i32 {index}, {r2}"));
 			let column = ir.value(format!("urem i32 {index}, {r2}"));
-			let padded_row = ir.value(format!("mul i32 {row}, {ROW_STRIDE}"));
+			let padded_row = ir.value(format!("mul i32 {row}, {EXPERT_SPLIT_MIN_PACKET_ROWS}"));
 			let padded = ir.value(format!("add i32 {padded_row}, {column}"));
 			let from = element(ir, &a3, &padded, 4);
 			let flag_row = ir.value(format!("add i32 {r5}, 1"));
@@ -39170,7 +39081,7 @@ fn split_expert_layer() -> String {
 	ir.inst(format!("br label %{list_skip}"));
 	ir.label(&list_skip);
 	// Every CTA prepares its row slice, then runs its waves of expert groups.
-	let prepare_seq = ir.value("mul i32 %seq, 64");
+	let prepare_seq = sequence_base(&mut ir);
 	ir.set("r22", I32, &prepare_seq);
 	let first_grid = grid(&mut ir, &a14, &a15, &prepare_seq, &deadline);
 	leave_unless(&mut ir, &first_grid, 102, "r12", "split.done");
@@ -39225,7 +39136,7 @@ fn split_expert_layer() -> String {
 			let ty_gate = field(ir, &group, 24, I32);
 			let ty_up = field(ir, &group, 28, I32);
 			let ty_down = field(ir, &group, 32, I32);
-			let group_scratch = element(ir, &a13, &within, 163840);
+			let group_scratch = element(ir, &a13, &within, expert_grid::GROUP_SCRATCH_BYTES);
 			let up_scratch = gep(ir, &group_scratch, "20480");
 			let down_scratch = gep(ir, &group_scratch, "65536");
 			let same_pair = ir.value(format!("icmp eq i32 {ty_gate}, {ty_up}"));
@@ -39263,7 +39174,7 @@ fn split_expert_layer() -> String {
 			ir.inst(format!("br label %{gate_done}"));
 			ir.label(&gate_done);
 			let gate_round = ir.value(format!("udiv i32 {wave}, {nctaid}"));
-			let tag_base = ir.value("mul i32 %seq, 64");
+			let tag_base = sequence_base(ir);
 			let tag_plus = ir.value(format!("add i32 {tag_base}, 2"));
 			let tag_round = ir.value(format!("mul i32 {gate_round}, 8"));
 			let tag = ir.value(format!("add i32 {tag_plus}, {tag_round}"));
@@ -39385,12 +39296,12 @@ fn split_expert_layer() -> String {
 	let combined = ir.value(format!("call i32 @split_local_combine(ptr addrspace(1) {a5}, ptr addrspace(1) {a6}, ptr addrspace(1) {a11}, ptr addrspace(1) {a12}, i32 {r5}, i32 {r2}, i32 %cols)"));
 	let combined_zero = is_zero(&mut ir, &combined);
 	note_status(&mut ir, &combined_zero, 212);
-	let reduce_seq = ir.value("mul i32 %seq, 64");
+	let reduce_seq = sequence_base(&mut ir);
 	let reduce_tag = ir.value(format!("add i32 {reduce_seq}, 62"));
 	ir.set("r22", I32, &reduce_tag);
 	let reduced = grid(&mut ir, &a14, &a15, &reduce_tag, &deadline);
 	leave_unless(&mut ir, &reduced, 113, "r12", "split.done");
-	let returned = ir.value(format!("call i32 @split_return(ptr addrspace(1) {a12}, ptr addrspace(1) {a16}, ptr addrspace(1) {a14}, ptr addrspace(1) {a17}, i32 %seq, i64 {deadline}, i32 {r2}, i32 %cols, i32 {ROW_STRIDE})"));
+	let returned = ir.value(format!("call i32 @split_return(ptr addrspace(1) {a12}, ptr addrspace(1) {a16}, ptr addrspace(1) {a14}, ptr addrspace(1) {a17}, i32 %seq, i64 {deadline}, i32 {r2}, i32 %cols, i32 {EXPERT_SPLIT_MIN_PACKET_ROWS})"));
 	let returned_zero = is_zero(&mut ir, &returned);
 	note_status(&mut ir, &returned_zero, 114);
 	ir.inst("br label %split.done");
@@ -39474,37 +39385,3 @@ pub fn expert_forward_ir() -> String {
 
 use expert_forward::{expert_grid, expert_job, expert_main};
 
-/// PTX text of the expert forward device functions, compiled from `expert_forward::expert_forward_ir` with the
-/// NVIDIA LLVM toolchain. Compiled text is cached under the native artifact directory by the hash of the IR.
-fn expert_forward_ptx() -> Result<String> {
-	let ir = expert_forward::expert_forward_ir();
-	let mut hash = 14695981039346656037_u64;
-	for byte in ir.as_bytes() {
-		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
-	}
-	let key = format!("recipe-expert-forward-{hash:016x}");
-	let directory = native_artifact_directory(&key)?;
-	let output = directory.join("expert-forward.ptx");
-	if let Ok(cached) = fs::read_to_string(&output) {
-		return Ok(cached);
-	}
-	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("expert forward artifact directory: {error}")))?;
-	let source = directory.join("expert-forward.ll");
-	let bitcode = directory.join("expert-forward.bc");
-	fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write expert forward IR: {error}")))?;
-	let mut compile = Command::new(native_nvidia_compiler()?);
-	compile.args(["-target", "nvptx64-nvidia-cuda", "-march=sm_52", "--cuda-feature=+ptx74", "-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(&source).arg("-o").arg(&bitcode);
-	native_command(compile, "expert forward LLVM IR compiler", &key)?;
-	let mut generate = Command::new(native_nvidia_codegen()?);
-	generate.args(["-mtriple=nvptx64-nvidia-cuda", "-mcpu=sm_52", "-mattr=+ptx74", "-O2", "-o"]).arg(&output).arg(&bitcode);
-	native_command(generate, "expert forward PTX code generator", &key)?;
-	let text = fs::read_to_string(&output).map_err(|error| RecipeError::new(format!("cannot read expert forward PTX: {error}")))?;
-	// The caller's module supplies the version, target, and address size, so only function text is kept.
-	let body = text
-		.lines()
-		.filter(|line| !(line.starts_with("//") || line.starts_with(".version") || line.starts_with(".target") || line.starts_with(".address_size")))
-		.collect::<Vec<_>>()
-		.join("\n");
-	fs::write(&output, &body).map_err(|error| RecipeError::new(format!("cannot cache expert forward PTX: {error}")))?;
-	Ok(body)
-}
