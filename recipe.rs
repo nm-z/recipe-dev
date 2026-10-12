@@ -8900,11 +8900,12 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	let packed_tape = if matches!(target,BackendTarget::Nvidia {..}) && (ir.contains("packed_prepare") || ir.contains("packed_matvec")) {PackedMatvec::tape_ptx()?} else {String::new()};
 	if !packed_tape.is_empty() {parts.push(packed_tape.as_bytes());}
+	let mtp = if matches!(target, BackendTarget::Nvidia { .. }) { MtpBatch::ptx()? } else { String::new() };
 	let split = if matches!(target, BackendTarget::Nvidia { .. }) { expert_split_functions()? } else { String::new() };
 	let expert_ir = if matches!(target, BackendTarget::Nvidia { .. }) { expert_forward::expert_forward_ir() } else { String::new() };
 	let p2p = if matches!(target, BackendTarget::Nvidia { .. }) { Some((p2p_functions()?, local_p2p_functions()?)) } else { None };
 	if let Some((p2p, local_p2p)) = &p2p {
-		parts.extend([MtpBatch::ptx().as_bytes(), p2p.as_bytes(), split.as_bytes(), PackedMatvec::ptx().as_bytes(), expert_ir.as_bytes(), local_p2p.as_bytes()]);
+		parts.extend([mtp.as_bytes(), p2p.as_bytes(), split.as_bytes(), PackedMatvec::ptx().as_bytes(), expert_ir.as_bytes(), local_p2p.as_bytes()]);
 	}
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	Ok(format!("recipe-native-{:016x}", native_fnv1a(&parts)))
@@ -9298,7 +9299,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				ptx_source.insert_str(at,"\n.func (.param .u32 result) split_main_forward(.param .u64 d,.param .u64 x,.param .u64 c,.param .u64 s,.param .u64 o,.param .u32 l,.param .u32 b,.param .u32 p,.param .u32 t,.param .u64 h);\n");
 			}
 
-			ptx_source.push_str(MtpBatch::ptx());
+			ptx_source.push_str(&MtpBatch::ptx()?);
 			ptx_source.push_str(&p2p_functions()?);
 			ptx_source.push_str(&local_p2p_functions()?);
 			ptx_source.push_str(&expert_split_functions()?);
@@ -17502,6 +17503,14 @@ impl MtpCheckpoint {
 		Ok(())
 	}
 }
+/// Lanes in a warp: the record scan steps by it and the routing reduction spans it.
+const MTP_WARP: usize = 32;
+/// Bits in one routing nibble: a source position, the inactive marker, or a selected slot.
+const MTP_NIBBLE_BITS: usize = 4;
+/// Positions in one speculative target batch: one bit each in the position mask.
+const MTP_POSITIONS: usize = 5;
+/// Count word that leads each selected-expert record.
+const MTP_RECORD_HEADER: usize = 1;
 /// One token position and its selected-expert slot in a speculative target batch.
 #[derive(Clone, Copy, Debug)]
 pub struct MtpColumn {
@@ -17528,9 +17537,9 @@ impl MtpBatch {
 	/// Selected records are `[count, expert IDs...]` with stride `top_k + 1`.
 	/// Router coefficients are FP32 `[expert * positions + position]`.
 	pub fn from_selected(selected: &[i32], coefficients: &[f32], positions: usize, top_k: usize, experts: usize) -> Result<Self> {
-		require((1..=5).contains(&positions), "MTP target batch requires 1..=5 positions")?;
-		require(top_k > 0 && top_k <= experts && top_k <= 16, "MTP selected-expert count is invalid")?;
-		let stride = checked_add(top_k, 1, "MTP selected-expert stride")?;
+		require((1..=MTP_POSITIONS).contains(&positions), format!("MTP target batch requires 1..={MTP_POSITIONS} positions"))?;
+		require(top_k > 0 && top_k <= experts && top_k <= 1 << MTP_NIBBLE_BITS, "MTP selected-expert count is invalid")?;
+		let stride = checked_add(top_k, MTP_RECORD_HEADER, "MTP selected-expert stride")?;
 		require(selected.len() == checked_mul(positions, stride, "MTP selected-expert records")?, "MTP selected-expert record size differs")?;
 		require(coefficients.len() == checked_mul(experts, positions, "MTP router coefficients")?, "MTP router coefficient size differs")?;
 		let mut groups = BTreeMap::<usize, Vec<MtpColumn>>::new();
@@ -17553,10 +17562,297 @@ impl MtpBatch {
 		}).collect();
 		Ok(Self { positions, top_k, experts, groups })
 	}
-	/// Linkable device functions, without a second PTX module header.
-	pub fn ptx() -> &'static str {
-		let source = include_str!("mtp.ptx");
-		&source[source.find("// Every warp").expect("MTP PTX function boundary is absent")..]
+	/// LLVM IR for the routing, column, scatter and combine helpers. Stride, position mask,
+	/// nibble width and warp width come from the constants above, so host and kernel agree.
+	pub fn ir() -> String {
+		let warp = MTP_WARP as u32;
+		let lane = warp - 1;
+		let header = MTP_RECORD_HEADER as u32;
+		let positions = MTP_POSITIONS as u32;
+		let width = 1_u32 << positions;
+		let position_mask = width - 1;
+		let nibble = MTP_NIBBLE_BITS as u32;
+		let nibble_mask = (1_u32 << nibble) - 1;
+		let columns = u32::BITS / nibble;
+		let word_mask = u32::BITS - 1;
+		let half = u32::BITS;
+		// Entry m names the set positions of m in ascending order; unused nibbles are inactive.
+		let table = (0..width)
+			.map(|mask| {
+				let mut word = u32::MAX;
+				for (index, position) in (0..positions).filter(|position| ((mask >> position) & 1) == 1).enumerate() {
+					let shift = nibble * index as u32;
+					word = (word & !(nibble_mask << shift)) | (position << shift);
+				}
+				format!("i32 {word}")
+			})
+			.collect::<Vec<_>>()
+			.join(", ");
+		// Butterfly reduction over one warp: each step exchanges the mask and the slot word.
+		let mut reduce = String::new();
+		let mut mask = String::from("%mask");
+		let mut slots = String::from("%slots");
+		for (step, offset) in std::iter::successors(Some(warp / 2), |offset| (*offset > 1).then_some(offset / 2)).enumerate() {
+			reduce.push_str(&format!(
+				"\t%mask.x{step} = call i32 @llvm.nvvm.shfl.bfly.i32(i32 {mask}, i32 {offset}, i32 {lane})\n\t%slots.x{step} = call i32 @llvm.nvvm.shfl.bfly.i32(i32 {slots}, i32 {offset}, i32 {lane})\n\t%mask.{step} = or i32 {mask}, %mask.x{step}\n\t%slots.{step} = or i32 {slots}, %slots.x{step}\n"
+			));
+			mask = format!("%mask.{step}");
+			slots = format!("%slots.{step}");
+		}
+		let loop_id = 10;
+		let unroll_id = 11;
+		format!(
+			r#"target datalayout = "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+@__mtp_routing_result = internal addrspace(3) global i64 0, align 8
+@__mtp_columns = internal addrspace(4) constant [{width} x i32] [{table}], align 4
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+declare i32 @llvm.nvvm.shfl.bfly.i32(i32, i32, i32)
+declare void @llvm.nvvm.barrier0()
+declare i32 @llvm.ctpop.i32(i32)
+
+define i64 @mtp_group_warp(ptr addrspace(1) %selected, i32 %positions, i32 %top_k, i32 %expert) noinline {{
+entry:
+	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+	%lane = and i32 %tid, {lane}
+	%stride = add i32 %top_k, {header}
+	%total = mul i32 %stride, %positions
+	br label %scan
+scan:
+	%i = phi i32 [ %lane, %entry ], [ %i.next, %next ]
+	%mask = phi i32 [ 0, %entry ], [ %mask.next, %next ]
+	%slots = phi i32 [ 0, %entry ], [ %slots.next, %next ]
+	%more = icmp ult i32 %i, %total
+	br i1 %more, label %record, label %reduce
+record:
+	%rec = udiv i32 %i, %stride
+	%off = urem i32 %i, %stride
+	%counted = icmp ne i32 %off, 0
+	br i1 %counted, label %load, label %next
+load:
+	%rec.index = mul i32 %rec, %stride
+	%count.p = getelementptr i32, ptr addrspace(1) %selected, i32 %rec.index
+	%count = call i32 asm sideeffect "ld.global.cg.u32 $0, [$1];", "=r,l,~{{memory}}"(ptr addrspace(1) %count.p)
+	%expert.p = getelementptr i32, ptr addrspace(1) %selected, i32 %i
+	%id = call i32 asm sideeffect "ld.global.cg.u32 $0, [$1];", "=r,l,~{{memory}}"(ptr addrspace(1) %expert.p)
+	%slot = sub i32 %off, {header}
+	%in.count = icmp ult i32 %slot, %count
+	%wanted = icmp eq i32 %id, %expert
+	%hit = and i1 %in.count, %wanted
+	br i1 %hit, label %set, label %next
+set:
+	%bit = shl i32 1, %rec
+	%mask.set = or i32 %mask, %bit
+	%nibble.shift = mul i32 %rec, {nibble}
+	%nibble.value = shl i32 %slot, %nibble.shift
+	%slots.set = or i32 %slots, %nibble.value
+	br label %next
+next:
+	%mask.next = phi i32 [ %mask, %record ], [ %mask, %load ], [ %mask.set, %set ]
+	%slots.next = phi i32 [ %slots, %record ], [ %slots, %load ], [ %slots.set, %set ]
+	%i.next = add i32 %i, {warp}
+	br label %scan, !llvm.loop !{loop_id}
+reduce:
+{reduce}	%low = zext i32 {mask} to i64
+	%high.wide = zext i32 {slots} to i64
+	%high = shl i64 %high.wide, {half}
+	%routing = or i64 %low, %high
+	ret i64 %routing
+}}
+
+define i32 @mtp_column_position(i32 %position_mask, i32 %column) noinline {{
+entry:
+	%m = and i32 %position_mask, {position_mask}
+	%p = getelementptr [{width} x i32], ptr addrspace(4) @__mtp_columns, i32 0, i32 %m
+	%word = load i32, ptr addrspace(4) %p, align 4
+	%shift.raw = mul i32 %column, {nibble}
+	%shift = and i32 %shift.raw, {word_mask}
+	%nibble.raw = lshr i32 %word, %shift
+	%nibble.value = and i32 %nibble.raw, {nibble_mask}
+	%inactive = icmp eq i32 %nibble.value, {nibble_mask}
+	%beyond = icmp uge i32 %column, {columns}
+	%absent = or i1 %inactive, %beyond
+	%position = select i1 %absent, i32 -1, i32 %nibble.value
+	ret i32 %position
+}}
+
+define i64 @mtp_group_cta(ptr addrspace(1) %selected, i32 %positions, i32 %top_k, i32 %expert) noinline {{
+entry:
+	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+	%warp0 = icmp ult i32 %tid, {warp}
+	br i1 %warp0, label %route, label %wait
+route:
+	%warp.route = call i64 @mtp_group_warp(ptr addrspace(1) %selected, i32 %positions, i32 %top_k, i32 %expert)
+	%lane0 = icmp eq i32 %tid, 0
+	br i1 %lane0, label %publish, label %wait
+publish:
+	store i64 %warp.route, ptr addrspace(3) @__mtp_routing_result, align 8
+	br label %wait
+wait:
+	call void @llvm.nvvm.barrier0()
+	%routing = load i64, ptr addrspace(3) @__mtp_routing_result, align 8
+	call void @llvm.nvvm.barrier0()
+	ret i64 %routing
+}}
+
+define void @mtp_scatter_warp(ptr addrspace(1) %down, ptr addrspace(1) %router, ptr addrspace(1) %partials, i64 %routing, i32 %expert, i32 %positions, i32 %top_k, i32 %rows) noinline {{
+entry:
+	%mask = trunc i64 %routing to i32
+	%slots.wide = lshr i64 %routing, {half}
+	%slots = trunc i64 %slots.wide to i32
+	%columns = call i32 @llvm.ctpop.i32(i32 %mask)
+	%total = mul i32 %columns, %rows
+	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+	%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+	%ctaid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+	%nctaid = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+	%start = mul i32 %ctaid, %ntid
+	%first = add i32 %start, %tid
+	%step = mul i32 %ntid, %nctaid
+	br label %loop
+loop:
+	%idx = phi i32 [ %first, %entry ], [ %idx.next, %body ]
+	%more = icmp ult i32 %idx, %total
+	br i1 %more, label %body, label %done
+body:
+	%column = udiv i32 %idx, %rows
+	%row = urem i32 %idx, %rows
+	%position = call i32 @mtp_column_position(i32 %mask, i32 %column)
+	%slot.shift.raw = mul i32 %position, {nibble}
+	%slot.shift = and i32 %slot.shift.raw, {word_mask}
+	%slot.bits = lshr i32 %slots, %slot.shift
+	%slot = and i32 %slot.bits, {nibble_mask}
+	%router.base = mul i32 %expert, %positions
+	%router.index = add i32 %router.base, %position
+	%router.p = getelementptr float, ptr addrspace(1) %router, i32 %router.index
+	%coefficient = call float asm sideeffect "ld.global.cg.f32 $0, [$1];", "=f,l,~{{memory}}"(ptr addrspace(1) %router.p)
+	%down.p = getelementptr float, ptr addrspace(1) %down, i32 %idx
+	%activation = call float asm sideeffect "ld.global.cg.f32 $0, [$1];", "=f,l,~{{memory}}"(ptr addrspace(1) %down.p)
+	%weighted = fmul float %coefficient, %activation
+	%slot.base = mul i32 %position, %top_k
+	%slot.index = add i32 %slot.base, %slot
+	%row.base = mul i32 %slot.index, %rows
+	%out.index = add i32 %row.base, %row
+	%out.p = getelementptr float, ptr addrspace(1) %partials, i32 %out.index
+	store float %weighted, ptr addrspace(1) %out.p, align 4
+	%idx.next = add i32 %idx, %step
+	br label %loop, !llvm.loop !{loop_id}
+done:
+	ret void
+}}
+
+define void @mtp_combine_experts(ptr addrspace(1) %selected, ptr addrspace(1) %partials, ptr addrspace(1) %output, i32 %positions, i32 %top_k, i32 %rows) noinline {{
+entry:
+	%total = mul i32 %positions, %rows
+	%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+	%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+	%ctaid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+	%nctaid = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+	%start = mul i32 %ctaid, %ntid
+	%first = add i32 %start, %tid
+	%step = mul i32 %ntid, %nctaid
+	%stride = add i32 %top_k, {header}
+	br label %loop
+loop:
+	%idx = phi i32 [ %first, %entry ], [ %idx.next, %store ]
+	%more = icmp ult i32 %idx, %total
+	br i1 %more, label %body, label %done
+body:
+	%pos = udiv i32 %idx, %rows
+	%row = urem i32 %idx, %rows
+	%record = mul i32 %pos, %stride
+	%count.p = getelementptr i32, ptr addrspace(1) %selected, i32 %record
+	%count = call i32 asm sideeffect "ld.global.cg.u32 $0, [$1];", "=r,l,~{{memory}}"(ptr addrspace(1) %count.p)
+	br label %slot
+slot:
+	%s = phi i32 [ 0, %body ], [ %s.next, %slot.body ]
+	%sum = phi float [ 0.0, %body ], [ %sum.next, %slot.body ]
+	%s.more = icmp ult i32 %s, %count
+	br i1 %s.more, label %slot.body, label %store
+slot.body:
+	%pos.slot = mul i32 %pos, %top_k
+	%pos.slot.index = add i32 %pos.slot, %s
+	%partial.row = mul i32 %pos.slot.index, %rows
+	%partial.index = add i32 %partial.row, %row
+	%partial.p = getelementptr float, ptr addrspace(1) %partials, i32 %partial.index
+	%partial = call float asm sideeffect "ld.global.cg.f32 $0, [$1];", "=f,l,~{{memory}}"(ptr addrspace(1) %partial.p)
+	%sum.next = fadd float %sum, %partial
+	%s.next = add i32 %s, 1
+	br label %slot, !llvm.loop !{loop_id}
+store:
+	%out.p = getelementptr float, ptr addrspace(1) %output, i32 %idx
+	store float %sum, ptr addrspace(1) %out.p, align 4
+	%idx.next = add i32 %idx, %step
+	br label %loop, !llvm.loop !{loop_id}
+done:
+	ret void
+}}
+
+define i32 @mtp_column_word(i32 %position_mask) noinline {{
+entry:
+	%m = and i32 %position_mask, {position_mask}
+	%p = getelementptr [{width} x i32], ptr addrspace(4) @__mtp_columns, i32 0, i32 %m
+	%word = load i32, ptr addrspace(4) %p, align 4
+	ret i32 %word
+}}
+
+!{loop_id} = distinct !{{!{loop_id}, !{unroll_id}}}
+!{unroll_id} = !{{!"llvm.loop.unroll.disable"}}
+"#
+		)
+	}
+	/// Linkable device functions, without a second PTX module header. The helpers are
+	/// compiled from `ir` and cached under the native directory by the hash of that IR.
+	pub fn ptx() -> Result<String> {
+		let ir = Self::ir();
+		let mut hash = 14695981039346656037_u64;
+		for byte in ir.bytes() {
+			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211);
+		}
+		let key = format!("mtp-{hash:016x}");
+		let directory = native_artifact_directory(&key)?;
+		let path = directory.join("functions.ptx");
+		if !path.is_file() {
+			fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create MTP native directory {}: {error}", directory.display())))?;
+			let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+			let stem = format!(".recipe-mtp-{}-{serial}", std::process::id());
+			let source = directory.join(format!("{stem}.ll"));
+			let bitcode = directory.join(format!("{stem}.bc"));
+			let output = directory.join(format!("{stem}.ptx"));
+			let temporary = NativeTemporaryFiles { paths: vec![source.clone(), bitcode.clone(), output.clone()] };
+			fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write MTP LLVM IR: {error}")))?;
+			// The helpers link into the sm_52 module, so they compile for that target only.
+			let feature = format!("+ptx{}", native_nvidia_ptx_version("sm_52")?);
+			let mut compiler = Command::new(native_nvidia_compiler()?);
+			compiler
+				.args(["-target", "nvptx64-nvidia-cuda"])
+				.arg("-march=sm_52")
+				.arg(format!("--cuda-feature={feature}"))
+				.args(["-O2", "-emit-llvm", "-c", "-x", "ir"])
+				.arg(&source)
+				.arg("-o")
+				.arg(&bitcode);
+			let diagnostic = native_command(compiler, "MTP LLVM IR compiler", &key)?;
+			validate_nvidia_ptx_feature(&feature, &diagnostic)?;
+			let mut codegen = Command::new(native_nvidia_codegen()?);
+			codegen.arg("-mtriple=nvptx64-nvidia-cuda").arg("-mcpu=sm_52").arg(format!("-mattr={feature}")).args(["-O2", "-o"]).arg(&output).arg(&bitcode);
+			let generated = native_command(codegen, "MTP PTX code generator", &key)?;
+			validate_nvidia_ptx_feature(&feature, &generated)?;
+			fs::rename(&output, &path).map_err(|error| RecipeError::new(format!("cannot publish MTP PTX {}: {error}", path.display())))?;
+			drop(temporary);
+		}
+		let text = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read MTP PTX {}: {error}", path.display())))?;
+		let body = text
+			.lines()
+			.filter(|line| !matches!(line.split_whitespace().next(), Some(".version" | ".target" | ".address_size")))
+			.collect::<Vec<_>>()
+			.join("\n");
+		Ok(format!("{body}\n"))
 	}
 }
 impl MtpExpertGroup {
@@ -17566,7 +17862,7 @@ impl MtpExpertGroup {
 		let mut slots = 0_u32;
 		for column in &self.columns {
 			mask |= 1 << column.position;
-			slots |= (column.slot as u32) << (4 * column.position);
+			slots |= (column.slot as u32) << (MTP_NIBBLE_BITS * column.position);
 		}
 		u64::from(mask) | (u64::from(slots) << 32)
 	}
@@ -21027,7 +21323,7 @@ impl ExpertExecution {
 	fn worker_source() -> Result<String> {
 		let peer = p2p_functions()?;
 		let local = local_p2p_functions()?;
-		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_ptx()?))
+		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx()?, PackedMatvec::ptx(), expert_forward_ptx()?))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
