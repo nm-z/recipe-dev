@@ -2580,7 +2580,10 @@ fn packed_contraction_word(kind: u32, block: u32) -> Option<u64> {
 		if t != kind || warps * 32 != block || !matches!(capacity, 1 | 2 | 4 | 8) { continue; }
 		let (method, lanes) = if pieces[1] == "h" { (0, pieces[5].parse::<u32>().ok()?) } else { (pieces[5].parse::<u32>().ok()?, pieces[6].parse::<u32>().ok()?) };
 		let slot = capacity.trailing_zeros() as usize;
-		if choices[slot].is_none_or(|old| (method, lanes) < old) { choices[slot] = Some((method, lanes)); }
+		// RECIPE_PACKED_LANES=wide prefers the widest lanes per method instead of the narrowest.
+		let wide = std::env::var("RECIPE_PACKED_LANES").as_deref() == Ok("wide");
+		let better = |old: (u32, u32)| if wide { (method, std::cmp::Reverse(lanes)) < (old.0, std::cmp::Reverse(old.1)) } else { (method, lanes) < old };
+		if choices[slot].is_none_or(better) { choices[slot] = Some((method, lanes)); }
 	}
 	choices.into_iter().enumerate().try_fold(0, |word, (slot, item)| item.map(|(method, lanes)| word | (u64::from(method | lanes << 8) << (slot * 16))))
 }
@@ -27959,7 +27962,10 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves;
+		// The expert-split kernel runs exactly one workgroup per SM, so widening it does not
+		// shrink the tile budget: it keeps the budget of its 8-wave baseline.
+		let budget_waves = if self.backend == Backend::Nvidia && !graph.expert_layers.is_empty() { waves.min(8) } else { waves };
+		let shared_budget = shared_values / budget_waves;
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
