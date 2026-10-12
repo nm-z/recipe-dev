@@ -223,6 +223,21 @@ dev:
 	.loss(mae|mse|...)|.loss(&evaluator)
 ```
 
+```rust
+let evaluator = recipe.model().layer(16).gelu().layer(1).loss(mse);
+let proposer = recipe.model().layer(1).loss(&evaluator);
+recipe.train().epochs(n).rat(online, "./command").target(0).run(&proposer, &recipe.data(auto));
+```
+
+```
+<- reset | choose a=v,... | close
+-> state s=v,...
+	actions a,...
+	choice v,...
+	ready
+-> score v
+```
+
 ## **Infer**
 
 ```rust
