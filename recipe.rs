@@ -39097,7 +39097,7 @@ fn split_expert_layer() -> String {
 	ir.set("r22", I32, &prepare_seq);
 	let first_grid = grid(&mut ir, &a14, &a15, &prepare_seq, &deadline);
 	leave_unless(&mut ir, &first_grid, 102, "r12", "split.done");
-	packed_prepare(&mut ir, &a7, &a8, &a9, &r2, &r2, &ctaid, &nctaid);
+	packed_prepare(&mut ir, &a7, &a8, &a9, &r2, "%cols", &ctaid, &nctaid);
 	let prepared_seq = bump(&mut ir, "r22", "1");
 	let prepared = grid(&mut ir, &a14, &a15, &prepared_seq, &deadline);
 	leave_unless(&mut ir, &prepared, 103, "r12", "split.done");
