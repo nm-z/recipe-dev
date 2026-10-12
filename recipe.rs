@@ -19707,6 +19707,8 @@ impl PeerPacket {
 	pub const PAYLOAD_BYTES: usize = 16384;
 	pub const SEQUENCE_OFFSET: u64 = 16384;
 	pub const SLOT_STRIDE: usize = 128;
+	/// Completion slots per SM: a split worker may keep two CTAs resident on each.
+	pub const CTAS_PER_SM: usize = 2;
 	pub const PACKET_BYTES: usize = 16452;
 
 	/// Use a local named NVIDIA device from `RECIPE_DEVICE`.
@@ -19721,13 +19723,13 @@ impl PeerPacket {
 			let ctas = match &gpu.driver { Driver::Cuda(driver) => driver.cus, _ => return Err(RecipeError::new("P2P requires a local NVIDIA device")) };
 			require(ctas != 0 && ctas <= 32, "P2P coordinator supports one CTA per SM on devices with 1..32 SMs")?;
 			let packet = gpu.allocate_bytes(packet_bytes)?;
-			let slots = match gpu.allocate_bytes(ctas as usize * Self::SLOT_STRIDE) {
+			let slots = match gpu.allocate_bytes(ctas as usize * Self::CTAS_PER_SM * Self::SLOT_STRIDE) {
 				Ok(slots) => slots,
 				Err(error) => { gpu.free(packet); return Err(error); }
 			};
 			let value = Self { gpu, packet, slots, ctas, sequence: 0, payload_bytes };
 			gpu.clear(packet, packet_bytes)?;
-			gpu.clear(slots, ctas as usize * Self::SLOT_STRIDE)?;
+			gpu.clear(slots, ctas as usize * Self::CTAS_PER_SM * Self::SLOT_STRIDE)?;
 			Ok(value)
 		}
 		#[cfg(not(nvidia))]
@@ -20045,6 +20047,11 @@ fn expert_enabled(file: &Gguf, devices: &[&Gpu]) -> bool {
 		&& devices.len() > 1
 		&& devices.iter().all(|gpu|gpu.name.strip_prefix("nv").and_then(|die|die.parse::<usize>().ok()).is_some_and(|die|die<DIES))
 }
+/// RECIPE_WORKER_CTAS_PER_SM: resident 256-thread blocks per SM on each worker die, 1 or 2;
+/// two fit in shared memory and need RECIPE_WORKER_MAXRREG=128 to fit in registers.
+fn worker_ctas_per_sm() -> u32 {
+	std::env::var("RECIPE_WORKER_CTAS_PER_SM").ok().and_then(|value|value.parse::<u32>().ok()).filter(|value|(1..=PeerPacket::CTAS_PER_SM as u32).contains(value)).unwrap_or(1)
+}
 struct ExpertModule { gpu: &'static Gpu, handle: usize, function: usize }
 impl ExpertModule {
 	fn load(gpu: &'static Gpu, bytes: &[u8]) -> Result<Self> {
@@ -20056,7 +20063,7 @@ impl ExpertModule {
 				let mut module=Self {gpu,handle:handle as usize,function:0};
 				gpu.status((driver.function)(&mut function,handle,c"expert_split_worker".as_ptr().cast()),"expert worker symbol")?;
 				gpu.status((driver.occupancy)(&mut active,function,256,40960),"expert worker occupancy")?;
-				require(active>=1 && driver.cus==16,"expert worker requires all 16 M60 SMs to be resident")?;
+				require(active>=worker_ctas_per_sm() as i32 && driver.cus==16,"expert worker requires all 16 M60 SMs to be resident with RECIPE_WORKER_CTAS_PER_SM blocks each; two need RECIPE_WORKER_MAXRREG=128")?;
 				module.function=function; Ok(module)
 			}
 		}
@@ -20136,7 +20143,7 @@ impl ExpertExecution {
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*192)?;
 			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
-			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 16*163840,16*8*640*4,16*8*640*2,16*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
+			let scratch = [5*10240*4, 8*10240*2, 8*10240/32*8, 5*16*10240*4, 5*dense_rows*4, 32*163840,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
 			#[cfg(nvidia)] if die != value.weights.plan.main_die {module=Some(ExpertModule::load(gpu,&bytes)?);}
 
@@ -20218,8 +20225,7 @@ impl ExpertExecution {
 		require(base.checked_add(phases as u32).and_then(|sequence|sequence.checked_mul(64)).is_some(),"expert completion sequence exhausted")?;
 		let mut control=Vec::new(); for word in [base,begin,capacity,layers as u32,first as u32,end-begin,0,0] {control.extend(word.to_ne_bytes());}
 		self.control.write_bytes(0,&control)?;
-		// RECIPE_WORKER_CTAS_PER_SM: resident 256-thread blocks per SM on each worker die; two fit in shared memory.
-		let per_sm=std::env::var("RECIPE_WORKER_CTAS_PER_SM").ok().and_then(|value|value.parse::<u32>().ok()).filter(|value|(1..=2).contains(value)).unwrap_or(1);
+		let per_sm=worker_ctas_per_sm();
 		// RECIPE_WORKER_THREADS: threads per worker block, 256 by default; one block per SM either way, so the grid barrier still counts SMs.
 		let block=std::env::var("RECIPE_WORKER_THREADS").ok().and_then(|value|value.parse::<u32>().ok()).filter(|value|matches!(value,256|512|1024)).unwrap_or(256);
 		for worker in &self.workers {
