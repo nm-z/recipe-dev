@@ -2468,7 +2468,9 @@ impl NativeLayout {
 			contexts.push(plan.allocate(&regions, unit, step, inference)?);
 			contexts_in_values.push(temporary);
 			let kv = if inference && node.op == Primitive::Attention {
-				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], unit, step, false)?;
+				// The decode attention loads four adjacent positions of the
+				// widest cache type at once.
+				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], ATTENTION_DECODE_KEYS * 8, step, false)?;
 				Some(offset)
 			} else {
 				None
@@ -5174,7 +5176,30 @@ impl NativeModelIr {
 						(extent.m.to_string(), extent.n.to_string())
 					};
 					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}, i32 {context_capacity}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
-					if fast_attention {
+					// A window of a few positions on a cached sequence takes the
+					// decode body: a CUDA warp is 32 lanes, one workgroup per head.
+					let decode_span = if self.inference && !online_order && backend == Backend::Nvidia && attention == "attention_forward_body" && blocks == 0 && pointers.attention_kv.is_some() {
+						attention_decode_span(node, (self.schedule.block / 32) as usize, self.schedule.shared_values as usize * self.schedule.element.bytes(), self.node_precision(node).state.bytes())
+					} else {
+						0
+					};
+					if decode_span != 0 {
+						let prefix = format!("n{index}.attention.decode");
+						let decode_call = format!(
+							"call void @attention_decode_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {attention_kv}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {span}, i32 {kv_heads}, i32 {value_heads}, i1 {gate}, i1 {unscaled}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							value = pointers.value,
+							kv_heads = integer_argument(node.argument[1], "attention key-value heads")?,
+							value_heads = attention_value_heads(node),
+							gate = node.argument[2] != 0.0,
+							unscaled = node.argument[7] < 0.0,
+						);
+						ir.push_str(&format!(
+							"%{prefix}.some = icmp ne i32 {span}, 0\n%{prefix}.few = icmp ule i32 {span}, {decode_span}\n%{prefix}.window = and i1 %{prefix}.some, %{prefix}.few\n%{prefix}.block = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()\n%{prefix}.geometry = icmp eq i32 %{prefix}.block, {block}\n%{prefix}.take = and i1 %{prefix}.window, %{prefix}.geometry\nbr i1 %{prefix}.take, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{decode_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n",
+							block = self.schedule.block
+						));
+					} else if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
 						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
@@ -22947,6 +22972,24 @@ fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalizati
 	let offset = graph.parameters.len() - parameters;
 	graph.parameters[offset..].fill(1.0);
 	Ok(())
+}
+/// Adjacent cache positions one decode attention load reads, and the queries
+/// each of its passes folds at once.
+const ATTENTION_DECODE_KEYS: usize = 4;
+/// Most query positions one decode attention call takes.
+const ATTENTION_DECODE_SPAN: usize = 8;
+/// Query positions the decode attention body takes in one call: as many as
+/// the staged queries, the waves' partial scores and the probabilities leave
+/// room for in the shared tile, or none when the context does not split into
+/// four-key loads or the head into four channels for each wave.
+fn attention_decode_span(node: &Node, waves: usize, shared_bytes: usize, state_bytes: usize) -> usize {
+	let heads = (node.argument[0] as usize).max(1);
+	let (width, keys) = (node.output.channels / heads, node.output.length);
+	if waves == 0 || keys % ATTENTION_DECODE_KEYS != 0 || width % (ATTENTION_DECODE_KEYS * waves) != 0 {
+		return 0;
+	}
+	let bytes = |span: usize| (span * width + waves * ATTENTION_DECODE_KEYS * keys + span * keys) * state_bytes;
+	(1..=ATTENTION_DECODE_SPAN).rev().find(|span| bytes(*span) <= shared_bytes).unwrap_or(0)
 }
 /// Key blocks the indexer scores for a sequence of `length` positions.
 /// The indexer blocks an attention scores, or none when it is dense. An indexer
