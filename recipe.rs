@@ -11996,13 +11996,13 @@ mod ngram {
 	/// Row `index` of a stored `[width, rows]` table, decoded from that row's own
 	/// bytes: a raw table holds little-endian f64 values, a quantized one its blocks.
 	pub(crate) fn table_row(table: &StoredWeight, width: usize, index: usize) -> Result<Vec<f64>> {
-		require(width != 0 && index.checked_mul(width).is_some_and(|start| start + width <= table.count), format!("table of {} values has no row {index} of {width}", table.count))?;
+		if !(width != 0 && index.checked_mul(width).is_some_and(|start| start + width <= table.count)) { return Err(RecipeError::new(format!("table of {} values has no row {index} of {width}", table.count))); }
 		if table.format.0 == 0 {
 			let bytes = table.bytes.slice(index * width * size_of::<f64>(), width * size_of::<f64>())?;
 			return Ok(bytes.chunks_exact(size_of::<f64>()).map(|value| f64::from_le_bytes(value.try_into().unwrap())).collect());
 		}
 		let spec = table.format.spec().ok_or_else(|| table.format.unavailable())?;
-		require(width % spec.block == 0, format!("table rows of {width} are not whole blocks of {}", spec.block))?;
+		if width % spec.block != 0 { return Err(RecipeError::new(format!("table rows of {width} are not whole blocks of {}", spec.block))); }
 		let row = width / spec.block * spec.stride;
 		table.format.decompress(&table.bytes.slice(index * row, row)?, &table.codebook, width)
 	}
@@ -15573,7 +15573,7 @@ impl StoredBytes {
 	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
 	/// row of a mapped table is read without touching the rest of it.
 	fn slice(&self, at: usize, length: usize) -> Result<Vec<u8>> {
-		require(at.checked_add(length).is_some_and(|end| end <= self.len()), format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))?;
+		if !at.checked_add(length).is_some_and(|end| end <= self.len()) { return Err(RecipeError::new(format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))); }
 		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
 		let (mut out, mut skipped) = (Vec::with_capacity(length), 0);
 		for run in self.0.iter() {
@@ -15729,6 +15729,16 @@ trait Integer {
 fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: &str, decode: impl Fn(&[u8], usize) -> f64 + Sync) -> Result<Vec<f64>> {
 	let blocks = count.div_ceil(block);
 	require(data.len() >= blocks * stride, error)?;
+	// A host lookup decodes one table row per head every decode step: spawning
+	// workers for it costs far more than decoding the row in place.
+	if count <= 1 << 16 {
+		let mut weights = Vec::with_capacity(count);
+		for chunk in 0..blocks {
+			let bytes = &data[chunk * stride..(chunk + 1) * stride];
+			weights.extend((0..block.min(count - chunk * block)).map(|index| decode(bytes, index)));
+		}
+		return Ok(weights);
+	}
 	let workers = cpu_worker_threads()? as usize;
 	let span = blocks.div_ceil(workers.max(1)).max(1);
 	let runs = parallel_map(blocks.div_ceil(span), |run| {
@@ -17588,9 +17598,12 @@ impl MtpRuntime {
 			let mut accepted = 1;
 			for offset in 0..proposed.len() {
 				self.logits = output_tape.logits_at(&predictions, base + offset)?;
-				let mut sample_logits = self.logits.clone();
-				for id in &sampler.suppressed { if let Some(logit) = sample_logits.get_mut(*id as usize) { *logit = -f64::MAX; } }
-				let reference_id = reference.step(generation.ids.len() - prompt.len(), &sample_logits).map_err(RecipeError::new)?;
+				let step = generation.ids.len() - prompt.len();
+				let reference_id = if sampler.suppressed.is_empty() { reference.step(step, &self.logits) } else {
+					let mut sample_logits = self.logits.clone();
+					for id in &sampler.suppressed { if let Some(logit) = sample_logits.get_mut(*id as usize) { *logit = -f64::MAX; } }
+					reference.step(step, &sample_logits)
+				}.map_err(RecipeError::new)?;
 				next = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&self.logits, &generation.ids));
 				if proposed.get(offset + 1) != Some(&next) { break; }
 				generation.ids.push(next);
@@ -17641,6 +17654,7 @@ impl MtpRuntime {
 		if let Some(progress) = progress { progress.phase("done", ended); }
 		generation.reference = reference.finish().map_err(RecipeError::new)?;
 		require(generation.reference.ok(), "reference logits comparison failed")?;
+		flush_logits()?;
 		Ok(generation)
 	}
 }
@@ -18842,8 +18856,8 @@ impl Infer {
 			drop(progress);
 			if let Err(error)=placed.export_router_picks() {eprintln!("cannot export router picks: {error}");}
 			let reply = coder.decode(&ids);
-			let mut operations = placed.take_operations("main");
-			if let Some(mtp) = &mtp { operations.extend(mtp.placed.take_operations("mtp")); }
+			let mut operations = placed.take_operations("main").unwrap_or_else(|error| { eprintln!("cannot read operation reports: {error}"); Vec::new() });
+			if let Some(mtp) = &mtp { operations.extend(mtp.placed.take_operations("mtp").unwrap_or_else(|error| { eprintln!("cannot read MTP operation reports: {error}"); Vec::new() })); }
 			let tensors = placed.take_tensors().unwrap_or_else(|error| { eprintln!("cannot read tensor observations: {error}"); Default::default() });
 			if let Err(error) = print_tensor_observations(&tensors) { eprintln!("cannot print tensor observations: {error}"); }
 			request_history.push(Arc::new(InferenceRequest {
@@ -19308,6 +19322,15 @@ impl Sampler {
 	}
 	pub fn sample(&mut self, logits: &[f64], previous: &[u32]) -> u32 {
 		assert!(!logits.is_empty(), "sampler received no logits");
+		if self.temperature <= 0.0 && (self.penalty == 1.0 || self.window == 0 || previous.is_empty()) {
+			// Greedy selection with no repetition penalty: the first largest unsuppressed logit, without copying the vocabulary.
+			let mut best: Option<(u32, f64)> = None;
+			for (id, logit) in logits.iter().copied().enumerate() {
+				if best.is_some_and(|(_, value)| logit.total_cmp(&value) != std::cmp::Ordering::Greater) || self.suppressed.contains(&(id as u32)) { continue; }
+				best = Some((id as u32, logit));
+			}
+			return best.expect("sampler suppressed every logit").0;
+		}
 		let mut candidates = logits.iter().copied().enumerate().map(|(id, logit)| (id as u32, logit)).collect::<Vec<_>>();
 		for id in previous.iter().rev().take(self.window) {
 			let logit = &mut candidates[*id as usize].1;
@@ -20602,9 +20625,10 @@ impl ExpertExecution {
 		}
 		Ok(())
 	}
-	fn finish(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<Vec<OperationReport>> {
+	/// Validate every worker receipt of the window and keep the receipts raw;
+	/// `observations` expands them into report rows when a request's operations are taken.
+	fn finish(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32) -> Result<OperationRecord> {
 		let phases=(end-begin).div_ceil(capacity) as usize*layers;
-		let mut observations=Vec::new();
 		let status=self.control.download_range::<u32>(6,2)?;
 		let mut receipts=Vec::new();
 		for worker in &self.workers {
@@ -20623,23 +20647,32 @@ impl ExpertExecution {
 			}
 			if let Err(error)=self.export_picks() {eprintln!("cannot export expert picks after failure: {error}");}
 		}
-		require(status[0]==0,format!("expert main dispatch failed: status {} layer {}; worker receipts use {}",status[0],status[1],self.pick_path.display()))?;
-		for (worker,reports) in receipts {
+		if status[0]!=0 {return Err(RecipeError::new(format!("expert main dispatch failed: status {} layer {}; worker receipts use {}",status[0],status[1],self.pick_path.display())));}
+		for (worker,reports) in &receipts {
 			for (phase,report) in reports.chunks_exact(32).enumerate() {
-				for (cta,status) in report[16..32].iter().enumerate() {
-					require(*status==1,format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16]))?;
+				if let Some((cta,status))=report[16..32].iter().enumerate().find(|(_,status)|**status!=1) {
+					return Err(RecipeError::new(format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16])));
 				}
+			}
+		}
+		Ok(OperationRecord::Experts { first,layers,begin,end,capacity,receipts:receipts.into_iter().enumerate().map(|(index,(_,reports))|(index,reports)).collect() })
+	}
+	fn observations(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32, receipts: Vec<(usize,Vec<u32>)>, observations: &mut Vec<OperationReport>) -> Result<()> {
+		for (index,reports) in receipts {
+			let worker=&self.workers[index];
+			let device=device_label(worker.gpu)?;
+			for (phase,report) in reports.chunks_exact(32).enumerate() {
 				let clock=|index|u64::from(report[index]) | u64::from(report[index+1])<<32;
 				let ticks=clock(6).saturating_sub(clock(2));
 				let layer=&self.layers[first+phase%layers]; let experts=report[14] as usize;
 				let start=begin+(phase/layers) as u32*capacity; let stop=(start+capacity).min(end);
 				observations.push(OperationReport { selected_experts:if layer.dense(){0}else{experts},weight_bytes:if layer.dense(){worker.read_bytes[layer.global]}else{experts*worker.read_bytes[layer.global]},
 					packed_calls:report[8] as usize,packed_fallbacks:[report[9] as usize,report[10] as usize,report[11] as usize,report[12] as usize],
-					device:device_label(worker.gpu)?,model:String::new(),block:layer.layer,node:layer.node,operation:if layer.dense(){"DenseRowSplit"}else{"ExpertSplit"}.to_owned(),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
+					device:device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:if layer.dense(){"DenseRowSplit"}else{"ExpertSplit"}.to_owned(),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 			}
 		}
-		Ok(observations)
+		Ok(())
 	}
 	fn export_picks(&self)->Result<()> {
 		let counts=self.pick_counts.download_range::<u32>(0,self.layers.len()*512)?;
@@ -21486,7 +21519,7 @@ impl Placed {
 						if count == 0 { clears.push((buffer, destination, row_bytes)); }
 						else {
 							let position = row * node.output.length + start + count - 1;
-							copies.push((buffer, base + layout.prefix_sums + position * row_bytes, destination, row_bytes));
+							copies.push((buffer, base + layout.prefix_sums + position * row_bytes, row_bytes, destination, row_bytes, row_bytes, 1));
 						}
 						counts[slot] = count as u64;
 					}
@@ -21509,30 +21542,29 @@ impl Placed {
 				require(checked_add(base, extent, "MTP delta checkpoint end")? <= buffer.bytes, "MTP delta checkpoint exceeds its buffer")?;
 				if end == 0 { clears.push((buffer, base, live)); continue; }
 				let slot = (end as usize - 1) % slots;
-				for pair in 0..pairs {
-					let cell = checked_add(checked_mul(pair, slots, "MTP delta checkpoint pair")?, slot, "MTP delta checkpoint slot")?;
-					let source = checked_add(checked_add(base, live, "MTP delta checkpoint region")?, checked_mul(cell, bytes, "MTP delta checkpoint offset")?, "MTP delta checkpoint address")?;
-					let target = checked_add(base, checked_mul(pair, bytes, "MTP delta live offset")?, "MTP delta live address")?;
-					copies.push((buffer, source, target, bytes));
-				}
+				// Pair p keeps its checkpoint cells at p * slots, so one strided copy restores every pair.
+				let source = checked_add(checked_add(base, live, "MTP delta checkpoint region")?, checked_mul(slot, bytes, "MTP delta checkpoint offset")?, "MTP delta checkpoint address")?;
+				copies.push((buffer, source, checked_mul(slots, bytes, "MTP delta checkpoint pitch")?, base, bytes, bytes, pairs));
 			}
 
 		}
 		// Validate the complete prefix before the first state mutation.
-		for (buffer, source, destination, bytes) in copies { buffer.copy_within(source, destination, bytes)?; }
+		for (buffer, source, source_pitch, destination, destination_pitch, bytes, rows) in copies { buffer.copy_within_strided(source, source_pitch, destination, destination_pitch, bytes, rows)?; }
 		for (buffer, destination, bytes) in clears { buffer.clear_range(destination, bytes)?; }
 		for (buffer, destination, bytes) in writes { buffer.write_bytes(destination, &bytes)?; }
 		for tape in self.tapes.iter().flatten() { tape.program.gpu.synchronize()?; tape.reached.store(end, Ordering::Release); }
 		Ok(())
 	}
 
-	fn take_operations(&self, model: &str) -> Vec<OperationReport> {
-		self.tapes.iter().flatten().flat_map(|tape| {
-			std::mem::take(&mut *tape.operations.lock().unwrap()).into_iter().map(|mut observation| {
+	fn take_operations(&self, model: &str) -> Result<Vec<OperationReport>> {
+		let mut operations = Vec::new();
+		for tape in self.tapes.iter().flatten() {
+			operations.extend(tape.take_operations()?.into_iter().map(|mut observation| {
 				observation.model = model.to_owned();
 				observation
-			})
-		}).collect()
+			}));
+		}
+		Ok(operations)
 	}
 	fn take_tensors(&self) -> Result<Vec<TensorObservation>> {
 		let mut tensors = Vec::new();
@@ -21799,6 +21831,7 @@ impl Placed {
 			}
 			Ok((predictions, sample_logits))
 		});
+		let result = result.and_then(|generation| flush_logits().map(|()| generation));
 		if result.is_err() { *state = DecodeState::default(); }
 		result
 	}
@@ -25200,6 +25233,41 @@ struct HostLookup {
 	width: usize,
 	length: usize,
 }
+enum LogitsMessage {
+	Bytes(Vec<u8>),
+	Flush(std::sync::mpsc::Sender<std::result::Result<(), String>>),
+}
+/// The `RECIPE_ALL_LOGITS` file and the one thread that appends `record_logits` bytes
+/// to it in order, so a decode step does not wait for the file.
+fn logits_writer() -> Option<&'static std::sync::mpsc::Sender<LogitsMessage>> {
+	static WRITER: OnceLock<Option<std::sync::mpsc::Sender<LogitsMessage>>> = OnceLock::new();
+	WRITER.get_or_init(|| {
+		let path = std::env::var("RECIPE_ALL_LOGITS").ok().filter(|path| !path.is_empty())?;
+		let (sender, receiver) = std::sync::mpsc::channel::<LogitsMessage>();
+		std::thread::spawn(move || {
+			let mut failure = None;
+			for message in receiver {
+				match message {
+					LogitsMessage::Bytes(bytes) if failure.is_none() => {
+						let written = fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|error| format!("cannot open {path}: {error}"))
+							.and_then(|mut file| std::io::Write::write_all(&mut file, &bytes).map_err(|error| format!("cannot write {path}: {error}")));
+						failure = written.err();
+					}
+					LogitsMessage::Bytes(_) => {}
+					LogitsMessage::Flush(reply) => { let _ = reply.send(failure.take().map_or(Ok(()), Err)); }
+				}
+			}
+		});
+		Some(sender)
+	}).as_ref()
+}
+/// Wait until every recorded logit is in the file.
+fn flush_logits() -> Result<()> {
+	let Some(writer) = logits_writer() else { return Ok(()) };
+	let (reply, done) = std::sync::mpsc::channel();
+	writer.send(LogitsMessage::Flush(reply)).map_err(|_| RecipeError::new("the logits writer has stopped"))?;
+	done.recv().map_err(|_| RecipeError::new("the logits writer has stopped"))?.map_err(RecipeError::new)
+}
 #[derive(Default)]
 struct LookupRows {
 	rows: std::collections::HashMap<(usize, usize), (Vec<f64>, u64)>,
@@ -25238,6 +25306,13 @@ impl LookupRows {
 		self.rows.insert(key, (values, self.clock));
 		Ok(())
 	}
+}
+/// One window's device measurements as they were transferred. A decode step keeps
+/// them raw; report rows are built when a request's operations are taken.
+enum OperationRecord {
+	Report(OperationReport),
+	Nodes { begin: u32, end: u32, retained_begin: u32, cache_begin: u32, clocks: Vec<u64>, fingerprints: Vec<u64>, cache_fingerprints: Vec<u64>, packed_routes: Vec<u32>, cache_channels: Vec<(usize, Vec<(u32, u64)>)> },
+	Experts { first: usize, layers: usize, begin: u32, end: u32, capacity: u32, receipts: Vec<(usize, Vec<u32>)> },
 }
 struct NativeTape {
 	expert_execution: Option<Arc<Mutex<ExpertExecution>>>,
@@ -25283,7 +25358,7 @@ struct NativeTape {
 	compile_seconds: f64,
 	load_seconds: f64,
 	last_device_seconds: AtomicU64,
-	operations: Mutex<Vec<OperationReport>>,
+	operations: Mutex<Vec<OperationRecord>>,
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
 	window_begin: std::sync::atomic::AtomicU32,
@@ -25914,10 +25989,10 @@ impl NativeTape {
 		self.window_begin.store(retained_begin, Ordering::Relaxed);
 		self.stage_lookups(begin, end, request.as_mut())?;
 		if let Some(clocks) = self.program.artifact.layout.clocks {
-			self.contexts.write_bytes(clocks, &vec![0_u8; self.nodes.len() * 24])?;
+			self.contexts.clear_range(clocks, self.nodes.len() * 24)?;
 		}
 		if let Some(offset) = self.program.artifact.layout.packed_routes {
-			self.contexts.write_bytes(offset, &vec![0_u8; self.nodes.len() * 20])?;
+			self.contexts.clear_range(offset, self.nodes.len() * 20)?;
 		}
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
@@ -25939,28 +26014,30 @@ impl NativeTape {
 		if let Err(error)=self.program.launch_forward(&mut call,single).and_then(|_|self.program.gpu.synchronize()) {
 			if let Some(execution)=expert_guard.as_mut() {execution.abort();} return Err(RecipeError::new(format!("forward: {error}")));
 		}
+		let mut records = Vec::with_capacity(3);
 		if let Some(execution)=expert_guard.as_mut() {
 			match execution.finish(self.expert_first,expert_count,begin,end,capacity) {
-				Ok(records)=>self.operations.lock().map_err(|_|RecipeError::new("expert operation reports are poisoned"))?.extend(records),
+				Ok(record)=>records.push(record),
 				Err(error)=>{execution.abort();return Err(error);},
 			}
 		}
+		drop(expert_guard);
 		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
-		self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?.push(OperationReport {
+		records.push(OperationRecord::Report(OperationReport {
 			device: self.device_label()?, model: String::new(), block: 0, node: usize::MAX, operation: "ForwardWindow".to_owned(), begin, end,
 			positions: (end - begin) as usize, ticks: ticks[1].wrapping_sub(ticks[0]).max(0) as u64,
 			seconds: (self.program.gpu.backend != Backend::Cpu).then_some(seconds), selected_experts: 0, weight_bytes: 0, packed_calls: 0,
 			packed_fallbacks: [0; 4], fingerprints: Vec::new(), cache_fingerprints: Vec::new(), cache_channel_fingerprints: Vec::new(),
-		});
+		}));
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
 		}
 		if let Some(clocks) = self.program.artifact.layout.clocks {
-			let ticks = self.contexts.download_range::<u64>(clocks / 8, self.nodes.len() * 3)?;
+			let clocks = self.contexts.download_range::<u64>(clocks / 8, self.nodes.len() * 3)?;
 			let fingerprints = if let Some(offset) = self.program.artifact.layout.fingerprints.filter(|_| begin < end) {
 				let first = if capacity < self.positions { 0 } else { retained_begin as usize };
 				self.contexts.download_range::<u64>(offset / 8 + first * self.nodes.len(), (end - retained_begin) as usize * self.nodes.len())?
@@ -25971,34 +26048,56 @@ impl NativeTape {
 			} else { Vec::new() };
 			let packed_routes = if let Some(offset) = self.program.artifact.layout.packed_routes {
 				self.contexts.download_range::<u32>(offset / 4, self.nodes.len() * 5)?
-			} else { vec![0; self.nodes.len() * 5] };
-			let mut operations = self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?;
-			let device = self.device_label()?;
-			for (index, (node, clocks)) in self.nodes.iter().zip(ticks.chunks_exact(3)).enumerate() {
-				if clocks[2] == 0 { continue; }
-				let cache_channel_fingerprints = if let Some(offset) = self.program.artifact.layout.cache_channel_fingerprints[index] {
-					let channels = attention_kv_bytes(node, 1, node.kv_precision)? / node.output.length / node.kv_precision.bytes();
-					self.contexts.download_range::<u64>(offset / 8, channels)?.into_iter().enumerate().map(|(channel, hash)| (channel as u32, hash)).collect()
-				} else { Vec::new() };
-				operations.push(OperationReport {
-					selected_experts:0, weight_bytes:0,
-					device: device.clone(), model: String::new(), block: node.block_index, node: index,
-					operation: node.primitive_name().to_owned(), begin, end, positions: clocks[2] as usize, ticks: clocks[1],
-					packed_calls: packed_routes[index * 5] as usize,
-					packed_fallbacks: [packed_routes[index * 5 + 1] as usize, packed_routes[index * 5 + 2] as usize, packed_routes[index * 5 + 3] as usize, packed_routes[index * 5 + 4] as usize],
-					seconds: (self.program.gpu.backend != Backend::Cpu).then_some(clocks[1] as f64 / 1e9),
-					fingerprints: fingerprints.chunks_exact(self.nodes.len()).enumerate().filter_map(|(row, hashes)| {
-						let position = retained_begin + row as u32;
-						(node.output.length == self.input.length || node.output.length == 1 && position + 1 == end).then_some((position, hashes[index]))
-					}).collect(),
-					cache_fingerprints: if node.op == Primitive::Attention {
-						cache_fingerprints.chunks_exact(self.nodes.len()).enumerate().map(|(row, hashes)| (cache_begin + row as u32, hashes[index])).collect()
-					} else { Vec::new() },
-					cache_channel_fingerprints,
-				});
+			} else { Vec::new() };
+			let mut cache_channels = Vec::new();
+			for (index, (node, clocks)) in self.nodes.iter().zip(clocks.chunks_exact(3)).enumerate() {
+				let Some(offset) = self.program.artifact.layout.cache_channel_fingerprints[index].filter(|_| clocks[2] != 0) else { continue };
+				let channels = attention_kv_bytes(node, 1, node.kv_precision)? / node.output.length / node.kv_precision.bytes();
+				cache_channels.push((index, self.contexts.download_range::<u64>(offset / 8, channels)?.into_iter().enumerate().map(|(channel, hash)| (channel as u32, hash)).collect()));
+			}
+			records.push(OperationRecord::Nodes { begin, end, retained_begin, cache_begin, clocks, fingerprints, cache_fingerprints, packed_routes, cache_channels });
+		}
+		self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?.extend(records);
+		Ok(())
+	}
+	/// Report rows for every window since the last call, built from the raw measurements each window kept.
+	fn take_operations(&self) -> Result<Vec<OperationReport>> {
+		let records = std::mem::take(&mut *self.operations.lock().map_err(|_| RecipeError::new("operation reports are poisoned"))?);
+		let device = self.device_label()?;
+		let mut operations = Vec::new();
+		for record in records {
+			match record {
+				OperationRecord::Report(report) => operations.push(report),
+				OperationRecord::Experts { first, layers, begin, end, capacity, receipts } => {
+					let execution = self.expert_execution.as_ref().ok_or_else(|| RecipeError::new("expert receipts have no execution"))?;
+					execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))?.observations(first, layers, begin, end, capacity, receipts, &mut operations)?;
+				}
+				OperationRecord::Nodes { begin, end, retained_begin, cache_begin, clocks, fingerprints, cache_fingerprints, packed_routes, mut cache_channels } => {
+					for (index, (node, clocks)) in self.nodes.iter().zip(clocks.chunks_exact(3)).enumerate() {
+						if clocks[2] == 0 { continue; }
+						let routes = packed_routes.get(index * 5..index * 5 + 5).unwrap_or(&[0; 5]);
+						let cache_channel_fingerprints = cache_channels.iter_mut().find(|(node, _)| *node == index).map(|(_, hashes)| std::mem::take(hashes)).unwrap_or_default();
+						operations.push(OperationReport {
+							selected_experts:0, weight_bytes:0,
+							device: device.clone(), model: String::new(), block: node.block_index, node: index,
+							operation: node.primitive_name().to_owned(), begin, end, positions: clocks[2] as usize, ticks: clocks[1],
+							packed_calls: routes[0] as usize,
+							packed_fallbacks: [routes[1] as usize, routes[2] as usize, routes[3] as usize, routes[4] as usize],
+							seconds: (self.program.gpu.backend != Backend::Cpu).then_some(clocks[1] as f64 / 1e9),
+							fingerprints: fingerprints.chunks_exact(self.nodes.len()).enumerate().filter_map(|(row, hashes)| {
+								let position = retained_begin + row as u32;
+								(node.output.length == self.input.length || node.output.length == 1 && position + 1 == end).then_some((position, hashes[index]))
+							}).collect(),
+							cache_fingerprints: if node.op == Primitive::Attention {
+								cache_fingerprints.chunks_exact(self.nodes.len()).enumerate().map(|(row, hashes)| (cache_begin + row as u32, hashes[index])).collect()
+							} else { Vec::new() },
+							cache_channel_fingerprints,
+						});
+					}
+				}
 			}
 		}
-		Ok(())
+		Ok(operations)
 	}
 	/// Evaluate rows after `first` with this trained native program. The input
 	/// buffer is reused in bounded chunks, and `%rows` changes per launch, so a
@@ -26122,18 +26221,17 @@ impl NativeTape {
 	/// `RECIPE_ALL_LOGITS=<path>` appends every output position this window kept:
 	/// a u32 position, then the vocabulary's logits as f32, all little-endian.
 	/// Positions whose rows the request layout no longer holds are skipped.
+	/// The file writes run on their own thread; `flush_logits` waits for them and returns their first error.
 	fn record_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<()> {
-		static PATH: OnceLock<Option<String>> = OnceLock::new();
-		let Some(path) = PATH.get_or_init(|| std::env::var("RECIPE_ALL_LOGITS").ok().filter(|path| !path.is_empty())) else { return Ok(()) };
+		let Some(writer) = logits_writer() else { return Ok(()) };
 		let (first, reached) = self.output_window(begin, end)?;
-		let mut bytes = Vec::new();
+		let mut bytes = Vec::with_capacity((reached.saturating_sub(first) as usize) * (4 + 4 * self.output.channels));
 		for position in first..reached {
 			let Ok(logits) = self.logits_at(predictions, position as usize) else { continue };
 			bytes.extend_from_slice(&position.to_le_bytes());
-			for value in logits { bytes.extend_from_slice(&(value as f32).to_le_bytes()); }
+			bytes.extend(logits.iter().flat_map(|value| (*value as f32).to_le_bytes()));
 		}
-		let mut file = fs::OpenOptions::new().create(true).append(true).open(path).map_err(|error| RecipeError::new(format!("cannot open {path}: {error}")))?;
-		std::io::Write::write_all(&mut file, &bytes).map_err(|error| RecipeError::new(format!("cannot write {path}: {error}")))
+		writer.send(LogitsMessage::Bytes(bytes)).map_err(|_| RecipeError::new("the logits writer has stopped"))
 	}
 	/// The logits of the last reached position, using the current request's output layout.
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
@@ -27607,7 +27705,33 @@ impl Gpu {
 		}
 	}
 }
+impl Gpu {
+	/// Copy `rows` runs of `bytes` from `source` every `source_pitch` bytes to `destination` every `destination_pitch` bytes.
+	fn copy_device_strided(&self, destination: u64, destination_pitch: usize, source: u64, source_pitch: usize, bytes: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { source_x: 0, source_y: 0, source_kind: 2, source_host: ptr::null_mut(), source, source_array: ptr::null_mut(), source_pitch,
+				destination_x: 0, destination_y: 0, destination_kind: 2, destination_host: ptr::null_mut(), destination, destination_array: ptr::null_mut(), destination_pitch, width: bytes, height: rows };
+			return self.status(unsafe { (driver.copy_strided)(&copy) }, "strided device copy");
+		}
+		for row in 0..rows as u64 {
+			self.copy_device(destination + row * destination_pitch as u64, source + row * source_pitch as u64, bytes)?;
+		}
+		Ok(())
+	}
+}
 impl Buffer {
+	fn copy_within_strided(&self, source: usize, source_pitch: usize, destination: usize, destination_pitch: usize, bytes: usize, rows: usize) -> Result<()> {
+		if bytes == 0 || rows == 0 { return Ok(()); }
+		if rows == 1 { return self.copy_within(source, destination, bytes); }
+		require(bytes <= source_pitch && bytes <= destination_pitch, "strided device copy rows overlap")?;
+		let span = |first: usize, pitch: usize| checked_add(checked_mul(rows - 1, pitch, "strided device copy span")?, checked_add(first, bytes, "strided device copy row")?, "strided device copy end");
+		let (source_end, destination_end) = (span(source, source_pitch)?, span(destination, destination_pitch)?);
+		require(source_end <= self.bytes && destination_end <= self.bytes, "strided device copy exceeds its buffer")?;
+		require(source_end <= destination || destination_end <= source, "strided device copy regions overlap")?;
+		self.runtime.copy_device_strided(self.pointer + destination as u64, destination_pitch, self.pointer + source as u64, source_pitch, bytes, rows)
+	}
 	fn copy_within(&self, source: usize, destination: usize, bytes: usize) -> Result<()> {
 		require(checked_add(source, bytes, "device copy source")? <= self.bytes && checked_add(destination, bytes, "device copy destination")? <= self.bytes, "device copy exceeds its buffer")?;
 		if bytes == 0 || source == destination { return Ok(()); }
@@ -27736,6 +27860,11 @@ impl Buffer {
 	}
 	fn download_float_bytes(&self, offset: usize, count: usize, precision: Compute) -> Result<Vec<f64>> {
 		let bytes = precision.bytes();
+		// Logits and hidden rows are FP32: widen them directly instead of decoding each value's bit fields.
+		if precision.plain_f32() && offset % size_of::<f32>() == 0 {
+			let values = self.download_range::<f32>(offset / size_of::<f32>(), count)?;
+			return Ok(values.into_iter().map(|value| { let value = f64::from(value); if value.is_nan() { f64::NAN.copysign(value) } else { value } }).collect());
+		}
 		let encoded = self.download_range::<u8>(offset, checked_mul(count, bytes, "GPU float byte download")?)?;
 		Ok(encoded
 			.chunks_exact(bytes)
@@ -27942,9 +28071,31 @@ impl Kernel {
 		}
 	}
 }
+/// CUDA_MEMCPY2D: one copy of `height` rows of `width` bytes between pitched regions.
+#[cfg(nvidia)]
+#[repr(C)]
+struct CudaCopy2d {
+	source_x: usize,
+	source_y: usize,
+	source_kind: u32,
+	source_host: Ptr,
+	source: u64,
+	source_array: Ptr,
+	source_pitch: usize,
+	destination_x: usize,
+	destination_y: usize,
+	destination_kind: u32,
+	destination_host: Ptr,
+	destination: u64,
+	destination_array: Ptr,
+	destination_pitch: usize,
+	width: usize,
+	height: usize,
+}
 #[cfg(nvidia)]
 struct Cuda {
 	copy_device: unsafe extern "C" fn(u64, u64, usize) -> i32,
+	copy_strided: unsafe extern "C" fn(*const CudaCopy2d) -> i32,
 	host_alloc: unsafe extern "C" fn(*mut Ptr,usize,u32)->i32,
 	host_device_pointer: unsafe extern "C" fn(*mut u64,Ptr,u32)->i32,
 	host_free: unsafe extern "C" fn(Ptr)->i32,
@@ -28826,8 +28977,15 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.iter().filter(|gpu| !matches!(gpu.backend, Backend::Cpu)).count() <= 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
-#[cfg(unix)]
+/// The machine name, queried once: every report row names its device with it.
 fn local_host() -> Result<String> {
+	static NAME: OnceLock<String> = OnceLock::new();
+	if let Some(name) = NAME.get() { return Ok(name.clone()); }
+	let name = query_local_host()?;
+	Ok(NAME.get_or_init(|| name).clone())
+}
+#[cfg(unix)]
+fn query_local_host() -> Result<String> {
 	// gethostname(3) rather than the hostname(1) executable, which a minimal
 	// image need not carry: a container without it failed device selection
 	// with "cannot read machine name: No such file or directory".
@@ -28843,7 +29001,7 @@ fn local_host() -> Result<String> {
 	Ok(host.trim().to_owned())
 }
 #[cfg(windows)]
-fn local_host() -> Result<String> {
+fn query_local_host() -> Result<String> {
 	let mut words = [0_u16; 256];
 	let mut length = words.len() as u32;
 	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query machine name")?;
@@ -29841,6 +29999,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
 				copy_device: runtime.function(b"cuMemcpyDtoD_v2\0")?,
+				copy_strided: runtime.function(b"cuMemcpy2D_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
@@ -35274,6 +35433,14 @@ impl Compute {
 		match self {
 			Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.unpack(bits),
 			Self::Int(format) => format.unpack(bits),
+		}
+	}
+	/// Whether `unpack` of these four-byte values is exactly the IEEE single-precision widening.
+	fn plain_f32(self) -> bool {
+		match self {
+			Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.bytes() == 4 && format != FloatFormat::FP8 && format != FloatFormat::FP8_E5M2
+				&& format.arithmetic == format.storage && format.storage.exp == 8 && format.storage.man == 23,
+			Self::Int(_) => false,
 		}
 	}
 	fn optimizer_epsilon(self, value: f64) -> f64 {
