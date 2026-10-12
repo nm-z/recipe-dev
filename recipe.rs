@@ -3097,22 +3097,30 @@ fn span_matvec_parts(node: &Node, stored: Option<&StoredWeight>, packed: bool) -
 		|| node.acc != Compute::FP32 || node.precision != Compute::FP32 || node.int_bits != 0 || !(node.argument[1] == 0.0 || node.argument[1] == 1.0) { return None; }
 	let (k, biased) = (node.input.channels, node.argument[2] == 0.0);
 	let plane = |weight, rows| SpanSpec { weight, k, rows, layout: SpanLayout::Tape { x: node.input.length, y: node.output.length }, bias: biased, relu: node.argument[1] == 1.0 };
-	if !packed { return None; }
-	let (mut parts, mut row, mut bytes) = (Vec::new(), 0, 0);
-	for (format, count) in stored?.format_segments() {
-		let spec = format.spec()?;
-		let weight = match spec.codec {
-			StorageCodec::F32 => SpanWeight::F32, StorageCodec::F16 => SpanWeight::F16, StorageCodec::BF16 => SpanWeight::BF16,
-			StorageCodec::Q8_0 => SpanWeight::Q8_0, StorageCodec::Q4K => SpanWeight::Q4K, StorageCodec::Q5K => SpanWeight::Q5K, StorageCodec::Q6K => SpanWeight::Q6K, _ => return None,
-		};
-		if biased || count % k != 0 || bytes % weight.alignment() != 0 { return None; }
-		let part = plane(weight, count / k);
-		if !part.valid() || part.row_bytes() * part.rows != count / spec.block * spec.stride { return None; }
-		parts.push((part, bytes, row));
-		row += count / k;
-		bytes += count / spec.block * spec.stride;
+	let mut parts = Vec::new();
+	if packed {
+		let (mut row, mut bytes) = (0, 0);
+		for (format, count) in stored?.format_segments() {
+			let spec = format.spec()?;
+			let weight = match spec.codec {
+				StorageCodec::F32 => SpanWeight::F32, StorageCodec::F16 => SpanWeight::F16, StorageCodec::BF16 => SpanWeight::BF16,
+				StorageCodec::Q8_0 => SpanWeight::Q8_0, StorageCodec::Q4K => SpanWeight::Q4K, StorageCodec::Q5K => SpanWeight::Q5K, StorageCodec::Q6K => SpanWeight::Q6K, _ => return None,
+			};
+			if biased || count % k != 0 || bytes % weight.alignment() != 0 { return None; }
+			let part = plane(weight, count / k);
+			if !part.valid() || part.row_bytes() * part.rows != count / spec.block * spec.stride { return None; }
+			parts.push((part, bytes, row));
+			row += count / k;
+			bytes += count / spec.block * spec.stride;
+		}
+		if row != node.output.channels { return None; }
+	} else {
+		let rows = node.output.channels;
+		let part = plane(SpanWeight::F32, rows);
+		if node.parameters != k * rows + if biased { rows } else { 0 } || !part.valid() { return None; }
+		parts.push((part, 0, 0));
 	}
-	(row == node.output.channels).then_some(parts)
+	Some(parts)
 }
 /// Context bytes one node's planes use in sequence, each plane's scratch on 16 bytes.
 fn span_matvec_scratch(parts: &[(SpanSpec, usize, usize)]) -> usize {
