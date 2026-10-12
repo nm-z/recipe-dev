@@ -2872,6 +2872,21 @@ define internal <3 x RECIPE_STATE> @delta_parameters(ptr addrspace(1) %gates, i6
 %result.d = insertelement <3 x RECIPE_STATE> %result.q, RECIPE_STATE %decay, i32 1
 %result.w = insertelement <3 x RECIPE_STATE> %result.d, RECIPE_STATE %write, i32 2
 ret <3 x RECIPE_STATE> %result.w }
+; The model-typed element at %index, widened, and its narrowing store: the
+; generated state-tile decode reads its inputs and writes its output through these.
+define internal RECIPE_STATE @delta_model_load(ptr addrspace(1) %base, i64 %index) #1 { entry:
+%pointer = getelementptr inbounds double, ptr addrspace(1) %base, i64 %index
+%model = load double, ptr addrspace(1) %pointer, align 8
+%value = call RECIPE_STATE @recipe.decode(double %model) ret RECIPE_STATE %value }
+define internal void @delta_model_store(ptr addrspace(1) %base, i64 %index, RECIPE_STATE %value) #1 { entry:
+%model = call double @recipe.encode(RECIPE_STATE %value)
+%pointer = getelementptr inbounds double, ptr addrspace(1) %base, i64 %index
+store double %model, ptr addrspace(1) %pointer, align 8 ret void }
+; exp(A) of one value head, the scale its softplus decay input is multiplied by.
+define internal RECIPE_STATE @delta_decay_scale(ptr addrspace(1) %weights, i64 %head, i32 %decode) #1 { entry:
+%parameter = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %head, i32 %decode)
+%parameter.wide = call RECIPE_STATE @recipe.decode(double %parameter)
+%scale = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %parameter.wide) ret RECIPE_STATE %scale }
 ; One head prepares its gates once for the live window. Columns read these
 ; scalars after the existing compiled unit's grid barrier.
 define internal void @delta_prepare_body(ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %prepared,

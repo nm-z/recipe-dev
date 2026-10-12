@@ -2856,13 +2856,23 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
+	/// One state-tile decode body per arithmetic and key-row count the Delta nodes use.
+	fn emit_delta_tiles(&self, backend: Backend, ir: &mut String) -> Result<()> {
+		let mut emitted = std::collections::HashSet::new();
+		for plan in self.plans.iter().filter(|plan| plan.node.op == Primitive::Delta) {
+			let (_, key_width, _, width) = delta_extent(&plan.node)?;
+			let Some(rows) = delta_tile_rows(backend, self.inference, key_width, width) else { continue };
+			let v = self.variant(&plan.node);
+			if !emitted.insert((v.to_owned(), rows)) { continue; }
+			let native = self.node_precision(&plan.node);
+			let shared = shared_tile_name(ir)?;
+			ir.push_str(&delta_tile_body(v, native.state_type, native.state.bytes(), rows, &shared));
+		}
+		Ok(())
+	}
 	fn emit_topk_shared(&self, backend: Backend, ir: &mut String) -> Result<()> {
 		if backend != Backend::Nvidia || !self.inference { return Ok(()); }
-		let shared_tile = ir.match_indices("@contraction_tile").find_map(|(at, _)| {
-			let tail = &ir[at + 1..];
-			let name = tail.split_whitespace().next()?;
-			tail[name.len()..].starts_with(" = external addrspace(3)").then(|| name.to_owned())
-		}).ok_or_else(|| RecipeError::new("shared contraction storage is absent"))?;
+		let shared_tile = shared_tile_name(ir)?;
 		let mut emitted = std::collections::HashSet::new();
 		for plan in self.plans.iter().filter(|plan| plan.node.op == Primitive::TopK) {
 			let v = self.variant(&plan.node);
@@ -5019,7 +5029,22 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let state = self.node_precision(node).state_type;
 					let prepared = format!("%n{index}.delta.prepared");
-					if self.inference {
+					// An NVIDIA decode keeps each state tile on chip across the window and
+					// evaluates its gates where it uses them, so no prepare pass precedes
+					// it. A launch geometry the tile body rejects takes the column walk.
+					let tiled = delta_tile_rows(backend, self.inference, key_width, width);
+					if let Some(rows) = tiled {
+						ir.push_str(&format!(
+							"%n{index}.delta.tiled = call i1 @delta_tile_forward_body_r{rows}{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, {arguments}, i32 {decode}, i32 %n{index}.begin, i32 %n{index}.end, i32 {checkpoints}, i32 {origin}, i32 %threads )\nbr i1 %n{index}.delta.tiled, label %n{index}.delta.tile.joined, label %n{index}.delta.tile.columns\nn{index}.delta.tile.columns:\n",
+							source = pointers.source,
+							second = pointers.second,
+							weights = pointers.weights,
+							value = pointers.value,
+							context = pointers.context,
+							arguments = shape.arguments,
+							decode = plan.decode(index)
+						));
+					} else if self.inference {
 						let cells = checked_mul(checked_mul(self.rows, shape.heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?, "delta states")?;
 						let offset = checked_mul(cells, checkpoints as usize + 1, "delta checkpoint states")?;
 						ir.push_str(&format!("{prepared} = getelementptr inbounds {state}, {pointer} {context}, i64 {offset}\n", context = pointers.context));
@@ -5030,8 +5055,13 @@ impl NativeModelIr {
 					}
 					emit_runtime_window_loop(&mut ir, index, "delta", pairs, &whole, |ir, _p, wide| {
 						let (pair, column, scalars) = if self.inference {
-							ir.push_str(&format!("%n{index}.delta.pair = udiv i64 {wide}, {columns}\n%n{index}.delta.column.wide = urem i64 {wide}, {columns}\n%n{index}.delta.column = trunc i64 %n{index}.delta.column.wide to i32\n%n{index}.delta.scalars.offset = mul i64 %n{index}.delta.pair, {stride}\n%n{index}.delta.scalars = getelementptr inbounds {state}, {pointer} {prepared}, i64 %n{index}.delta.scalars.offset\n", stride = node.output.length * 3));
-							(format!("%n{index}.delta.pair"), format!("%n{index}.delta.column"), format!("%n{index}.delta.scalars"))
+							ir.push_str(&format!("%n{index}.delta.pair = udiv i64 {wide}, {columns}\n%n{index}.delta.column.wide = urem i64 {wide}, {columns}\n%n{index}.delta.column = trunc i64 %n{index}.delta.column.wide to i32\n"));
+							// Without a prepare pass each column evaluates its own gates.
+							let scalars = if tiled.is_some() { "null".to_owned() } else {
+								ir.push_str(&format!("%n{index}.delta.scalars.offset = mul i64 %n{index}.delta.pair, {stride}\n%n{index}.delta.scalars = getelementptr inbounds {state}, {pointer} {prepared}, i64 %n{index}.delta.scalars.offset\n", stride = node.output.length * 3));
+								format!("%n{index}.delta.scalars")
+							};
+							(format!("%n{index}.delta.pair"), format!("%n{index}.delta.column"), scalars)
 						} else { (wide.to_owned(), "0".to_owned(), "null".to_owned()) };
 						ir.push_str(&format!(
 							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {pair}, {arguments}, i32 {entries}, i32 {decode}, i32 %n{index}.begin, i32 %n{index}.end, i32 {checkpoints}, i32 {origin}, i32 {column}, i32 {columns}, {pointer} {scalars} )\n",
@@ -5045,6 +5075,7 @@ impl NativeModelIr {
 							arguments = shape.arguments
 						));
 					})?;
+					if tiled.is_some() { ir.push_str(&format!("br label %n{index}.delta.tile.joined\nn{index}.delta.tile.joined:\n")); }
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertOut) => {
@@ -8158,6 +8189,7 @@ impl NativeModelIr {
 		self.specialize_contractions(backend, matrix.is_some(), &mut ir)?;
 		self.specialize_experts(backend, &mut ir)?;
 		self.emit_topk_shared(backend, &mut ir)?;
+		self.emit_delta_tiles(backend, &mut ir)?;
 		let mut ir = prune_internal_definitions(ir);
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
@@ -8812,6 +8844,313 @@ fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 		partials,
 		arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}, i32 {}", integer_argument(node.argument[6], "delta tiled heads")?),
 	})
+}
+
+/// The shared tile every workgroup owns, as the module names it.
+fn shared_tile_name(ir: &str) -> Result<String> {
+	ir.match_indices("@contraction_tile")
+		.find_map(|(at, _)| {
+			let tail = &ir[at + 1..];
+			let name = tail.split_whitespace().next()?;
+			tail[name.len()..].starts_with(" = external addrspace(3)").then(|| name.to_owned())
+		})
+		.ok_or_else(|| RecipeError::new("shared contraction storage is absent"))
+}
+
+/// The warps of a state tile split a head's key rows into this many bands.
+const DELTA_TILE_BANDS: usize = 8;
+
+/// The key rows of one value column each lane of a state-tile decode holds in
+/// registers, when the node decodes in tiles: an NVIDIA inference layout whose
+/// key rows split into bands and whose value columns into whole warps.
+fn delta_tile_rows(backend: Backend, inference: bool, key_width: i32, width: i32) -> Option<usize> {
+	let key_width = usize::try_from(key_width).ok()?;
+	let rows = key_width / DELTA_TILE_BANDS;
+	(backend == Backend::Nvidia && inference && key_width % DELTA_TILE_BANDS == 0 && (1..=32).contains(&rows) && width > 0 && width % 32 == 0).then_some(rows)
+}
+
+/// The gated delta rule over one decode window with every state cell on chip.
+/// A workgroup walks (row, value head, column tile) items; within an item warp
+/// `w` holds the key rows of band `w % 8` for value column `lane` of sub-tile
+/// `w / 8` in registers, so a column tile spans 32 columns per eight warps. The
+/// state is read once from the checkpoint slot before the window (the live
+/// state without slots), every position's state is written once to its slot,
+/// and the live state is written back only when no slot holds it: with slots,
+/// every call restores from a slot, so the live state is never read again. Key
+/// reductions sum each lane's rows in order, then the band partials in band
+/// order. One lane evaluates each position's gates while the others stage its
+/// keys and queries, and the workgroup reads them from the shared tile. A launch whose
+/// geometry or shared tile cannot hold the layout returns false having touched
+/// nothing, and the caller walks columns instead.
+fn delta_tile_body(v: &str, s: &str, align: usize, rows: usize, shared: &str) -> String {
+	let bands = DELTA_TILE_BANDS;
+	let (lanes, key_width) = (bands * 32, bands * rows);
+	let each = |line: &dyn Fn(usize) -> String| (0..rows).map(line).collect::<String>();
+	let band_sum = |prefix: &str, gather: &str| {
+		(0..bands)
+			.map(|g| {
+				let previous = if g == 0 { "%zero".to_owned() } else { format!("%{prefix}.{}", g - 1) };
+				format!(
+					"%{prefix}.at.{g} = getelementptr {s}, ptr addrspace(3) {gather}, i64 {}\n%{prefix}.part.{g} = load {s}, ptr addrspace(3) %{prefix}.at.{g}, align {align}\n%{prefix}.{g} = call {s} @recipe.state.add{v}({s} {previous}, {s} %{prefix}.part.{g})\n",
+					g * 32
+				)
+			})
+			.collect::<String>()
+	};
+	let row_sum = |prefix: &str, term: &str, j: usize| {
+		if j == 0 { format!("%{prefix}.0 = call {s} @recipe.state.add{v}({s} %zero, {s} %{term}.0)\n") } else { format!("%{prefix}.{j} = call {s} @recipe.state.add{v}({s} %{prefix}.{}, {s} %{term}.{j})\n", j - 1) }
+	};
+	let strides = (1..rows).map(|j| format!("%stride.{j} = mul i64 %vwidth.wide, {j}\n")).collect::<String>();
+	let at = |name: &str, base: &str, j: usize| {
+		if j == 0 { format!("%{name}.0 = getelementptr inbounds {s}, ptr addrspace(1) {base}, i64 0\n") } else { format!("%{name}.{j} = getelementptr inbounds {s}, ptr addrspace(1) {base}, i64 %stride.{j}\n") }
+	};
+	let restore = each(&|j| format!("{}%restored.{j} = load {s}, ptr addrspace(1) %restore.at.{j}, align {align}\n", at("restore.at", "%restore.pointer", j)));
+	let initial = each(&|j| format!("%initial.{j} = phi {s} [ %zero, %item.body ], [ %restored.{j}, %item.restore ]\n"));
+	let cells = each(&|j| format!("%cell.{j} = phi {s} [ %initial.{j}, %item.ready ], [ %updated.{j}, %latch ]\n"));
+	// Decay the old state before predicting the value the delta update removes.
+	let read = each(&|j| {
+		format!(
+			"%key.at.{j} = getelementptr {s}, ptr addrspace(3) %key.band, i64 {j}\n%key.{j} = load {s}, ptr addrspace(3) %key.at.{j}, align {align}\n%decayed.{j} = call {s} @recipe.state.mul{v}({s} %decay, {s} %cell.{j})\n%product.{j} = call {s} @recipe.state.mul{v}({s} %key.{j}, {s} %decayed.{j})\n{}",
+			row_sum("read.sum", "product", j)
+		)
+	});
+	let write = each(&|j| {
+		format!(
+			"%term.{j} = call {s} @recipe.state.mul{v}({s} %key.{j}, {s} %write.error)\n%updated.{j} = call {s} @recipe.state.add{v}({s} %decayed.{j}, {s} %term.{j})\n%query.at.{j} = getelementptr {s}, ptr addrspace(3) %query.band, i64 {j}\n%query.{j} = load {s}, ptr addrspace(3) %query.at.{j}, align {align}\n%query.scaled.{j} = call {s} @recipe.state.mul{v}({s} %query.{j}, {s} %query.scale)\n%readout.{j} = call {s} @recipe.state.mul{v}({s} %query.scaled.{j}, {s} %updated.{j})\n{}",
+			row_sum("out.sum", "readout", j)
+		)
+	});
+	let save = each(&|j| format!("{}store {s} %updated.{j}, ptr addrspace(1) %save.at.{j}, align {align}\n", at("save.at", "%save.pointer", j)));
+	let keep = each(&|j| format!("{}store {s} %cell.{j}, ptr addrspace(1) %keep.at.{j}, align {align}\n", at("keep.at", "%work.pointer", j)));
+	let last = rows - 1;
+	let prediction = band_sum("prediction", "%read.gather");
+	let output = band_sum("output", "%out.gather");
+	let final_band = bands - 1;
+	format!(
+		r#"
+define internal i1 @delta_tile_forward_body_r{rows}{v}(ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i32 %rows, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs, i32 %tiled, i32 %decode, i32 %begin, i32 %end, i32 %checkpoints, i32 %origin, i32 %threads) #3 {{
+entry:
+%lid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+%group = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+%width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+%warp = lshr i32 %lid, 5
+%lane = and i32 %lid, 31
+%band = urem i32 %warp, {bands}
+%sub = udiv i32 %warp, {bands}
+%subs = udiv i32 %width, {lanes}
+%block.rest = urem i32 %width, {lanes}
+%block.whole = icmp eq i32 %block.rest, 0
+%block.some = icmp ne i32 %subs, 0
+%block.fits = and i1 %block.whole, %block.some
+%span.whole = mul i32 %subs, 32
+%span = select i1 %block.fits, i32 %span.whole, i32 32
+%span.rest = urem i32 %vwidth, %span
+%span.fits = icmp eq i32 %span.rest, 0
+%keys.fit = icmp eq i32 %kwidth, {key_width}
+%shared.values = add i32 %kwidth, %width
+%shared.pairs = shl i32 %shared.values, 1
+%shared.count = add i32 %shared.pairs, 3
+%shared.bytes = mul i32 %shared.count, {align}
+%tile.bytes = call i32 @recipe.tile.bytes()
+%shared.fits = icmp ule i32 %shared.bytes, %tile.bytes
+%fits.block = and i1 %block.fits, %span.fits
+%fits.keys = and i1 %fits.block, %keys.fit
+%fits = and i1 %fits.keys, %shared.fits
+br i1 %fits, label %start, label %reject
+reject:
+ret i1 false
+start:
+%groups = udiv i32 %threads, %width
+%tiles = udiv i32 %vwidth, %span
+%pairs.live = mul i32 %rows, %vheads
+%items = mul i32 %pairs.live, %tiles
+%zero = call {s} @recipe.state.from.u1{v}(i1 false)
+%kheads.wide = zext i32 %kheads to i64
+%kwidth.wide = zext i32 %kwidth to i64
+%vheads.wide = zext i32 %vheads to i64
+%vwidth.wide = zext i32 %vwidth to i64
+%length.wide = zext i32 %length to i64
+%pairs.wide = zext i32 %pairs to i64
+%state = mul i64 %kwidth.wide, %vwidth.wide
+%kchannels = mul i64 %kheads.wide, %kwidth.wide
+%kstream = mul i64 %kchannels, %length.wide
+%vchannels = mul i64 %vheads.wide, %vwidth.wide
+%stream = mul i64 %vchannels, %length.wide
+%kplanes = mul i64 %kstream, 2
+%row.stride = add i64 %kplanes, %stream
+%grouping = udiv i32 %vheads, %kheads
+%grouping.wide = zext i32 %grouping to i64
+%is.tiled = icmp ne i32 %tiled, 0
+%gate.stream = mul i64 %vheads.wide, %length.wide
+%checkpointing = icmp ne i32 %checkpoints, 0
+%divisor = select i1 %checkpointing, i32 %checkpoints, i32 1
+%slots = zext i32 %checkpoints to i64
+%region = mul i64 %pairs.wide, %state
+%global.begin = add i32 %origin, %begin
+%fresh = icmp eq i32 %global.begin, 0
+%previous = sub i32 %global.begin, 1
+%restore.slot = urem i32 %previous, %divisor
+%restore.slot.wide = zext i32 %restore.slot to i64
+%keys = getelementptr i8, ptr addrspace(3) @{shared}, i64 0
+%queries = getelementptr {s}, ptr addrspace(3) %keys, i64 %kwidth.wide
+%reads = getelementptr {s}, ptr addrspace(3) %queries, i64 %kwidth.wide
+%width.wide = zext i32 %width to i64
+%outs = getelementptr {s}, ptr addrspace(3) %reads, i64 %width.wide
+%lid.wide = zext i32 %lid to i64
+%read.mine = getelementptr {s}, ptr addrspace(3) %reads, i64 %lid.wide
+%out.mine = getelementptr {s}, ptr addrspace(3) %outs, i64 %lid.wide
+%scalar.query = getelementptr {s}, ptr addrspace(3) %outs, i64 %width.wide
+%scalar.decay = getelementptr {s}, ptr addrspace(3) %scalar.query, i64 1
+%scalar.write = getelementptr {s}, ptr addrspace(3) %scalar.query, i64 2
+%gating = icmp eq i32 %lid, 0
+%sub.lanes = mul i32 %sub, {lanes}
+%gather = add i32 %sub.lanes, %lane
+%gather.wide = zext i32 %gather to i64
+%read.gather = getelementptr {s}, ptr addrspace(3) %reads, i64 %gather.wide
+%out.gather = getelementptr {s}, ptr addrspace(3) %outs, i64 %gather.wide
+%first = mul i32 %band, {rows}
+%first.wide = zext i32 %first to i64
+%key.band = getelementptr {s}, ptr addrspace(3) %keys, i64 %first.wide
+%query.band = getelementptr {s}, ptr addrspace(3) %queries, i64 %first.wide
+%sub.columns = mul i32 %sub, 32
+%column.offset = add i32 %sub.columns, %lane
+%leader = icmp eq i32 %band, 0
+%stage.count = shl i32 %kwidth, 1
+{strides}call void @llvm.nvvm.barrier0()
+br label %item.loop
+item.loop:
+%item = phi i32 [ %group, %start ], [ %item.next, %item.done ]
+%item.more = icmp ult i32 %item, %items
+br i1 %item.more, label %item.body, label %exit
+item.body:
+%pair = udiv i32 %item, %tiles
+%tile = urem i32 %item, %tiles
+%tile.base = mul i32 %tile, %span
+%column = add i32 %tile.base, %column.offset
+%column.wide = zext i32 %column to i64
+%pair.wide = zext i32 %pair to i64
+%row = udiv i64 %pair.wide, %vheads.wide
+%head = urem i64 %pair.wide, %vheads.wide
+%input.row = mul i64 %row, %row.stride
+%khead.grouped = udiv i64 %head, %grouping.wide
+%khead.tiled = urem i64 %head, %kheads.wide
+%khead = select i1 %is.tiled, i64 %khead.tiled, i64 %khead.grouped
+%khead.base = mul i64 %khead, %kwidth.wide
+%khead.offset = mul i64 %khead.base, %length.wide
+%head.base = mul i64 %head, %vwidth.wide
+%head.offset = mul i64 %head.base, %length.wide
+%q.base = add i64 %input.row, %khead.offset
+%k.base = add i64 %q.base, %kstream
+%value.plane = add i64 %input.row, %kplanes
+%v.base = add i64 %value.plane, %head.offset
+%output.row = mul i64 %row, %stream
+%o.base = add i64 %output.row, %head.offset
+%gate.row = mul i64 %row, %gate.stream
+%gate.pair = mul i64 %gate.row, 2
+%head.length = mul i64 %head, %length.wide
+%a.base = add i64 %gate.pair, %head.length
+%b.base = add i64 %a.base, %gate.stream
+%column.row = mul i64 %column.wide, %length.wide
+%v.column = add i64 %v.base, %column.row
+%o.column = add i64 %o.base, %column.row
+%decay.scale = call {s} @delta_decay_scale{v}(ptr addrspace(1) %weights, i64 %head, i32 %decode)
+%cell.row = mul i64 %first.wide, %vwidth.wide
+%cell.base = add i64 %cell.row, %column.wide
+%work.base = mul i64 %pair.wide, %state
+%work.cell = add i64 %work.base, %cell.base
+%work.pointer = getelementptr inbounds {s}, ptr addrspace(1) %context, i64 %work.cell
+%checkpoint.pair = mul i64 %pair.wide, %slots
+%restore.pair = add i64 %checkpoint.pair, %restore.slot.wide
+%restore.offset = mul i64 %restore.pair, %state
+%restore.region = add i64 %region, %restore.offset
+%restore.from = select i1 %checkpointing, i64 %restore.region, i64 %work.base
+%restore.cell = add i64 %restore.from, %cell.base
+%restore.pointer = getelementptr inbounds {s}, ptr addrspace(1) %context, i64 %restore.cell
+br i1 %fresh, label %item.ready, label %item.restore
+item.restore:
+{restore}br label %item.ready
+item.ready:
+{initial}br label %time.loop
+time.loop:
+%time = phi i32 [ %begin, %item.ready ], [ %time.next, %latch ]
+{cells}%time.more = icmp ult i32 %time, %end
+br i1 %time.more, label %step, label %item.finish
+step:
+%time.wide = zext i32 %time to i64
+%value.index = add i64 %v.column, %time.wide
+%value = call {s} @delta_model_load{v}(ptr addrspace(1) %input, i64 %value.index)
+br i1 %gating, label %gate, label %stage.loop
+gate:
+%parameters = call <3 x {s}> @delta_parameters{v}(ptr addrspace(1) %gates, i64 %a.base, i64 %b.base, i32 %kwidth, i32 %time, {s} %decay.scale)
+%parameter.query = extractelement <3 x {s}> %parameters, i32 0
+%parameter.decay = extractelement <3 x {s}> %parameters, i32 1
+%parameter.write = extractelement <3 x {s}> %parameters, i32 2
+store {s} %parameter.query, ptr addrspace(3) %scalar.query, align {align}
+store {s} %parameter.decay, ptr addrspace(3) %scalar.decay, align {align}
+store {s} %parameter.write, ptr addrspace(3) %scalar.write, align {align}
+br label %stage.loop
+stage.loop:
+%stage = phi i32 [ %lid, %step ], [ %lid, %gate ], [ %stage.next, %stage.body ]
+%stage.more = icmp ult i32 %stage, %stage.count
+br i1 %stage.more, label %stage.body, label %stage.done
+stage.body:
+%stage.query = icmp uge i32 %stage, %kwidth
+%stage.shifted = sub i32 %stage, %kwidth
+%stage.channel = select i1 %stage.query, i32 %stage.shifted, i32 %stage
+%stage.channel.wide = zext i32 %stage.channel to i64
+%stage.plane = select i1 %stage.query, i64 %q.base, i64 %k.base
+%stage.row = mul i64 %stage.channel.wide, %length.wide
+%stage.offset = add i64 %stage.row, %time.wide
+%stage.index = add i64 %stage.plane, %stage.offset
+%stage.value = call {s} @delta_model_load{v}(ptr addrspace(1) %input, i64 %stage.index)
+%stage.wide = zext i32 %stage to i64
+%stage.at = getelementptr {s}, ptr addrspace(3) %keys, i64 %stage.wide
+store {s} %stage.value, ptr addrspace(3) %stage.at, align {align}
+%stage.next = add i32 %stage, %width
+br label %stage.loop
+stage.done:
+call void @llvm.nvvm.barrier0()
+%decay = load {s}, ptr addrspace(3) %scalar.decay, align {align}
+{read}store {s} %read.sum.{last}, ptr addrspace(3) %read.mine, align {align}
+call void @llvm.nvvm.barrier0()
+%query.scale = load {s}, ptr addrspace(3) %scalar.query, align {align}
+%write = load {s}, ptr addrspace(3) %scalar.write, align {align}
+{prediction}%error = call {s} @recipe.state.sub{v}({s} %value, {s} %prediction.{final_band})
+%write.error = call {s} @recipe.state.mul{v}({s} %write, {s} %error)
+{write}store {s} %out.sum.{last}, ptr addrspace(3) %out.mine, align {align}
+br i1 %checkpointing, label %save, label %saved
+save:
+%global.time = add i32 %origin, %time
+%save.slot = urem i32 %global.time, %divisor
+%save.slot.wide = zext i32 %save.slot to i64
+%save.pair = add i64 %checkpoint.pair, %save.slot.wide
+%save.offset = mul i64 %save.pair, %state
+%save.region = add i64 %region, %save.offset
+%save.cell = add i64 %save.region, %cell.base
+%save.pointer = getelementptr inbounds {s}, ptr addrspace(1) %context, i64 %save.cell
+{save}br label %saved
+saved:
+call void @llvm.nvvm.barrier0()
+br i1 %leader, label %emit, label %latch
+emit:
+{output}%output.index = add i64 %o.column, %time.wide
+call void @delta_model_store{v}(ptr addrspace(1) %output, i64 %output.index, {s} %output.{final_band})
+br label %latch
+latch:
+%time.next = add i32 %time, 1
+br label %time.loop
+item.finish:
+br i1 %checkpointing, label %item.done, label %item.keep
+item.keep:
+{keep}br label %item.done
+item.done:
+%item.next = add i32 %item, %groups
+br label %item.loop
+exit:
+ret i1 true
+}}
+"#
+	)
 }
 
 /// List the positions routed to each expert, in ascending expert and position
@@ -28063,7 +28402,23 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values).max(if packed_native { PackedMatvec::SHARED_BYTES.div_ceil(element.bytes()) as u32 } else { 0 });
+		// A state-tile delta decode stages a head's keys and scaled queries and one
+		// partial per lane for each of its two key reductions.
+		let delta_shared_values = graph
+			.nodes
+			.iter()
+			.filter(|node| node.op == Primitive::Delta)
+			.map(|node| {
+				let (_, key_width, _, width) = delta_extent(node)?;
+				let bytes = NativePrecision::new(node.precision, node.acc)?.state.bytes();
+				let values = delta_tile_rows(self.backend, inference, key_width, width).map_or(0, |rows| (2 * (rows * DELTA_TILE_BANDS + block as usize) + 3) * bytes);
+				Ok(narrow(values.div_ceil(element.bytes()), "delta tile shared values")? as u32)
+			})
+			.collect::<Result<Vec<_>>>()?
+			.into_iter()
+			.max()
+			.unwrap_or(0);
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(delta_shared_values).max(if packed_native { PackedMatvec::SHARED_BYTES.div_ceil(element.bytes()) as u32 } else { 0 });
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
