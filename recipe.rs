@@ -2600,20 +2600,20 @@ fn packed_contraction_word(kind: u32, block: u32) -> Option<u64> {
 }
 /// Stored weight layouts the position-batched matvec decodes in registers.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum SpanWeight { F32, F16, BF16, Q8_0, Q4K, Q5K, Q6K }
+enum SpanWeight { F32, F16, BF16, Q8_0, Q4K, Q5K, Q6K, IQ2XS, IQ3XXS, IQ4NL }
 impl SpanWeight {
 	/// Values one lane decodes per task: one 16-byte line of a float format,
 	/// one Q8_0 block, one Q5_K sub-block pair, or a quarter of a Q6_K half.
-	fn task(self) -> usize { match self { Self::F32 => 4, Self::F16 | Self::BF16 => 8, Self::Q8_0 => 32, Self::Q4K | Self::Q5K => 64, Self::Q6K => 32 } }
-	fn block(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 => 1, Self::Q8_0 => 32, Self::Q4K | Self::Q5K | Self::Q6K => 256 } }
-	fn stride(self) -> usize { match self { Self::F32 => 4, Self::F16 | Self::BF16 => 2, Self::Q8_0 => 34, Self::Q4K => 144, Self::Q5K => 176, Self::Q6K => 210 } }
+	fn task(self) -> usize { match self { Self::F32 => 4, Self::F16 | Self::BF16 => 8, Self::Q8_0 | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 32, Self::Q4K | Self::Q5K => 64 } }
+	fn block(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 => 1, Self::Q8_0 | Self::IQ4NL => 32, Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ2XS | Self::IQ3XXS => 256 } }
+	fn stride(self) -> usize { match self { Self::F32 => 4, Self::F16 | Self::BF16 => 2, Self::Q8_0 => 34, Self::Q4K => 144, Self::Q5K => 176, Self::Q6K => 210, Self::IQ2XS => 74, Self::IQ3XXS => 98, Self::IQ4NL => 18 } }
 	/// Staged activations gain four floats every `pad` values, so the eight lanes of a
 	/// 16-byte shared-load phase read eight different bank quads.
-	fn pad(self) -> usize { match self { Self::F32 => 0, Self::F16 | Self::BF16 | Self::Q8_0 => 32, Self::Q4K | Self::Q5K => 64, Self::Q6K => 128 } }
+	fn pad(self) -> usize { match self { Self::F32 => 0, Self::F16 | Self::BF16 | Self::Q8_0 | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 32, Self::Q4K | Self::Q5K => 64, Self::Q6K => 128 } }
 	/// Tasks a chunk boundary must respect: a Q6_K task's values interleave across its superblock.
 	fn granule(self) -> usize { if self == Self::Q6K { 8 } else { 1 } }
 	/// Tasks each lane keeps in flight, about 64-80 weight bytes.
-	fn unroll(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 => 4, Self::Q8_0 | Self::Q6K => 2, Self::Q4K | Self::Q5K => 1 } }
+	fn unroll(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 => 4, Self::Q8_0 | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 2, Self::Q4K | Self::Q5K => 1 } }
 	/// Rows a slot works on together when it has that many. Q4_K brings so few weight
 	/// bytes per value that from two positions on its staged-activation reads, not its
 	/// weights, would bound it; two rows share each read. RECIPE_SPAN_PAIR=0 keeps one row.
@@ -2621,8 +2621,8 @@ impl SpanWeight {
 		if many && positions >= 2 && self == Self::Q4K && std::env::var("RECIPE_SPAN_PAIR").as_deref() != Ok("0") { 2 } else { 1 }
 	}
 	/// Byte alignment the weight lines need beyond the format's own.
-	fn alignment(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 | Self::Q4K | Self::Q5K => 16, Self::Q8_0 | Self::Q6K => 2 } }
-	fn name(self) -> &'static str { match self { Self::F32 => "f32", Self::F16 => "f16", Self::BF16 => "bf16", Self::Q8_0 => "q8_0", Self::Q4K => "q4k", Self::Q5K => "q5k", Self::Q6K => "q6k" } }
+	fn alignment(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 | Self::Q4K | Self::Q5K => 16, Self::Q8_0 | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 2 } }
+	fn name(self) -> &'static str { match self { Self::F32 => "f32", Self::F16 => "f16", Self::BF16 => "bf16", Self::Q8_0 => "q8_0", Self::Q4K => "q4k", Self::Q5K => "q5k", Self::Q6K => "q6k", Self::IQ2XS => "iq2xs", Self::IQ3XXS => "iq3xxs", Self::IQ4NL => "iq4nl" } }
 }
 /// Where a plane's activations and outputs live.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -2716,6 +2716,8 @@ fn span_matvec_declarations(ir: &str) -> String {
 		("@llvm.nvvm.barrier0.or(", "declare i32 @llvm.nvvm.barrier0.or(i32)"),
 		("@llvm.fshr.i32(", "declare i32 @llvm.fshr.i32(i32, i32, i32)"),
 		("@llvm.fmuladd.f32(", "declare float @llvm.fmuladd.f32(float, float, float)"),
+		("@llvm.cttz.i32(", "declare i32 @llvm.cttz.i32(i32, i1)"),
+		("@llvm.ctpop.i32(", "declare i32 @llvm.ctpop.i32(i32)"),
 	].into_iter().filter(|(name, _)| !ir.lines().any(|line| line.starts_with("declare") && line.contains(name))).map(|(_, line)| format!("{line}\n")).collect()
 }
 /// The metadata node marking weight loads invariant, so they use the read-only path.
@@ -2733,16 +2735,19 @@ fn span_matvec_function(spec: &SpanSpec, name: &str, shared: &str) -> String {
 	let o = &mut ir;
 	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
 	let arguments = "ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) %scratch, i32 %begin, i32 %rows";
-	emit!("define internal void @{name}({arguments}, i32 %span) #1 {{\nentry:\nswitch i32 %span, label %exit [");
+	// The grid's workgroups take the plane; `.group` hands it to workgroups `cta` of `ncta`
+	// with the staged positions the set bits of `mask` (all positions when it is zero).
+	emit!("define internal void @{name}({arguments}, i32 %span) #1 {{\nentry:\n%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()\n%ncta = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()\ncall void @{name}.group({arguments}, i32 %span, i32 %cta, i32 %ncta, i32 0)\nret void\n}}");
+	emit!("define internal void @{name}.group({arguments}, i32 %span, i32 %cta, i32 %ncta, i32 %mask) #1 {{\nentry:\nswitch i32 %span, label %exit [");
 	for s in 1..=SPAN_POSITIONS { emit!("i32 {s}, label %s{s}"); }
 	emit!("]");
-	for s in 1..=SPAN_POSITIONS { emit!("s{s}:\ncall void @{name}.s{s}({arguments})\nbr label %exit"); }
+	for s in 1..=SPAN_POSITIONS { emit!("s{s}:\ncall void @{name}.s{s}({arguments}, i32 %cta, i32 %ncta, i32 %mask)\nbr label %exit"); }
 	emit!("exit:\nret void\n}}");
 	// Each width is its own function: the optimizer then cannot merge the paths'
 	// blocks into one register allocation that every width pays for.
 	for s in 1..=SPAN_POSITIONS {
-		emit!("define internal void @{name}.s{s}({arguments}) #3 {{\nentry:");
-		emit!("%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()\n%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()\n%ncta = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()");
+		emit!("define internal void @{name}.s{s}({arguments}, i32 %cta, i32 %ncta, i32 %mask) #3 {{\nentry:");
+		emit!("%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()");
 		emit!("%warp = lshr i32 %tid, 5\n%lane = and i32 %tid, 31\n%warps = lshr i32 %ntid, 5\n%begin.wide = zext i32 %begin to i64\n%stage.step = shl i32 %ntid, 3\n%first = icmp eq i32 %tid, 0");
 		for j in 1..8 { emit!("%stage.offset{j} = mul i32 %ntid, {j}"); }
 		emit!("br label %s{s}");
@@ -2752,31 +2757,67 @@ fn span_matvec_function(spec: &SpanSpec, name: &str, shared: &str) -> String {
 	ir
 }
 
-/// GGML type codes of the dense split slice formats with a position-batched matvec.
-const SPAN_SPLIT_FORMATS: [(u32, SpanWeight); 4] = [(8, SpanWeight::Q8_0), (12, SpanWeight::Q4K), (13, SpanWeight::Q5K), (14, SpanWeight::Q6K)];
-/// The dense split's slice entry, `i32 @span_split_dense(type, k, rows, weights, x, y, columns)`,
-/// for slices `widths` wide: a slice whose format and width have a position-batched
-/// matvec, and whose columns fit its staged input, runs here and returns 1; any other
-/// returns 0 and keeps its previous kernel. Columns are position-major, as the split stages them.
-fn span_split_ir(widths: &[usize], shared: &str) -> String {
-	let (mut functions, mut cases) = (String::new(), Vec::new());
-	for &k in widths {
-		for (code, weight) in SPAN_SPLIT_FORMATS {
-			let spec = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
-			let Some(widest) = (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last().filter(|_| spec.valid()) else { continue };
-			let name = format!("span_split.{}", spec.key());
-			functions.push_str(&span_matvec_function(&spec, &name, shared));
-			cases.push((code, k, widest, name));
+/// GGML type codes of the split slice and expert formats with a position-batched matvec.
+const SPAN_SPLIT_FORMATS: [(u32, SpanWeight); 7] = [
+	(8, SpanWeight::Q8_0), (12, SpanWeight::Q4K), (13, SpanWeight::Q5K), (14, SpanWeight::Q6K), (17, SpanWeight::IQ2XS), (18, SpanWeight::IQ3XXS), (20, SpanWeight::IQ4NL),
+];
+/// The IQ4_NL levels.
+const SPAN_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+/// The split entries, for planes whose format and width have a position-batched
+/// matvec and whose columns fit the staged input; any other returns 0 and keeps its
+/// previous kernel. Columns are position-major, as the split stages them, and rows
+/// come at run time.
+/// `i32 @span_split_dense(type, k, rows, weights, x, y, columns)` runs a dense slice
+/// (`dense` widths) on every workgroup; `i32 @span_split_expert(type, k, rows,
+/// weights, x, y, columns, mask, rank, count)` runs one expert matrix (`experts`
+/// widths) on workgroups `rank` of `count`, staging the input columns the set bits of
+/// `mask` name (all `columns` when zero) and writing its outputs compactly.
+fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
+	let mut functions = String::new();
+	let mut names = std::collections::HashSet::new();
+	let mut cases = |widths: &[usize], functions: &mut String| -> Vec<(u32, usize, usize, String)> {
+		let mut cases = Vec::new();
+		for &k in widths {
+			for (code, weight) in SPAN_SPLIT_FORMATS {
+				let spec = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
+				let Some(widest) = (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last().filter(|_| spec.valid()) else { continue };
+				let name = format!("span_split.{}", spec.key());
+				if names.insert(name.clone()) { functions.push_str(&span_matvec_function(&spec, &name, shared)); }
+				cases.push((code, k, widest, name));
+			}
 		}
+		cases
+	};
+	let (dense, experts) = (cases(dense, &mut functions), cases(experts, &mut functions));
+	let mut ir = String::new();
+	for (entry, cases, extra) in [("dense", dense, ""), ("expert", experts, ", i32 %mask, i32 %rank, i32 %count")] {
+		ir.push_str(&format!("define i32 @span_split_{entry}(i32 %type, i32 %k, i32 %rows, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %columns{extra}) #3 {{\nentry:\n%some = icmp ne i32 %columns, 0\nbr label %case0\n"));
+		for (n, (code, k, widest, name)) in cases.iter().enumerate() {
+			ir.push_str(&format!("case{n}:\n%case{n}.type = icmp eq i32 %type, {code}\n%case{n}.k = icmp eq i32 %k, {k}\n%case{n}.fits = icmp ule i32 %columns, {widest}\n%case{n}.a = and i1 %case{n}.type, %case{n}.k\n%case{n}.b = and i1 %case{n}.a, %case{n}.fits\n%case{n}.run = and i1 %case{n}.b, %some\nbr i1 %case{n}.run, label %case{n}.call, label %case{}\ncase{n}.call:\n", n + 1));
+			if extra.is_empty() {
+				ir.push_str(&format!("call void @{name}(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 %columns)\nret i32 1\n"));
+			} else {
+				ir.push_str(&format!("call void @{name}.group(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 %columns, i32 %rank, i32 %count, i32 %mask)\nret i32 1\n"));
+			}
+		}
+		ir.push_str(&format!("case{}:\nret i32 0\n}}\n", cases.len()));
 	}
-	let mut ir = String::from("define i32 @span_split_dense(i32 %type, i32 %k, i32 %rows, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %columns) #3 {\nentry:\n%some = icmp ne i32 %columns, 0\nbr label %case0\n");
-	for (n, (code, k, widest, name)) in cases.iter().enumerate() {
-		ir.push_str(&format!("case{n}:\n%case{n}.type = icmp eq i32 %type, {code}\n%case{n}.k = icmp eq i32 %k, {k}\n%case{n}.fits = icmp ule i32 %columns, {widest}\n%case{n}.a = and i1 %case{n}.type, %case{n}.k\n%case{n}.b = and i1 %case{n}.a, %case{n}.fits\n%case{n}.run = and i1 %case{n}.b, %some\nbr i1 %case{n}.run, label %case{n}.call, label %case{}\n", n + 1));
-		ir.push_str(&format!("case{n}.call:\ncall void @{name}(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 %columns)\nret i32 1\n"));
-	}
-	ir.push_str(&format!("case{}:\nret i32 0\n}}\n", cases.len()));
 	ir.push_str(&functions);
 	ir
+}
+/// The IQ2_XS and IQ3_XXS grids the matvecs look up, as module constants, taken from
+/// the packed PTX's own tables so both decode the same levels; `None` when `ptx` lacks them.
+fn span_grids_ir(ptx: &str) -> Option<String> {
+	let table = |name: &str| -> Option<Vec<u8>> {
+		let at = ptx.find(&format!(" {name}["))?;
+		let open = at + ptx[at..].find('{')? + 1;
+		let close = open + ptx[open..].find('}')?;
+		ptx[open..close].split(',').map(|value| value.trim().parse::<u8>().ok()).collect()
+	};
+	let (two, three) = (table("iq2xs_grid")?, table("iq3xxs_grid")?);
+	if two.len() != 4096 || three.len() != 1024 { return None; }
+	let words = |bytes: &[u8], width: usize, ty: &str| bytes.chunks(width).map(|chunk| format!("{ty} {}", chunk.iter().rev().fold(0u64, |word, byte| word << 8 | u64::from(*byte)))).collect::<Vec<_>>().join(", ");
+	Some(format!("@span.iq2xs.grid = internal addrspace(1) constant [512 x i64] [{}], align 8\n@span.iq3xxs.grid = internal addrspace(1) constant [256 x i32] [{}], align 4\n", words(&two, 8, "i64"), words(&three, 4, "i32")))
 }
 
 fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
@@ -2794,6 +2835,11 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 		l - 1, l.trailing_zeros(), 32 / l, 32 / l);
 	if l == 32 { emit!("%{p}.mask = add i32 -1, 0"); } else { emit!("%{p}.mask.shift = mul i32 %{p}.slot.in, {l}\n%{p}.mask = shl i32 {}, %{p}.mask.shift", (1u64 << l) - 1); }
 	emit!("%{p}.partials = getelementptr i8, ptr addrspace(1) %scratch, i64 {}", SpanSpec::counter_bytes(&plan));
+	// Staged position j reads input column j, or the j-th set bit of a nonzero mask.
+	emit!("%{p}.all = icmp eq i32 %mask, 0\n%{p}.m0 = add i32 %mask, 0");
+	for j in 0..s {
+		emit!("%{p}.bit{j} = call i32 @llvm.cttz.i32(i32 %{p}.m{j}, i1 false)\n%{p}.col{j} = select i1 %{p}.all, i32 {j}, i32 %{p}.bit{j}\n%{p}.m{j}.less = sub i32 %{p}.m{j}, 1\n%{p}.m{} = and i32 %{p}.m{j}, %{p}.m{j}.less", j + 1);
+	}
 	let (rows, group, groups, units) = if spec.rows == 0 {
 		emit!("%{p}.group0 = add i32 %rows, %ncta\n%{p}.group1 = sub i32 %{p}.group0, 1\n%{p}.group2 = udiv i32 %{p}.group1, %ncta\n%{p}.group.none = icmp eq i32 %{p}.group2, 0\n%{p}.group = select i1 %{p}.group.none, i32 1, i32 %{p}.group2");
 		emit!("%{p}.groups0 = add i32 %rows, %{p}.group\n%{p}.groups1 = sub i32 %{p}.groups0, 1\n%{p}.groups = udiv i32 %{p}.groups1, %{p}.group");
@@ -2814,8 +2860,10 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 	for j in 0..8 {
 		let q = format!("%{p}.st{j}");
 		if j == 0 { emit!("{q}.i = add i32 %{p}.si, 0"); } else { emit!("{q}.i = add i32 %{p}.si, %stage.offset{j}"); }
-		emit!("{q}.ok = icmp ult i32 {q}.i, %{p}.items\n{q}.ic = select i1 {q}.ok, i32 {q}.i, i32 0\n{q}.kk = udiv i32 {q}.ic, {s}\n{q}.p = urem i32 {q}.ic, {s}\n{q}.k = add i32 %{p}.k0, {q}.kk");
-		emit!("{q}.k.wide = zext i32 {q}.k to i64\n{q}.row = mul i64 {q}.k.wide, {}\n{q}.p.wide = zext i32 {q}.p to i64\n{q}.position = add i64 %begin.wide, {q}.p.wide\n{q}.column = mul i64 {q}.position, {}\n{q}.at = add i64 {q}.row, {q}.column", channel, position);
+		emit!("{q}.ok = icmp ult i32 {q}.i, %{p}.items\n{q}.ic = select i1 {q}.ok, i32 {q}.i, i32 0\n{q}.kk = udiv i32 {q}.ic, {s}\n{q}.p = urem i32 {q}.ic, {s}\n{q}.k = add i32 %{p}.k0, {q}.kk\n{q}.column0 = add i32 %{p}.col0, 0");
+		for c in 1..s { emit!("{q}.is{c} = icmp eq i32 {q}.p, {c}\n{q}.column{c} = select i1 {q}.is{c}, i32 %{p}.col{c}, i32 {q}.column{}", c - 1); }
+		emit!("{q}.column.index = add i32 {q}.column{}, 0", s - 1);
+		emit!("{q}.k.wide = zext i32 {q}.k to i64\n{q}.row = mul i64 {q}.k.wide, {}\n{q}.p.wide = zext i32 {q}.column.index to i64\n{q}.position = add i64 %begin.wide, {q}.p.wide\n{q}.column = mul i64 {q}.position, {}\n{q}.at = add i64 {q}.row, {q}.column", channel, position);
 		emit!("{q}.from = getelementptr float, ptr addrspace(1) %x, i64 {q}.at\n{q}.v = load float, ptr addrspace(1) {q}.from, align 4");
 	}
 	for j in 0..8 {
@@ -2975,6 +3023,24 @@ fn span_task_load(o: &mut String, w: SpanWeight, t: &str, task: &str, row: &str,
 			}
 			emit!("{t}.scale.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 208\n{t}.scale.half = load half, ptr addrspace(1) {t}.scale.at, align 2, {invariant}");
 		}
+		SpanWeight::IQ2XS | SpanWeight::IQ3XXS => {
+			// A task is one 32-value group of a 256-value block: its grid indices, and the
+			// scale byte (IQ2_XS) or the scale-and-signs word (IQ3_XXS).
+			let stride = if w == SpanWeight::IQ2XS { 74 } else { 98 };
+			emit!("{t}.block = lshr i32 {task}, 3\n{t}.sub = and i32 {task}, 7\n{t}.block.wide = zext i32 {t}.block to i64\n{t}.byte = mul i64 {t}.block.wide, {stride}\n{t}.at = getelementptr i8, ptr addrspace(1) {row}, i64 {t}.byte");
+			emit!("{t}.scale.half = load half, ptr addrspace(1) {t}.at, align 2, {invariant}\n{t}.sub8 = shl i32 {t}.sub, 3\n{t}.q.offset0 = add i32 {t}.sub8, 2\n{t}.q.offset = zext i32 {t}.q.offset0 to i64\n{t}.q.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 {t}.q.offset");
+			span_words(o, &format!("{t}.q"), &format!("{t}.q.at"), 8, invariant);
+			if w == SpanWeight::IQ2XS {
+				emit!("{t}.sc.offset0 = add i32 {t}.sub, 66\n{t}.sc.offset = zext i32 {t}.sc.offset0 to i64\n{t}.sc.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 {t}.sc.offset\n{t}.sc.byte = load i8, ptr addrspace(1) {t}.sc.at, align 1, {invariant}");
+			} else {
+				emit!("{t}.sub4 = shl i32 {t}.sub, 2\n{t}.a.offset0 = add i32 {t}.sub4, 66\n{t}.a.offset = zext i32 {t}.a.offset0 to i64\n{t}.a.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 {t}.a.offset");
+				span_words(o, &format!("{t}.a"), &format!("{t}.a.at"), 4, invariant);
+			}
+		}
+		SpanWeight::IQ4NL => {
+			emit!("{t}.wide = zext i32 {task} to i64\n{t}.byte = mul i64 {t}.wide, 18\n{t}.at = getelementptr i8, ptr addrspace(1) {row}, i64 {t}.byte\n{t}.scale.half = load half, ptr addrspace(1) {t}.at, align 2, {invariant}\n{t}.q.at = getelementptr i8, ptr addrspace(1) {t}.at, i64 2");
+			span_words(o, &format!("{t}.q"), &format!("{t}.q.at"), 16, invariant);
+		}
 	}
 }
 
@@ -2983,7 +3049,6 @@ fn span_activations(o: &mut String, q: &str, shared: &str, stride: usize, positi
 	o.push_str(&format!("{q}.offset = add i32 {index}, {}\n{q}.at = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.offset\n{q} = load <4 x float>, ptr addrspace(3) {q}.at, align 16\n", position * stride));
 	std::array::from_fn(|i| { o.push_str(&format!("{q}.e{i} = extractelement <4 x float> {q}, i32 {i}\n")); format!("{q}.e{i}") })
 }
-/// Fold products into a running sum: `sum + Σ weights[i] * values[i]`.
 /// The exact float of each byte of a word, less `bias`: or-ing the byte into the
 /// mantissa of 2^23 and subtracting 2^23 + `bias`.
 fn span_bytes(o: &mut String, q: &str, word: &str, less: u32) -> [String; 4] {
@@ -3103,6 +3168,69 @@ fn span_task_quads(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<Spa
 			}
 			steps
 		}
+		SpanWeight::IQ2XS | SpanWeight::IQ3XXS => {
+			emit!("{t}.d = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
+			// Each 8-value run has a grid entry and seven sign bits whose parity completes the eighth.
+			let mut runs = Vec::new();
+			let scales = if w == SpanWeight::IQ2XS {
+				emit!("{t}.sc = zext i8 {t}.sc.byte to i32\n{t}.n0 = and i32 {t}.sc, 15\n{t}.n1 = lshr i32 {t}.sc, 4");
+				for g in 0..2 { emit!("{t}.n{g}.f = uitofp i32 {t}.n{g} to float\n{t}.n{g}.h = fadd float {t}.n{g}.f, 0.5\n{t}.n{g}.d = fmul float {t}.d, {t}.n{g}.h\n{t}.db{g} = fmul float {t}.n{g}.d, 0.25"); }
+				for l in 0..4 {
+					let r = format!("{t}.l{l}");
+					if l % 2 == 0 { emit!("{r}.e = and i32 {t}.q.w{}, 65535", l / 2); } else { emit!("{r}.e = lshr i32 {t}.q.w{}, 16", l / 2); }
+					emit!("{r}.index0 = and i32 {r}.e, 511\n{r}.index = zext i32 {r}.index0 to i64\n{r}.at = getelementptr [512 x i64], ptr addrspace(1) @span.iq2xs.grid, i64 0, i64 {r}.index\n{r}.grid = load i64, ptr addrspace(1) {r}.at, align 8, !invariant.load {SPAN_INVARIANT}");
+					emit!("{r}.lo = trunc i64 {r}.grid to i32\n{r}.hi.wide = lshr i64 {r}.grid, 32\n{r}.hi = trunc i64 {r}.hi.wide to i32\n{r}.signs7 = lshr i32 {r}.e, 9");
+					runs.push((r.clone(), [format!("{r}.lo"), format!("{r}.hi")], l / 2));
+				}
+				vec![Some(format!("{t}.db0")), Some(format!("{t}.db1"))]
+			} else {
+				emit!("{t}.n = lshr i32 {t}.a.w0, 28\n{t}.n.f = uitofp i32 {t}.n to float\n{t}.n.h = fadd float {t}.n.f, 0.5\n{t}.n.d = fmul float {t}.d, {t}.n.h\n{t}.db = fmul float {t}.n.d, 0.5");
+				for l in 0..4 {
+					let r = format!("{t}.l{l}");
+					for h in 0..2 {
+						let byte = 2 * l + h;
+						emit!("{r}.i{h}.shift = lshr i32 {t}.q.w{}, {}\n{r}.i{h}.byte = and i32 {r}.i{h}.shift, 255\n{r}.i{h} = zext i32 {r}.i{h}.byte to i64\n{r}.g{h}.at = getelementptr [256 x i32], ptr addrspace(1) @span.iq3xxs.grid, i64 0, i64 {r}.i{h}\n{r}.g{h} = load i32, ptr addrspace(1) {r}.g{h}.at, align 4, !invariant.load {SPAN_INVARIANT}", byte / 4, 8 * (byte % 4));
+					}
+					emit!("{r}.signs.shift = lshr i32 {t}.a.w0, {}\n{r}.signs7 = and i32 {r}.signs.shift, 127", 7 * l);
+					runs.push((r.clone(), [format!("{r}.g0"), format!("{r}.g1")], 0));
+				}
+				vec![Some(format!("{t}.db"))]
+			};
+			for (l, (r, words, group)) in runs.into_iter().enumerate() {
+				emit!("{r}.parity0 = call i32 @llvm.ctpop.i32(i32 {r}.signs7)\n{r}.parity1 = and i32 {r}.parity0, 1\n{r}.parity = shl i32 {r}.parity1, 7\n{r}.signs = or i32 {r}.signs7, {r}.parity");
+				for (h, word) in words.iter().enumerate() {
+					let mut decode = String::new();
+					code!(decode, "{r}.h{h}.o = add i32 {t}.slot, {}", 8 * l + 4 * h);
+					let magnitudes = span_bytes(&mut decode, &format!("{r}.h{h}.m"), word, 0);
+					let weights = std::array::from_fn(|b| {
+						let v = format!("{r}.h{h}.v{b}");
+						code!(decode, "{v}.sign0 = lshr i32 {r}.signs, {}\n{v}.sign1 = and i32 {v}.sign0, 1\n{v}.sign = shl i32 {v}.sign1, 31\n{v}.bits0 = bitcast float {} to i32\n{v}.bits = xor i32 {v}.bits0, {v}.sign\n{v} = bitcast i32 {v}.bits to float", 4 * h + b, magnitudes[b]);
+						v
+					});
+					quads.push(SpanQuad { decode, weights, offset: format!("{r}.h{h}.o"), group });
+				}
+			}
+			scales
+		}
+		SpanWeight::IQ4NL => {
+			emit!("{t}.d = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
+			// The sixteen IQ4_NL levels, four to a word, picked by each code.
+			let words: [i32; 4] = std::array::from_fn(|i| i32::from_le_bytes(std::array::from_fn(|b| SPAN_IQ4NL[4 * i + b] as u8)));
+			for quad in 0..8 {
+				let q = format!("{t}.k{quad}");
+				let mut decode = String::new();
+				code!(decode, "{q}.o = add i32 {t}.slot, {}", 4 * quad);
+				let weights = std::array::from_fn(|b| {
+					let v = format!("{q}.v{b}");
+					code!(decode, "{v}.shift = lshr i32 {t}.q.w{}, {}\n{v}.code = and i32 {v}.shift, 15\n{v}.word = lshr i32 {v}.code, 2\n{v}.odd = icmp eq i32 {v}.word, 1\n{v}.three = icmp eq i32 {v}.word, 3\n{v}.high = icmp uge i32 {v}.word, 2", quad % 4, 8 * b + 4 * (quad / 4));
+					code!(decode, "{v}.low.pair = select i1 {v}.odd, i32 {}, i32 {}\n{v}.high.pair = select i1 {v}.three, i32 {}, i32 {}\n{v}.levels = select i1 {v}.high, i32 {v}.high.pair, i32 {v}.low.pair", words[1], words[0], words[3], words[2]);
+					code!(decode, "{v}.lane = and i32 {v}.code, 3\n{v}.lane8 = shl i32 {v}.lane, 3\n{v}.level0 = lshr i32 {v}.levels, {v}.lane8\n{v}.level = and i32 {v}.level0, 255\n{v}.signed = xor i32 {v}.level, 128\n{v}.bits = or i32 {v}.signed, 1258291200\n{v}.float = bitcast i32 {v}.bits to float\n{v} = fsub float {v}.float, {}", span_float(8388736.0));
+					v
+				});
+				quads.push(SpanQuad { decode, weights, offset: format!("{q}.o"), group: 0 });
+			}
+			vec![Some(format!("{t}.d"))]
+		}
 	};
 	(quads, scales)
 }
@@ -3172,7 +3300,8 @@ fn span_matvec_parts(node: &Node, stored: Option<&StoredWeight>, packed: bool) -
 			let spec = format.spec()?;
 			let weight = match spec.codec {
 				StorageCodec::F32 => SpanWeight::F32, StorageCodec::F16 => SpanWeight::F16, StorageCodec::BF16 => SpanWeight::BF16,
-				StorageCodec::Q8_0 => SpanWeight::Q8_0, StorageCodec::Q4K => SpanWeight::Q4K, StorageCodec::Q5K => SpanWeight::Q5K, StorageCodec::Q6K => SpanWeight::Q6K, _ => return None,
+				StorageCodec::Q8_0 => SpanWeight::Q8_0, StorageCodec::Q4K => SpanWeight::Q4K, StorageCodec::Q5K => SpanWeight::Q5K, StorageCodec::Q6K => SpanWeight::Q6K,
+				StorageCodec::IQ2XS => SpanWeight::IQ2XS, StorageCodec::IQ3XXS => SpanWeight::IQ3XXS, StorageCodec::IQ4NL => SpanWeight::IQ4NL, _ => return None,
 			};
 			if biased || count % k != 0 || bytes % weight.alignment() != 0 { return None; }
 			let part = plane(weight, count / k);
@@ -3190,8 +3319,8 @@ fn span_matvec_parts(node: &Node, stored: Option<&StoredWeight>, packed: bool) -
 	}
 	Some(parts)
 }
-/// The widths of the dense split slices a module may run through the position-batched
-/// matvec, none when RECIPE_SPAN_MATVEC=0: the slice entry then leaves every slice on its kernel.
+/// The widths of the split slices or expert matrices a module may run through the
+/// position-batched matvec, none when RECIPE_SPAN_MATVEC=0: the entries then leave every plane on its kernel.
 fn span_split_widths(widths: impl IntoIterator<Item = usize>) -> Vec<usize> {
 	if std::env::var("RECIPE_SPAN_MATVEC").as_deref() == Ok("0") { return Vec::new(); }
 	let mut widths = widths.into_iter().collect::<Vec<_>>();
@@ -3199,17 +3328,20 @@ fn span_split_widths(widths: impl IntoIterator<Item = usize>) -> Vec<usize> {
 	widths.dedup();
 	widths
 }
-/// The dense split's slice entry for the expert worker module, which is PTX only: the
-/// LLVM of `span_split_ir` compiled once per width set and cached, without its header
-/// or shared declaration, since the worker declares `scratch`, the dynamic shared
-/// memory the matvecs stage into. Without widths the entry declines every slice.
-fn span_split_ptx(widths: &[usize], target: &BackendTarget) -> Result<String> {
-	if widths.is_empty() {
-		return Ok(".visible .func (.param .b32 result) span_split_dense(.param .b32 t,.param .b32 k,.param .b32 m,.param .b64 w,.param .b64 x,.param .b64 y,.param .b32 c)\n{\n\t.reg .b32 none;\n\tmov.u32 none,0;\n\tst.param.b32 [result],none;\n\tret;\n}\n".to_owned());
+/// The split entries for the expert worker module, which is PTX only: the LLVM of
+/// `span_split_ir` compiled once per width set and cached, without its header or
+/// shared declaration, since the worker declares `scratch`, the dynamic shared memory
+/// the matvecs stage into. Without widths both entries decline every plane.
+fn span_split_ptx(dense: &[usize], experts: &[usize], target: &BackendTarget) -> Result<String> {
+	if dense.is_empty() && experts.is_empty() {
+		let decline = |name: &str, parameters: &str| format!(".visible .func (.param .b32 result) {name}({parameters})\n{{\n\t.reg .b32 none;\n\tmov.u32 none,0;\n\tst.param.b32 [result],none;\n\tret;\n}}\n");
+		let common = ".param .b32 t,.param .b32 k,.param .b32 m,.param .b64 w,.param .b64 x,.param .b64 y,.param .b32 c";
+		return Ok(decline("span_split_dense", common) + &decline("span_split_expert", &format!("{common},.param .b32 mask,.param .b32 rank,.param .b32 count")));
 	}
 	let BackendTarget::Nvidia { architecture } = target else { return Err(RecipeError::new("the dense split entry is NVIDIA PTX")) };
 	let feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
-	let functions = span_split_ir(widths, "scratch");
+	let mut functions = span_split_ir(dense, experts, "scratch");
+	if functions.contains("@span.iq") { functions.push_str(&span_grids_ir(PackedMatvec::ptx()).ok_or_else(|| RecipeError::new("packed PTX lacks the IQ grids"))?); }
 	let ir = format!("target triple = \"nvptx64-nvidia-cuda\"\n@scratch = external addrspace(3) global [0 x float], align 16\nattributes #1 = {{ alwaysinline nounwind }}\nattributes #3 = {{ noinline nounwind }}\n{}{functions}{SPAN_INVARIANT} = !{{}}\n", span_matvec_declarations(""));
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
@@ -8138,8 +8270,12 @@ impl NativeModelIr {
 			if emitted.insert(spec.key()) { functions.push_str(&span_matvec_function(&spec, &format!("span_matvec.{}", spec.key()), &shared)); }
 		}
 		if split {
-			let widths = span_split_widths(self.plans.iter().filter(|plan| plan.node.block_kind == "split_dense").map(|plan| plan.node.input.channels));
-			functions.push_str(&span_split_ir(&widths, &shared));
+			let dense = span_split_widths(self.plans.iter().filter(|plan| plan.node.block_kind == "split_dense").map(|plan| plan.node.input.channels));
+			// An expert's gate and up read the layer input; its down reads the hidden width.
+			let experts = span_split_widths(self.plans.iter().filter(|plan| plan.node.block_kind == "split_expert" && plan.node.op == Primitive::ExpertIn)
+				.flat_map(|plan| [plan.node.input.channels, plan.node.argument[2] as usize]));
+			functions.push_str(&span_split_ir(&dense, &experts, &shared));
+			if functions.contains("@span.iq") { functions.push_str(&span_grids_ir(PackedMatvec::ptx()).ok_or_else(|| RecipeError::new("packed PTX lacks the IQ grids"))?); }
 		}
 		ir.push_str(&span_matvec_declarations(ir));
 		ir.push_str(&functions);
@@ -21204,8 +21340,9 @@ impl ExpertExecution {
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
 		let main = device(Some(&format!("nv{}", plan.main_die)))?;
-		let widths = span_split_widths(layers.iter().filter(|layer| layer.dense()).map(ExpertLayer::input_width));
-		let source = Self::worker_source(&span_split_ptx(&widths, &main.native_target)?);
+		let dense = span_split_widths(layers.iter().filter(|layer| layer.dense()).map(ExpertLayer::input_width));
+		let experts = span_split_widths(layers.iter().filter(|layer| !layer.dense()).flat_map(|layer| [layer.input_width(), layer.hidden()]));
+		let source = Self::worker_source(&span_split_ptx(&dense, &experts, &main.native_target)?);
 		// RECIPE_WORKER_MAXRREG caps worker registers so more threads fit per SM; it is part of the cubin's identity.
 		let maxrreg = std::env::var("RECIPE_WORKER_MAXRREG").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| (32..=255).contains(value));
 		let key = native_artifact_key(&main.native_target, &format!("{source}\n// maxrregcount {maxrreg:?}\n"))?;
@@ -37140,7 +37277,7 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 }
 
 /// Owned worker module text for preassembly without allocating model weights.
-pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source(&span_split_ptx(&[], &BackendTarget::Nvidia { architecture: "sm_52".to_owned() }).unwrap_or_default()) }
+pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source(&span_split_ptx(&[], &[], &BackendTarget::Nvidia { architecture: "sm_52".to_owned() }).unwrap_or_default()) }
 fn expert_forward_functions() -> &'static str { r#"
 // Real forward glue. Every local completion stage has a distinct sequence.
 .func (.param .u32 result) split_grid(.param .u64 s0,.param .u64 f0,.param .u32 q0,.param .u64 d0) {
@@ -37266,6 +37403,28 @@ wave_begin:
 	mul.wide.u32 a23,r30,40; add.u64 a30,a10,a23; ld.global.u64 a31,[a30]; ld.global.u64 a32,[a30+8]; ld.global.u64 a33,[a30+16];
 	ld.global.u32 r34,[a30+24]; ld.global.u32 r35,[a30+28]; ld.global.u32 r36,[a30+32];
 	mul.wide.u32 a23,r26,163840; add.u64 a34,a13,a23; add.u64 a35,a34,20480; add.u64 a36,a34,65536;
+	// Gate and up with a position-batched matvec read each weight once for the expert's columns.
+	mov.u32 r43,0;
+	{ .param .b32 t,k,m,c,mask,rank,count,ok; .param .b64 w,x,o; st.param.b32 [t],r34; st.param.b32 [k],r2; st.param.b32 [m],r3; st.param.b64 [w],a31; st.param.b64 [x],a7; st.param.b64 [o],a34;
+	st.param.b32 [c],r32; st.param.b32 [mask],r31; st.param.b32 [rank],r27; st.param.b32 [count],r28; call.uni (ok),span_split_expert,(t,k,m,w,x,o,c,mask,rank,count); ld.param.b32 r45,[ok]; }
+	setp.eq.u32 p6,r45,0; @p6 bra gate_up_packed;
+	{ .param .b32 t,k,m,c,mask,rank,count,ok; .param .b64 w,x,o; st.param.b32 [t],r35; st.param.b32 [k],r2; st.param.b32 [m],r3; st.param.b64 [w],a32; st.param.b64 [x],a7; st.param.b64 [o],a35;
+	st.param.b32 [c],r32; st.param.b32 [mask],r31; st.param.b32 [rank],r27; st.param.b32 [count],r28; call.uni (ok),span_split_expert,(t,k,m,w,x,o,c,mask,rank,count); ld.param.b32 r46,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; mov.u32 r44,1; st.param.u32 [receipt],r44;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	setp.ne.u32 p6,r46,0; @p6 bra gate_up_spanned;
+	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
+	st.param.u64 [w],a32; st.param.u64 [x],a8; st.param.u64 [sc],a9; st.param.u64 [o],a35; st.param.u64 [sh],a1;
+	st.param.u32 [ty],r35; st.param.u32 [k],r2; st.param.u32 [m],r3; st.param.u32 [cap],r33; st.param.u32 [c],r32; st.param.u32 [mask],r31; st.param.u32 [rank],r27; st.param.u32 [count],r28;
+	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,205; bra gate_up_complete;
+gate_up_spanned:
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; mov.u32 r44,1; st.param.u32 [receipt],r44;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+	bra gate_up_complete;
+gate_up_packed:
 	// The measured fused path writes the group's compact active product directly.
 	mov.u32 r43,0; setp.eq.u32 p3,r34,r35; setp.eq.u32 p4,r34,17; setp.eq.u32 p5,r34,18; or.pred p4,p4,p5; and.pred p3,p3,p4;
 	setp.le.u32 p4,r33,2; and.pred p3,p3,p4; @!p3 bra gate_up_separate;
@@ -37323,6 +37482,11 @@ product_done:
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
 	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
 	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,108; @p1 bra worker_done;
+	// The down matrix reads the group's compact fp32 product directly when it has a batched matvec.
+	mul.lo.u32 r45,r26,r38; mul.wide.u32 a23,r45,4; add.u64 a44,a18,a23;
+	{ .param .b32 t,k,m,c,mask,rank,count,ok; .param .b64 w,x,o; st.param.b32 [t],r36; st.param.b32 [k],r3; st.param.b32 [m],r2; st.param.b64 [w],a33; st.param.b64 [x],a44; st.param.b64 [o],a36;
+	st.param.b32 [c],r32; mov.u32 r46,0; st.param.b32 [mask],r46; st.param.b32 [rank],r27; st.param.b32 [count],r28; call.uni (ok),span_split_expert,(t,k,m,w,x,o,c,mask,rank,count); ld.param.b32 r45,[ok]; }
+	setp.ne.u32 p6,r45,0; @p6 bra down_spanned;
 	mul.lo.u32 r17,r26,r3; mul.wide.u32 a23,r17,16; add.u64 a37,a19,a23; mul.wide.u32 a23,r17,2; add.u64 a38,a20,a23;
 	{ .param .u64 w,x,sc,o,sh; .param .u32 ty,k,m,cap,c,mask,rank,count,ok;
 	st.param.u64 [w],a33; st.param.u64 [x],a37; st.param.u64 [sc],a38; st.param.u64 [o],a36; st.param.u64 [sh],a1;
@@ -37330,7 +37494,11 @@ product_done:
 	call.uni (ok),split_mv,(w,ty,x,sc,o,k,m,cap,c,mask,rank,count,sh); ld.param.u32 r13,[ok]; }
 	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; st.param.u32 [receipt],r13;
 	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
-	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,209;
+	setp.eq.u32 p1,r13,0; @p1 mov.u32 r12,209; bra down_complete;
+down_spanned:
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r27; mov.u32 r44,1; st.param.u32 [receipt],r44;
+	mov.u32 r44,0; st.param.u32 [field],r44; call.uni split_route_count,(rp,rank,field,receipt); }
+down_complete:
 	add.u32 r22,r22,1;
 	{ .param .u64 sl,fl,dl; .param .u32 sq,ok; st.param.u64 [sl],a14; st.param.u64 [fl],a15; st.param.u64 [dl],a22; st.param.u32 [sq],r22;
 	call.uni (ok),split_grid,(sl,fl,sq,dl); ld.param.u32 r13,[ok]; }
