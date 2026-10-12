@@ -37640,6 +37640,10 @@ const V4I32: &str = "<4 x i32>";
 const GLOBAL: &str = "ptr addrspace(1)";
 /// Metadata node that keeps LLVM from unrolling the butterfly reduction into five static shuffles.
 const UNROLL_DISABLED: usize = 900;
+/// Branch weights that make the first successor the likely one, so block layout keeps the reference order.
+const PREFERRED_BRANCH: usize = 960;
+/// Mild weights for a branch whose both sides stay in the reference order.
+const MILD_BRANCH: usize = 961;
 
 /// Natural alignment of a memory access. Descriptor words are naturally aligned, and stating it keeps
 /// LLVM from splitting a 64-bit descriptor load into two 32-bit loads.
@@ -37898,7 +37902,8 @@ fn split_dense_layer() -> String {
 			let dense_block = ir.fresh("dl.typed");
 			let packed_block = format!("{dense_block}.packed");
 			let joined = format!("{dense_block}.computed");
-			ir.inst(format!("br i1 {typed}, label %{dense_block}, label %{packed_block}"));
+			let untyped = ir.value(format!("xor i1 {typed}, true"));
+			ir.inst(format!("br i1 {untyped}, label %{packed_block}, label %{dense_block}, !prof !{MILD_BRANCH}"));
 			ir.label(&packed_block);
 			let meta = field(ir, &entry, 24, I32);
 			let log2 = log2_of(ir, &cap);
@@ -38065,10 +38070,10 @@ pub mod expert_main {
 
 /// Cache-global load at a constant byte offset. LLVM has no `.cg` qualifier, so this one instruction is inline asm.
 fn ld_cg(ir: &mut Ir, ty: &str, base: &str, offset: usize) -> String {
-	let at = gep(ir, base, &offset.to_string());
-	let bits = ir.value(format!("ptrtoint ptr addrspace(1) {at} to i64"));
+	let bits = ir.value(format!("ptrtoint ptr addrspace(1) {base} to i64"));
 	let (constraint, text) = if ty == F32 { ("=f", "ld.global.cg.f32") } else { ("=r", "ld.global.cg.u32") };
-	ir.value(format!("call {ty} asm sideeffect \"{text} $0, [$1];\", \"{constraint},l\"(i64 {bits})"))
+	let address = if offset == 0 { "[$1]".to_owned() } else { format!("[$1+{offset}]") };
+	ir.value(format!("call {ty} asm sideeffect \"{text} $0, {address};\", \"{constraint},l\"(i64 {bits})"))
 }
 
 /// Dense forward of one main-die layer: gather the input rows, publish them to each peer, run the local
@@ -38354,8 +38359,8 @@ fn expert_split_worker() -> String {
 	let last = ir.value(format!("icmp ne i32 {last_only}, 0"));
 	let cols = ir.value(format!("select i1 {last}, i32 1, i32 {rows_now}"));
 	let dense_flag = field(&mut ir, &desc, flag(F_DENSE), I32);
-	let is_dense = ir.value(format!("icmp ne i32 {dense_flag}, 0"));
-	ir.inst(format!("br i1 {is_dense}, label %dense, label %expert"));
+	let is_expert = ir.value(format!("icmp eq i32 {dense_flag}, 0"));
+	ir.inst(format!("br i1 {is_expert}, label %expert, label %dense, !prof !{PREFERRED_BRANCH}"));
 	ir.label("expert");
 	let expert_status = ir.value(format!("call i32 @split_expert_layer(ptr addrspace(1) {desc}, i32 {seq}, i32 {cols}, ptr {scratch}, ptr addrspace(1) {report})"));
 	ir.set("r11", I32, &expert_status);
@@ -39164,6 +39169,8 @@ pub fn expert_forward_ir() -> String {
 	module += &expert_split_worker();
 	// The reference keeps each stage as its own device function, so none may be inlined into another.
 	module += "attributes #0 = { noinline nounwind }\n";
+	module += &format!("!{PREFERRED_BRANCH} = !{{!\"branch_weights\", i32 2000, i32 1}}\n");
+	module += &format!("!{MILD_BRANCH} = !{{!\"branch_weights\", i32 3, i32 2}}\n");
 	module += &format!("!{UNROLL_DISABLED} = distinct !{{!{UNROLL_DISABLED}, !{}}}\n!{} = !{{!\"llvm.loop.unroll.disable\"}}\n", UNROLL_DISABLED + 1, UNROLL_DISABLED + 1);
 	module
 }
