@@ -2745,6 +2745,33 @@ fn span_matvec_function(spec: &SpanSpec, name: &str, shared: &str) -> String {
 	ir
 }
 
+/// GGML type codes of the dense split slice formats with a position-batched matvec.
+const SPAN_SPLIT_FORMATS: [(u32, SpanWeight); 4] = [(8, SpanWeight::Q8_0), (12, SpanWeight::Q4K), (13, SpanWeight::Q5K), (14, SpanWeight::Q6K)];
+/// The dense split's slice entry, `i32 @span_split_dense(type, k, rows, weights, x, y, columns)`,
+/// for slices `widths` wide: a slice whose format and width have a position-batched
+/// matvec, and whose columns fit its staged input, runs here and returns 1; any other
+/// returns 0 and keeps its previous kernel. Columns are position-major, as the split stages them.
+fn span_split_ir(widths: &[usize], shared: &str) -> String {
+	let (mut functions, mut cases) = (String::new(), Vec::new());
+	for &k in widths {
+		for (code, weight) in SPAN_SPLIT_FORMATS {
+			let spec = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
+			let Some(widest) = (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last().filter(|_| spec.valid()) else { continue };
+			let name = format!("span_split.{}", spec.key());
+			functions.push_str(&span_matvec_function(&spec, &name, shared));
+			cases.push((code, k, widest, name));
+		}
+	}
+	let mut ir = String::from("define i32 @span_split_dense(i32 %type, i32 %k, i32 %rows, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %columns) #3 {\nentry:\n%some = icmp ne i32 %columns, 0\nbr label %case0\n");
+	for (n, (code, k, widest, name)) in cases.iter().enumerate() {
+		ir.push_str(&format!("case{n}:\n%case{n}.type = icmp eq i32 %type, {code}\n%case{n}.k = icmp eq i32 %k, {k}\n%case{n}.fits = icmp ule i32 %columns, {widest}\n%case{n}.a = and i1 %case{n}.type, %case{n}.k\n%case{n}.b = and i1 %case{n}.a, %case{n}.fits\n%case{n}.run = and i1 %case{n}.b, %some\nbr i1 %case{n}.run, label %case{n}.call, label %case{}\n", n + 1));
+		ir.push_str(&format!("case{n}.call:\ncall void @{name}(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 %columns)\nret i32 1\n"));
+	}
+	ir.push_str(&format!("case{}:\nret i32 0\n}}\n", cases.len()));
+	ir.push_str(&functions);
+	ir
+}
+
 fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
 	let plan = spec.plan(s);
@@ -3121,6 +3148,43 @@ fn span_matvec_parts(node: &Node, stored: Option<&StoredWeight>, packed: bool) -
 		parts.push((part, 0, 0));
 	}
 	Some(parts)
+}
+/// The widths of the dense split slices a module may run through the position-batched
+/// matvec, none when RECIPE_SPAN_MATVEC=0: the slice entry then leaves every slice on its kernel.
+fn span_split_widths(widths: impl IntoIterator<Item = usize>) -> Vec<usize> {
+	if std::env::var("RECIPE_SPAN_MATVEC").as_deref() == Ok("0") { return Vec::new(); }
+	let mut widths = widths.into_iter().collect::<Vec<_>>();
+	widths.sort_unstable();
+	widths.dedup();
+	widths
+}
+/// The dense split's slice entry for the expert worker module, which is PTX only: the
+/// LLVM of `span_split_ir` compiled once per width set and cached, without its header
+/// or shared declaration, since the worker declares `scratch`, the dynamic shared
+/// memory the matvecs stage into. Without widths the entry declines every slice.
+fn span_split_ptx(widths: &[usize], target: &BackendTarget) -> Result<String> {
+	if widths.is_empty() {
+		return Ok(".visible .func (.param .b32 result) span_split_dense(.param .b32 t,.param .b32 k,.param .b32 m,.param .b64 w,.param .b64 x,.param .b64 y,.param .b32 c)\n{\n\t.reg .b32 none;\n\tmov.u32 none,0;\n\tst.param.b32 [result],none;\n\tret;\n}\n".to_owned());
+	}
+	let BackendTarget::Nvidia { architecture } = target else { return Err(RecipeError::new("the dense split entry is NVIDIA PTX")) };
+	let feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
+	let functions = span_split_ir(widths, "scratch");
+	let ir = format!("target triple = \"nvptx64-nvidia-cuda\"\n@scratch = external addrspace(3) global [0 x float], align 16\nattributes #1 = {{ alwaysinline nounwind }}\nattributes #3 = {{ noinline nounwind }}\n{}{functions}{SPAN_INVARIANT} = !{{}}\n", span_matvec_declarations(""));
+	let key = native_artifact_key(target, &ir)?;
+	let directory = native_artifact_directory(&key)?;
+	let output = directory.join("span-split.ptx");
+	if !output.is_file() {
+		fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create span split directory: {error}")))?;
+		let source = directory.join("span-split.ll");
+		let staged = directory.join(format!(".span-split-{}.ptx", std::process::id()));
+		fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write span split LLVM IR: {error}")))?;
+		let mut command = Command::new(native_nvidia_compiler()?);
+		command.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).arg(format!("--cuda-feature={feature}")).args(["-O2", "-S", "-x", "ir"]).arg(&source).arg("-o").arg(&staged);
+		validate_nvidia_ptx_feature(&feature, &native_command(command, "span split PTX compiler", &key)?)?;
+		fs::rename(&staged, &output).map_err(|error| RecipeError::new(format!("cannot publish span split PTX: {error}")))?;
+	}
+	let ptx = fs::read_to_string(&output).map_err(|error| RecipeError::new(format!("cannot read span split PTX: {error}")))?;
+	Ok(ptx.lines().filter(|line| ![".version", ".target", ".address_size", ".extern .shared", "//"].iter().any(|prefix| line.starts_with(prefix))).map(|line| format!("{line}\n")).collect())
 }
 /// Context bytes one node's planes use in sequence, each plane's scratch on 16 bytes.
 fn span_matvec_scratch(parts: &[(SpanSpec, usize, usize)]) -> usize {
@@ -8019,7 +8083,9 @@ impl NativeModelIr {
 	/// One position-batched matvec definition per distinct plane, with the intrinsics and metadata they use.
 	fn emit_span_matvecs(&self, backend: Backend, ir: &mut String) -> Result<()> {
 		let specs = self.plans.iter().filter_map(|plan| self.span_matvec_planes(backend, plan)).flatten().map(|(spec, ..)| spec).collect::<Vec<_>>();
-		if specs.is_empty() { return Ok(()); }
+		// The dense split's PTX appended to this module calls the slice entry whenever it runs here.
+		let split = backend == Backend::Nvidia && self.inference && ir.contains("split_main_forward") && !ir.contains("@span_split_dense(");
+		if specs.is_empty() && !split { return Ok(()); }
 		let shared = ir.match_indices("@contraction_tile").find_map(|(at, _)| {
 			let tail = &ir[at + 1..];
 			let name = tail.split_whitespace().next()?;
@@ -8029,6 +8095,10 @@ impl NativeModelIr {
 		let mut functions = String::new();
 		for spec in specs {
 			if emitted.insert(spec.key()) { functions.push_str(&span_matvec_function(&spec, &format!("span_matvec.{}", spec.key()), &shared)); }
+		}
+		if split {
+			let widths = span_split_widths(self.plans.iter().filter(|plan| plan.node.block_kind == "split_dense").map(|plan| plan.node.input.channels));
+			functions.push_str(&span_split_ir(&widths, &shared));
 		}
 		ir.push_str(&span_matvec_declarations(ir));
 		ir.push_str(&functions);
@@ -21085,13 +21155,16 @@ impl ExpertExecution {
 		self.worker_path=path.to_path_buf();
 		Ok(())
 	}
-	fn worker_source() -> String {
-		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
+	/// The worker module, with `span` the dense split's slice entry (after the packed
+	/// helpers, whose `scratch` it stages into, and before the split that calls it).
+	fn worker_source(span: &str) -> String {
+		format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{span}\n{}", p2p_functions(), local_p2p_functions(), expert_split_functions(), MtpBatch::ptx(), PackedMatvec::ptx(), expert_forward_functions())
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
 		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
 		let main = device(Some(&format!("nv{}", plan.main_die)))?;
-		let source = Self::worker_source();
+		let widths = span_split_widths(layers.iter().filter(|layer| layer.dense()).map(ExpertLayer::input_width));
+		let source = Self::worker_source(&span_split_ptx(&widths, &main.native_target)?);
 		// RECIPE_WORKER_MAXRREG caps worker registers so more threads fit per SM; it is part of the cubin's identity.
 		let maxrreg = std::env::var("RECIPE_WORKER_MAXRREG").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| (32..=255).contains(value));
 		let key = native_artifact_key(&main.native_target, &format!("{source}\n// maxrregcount {maxrreg:?}\n"))?;
@@ -37026,7 +37099,7 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 }
 
 /// Owned worker module text for preassembly without allocating model weights.
-pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source() }
+pub fn expert_worker_ptx() -> String { ExpertExecution::worker_source(&span_split_ptx(&[], &BackendTarget::Nvidia { architecture: "sm_52".to_owned() }).unwrap_or_default()) }
 fn expert_forward_functions() -> &'static str { r#"
 // Real forward glue. Every local completion stage has a distinct sequence.
 .func (.param .u32 result) split_grid(.param .u64 s0,.param .u64 f0,.param .u32 q0,.param .u64 d0) {
@@ -37314,6 +37387,10 @@ dl_prepared:
 dl_slice:
 	setp.ge.u32 p1,r21,r3; @p1 bra dl_return; mul.wide.u32 a17,r21,40; add.u64 a18,a9,a17;
 	ld.global.u64 a19,[a18]; ld.global.u32 r23,[a18+8]; ld.global.u32 r24,[a18+12]; ld.global.u32 r25,[a18+16]; ld.global.u64 a20,[a18+32];
+	// A slice with a position-batched matvec reads its weights once for every column.
+	{ .param .b32 t,k,m,c,ok; .param .b64 w,x,o; st.param.b32 [t],r23; st.param.b32 [k],r24; st.param.b32 [m],r25; st.param.b64 [w],a19; st.param.b64 [x],a6; st.param.b64 [o],a10; st.param.b32 [c],r1;
+	call.uni (ok),span_split_dense,(t,k,m,w,x,o,c); ld.param.b32 r12,[ok]; }
+	setp.ne.u32 p1,r12,0; @p1 bra dl_span;
 	setp.eq.u32 p1,r23,0; setp.eq.u32 p2,r23,30; or.pred p1,p1,p2; @p1 bra dl_typed;
 	ld.global.u32 r28,[a18+24]; bfind.u32 r30,r22; shl.b32 r30,r30,3; shr.u32 r28,r28,r30; and.b32 r28,r28,255; mov.u32 r29,0;
 	setp.eq.u32 p1,r23,17; setp.eq.u32 p2,r22,8; and.pred p1,p1,p2; @p1 mov.u32 r29,2;
@@ -37326,6 +37403,10 @@ dl_slice:
 	mov.u32 r30,0; st.param.u32 [field],r30; call.uni split_route_count,(rp,rank,field,receipt); }
 
 	setp.eq.u32 p1,r12,0; @p1 mov.u32 r11,404; @p1 bra dl_done; bra dl_computed;
+dl_span:
+	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r6;
+	mov.u32 r30,0; st.param.u32 [field],r30; st.param.u32 [receipt],r12; call.uni split_route_count,(rp,rank,field,receipt); }
+	bra dl_computed;
 dl_typed:
 	{ .param .u64 w,x,o; .param .u32 t,k,m,c; st.param.u64 [w],a19; st.param.u64 [x],a6; st.param.u64 [o],a10; st.param.u32 [t],r23; st.param.u32 [k],r24; st.param.u32 [m],r25; st.param.u32 [c],r1; call.uni split_dense_typed,(w,t,x,o,k,m,c); }
 	{ .param .u64 rp; .param .u32 rank,field,receipt; st.param.u64 [rp],a2; st.param.u32 [rank],r6;
