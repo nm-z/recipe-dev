@@ -208,6 +208,37 @@ fn write_stepper_checkpoint(path: &Path) {
 	std::fs::write(path, out).expect("cannot write the stepper checkpoint");
 }
 
+fn script_dependencies(work: &Path, report: &mut Report) {
+	let binary = environment("RECIPE_BINARY");
+	let source = work.join("dependencies.rs");
+	let payload = work.join("dependency-input.json");
+	let program = r##"//! ```cargo
+//! [dependencies]
+//! serde_json = "=1.0.145"
+//! ```
+use recipe::*;
+fn main() {
+	let value: serde_json::Value = serde_json::from_str(include_str!("dependency-input.json")).unwrap();
+	let _model = recipe.model().layer(1).fp(32);
+	println!("{} {}", value["value"], std::env::args().nth(1).unwrap());
+}
+"##;
+	std::fs::write(&source, program).expect("cannot write the dependency program");
+	for (name, value) in [("script_dependencies", 42), ("script_dependency_cache", 43)] {
+		std::fs::write(&payload, format!("{{\"value\":{value}}}")).expect("cannot write the dependency input");
+		let output = std::process::Command::new(&binary).arg("run").arg(&source).args(["--device", "cpu", "--", "argument"]).output().expect("cannot run the dependency program");
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		std::fs::write(work.join(format!("{name}.log")), format!("exit_code={:?}\n{stdout}\n{stderr}", output.status.code())).expect("cannot write dependency evidence");
+		report.record(name, output.status.success() && stdout.trim() == format!("{value} argument"), format!("exit_code={:?} output={}", output.status.code(), stdout.trim()));
+	}
+	std::fs::write(&source, program.replace("fn main() {", "fn main() { compile_error!(\"intentional compile failure\");")).expect("cannot write the invalid dependency program");
+	let output = std::process::Command::new(&binary).arg("run").arg(&source).args(["--device", "cpu"]).output().expect("cannot run the invalid dependency program");
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	std::fs::write(work.join("script_dependency_failure.log"), format!("exit_code={:?}\n{stderr}", output.status.code())).expect("cannot write dependency failure evidence");
+	report.record("script_dependency_failure", !output.status.success() && output.stdout.is_empty() && stderr.contains("intentional compile failure"), format!("exit_code={:?} output_bytes={}", output.status.code(), output.stdout.len()));
+}
+
 fn main() {
 	let root = PathBuf::from(environment("RECIPE_SUITE_ROOT"));
 	let work = PathBuf::from(environment("RECIPE_SUITE_WORK"));
@@ -219,6 +250,7 @@ fn main() {
 	let linear_source = root.join("data/linear.csv");
 	let multi_source = root.join("data/multi.csv");
 	let mut report = Report { checks: Vec::new() };
+	script_dependencies(&work, &mut report);
 
 	// 1. A linear model recovers an exact linear relationship, checked against
 	//    the closed form rather than against a recorded value.

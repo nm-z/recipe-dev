@@ -87,24 +87,69 @@ fn child_status(command: &mut Command) -> std::io::Result<std::process::ExitStat
 	command.status()
 }
 
+fn script_manifest(source: &Path) -> Option<String> {
+	let text = fs::read_to_string(source).unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
+	let (mut manifest, mut opened, mut closed) = (String::new(), false, false);
+	for (index, line) in text.lines().enumerate() {
+		let line = line.trim_start();
+		if line.is_empty() || (index == 0 && line.starts_with("#!") && !line.starts_with("#![")) { continue; }
+		let Some(comment) = line.strip_prefix("//!") else { break };
+		let comment = comment.strip_prefix(' ').unwrap_or(comment);
+		if comment.trim() == "```cargo" {
+			if opened { invalid("a Recipe script may declare only one cargo manifest"); }
+			opened = true;
+		} else if opened && !closed {
+			if comment.trim() == "```" { closed = true; }
+			else { manifest.push_str(comment); manifest.push('\n'); }
+		}
+	}
+	if opened && !closed { invalid("the script's cargo manifest has no closing ``` line"); }
+	opened.then_some(manifest)
+}
+
+fn compile_script(source: &Path, library: &Path, dependencies: &Path, output: &Path) -> std::process::ExitStatus {
+	let Some(manifest) = script_manifest(source) else {
+		return child_status(Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display()))
+			.arg("-L").arg(format!("dependency={}", dependencies.display())).arg("-o").arg(output)).expect("cannot execute rustc");
+	};
+	use std::hash::{Hash, Hasher};
+	let source = fs::canonicalize(source).expect("cannot resolve Recipe script");
+	let mut key = std::hash::DefaultHasher::new();
+	source.hash(&mut key);
+	let root = std::env::var_os("CARGO_HOME").map(PathBuf::from)
+		.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+		.unwrap_or_else(std::env::temp_dir).join("recipe-scripts").join(format!("{:016x}", key.finish()));
+	fs::create_dir_all(&root).expect("cannot create Recipe script cache");
+	let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join("compile.lock")).expect("cannot open Recipe script cache lock");
+	lock.lock().expect("cannot lock Recipe script cache");
+	let path = root.join("Cargo.toml");
+	// Keep the original source path so modules, include! and compiler diagnostics
+	// retain their script-relative paths. Cargo owns dependency resolution and its lockfile.
+	let text = format!("[package]\nname = \"recipe-script\"\nversion = \"0.0.0\"\nedition = \"2024\"\nbuild = false\n\n[workspace]\n\n[[bin]]\nname = \"recipe-script\"\npath = {:?}\n\n{manifest}", source.to_string_lossy());
+	if fs::read_to_string(&path).ok().as_deref() != Some(&text) { fs::write(&path, text).expect("cannot write Recipe script manifest"); }
+	// The prebuilt library is not a Cargo dependency. Its identity must still
+	// invalidate the final script when the installed Recipe build changes.
+	library.hash(&mut key);
+	let metadata = fs::metadata(library).expect("cannot inspect Recipe library");
+	metadata.len().hash(&mut key);
+	metadata.modified().expect("cannot inspect Recipe library modification time").hash(&mut key);
+	let target = root.join("target");
+	let status = child_status(Command::new("cargo").arg("rustc").arg("--release").arg("--manifest-path").arg(&path).arg("--target-dir").arg(&target)
+		.arg("--bin").arg("recipe-script").arg("--").arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", dependencies.display()))
+		.arg("--cfg").arg(format!("recipe_library=\"{:016x}\"", key.finish()))).expect("cannot execute cargo for Recipe script dependencies");
+	if status.success() {
+		fs::copy(target.join("release").join(format!("recipe-script{}", std::env::consts::EXE_SUFFIX)), output).expect("cannot copy compiled Recipe script");
+	}
+	status
+}
+
 fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	let output = directory.join(format!("recipe-script-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
-	let status = child_status(
-		Command::new("rustc")
-			.arg("--edition=2024")
-			.arg(source)
-			.arg("--extern")
-			.arg(format!("recipe={}", library.display()))
-			.arg("-L")
-			.arg(format!("dependency={}", dependencies.display()))
-			.arg("-o")
-			.arg(&output),
-	)
-	.expect("cannot execute rustc");
+	let status = compile_script(source, &library, &dependencies, &output);
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
