@@ -22878,9 +22878,30 @@ impl ExpertExecution {
 
 			value.workers.push(ExpertWorker { read_bytes:Vec::new(), die, gpu, jobs, reports, scratch, module });
 		}
+		// Staged dense returns: every peer die owns a main-die region that holds its largest dense layer,
+		// each slice's rows rounded up to four and room for every speculative position.
+		let mut staging_offsets=Vec::with_capacity(value.workers.len());let mut staging_bytes=0usize;
+		for worker in &value.workers {
+			let mut largest=0usize;
+			for layer in value.layers.iter().filter(|layer|layer.dense() && worker.die!=value.weights.plan.main_die) {
+				let SplitWork::Dense(tensors)=&layer.work else {continue};
+				let model=if layer.mtp {match head {Some(head)=>head,None=>continue}} else {target};
+				let mut names=std::collections::HashSet::new();let mut rows=0usize;
+				for tensor in tensors {
+					if !names.insert(tensor.name.clone()) {continue;}
+					let Some(original)=model.tensor(&tensor.name) else {continue};
+					let Some((_,bytes,_,_))=value.weights.dense_bindings.get(&(layer.mtp,tensor.name.clone(),worker.die)).copied() else {continue};
+					rows+=(bytes/(original.bytes/original.shape[1] as usize)).next_multiple_of(4);
+				}
+				largest=largest.max(rows);
+			}
+			staging_offsets.push(staging_bytes);staging_bytes+=(largest*SPECULATIVE_POSITIONS*4).next_multiple_of(256);
+		}
+		let staging=Buffer::zeroed(main,staging_bytes.max(256))?;let staging_base=staging.pointer;value.channel_tables.push(staging);
 		for layer in &value.layers {
 			let mut channels=Vec::new();
 			let mut responses=Vec::<u64>::new();
+			let mut returns=Vec::<u64>::new();
 			for (channel,worker) in value.workers.iter_mut().enumerate() {
 				let (request,response,route)=value.weights.channel(channel).ok_or_else(||RecipeError::new("split channel is absent"))?;
 				let mut matrices=Vec::new();let mut read_bytes=0;let mut slices=0;
@@ -22899,7 +22920,7 @@ impl ExpertExecution {
 					},
 					SplitWork::Dense(tensors)=> {
 						let model=if layer.mtp {head.ok_or_else(||RecipeError::new("dense MTP rows require a checkpoint"))?} else {target};
-						let mut names=std::collections::HashSet::new();
+						let mut names=std::collections::HashSet::new();let mut staged_rows=0usize;
 						for tensor in tensors {
 							if !names.insert(tensor.name.clone()) {continue;}
 							let original=model.tensor(&tensor.name).ok_or_else(||RecipeError::new("dense source header is absent"))?;
@@ -22909,6 +22930,12 @@ impl ExpertExecution {
 							if row_map.iter().all(|row|*row==u32::MAX) {continue;}
 							let map=Buffer::upload(worker.gpu,&row_map)?;
 							matrices.extend([address,(kind as u64)|((original.shape[0])<<32),rows as u64,dense_lane_word(original) as u64,map.pointer]);
+							// The main die scatters this slice from its staging run: [staged address, row map, rows].
+							if worker.die!=value.weights.plan.main_die {
+								let main_map=Buffer::upload(main,&row_map)?;
+								returns.extend([staging_base+(staging_offsets[channel]+staged_rows*SPECULATIVE_POSITIONS*4) as u64,main_map.pointer,rows as u64]);
+								value.channel_tables.push(main_map);staged_rows+=rows.next_multiple_of(4);
+							}
 							value.channel_tables.push(map);read_bytes+=bytes;slices+=1;
 						}
 					},
@@ -22928,6 +22955,8 @@ impl ExpertExecution {
 				debug_assert_eq!(record.len(),expert_job::scratch(0));for pointer in [worker.scratch[6].pointer,worker.scratch[7].pointer,worker.scratch[8].pointer] {record.extend(pointer.to_ne_bytes());}
 				debug_assert_eq!(record.len(),expert_job::flag(0));for dimension in [u32::from(layer.dense()),u32::from(layer.last_only),if layer.dense() {(layer.input_width()+3)&!3} else {layer.input_width().max(EXPERT_SPLIT_MIN_PACKET_ROWS)} as u32,u32::from(layer.tensors().iter().any(|tensor|!matches!(tensor.kind,0|30)))] {record.extend(dimension.to_ne_bytes());}
 				debug_assert_eq!(record.len(),expert_job::TERMINAL);record.extend(u32::from(layer.terminal).to_ne_bytes());
+				let staged=if layer.dense() && worker.die!=value.weights.plan.main_die {staging_base+staging_offsets[channel] as u64} else {0};
+				record.resize(expert_job::STAGING,0);record.extend(staged.to_ne_bytes());
 				record.resize(expert_job::BYTES,0);worker.jobs.write_bytes(layer.global*expert_job::BYTES,&record)?;
 				value.channel_tables.push(table);
 			}
@@ -22941,6 +22970,11 @@ impl ExpertExecution {
 			debug_assert_eq!(record.len(),expert_main::GLOBAL);for dimension in [layer.global as u32,participants as u32,layer.input_width() as u32,layer.expert_count() as u32,10,layer.hidden() as u32] {record.extend(dimension.to_ne_bytes());}
 			debug_assert_eq!(record.len(),expert_main::PICK_COUNTS);record.extend((value.pick_counts.pointer+layer.global as u64*512*4).to_ne_bytes());
 			debug_assert_eq!(record.len(),expert_main::DENSE);record.extend(u32::from(layer.dense()).to_ne_bytes());
+			let return_table=if returns.is_empty() {None} else {Some(Buffer::upload(main,&returns)?)};
+			record.resize(expert_main::RETURNS,0);record.extend(return_table.as_ref().map_or(0,|table|table.pointer).to_ne_bytes());
+			debug_assert_eq!(record.len(),expert_main::RETURN_COUNT);record.extend(((returns.len()/3) as u32).to_ne_bytes());
+			debug_assert_eq!(record.len(),expert_main::TERMINAL);record.extend(u32::from(layer.terminal).to_ne_bytes());
+			if let Some(table)=return_table {value.channel_tables.push(table);}
 			debug_assert_eq!(record.len(),expert_main::BYTES);value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
 			if let Some(table)=layer_responses {value.channel_tables.push(table);}
 		}
@@ -39254,11 +39288,11 @@ fn sequence_base(ir: &mut Ir) -> String {
 	ir.value(format!("mul i32 %seq, {EXPERT_SPLIT_RETURN_TAG_STRIDE}"))
 }
 
-/// Byte layout of the 192-byte per-layer job descriptor. The host writes it in `ExpertWorker::new` and
+/// Byte layout of the 200-byte per-layer job descriptor. The host writes it in `ExpertWorker::new` and
 /// the device IR in `expert_forward_ir` reads it, so both take every offset from here.
 pub mod expert_job {
 	/// Bytes per layer in the job buffer.
-	pub const BYTES: usize = 192;
+	pub const BYTES: usize = 200;
 	/// Sixteen u64 pointer fields, in host write order (see the `P_*` indices).
 	pub const fn pointer(field: usize) -> usize {
 		8 * field
@@ -39277,6 +39311,9 @@ pub mod expert_job {
 	}
 	/// One u32 terminal flag.
 	pub const TERMINAL: usize = 184;
+	/// One u64 main-die address where a dense layer's slices land contiguously, or 0 to scatter
+	/// each output value straight into the main die's activation.
+	pub const STAGING: usize = 192;
 	pub const P_REQUEST: usize = 0;
 	pub const P_REQUEST_SEQUENCE: usize = 1;
 	pub const P_ROUTE: usize = 2;
@@ -39816,6 +39853,11 @@ fn split_dense_layer() -> String {
 		st(ir, I64, &at, &slot, false);
 	});
 	ir.set("r21", I32, "0");
+	// r27 counts the staged rows of the slices already sent, each rounded up to four.
+	ir.set("r27", I32, "0");
+	let staging = word_address(&mut ir, "%desc", STAGING, false);
+	let staging_bits = ir.value(format!("ptrtoint ptr addrspace(1) {staging} to i64"));
+	let staged = ir.value(format!("icmp ne i64 {staging_bits}, 0"));
 	let cap_gt1 = ir.value("icmp ugt i32 %cols, 1");
 	let cap_gt2 = ir.value("icmp ugt i32 %cols, 2");
 	let cap_gt4 = ir.value("icmp ugt i32 %cols, 4");
@@ -39892,7 +39934,62 @@ fn split_dense_layer() -> String {
 			let padded_block = ir.fresh("dl.padded");
 			let scatter_block = format!("{padded_block}.scatter");
 			let scattered = format!("{padded_block}.scattered");
-			ir.inst(format!("br i1 {padded}, label %{padded_block}, label %{scatter_block}"));
+			let choose_block = format!("{padded_block}.choose");
+			let stage_block = format!("{padded_block}.stage");
+			ir.inst(format!("br i1 {padded}, label %{padded_block}, label %{choose_block}"));
+			ir.label(&choose_block);
+			ir.inst(format!("br i1 {staged}, label %{stage_block}, label %{scatter_block}"));
+			// Staged return: the slice's position-major outputs go to the main die as one contiguous run
+			// of 16-byte stores, so the link carries a few full packets instead of one 4-byte write per value;
+			// the main die scatters them into its activation after every peer has replied.
+			ir.label(&stage_block);
+			let staged_rows = ir.get("r27", I32);
+			let staged_floats = ir.value(format!("mul i32 {staged_rows}, {}", crate::SPECULATIVE_POSITIONS));
+			let stage_at = element(ir, &staging, &staged_floats, 4);
+			let stage_count = ir.value(format!("mul i32 {rows_m}, %cols"));
+			let stage_quads = ir.value(format!("lshr i32 {stage_count}, 2"));
+			ir.set("r15", I32, &gid);
+			while_loop(
+				ir,
+				|ir| {
+					let quad = ir.get("r15", I32);
+					ir.value(format!("icmp ult i32 {quad}, {stage_quads}"))
+				},
+				|ir| {
+					let quad = ir.get("r15", I32);
+					let lane = ir.value(format!("shl i32 {quad}, 2"));
+					let from = element(ir, &a10, &lane, 4);
+					let vector = ir.value(format!("load {V4F32}, ptr addrspace(1) {from}, align 16"));
+					let to = element(ir, &stage_at, &lane, 4);
+					ir.inst(format!("store volatile {V4F32} {vector}, ptr addrspace(1) {to}, align 16"));
+					let next = ir.value(format!("add i32 {quad}, {stride}"));
+					ir.set("r15", I32, &next);
+				},
+			);
+			let stage_tail = ir.value(format!("and i32 {stage_count}, -4"));
+			let stage_tail_index = ir.value(format!("add i32 {stage_tail}, {gid}"));
+			ir.set("r15", I32, &stage_tail_index);
+			while_loop(
+				ir,
+				|ir| {
+					let index = ir.get("r15", I32);
+					ir.value(format!("icmp ult i32 {index}, {stage_count}"))
+				},
+				|ir| {
+					let index = ir.get("r15", I32);
+					let from = element(ir, &a10, &index, 4);
+					let value = ld(ir, F32, &from, false);
+					let to = element(ir, &stage_at, &index, 4);
+					st(ir, F32, &value, &to, true);
+					let next = ir.value(format!("add i32 {index}, {stride}"));
+					ir.set("r15", I32, &next);
+				},
+			);
+			let rows_rounded = ir.value(format!("add i32 {rows_m}, 3"));
+			let rows_quad = ir.value(format!("and i32 {rows_rounded}, -4"));
+			let staged_next = ir.value(format!("add i32 {staged_rows}, {rows_quad}"));
+			ir.set("r27", I32, &staged_next);
+			ir.inst(format!("br label %{scattered}"));
 			ir.label(&scatter_block);
 			ir.set("r15", I32, &gid);
 			let scatter_bound = ir.value(format!("mul i32 {rows_m}, %cols"));
@@ -39998,10 +40095,10 @@ fn split_dense_layer() -> String {
 	ir.function("define i32 @split_dense_layer(ptr addrspace(1) %desc, i32 %seq, i32 %cols, ptr %sh, ptr addrspace(1) %report)")
 }
 
-/// Byte layout of the 108-byte main-die descriptor the host writes once per layer. Pointer fields occupy
-/// 0..72, dimensions 72..96, the pick-count pointer 96, and the dense flag 104.
+/// Byte layout of the 128-byte main-die descriptor the host writes once per layer. Pointer fields occupy
+/// 0..72, dimensions 72..96, the pick-count pointer 96, the dense flag 104, and the staged returns 112..128.
 pub mod expert_main {
-	pub const BYTES: usize = 108;
+	pub const BYTES: usize = 128;
 	pub const CONTROL: usize = 0;
 	pub const CHANNELS: usize = 8;
 	pub const RESPONSES: usize = 16;
@@ -40018,6 +40115,11 @@ pub mod expert_main {
 	pub const TOP: usize = 88;
 	pub const PICK_COUNTS: usize = 96;
 	pub const DENSE: usize = 104;
+	/// The staged dense returns: a table of [staged address, row map, rows] u64 triples, their count,
+	/// and the terminal flag that keeps the padded single-column return on the direct path.
+	pub const RETURNS: usize = 112;
+	pub const RETURN_COUNT: usize = 120;
+	pub const TERMINAL: usize = 124;
 }
 
 /// Cache-global load at a constant byte offset. LLVM has no `.cg` qualifier, so this one instruction is inline asm.
@@ -40242,6 +40344,64 @@ fn split_dense_forward() -> String {
 	ir.set("r20", I32, &waiting_next);
 	ir.inst(format!("br label %{wait_head}"));
 	ir.label(&wait_exit);
+	// Every peer has replied: scatter each staged slice ([position][row] floats) into the activation.
+	// A terminal single-column layer with at most eight rows per position keeps its padded direct return.
+	let return_table = word_address(&mut ir, "%desc", RETURNS, false);
+	let return_count = field(&mut ir, "%desc", RETURN_COUNT, I32);
+	let terminal = field(&mut ir, "%desc", TERMINAL, I32);
+	let is_terminal = ir.value(format!("icmp ne i32 {terminal}, 0"));
+	let single = ir.value("icmp eq i32 %cols, 1");
+	let wide = ir.value("icmp ugt i32 %length, 1");
+	let narrow = ir.value("icmp ule i32 %length, 8");
+	let padded_terms = ir.value(format!("and i1 {is_terminal}, {single}"));
+	let padded_rows = ir.value(format!("and i1 {wide}, {narrow}"));
+	let padded = ir.value(format!("and i1 {padded_terms}, {padded_rows}"));
+	let staged_count = ir.value(format!("select i1 {padded}, i32 0, i32 {return_count}"));
+	ir.set("r28", I32, "0");
+	while_loop(
+		&mut ir,
+		|ir| {
+			let entry = ir.get("r28", I32);
+			ir.value(format!("icmp ult i32 {entry}, {staged_count}"))
+		},
+		|ir| {
+			let entry_index = ir.get("r28", I32);
+			let entry = element(ir, &return_table, &entry_index, 24);
+			let staged = word_address(ir, &entry, 0, false);
+			let row_map = word_address(ir, &entry, 8, false);
+			let rows = field(ir, &entry, 16, I32);
+			let bound = ir.value(format!("mul i32 {rows}, %cols"));
+			ir.set("r29", I32, &gid);
+			while_loop(
+				ir,
+				|ir| {
+					let index = ir.get("r29", I32);
+					ir.value(format!("icmp ult i32 {index}, {bound}"))
+				},
+				|ir| {
+					let index = ir.get("r29", I32);
+					let position = ir.value(format!("udiv i32 {index}, {rows}"));
+					let row = ir.value(format!("urem i32 {index}, {rows}"));
+					let slot_at = element(ir, &row_map, &row, 4);
+					let slot = ld(ir, I32, &slot_at, false);
+					let valid = ir.value(format!("icmp ne i32 {slot}, -1"));
+					when(ir, &valid, |ir| {
+						let from = element(ir, &staged, &index, 4);
+						let value = ld(ir, F32, &from, true);
+						let target_row = ir.value(format!("mul i32 {slot}, %length"));
+						let target_begin = ir.value(format!("add i32 {target_row}, %begin"));
+						let target = ir.value(format!("add i32 {target_begin}, {position}"));
+						let to = element(ir, "%output", &target, 4);
+						st(ir, F32, &value, &to, false);
+					});
+					let next = ir.value(format!("add i32 {index}, {stride}"));
+					ir.set("r29", I32, &next);
+				},
+			);
+			let next_entry = ir.value(format!("add i32 {entry_index}, 1"));
+			ir.set("r28", I32, &next_entry);
+		},
+	);
 	ir.set("r26", I32, "1");
 	ir.inst("br label %df.success");
 	ir.label("df.success");
