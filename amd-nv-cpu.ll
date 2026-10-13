@@ -6586,7 +6586,7 @@ ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly 
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
 i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, double %epsilon,
-i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin ) #3 { entry:
+i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin, i32 %window ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
@@ -6911,7 +6911,13 @@ score.prepare:
 %score.query = add i32 %query.base, %score.query.local
 %score.key = add i32 %key.tile.base, %score.key.local
 %score.causal = icmp ule i32 %score.key, %score.query
-br i1 %score.causal, label %score.selection, label %score.invalid
+; A sliding layer sees only the last %window positions, the query among them; zero sees all.
+%score.age = sub i32 %score.query, %score.key
+%score.near = icmp ult i32 %score.age, %window
+%score.unlimited = icmp eq i32 %window, 0
+%score.reach = or i1 %score.near, %score.unlimited
+%score.visible = and i1 %score.causal, %score.reach
+br i1 %score.visible, label %score.selection, label %score.invalid
 score.selection:
 br i1 %select, label %score.selection.chosen, label %score.complete
 score.selection.chosen:
