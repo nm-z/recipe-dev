@@ -124,13 +124,13 @@ fn gguf_text(out: &mut Vec<u8>, value: &str) {
 /// Writes a synthetic checkpoint: a native Q8_0 n-gram row table, a three-tap
 /// convolution dilated by the order-3 n-gram, and dense tensors for the stream
 /// around one per-layer embedding block.
-fn write_stepper_checkpoint(path: &Path) {
+fn write_stepper_checkpoint(path: &Path, positions: u32, attention_key: f32, attention_value: f32) {
 	let tensors: Vec<(&str, Vec<f32>)> = vec![
 		("token_embd.weight", vec![1.0, 2.0]),
-		("blk.0.attn_q.weight", vec![0.0]),
-		("blk.0.attn_k.weight", vec![0.0]),
-		("blk.0.attn_v.weight", vec![0.0]),
-		("blk.0.attn_output.weight", vec![0.0]),
+		("blk.0.attn_q.weight", vec![attention_key]),
+		("blk.0.attn_k.weight", vec![attention_key]),
+		("blk.0.attn_v.weight", vec![attention_value]),
+		("blk.0.attn_output.weight", vec![attention_value]),
 		("blk.0.ffn_gate.weight", vec![2.0]),
 		("blk.0.ffn_up.weight", vec![3.0]),
 		("blk.0.ffn_down.weight", vec![1.0]),
@@ -149,7 +149,7 @@ fn write_stepper_checkpoint(path: &Path) {
 		metadata.extend_from_slice(&8u32.to_le_bytes());
 		gguf_text(&mut metadata, value);
 	}
-	for (name, value) in [("llama.context_length", 160u32), ("tokenizer.ggml.bos_token_id", 0), ("tokenizer.ggml.eos_token_id", 1), ("ngram.heads", 1), ("ngram.kernel", 3), ("ngram.layer", 0)] {
+	for (name, value) in [("llama.context_length", positions), ("tokenizer.ggml.bos_token_id", 0), ("tokenizer.ggml.eos_token_id", 1), ("ngram.heads", 1), ("ngram.kernel", 3), ("ngram.layer", 0)] {
 		gguf_text(&mut metadata, name);
 		metadata.extend_from_slice(&4u32.to_le_bytes());
 		metadata.extend_from_slice(&value.to_le_bytes());
@@ -219,6 +219,53 @@ fn main() {
 	let linear_source = root.join("data/linear.csv");
 	let multi_source = root.join("data/multi.csv");
 	let mut report = Report { checks: Vec::new() };
+
+	// Each process describes one GGUF model. Isolate these fixtures from the stepper below.
+	if let Some(attention_mode) = std::env::args().find(|argument| matches!(argument.as_str(), "--attention" | "--attention-rescale")) {
+		let rescaling = attention_mode == "--attention-rescale";
+		let positions = if rescaling { 2 } else { 4096 };
+		let attention = work.join("attention.gguf");
+		write_stepper_checkpoint(&attention, positions, if rescaling { 1.0 } else { 0.0 }, 1.0);
+		let attention_model = recipe.model().no(bias).embed(2, 1).fp(32).res([attn(1).fp(32).kv(1).fp(16)]).fp(32).layer(2).fp(32);
+		let attention_file = recipe.gguf(attention.to_str().expect("attention path is not UTF-8"));
+		let attention_placed = attention_file.place(&attention_model, positions as usize, &[]);
+		if rescaling {
+			// Scores 2 and 4 raise the maximum after accumulating a nonzero value.
+			let whole = attention_placed.prefill(&[0, 1]);
+			attention_placed.prefill(&[0]);
+			let stepped = attention_placed.step(1);
+			let expected = 2.0 + (1.0 + 2.0 * 2.0_f64.exp()) / (1.0 + 2.0_f64.exp());
+			let worst = worst_absolute(&whole, &[expected, -expected]).max(worst_absolute(&stepped, &[expected, -expected]));
+			report.record("attention_fp16_kv_wide_rescale", worst < 1e-6, format!("scores=2,4 worst_abs_err={worst:.9} tolerance=0.000001"));
+			assert!(worst < 1e-6, "fp16 KV storage rounded the attention value rescale: {worst}");
+		} else {
+			// Uniform attention averages alternating values 1 and 2; the residual adds the last input.
+			let ids: Vec<u32> = (0..4096).map(|position| (position % 2) as u32).collect();
+			let whole = attention_placed.prefill(&ids);
+			let prefix = attention_placed.prefill(&ids[..4094]);
+			let odd = attention_placed.step(0);
+			let even = attention_placed.step(1);
+			let expected_odd = (2048.0 + 2047.0 * 2.0) / 4095.0;
+			let worst = worst_absolute(&whole, &[3.5, -3.5]).max(worst_absolute(&prefix, &[3.5, -3.5]))
+				.max(worst_absolute(&odd, &[1.0 + expected_odd, -1.0 - expected_odd])).max(worst_absolute(&even, &[3.5, -3.5]));
+			report.record("attention_fp16_kv_wide_sum", worst < 1e-6, format!("positions=4096 worst_abs_err={worst:.9} tolerance=0.000001"));
+			assert!(worst < 1e-6, "fp16 KV storage rounded the attention value sum: {worst}");
+		}
+		return;
+	}
+	for (mode, config, name) in [
+		("--attention", None, "attention_fp16_kv_wide_sum"),
+		("--attention-rescale", None, "attention_fp16_kv_wide_rescale"),
+		("--attention", Some("llamacpp"), "attention_online_fp16_kv_wide_sum"),
+		("--attention-rescale", Some("llamacpp"), "attention_online_fp16_kv_wide_rescale"),
+	] {
+		let mut attention_command = std::process::Command::new(std::env::current_exe().expect("cannot locate the suite"));
+		attention_command.arg(mode);
+		if let Some(config) = config { attention_command.env("RECIPE_CONFIG", config); }
+		let attention_check = attention_command.output().expect("cannot execute attention check");
+		report.record(name, attention_check.status.success(), String::from_utf8_lossy(&attention_check.stdout).trim().to_owned());
+		assert!(attention_check.status.success(), "{name} failed: {}", String::from_utf8_lossy(&attention_check.stderr));
+	}
 
 	// 1. A linear model recovers an exact linear relationship, checked against
 	//    the closed form rather than against a recorded value.
@@ -340,7 +387,7 @@ fn main() {
 	// 8. A per-layer embedding stepper: a whole sequence, a prefill, and a
 	//    prefill followed by single steps must produce the same logits bits.
 	let stepper = work.join("stepper.gguf");
-	write_stepper_checkpoint(&stepper);
+	write_stepper_checkpoint(&stepper, 160, 0.0, 0.0);
 	let file = recipe.gguf(stepper.to_str().expect("stepper path is not UTF-8"));
 	let table = file.ngram();
 	let gate = layer(1).fp(64).silu().fp(64);

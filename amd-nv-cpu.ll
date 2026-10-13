@@ -6331,14 +6331,14 @@ ret void
 ; the cache type, each key's dot in four 16-lane accumulators of fused
 ; multiply-adds folded by halves, the keys walked in position order under an
 ; online softmax whose exponentials come from the CPU's libm, the values
-; accumulated in the cache type (one fma, rounded, per key), the sum as
+; accumulated in the declared state type, independently of KV storage, the sum as
 ; fma(S, ms, vs), and the output the accumulator times one over the sum.
 define internal void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context,
 i64 %row.stride, i64 %row.cache, i64 %output.row, i32 %head, i32 %position, i32 %heads, i32 %kv.heads, i32 %value.heads,
 i32 %width, i32 %length, i1 %unscaled, i32 %buffer.length, i32 %buffer.origin) #1 {
 entry:
 %q16 = alloca [256 x RECIPE_KV], align RECIPE_KV_ALIGN, addrspace(5)
-%v16 = alloca [256 x RECIPE_KV], align RECIPE_KV_ALIGN, addrspace(5)
+%values = alloca [256 x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %lanes = alloca [64 x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
@@ -6368,7 +6368,6 @@ entry:
 %v.base = mul i64 %value.channel.wide, %length.wide
 %v.plane = add i64 %row.cache, %kv.plane.wide
 %v.row = add i64 %v.plane, %v.base
-%zero.kv = call RECIPE_KV @recipe.kv.from.state(RECIPE_STATE %state.zero)
 br label %q.loop
 q.loop:
 %q.d = phi i32 [ 0, %entry ], [ %q.d.next, %q.step ]
@@ -6387,8 +6386,8 @@ q.step:
 %q.kv = call RECIPE_KV @recipe.kv.from.state(RECIPE_STATE %q.scaled)
 %q16.ptr = getelementptr RECIPE_KV, ptr addrspace(5) %q16, i32 %q.d
 store RECIPE_KV %q.kv, ptr addrspace(5) %q16.ptr, align RECIPE_KV_ALIGN
-%v16.init.ptr = getelementptr RECIPE_KV, ptr addrspace(5) %v16, i32 %q.d
-store RECIPE_KV %zero.kv, ptr addrspace(5) %v16.init.ptr, align RECIPE_KV_ALIGN
+%values.init.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %values, i32 %q.d
+store RECIPE_STATE %state.zero, ptr addrspace(5) %values.init.ptr, align RECIPE_STATE_ALIGN
 %q.d.next = add i32 %q.d, 1
 br label %q.loop
 q.done:
@@ -6529,12 +6528,9 @@ value.loop:
 %vd.more = icmp ult i32 %vd, %width
 br i1 %vd.more, label %value.step, label %key.finish
 value.step:
-%v16.ptr = getelementptr RECIPE_KV, ptr addrspace(5) %v16, i32 %vd
-%acc.kv = load RECIPE_KV, ptr addrspace(5) %v16.ptr, align RECIPE_KV_ALIGN
-%acc = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %acc.kv)
-%acc.scaled.raw = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %acc, RECIPE_STATE %ms)
-%acc.scaled.kv = call RECIPE_KV @recipe.kv.from.state(RECIPE_STATE %acc.scaled.raw)
-%acc.scaled = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %acc.scaled.kv)
+%values.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %values, i32 %vd
+%acc = load RECIPE_STATE, ptr addrspace(5) %values.ptr, align RECIPE_STATE_ALIGN
+%acc.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %acc, RECIPE_STATE %ms)
 %acc.base = select i1 %greater, RECIPE_STATE %acc.scaled, RECIPE_STATE %acc
 %vd.wide = zext i32 %vd to i64
 %vd.offset = mul i64 %vd.wide, %length.wide
@@ -6545,8 +6541,7 @@ value.step:
 %v.kv = load RECIPE_KV, ptr addrspace(1) %v.ptr, align RECIPE_KV_ALIGN
 %v.value = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %v.kv)
 %acc.next.raw = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %acc.base, RECIPE_STATE %v.value, RECIPE_STATE %vs)
-%acc.next.kv = call RECIPE_KV @recipe.kv.from.state(RECIPE_STATE %acc.next.raw)
-store RECIPE_KV %acc.next.kv, ptr addrspace(5) %v16.ptr, align RECIPE_KV_ALIGN
+store RECIPE_STATE %acc.next.raw, ptr addrspace(5) %values.ptr, align RECIPE_STATE_ALIGN
 %vd.next = add i32 %vd, 1
 br label %value.loop
 key.finish:
@@ -6561,9 +6556,8 @@ out.loop:
 %od.more = icmp ult i32 %od, %width
 br i1 %od.more, label %out.step, label %done
 out.step:
-%out.acc.ptr = getelementptr RECIPE_KV, ptr addrspace(5) %v16, i32 %od
-%out.acc.kv = load RECIPE_KV, ptr addrspace(5) %out.acc.ptr, align RECIPE_KV_ALIGN
-%out.acc = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %out.acc.kv)
+%out.acc.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %values, i32 %od
+%out.acc = load RECIPE_STATE, ptr addrspace(5) %out.acc.ptr, align RECIPE_STATE_ALIGN
 %out.value = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %out.acc, RECIPE_STATE %inverse)
 %od.wide = zext i32 %od to i64
 %out.offset = mul i64 %od.wide, %length.wide
