@@ -374,7 +374,7 @@ fn main() {
 	// 9. A gated delta model trains at each precision: it is not refused, its loss is finite and falls,
 	//    and the same seed repeats the report bits.
 	for (name, bits) in [("delta_fp32", 32_u8), ("delta_fp16", 16_u8)] {
-		let delta = recipe.model().layer(32).fp(bits).delta(1, 2).fp(bits).keys(1, 32).values(32).out(32).delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Sigmoid).delta_gates(Activation::Softplus, Activation::Sigmoid).layer(1).fp(bits).loss(mse);
+		let delta = recipe.model().layer(32).fp(bits).delta(1, 2).fp(bits).keys(1, 32).values(32).delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Sigmoid).delta_gates(Activation::Softplus, Activation::Sigmoid).layer(1).fp(bits).loss(mse);
 		let first = recipe.train().seed(SEED).lr(DELTA_RATE).epochs(DELTA_EPOCHS).run(&delta, &multi);
 		let second = recipe.train().seed(SEED).lr(DELTA_RATE).epochs(DELTA_EPOCHS).run(&delta, &multi);
 		let falls = first.initial_loss().is_finite() && first.final_loss().is_finite() && first.final_loss() < first.initial_loss();

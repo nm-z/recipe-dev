@@ -65,7 +65,7 @@ attn(heads).int(8)
 
 ```rust
 let attention = recipe.model()
-	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
+	.delta(48, 4).keys(16, 128).values(128)
 	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
 	.delta_gates(Activation::Softplus, Activation::Sigmoid)
@@ -92,7 +92,6 @@ let model = recipe.model()
 		.keys(count, width)
 		.values(width)
 		.delta_norms(l2, rms)
-		.out(width)
 		.delta_activations(convolution, output)
 		.delta_gates(decay, write)
 	perc(width)
@@ -273,7 +272,7 @@ place(path, &[blocks])
 A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, a hyper-connection block its gate projections and head mixer, a per-layer embedding block its projections, scales and taps, and a normalization its scale.
 
 ```rust
-let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
+let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state)
 	.delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Silu).delta_gates(Activation::Softplus, Activation::Sigmoid)
 	.delta_from(DeltaTensors::block(layer));
 model = model.res([norm(rms).scale_from("blk.0.attn_norm.weight"), Block::from(delta).norm(rms).scale_from("blk.0.post_attention_norm.weight")]);
