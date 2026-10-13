@@ -33143,6 +33143,8 @@ fn data_audio_header(bytes: &[u8]) -> Result<(u16, usize, usize, usize, &[u8])> 
 const PROBE_IMAGE_BYTES: u64 = 1 << 20;
 /// Bytes of each delimited field the probe keeps. Longer fields keep their true length.
 const PROBE_FIELD_BYTES: usize = 4096;
+/// Bytes of each start, middle, and end value shown in a column snippet.
+const PROBE_SNIPPET_BYTES: usize = 64;
 const PROBE_CHUNK_BYTES: usize = 1 << 16;
 /// Most distinct values a categorical feature may have.
 const PROBE_CATEGORY_LIMIT: usize = 16;
@@ -33307,11 +33309,22 @@ struct ProbeColumn {
 	/// Distinct values, counted up to one past the categorical limit so a larger count is visible.
 	distinct: BTreeSet<String>,
 	longest: usize,
+	snippets: Vec<(usize, ProbeCell)>,
 }
 
 impl ProbeColumn {
 	fn new(name: String) -> Self {
-		Self { name, values: 0, integer: true, float: true, distinct: BTreeSet::new(), longest: 0 }
+		Self { name, values: 0, integer: true, float: true, distinct: BTreeSet::new(), longest: 0, snippets: Vec::new() }
+	}
+
+	fn snippet(&mut self, row: usize, rows: usize, cell: &ProbeCell) {
+		if rows != 0 && [0, rows / 2, rows - 1].contains(&row) {
+			let mut end = cell.text.len().min(PROBE_SNIPPET_BYTES);
+			while !cell.text.is_char_boundary(end) {
+				end -= 1;
+			}
+			self.snippets.push((row, ProbeCell { text: cell.text[..end].to_owned(), length: cell.length }));
+		}
 	}
 
 	fn observe(&mut self, cell: &ProbeCell) {
@@ -33406,7 +33419,19 @@ fn probe_delimited(path: &Path) -> Result<ProbeTable> {
 	for (column, name) in columns.iter_mut().zip(names) {
 		column.name = name;
 	}
-	Ok(ProbeTable { path: path.to_owned(), name, rows: data_rows + usize::from(headerless), ragged: !rectangular, columns })
+	let rows = data_rows + usize::from(headerless);
+	let mut record = 0usize;
+	probe_records(path, delimiter, |row| {
+		if headerless || record != 0 {
+			let index = record - usize::from(!headerless);
+			for (column, cell) in columns.iter_mut().zip(row) {
+				column.snippet(index, rows, cell);
+			}
+		}
+		record += 1;
+		Ok(())
+	})?;
+	Ok(ProbeTable { path: path.to_owned(), name, rows, ragged: !rectangular, columns })
 }
 
 struct ProbeAudio {
@@ -33549,6 +33574,14 @@ fn probe_database(path: &Path) -> Result<ProbeDatabase> {
 			Ok(())
 		})
 		.map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+		let mut index = 0usize;
+		sqlite_scan(&mut file, layout, table.root, &aliases, &mut |row: &[String]| {
+			for (column, value) in columns.iter_mut().zip(row) {
+				column.snippet(index, rows, &probe_cell(value));
+			}
+			index += 1;
+			Ok(())
+		})?;
 		tables.push(ProbeSqliteTable { name: table.name, rows, declared: table.columns.iter().map(|column| column.declared.clone()).collect(), columns });
 	}
 	Ok(ProbeDatabase { page_size: layout.page_size, pages: layout.pages, tables })
@@ -33576,20 +33609,22 @@ fn json_optional(value: Option<usize>) -> String {
 /// One column's evidence in the packet. A declared type is included when the source declares one.
 fn probe_column_json(column: &ProbeColumn, declared: Option<&String>) -> String {
 	let declared = declared.map_or(String::new(), |declared| format!("\"declared\":{},", data_json_string(declared)));
+	let snippets = column.snippets.iter().map(|(row, cell)| format!("{{\"row\":{row},\"text\":{},\"bytes\":{}}}", data_json_string(&cell.text), cell.length)).collect::<Vec<_>>();
 	format!(
-		"{{\"name\":{},{declared}\"dtype\":{},\"values\":{},\"integer\":{},\"float\":{},\"distinct\":{},\"longest\":{}}}",
+		"{{\"name\":{},{declared}\"dtype\":{},\"values\":{},\"integer\":{},\"float\":{},\"distinct\":{},\"longest\":{},\"snippets\":[{}]}}",
 		data_json_string(&column.name),
 		data_json_string(column.suggested()),
 		column.values,
 		column.integer,
 		column.float,
 		column.distinct.len(),
-		column.longest
+		column.longest,
+		snippets.join(",")
 	)
 }
 
 /// Builds the bounded metadata packet for one dataset. The packet holds names, counts,
-/// dimensions, and per-column type evidence. It never contains cell values, pixels, or samples.
+/// dimensions, per-column type evidence, and bounded column snippets. It contains no pixels or audio samples.
 /// Output is one JSON object followed by a newline.
 pub fn propose_data_schema(source: impl AsRef<Path>) -> Result<String> {
 	let source = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve dataset: {error}")))?;
@@ -33922,12 +33957,96 @@ fn probe_table_answers(table: &JsonValue, samples: usize, decided: &BTreeMap<Str
 		.collect()
 }
 
+/// Serializes probe metadata for the answerer, excluding cell snippets and the question tree.
+fn probe_metadata_json(value: &JsonValue) -> String {
+	match value {
+		JsonValue::Null => "null".to_owned(),
+		JsonValue::Bool(value) => value.to_string(),
+		JsonValue::Number(value) => value.clone(),
+		JsonValue::Text(value) => data_json_string(value),
+		JsonValue::Array(items) => format!("[{}]", items.iter().map(probe_metadata_json).collect::<Vec<_>>().join(",")),
+		JsonValue::Object(fields) => format!("{{{}}}", fields.iter().filter(|(name, _)| !matches!(name.as_str(), "snippets" | "questions"))
+			.map(|(name, value)| format!("{}:{}", data_json_string(name), probe_metadata_json(value))).collect::<Vec<_>>().join(",")),
+	}
+}
+
+fn probe_question_active(question: &JsonValue, decided: &BTreeMap<String, String>) -> Result<bool> {
+	match data_field(question, "after") {
+		Ok(JsonValue::Null) | Err(_) => Ok(true),
+		Ok(parent) => {
+			let id = data_text(data_field(parent, "id")?, "after.id")?;
+			let choice = data_text(data_field(parent, "choice")?, "after.choice")?;
+			Ok(decided.get(id).is_some_and(|answer| answer == choice))
+		}
+	}
+}
+
+/// Confirms a proposal through Jev's typed choice protocol, one active question per call.
+/// `ask` receives metadata without cell snippets and returns a Jev JSON response. The
+/// returned answers and loader schema have passed the same checks as `finalize_data_schema`.
+pub fn check_data_schema(proposal: impl AsRef<Path>, model: &str, mut ask: impl FnMut(&str) -> std::io::Result<String>) -> Result<(String, String, String)> {
+	let proposal = data_document(proposal.as_ref())?;
+	require(data_count(data_field(&proposal, "schema_version")?, "schema_version")? == 1, "proposal schema version is unsupported")?;
+	let metadata = probe_metadata_json(&proposal);
+	let mut decided = BTreeMap::<String, String>::new();
+	let mut records = Vec::new();
+	for question in data_items(data_field(&proposal, "questions")?, "questions")? {
+		if !probe_question_active(question, &decided)? {
+			continue;
+		}
+		let id = data_text(data_field(question, "id")?, "id")?;
+		require(!decided.contains_key(id), format!("question {id} is repeated"))?;
+		let prompt = data_text(data_field(question, "prompt")?, "prompt")?;
+		let choices = data_items(data_field(question, "choices")?, "choices")?.iter().map(|value| data_text(value, "choice")).collect::<Result<Vec<_>>>()?;
+		require(!choices.is_empty() && choices.iter().collect::<BTreeSet<_>>().len() == choices.len(), format!("question {id} choices are empty or repeated"))?;
+		let criteria = choices.iter().map(|choice| format!("{}:{}", data_json_string(choice), data_json_string(choice))).collect::<Vec<_>>().join(",");
+		let request = format!("{{\"model\":{},\"state\":{{\"metadata\":{metadata},\"answers\":[{}]}},\"questions\":{{{}:{{\"type\":\"choice\",\"instructions\":{},\"criteria\":{{{criteria}}}}}}}}}",
+			data_json_string(model), records.join(","), data_json_string(id), data_json_string(prompt));
+		let response = ask(&request).map_err(|error| RecipeError::new(format!("question {id}: {error}")))?;
+		require(response.len() as u64 <= PROBE_DOCUMENT_BYTES, format!("question {id} response exceeds {PROBE_DOCUMENT_BYTES} bytes"))?;
+		let (response, rest) = json_value(&response)?;
+		require(rest.trim().is_empty(), format!("question {id} response has trailing content"))?;
+		let JsonValue::Object(answers) = data_field(&response, "answers")? else { return Err(RecipeError::new(format!("question {id} answers must be an object"))) };
+		require(answers.len() == 1 && answers[0].0 == id, format!("question {id} response must answer only that question"))?;
+		let answer = &answers[0].1;
+		require(data_text(data_field(answer, "type")?, "type")? == "choice", format!("question {id} response is not a choice"))?;
+		let choice = data_text(data_field(answer, "choice")?, "choice")?;
+		require(choices.contains(&choice), format!("answer {id} selected {choice:?}, which the question does not offer"))?;
+		let JsonValue::Object(probabilities) = data_field(answer, "probabilities")? else { return Err(RecipeError::new(format!("question {id} probabilities must be an object"))) };
+		require(probabilities.len() == choices.len(), format!("question {id} probabilities must name every offered choice"))?;
+		let (mut seen, mut sum, mut selected, mut maximum) = (BTreeSet::new(), 0.0, 0.0, 0.0_f64);
+		for (label, value) in probabilities {
+			require(choices.contains(&label.as_str()) && seen.insert(label), format!("question {id} probability label {label:?} is unknown or repeated"))?;
+			let JsonValue::Number(value) = value else { return Err(RecipeError::new(format!("question {id} probability must be numeric"))) };
+			let probability = value.parse::<f64>().map_err(|_| RecipeError::new(format!("question {id} probability is invalid")))?;
+			require((0.0..=1.0).contains(&probability), format!("question {id} probability is outside 0 to 1"))?;
+			sum += probability;
+			maximum = maximum.max(probability);
+			if label == choice {
+				selected = probability;
+			}
+		}
+		require((sum - 1.0_f64).abs() <= 1e-6, format!("question {id} probabilities do not sum to 1"))?;
+		require(selected == maximum, format!("question {id} choice is not a highest-probability option"))?;
+		records.push(format!("{{\"id\":{},\"choice\":{},\"probability\":{selected}}}", data_json_string(id), data_json_string(choice)));
+		decided.insert(id.to_owned(), choice.to_owned());
+	}
+	let answers = format!("{{\"schema_version\":1,\"status\":\"ok\",\"answers\":[{}]}}\n", records.join(","));
+	let (document, _) = json_value(&answers)?;
+	let (schema, decisions) = finalize_data_documents(&proposal, &document)?;
+	Ok((answers, schema, decisions))
+}
+
 /// Checks the answers against the question tree and the probe's evidence, then returns the
 /// loader schema JSON and one `id choice probability` line per answered question.
 /// A wrong answer fails here and names the question that diverged.
 pub fn finalize_data_schema(proposal: impl AsRef<Path>, answers: impl AsRef<Path>) -> Result<(String, String)> {
 	let proposal = data_document(proposal.as_ref())?;
 	let answers = data_document(answers.as_ref())?;
+	finalize_data_documents(&proposal, &answers)
+}
+
+fn finalize_data_documents(proposal: &JsonValue, answers: &JsonValue) -> Result<(String, String)> {
 	require(data_count(data_field(&proposal, "schema_version")?, "schema_version")? == 1, "proposal schema version is unsupported")?;
 	require(data_count(data_field(&answers, "schema_version")?, "schema_version")? == 1, "answer schema version is unsupported")?;
 	let status = data_text(data_field(&answers, "status")?, "status")?;
@@ -33949,14 +34068,7 @@ pub fn finalize_data_schema(proposal: impl AsRef<Path>, answers: impl AsRef<Path
 	for question in data_items(data_field(&proposal, "questions")?, "questions")? {
 		let id = data_text(data_field(question, "id")?, "id")?;
 		let choices = data_items(data_field(question, "choices")?, "choices")?;
-		let active = match data_field(question, "after") {
-			Ok(JsonValue::Null) | Err(_) => true,
-			Ok(parent) => {
-				let parent_id = data_text(data_field(parent, "id")?, "after.id")?;
-				let parent_choice = data_text(data_field(parent, "choice")?, "after.choice")?;
-				decided.get(parent_id).is_some_and(|choice| choice == parent_choice)
-			}
-		};
+		let active = probe_question_active(question, &decided)?;
 		let answer = answered.remove(id);
 		if !active {
 			require(answer.is_none(), format!("answer {id} is outside the active branch and must be absent"))?;
