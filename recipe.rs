@@ -2622,6 +2622,8 @@ impl SpanWeight {
 	}
 	/// Byte alignment the weight lines need beyond the format's own.
 	fn alignment(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 | Self::Q4K | Self::Q5K => 16, Self::Q8_0 | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 2 } }
+	/// Whether the integer matvec (`RECIPE_XMAD_MATVEC=1`) multiplies this format's weights as integers with XMAD.
+	fn xmad(self) -> bool { matches!(self, Self::Q8_0 | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ2XS | Self::IQ4NL) && std::env::var("RECIPE_XMAD_MATVEC").as_deref() == Ok("1") }
 	fn name(self) -> &'static str { match self { Self::F32 => "f32", Self::F16 => "f16", Self::BF16 => "bf16", Self::Q8_0 => "q8_0", Self::Q4K => "q4k", Self::Q5K => "q5k", Self::Q6K => "q6k", Self::IQ2XS => "iq2xs", Self::IQ3XXS => "iq3xxs", Self::IQ4NL => "iq4nl" } }
 }
 /// Where a plane's activations and outputs live.
@@ -2654,7 +2656,10 @@ fn span_lanes(tasks: usize) -> usize {
 impl SpanSpec {
 	fn tasks(&self) -> usize { self.k / self.weight.task() }
 	fn row_bytes(&self) -> usize { self.k / self.weight.block() * self.weight.stride() }
-	fn padded(&self, values: usize) -> usize { let pad = self.weight.pad(); if pad == 0 { values } else { values + 4 * values.div_ceil(pad) } }
+	/// Floats the padded activations of `values` inputs take.
+	fn data(&self, values: usize) -> usize { let pad = self.weight.pad(); if pad == 0 { values } else { values + 4 * values.div_ceil(pad) } }
+	/// Floats a staged input of `values` takes: its padded activations, then for the integer matvec a scale and a sum per 32-value block.
+	fn padded(&self, values: usize) -> usize { self.data(values) + if self.weight.xmad() { 2 * values.div_ceil(32) } else { 0 } }
 	fn valid(&self) -> bool {
 		let w = self.weight;
 		self.k != 0 && self.k % w.block() == 0 && self.k % w.task() == 0 && self.tasks() % w.granule() == 0
@@ -2718,6 +2723,9 @@ fn span_matvec_declarations(ir: &str) -> String {
 		("@llvm.fmuladd.f32(", "declare float @llvm.fmuladd.f32(float, float, float)"),
 		("@llvm.cttz.i32(", "declare i32 @llvm.cttz.i32(i32, i1)"),
 		("@llvm.ctpop.i32(", "declare i32 @llvm.ctpop.i32(i32)"),
+		("@llvm.fabs.f32(", "declare float @llvm.fabs.f32(float)"),
+		("@llvm.maxnum.f32(", "declare float @llvm.maxnum.f32(float, float)"),
+		("@llvm.round.f32(", "declare float @llvm.round.f32(float)"),
 	].into_iter().filter(|(name, _)| !ir.lines().any(|line| line.starts_with("declare") && line.contains(name))).map(|(_, line)| format!("{line}\n")).collect()
 }
 /// The metadata node marking weight loads invariant, so they use the read-only path.
@@ -2872,7 +2880,7 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 		emit!("{q}.plane = mul i32 {q}.p, {}\n{q}.to.index = add i32 {q}.plane, {q}.slot\n{q}.to = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.to.index\nstore float {q}.v, ptr addrspace(3) {q}.to, align 4", plan.stride);
 	}
 	emit!("%{p}.si.next = add i32 %{p}.si, %stage.step\n%{p}.si.more = icmp ult i32 %{p}.si.next, %{p}.items\nbr i1 %{p}.si.more, label %{p}.stage.loop, label %{p}.stage.done");
-	emit!("{p}.stage.done:\ncall void @llvm.nvvm.barrier0()\nbr label %{p}.compute\n{p}.compute:");
+	if w.xmad() { span_quantize(o, &p, spec.data(plan.chunk * w.task()), plan.stride, w.task(), s, shared, w.pad()); } else { emit!("{p}.stage.done:\ncall void @llvm.nvvm.barrier0()\nbr label %{p}.compute\n{p}.compute:"); }
 	emit!("%{p}.g0 = mul i32 %{p}.g, {group}\n%{p}.grem = sub i32 {rows}, %{p}.g0\n%{p}.gsmall = icmp ult i32 %{p}.grem, {group}\n%{p}.rows = select i1 %{p}.gsmall, i32 %{p}.grem, i32 {group}");
 	// A slot works on `pass` rows at once: each staged activation it reads serves all of them.
 	let pass = plan.pass;
@@ -2898,8 +2906,13 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 	}
 	for j in 0..u {
 		let t = format!("%{p}.t{j}");
-		let sets = (0..pass).map(|i| { let q = format!("{t}.r{i}"); let (quads, scales) = span_task_quads(o, w, &q, &format!("{t}.cl")); (q, quads, scales) }).collect::<Vec<_>>();
-		span_task_products(o, &sets, s, plan.stride, shared);
+		if w.xmad() {
+			let sets = (0..pass).map(|i| { let q = format!("{t}.r{i}"); let (quads, groups) = span_task_quads_xmad(o, w, &q, &format!("{t}.cl")); (q, quads, groups) }).collect::<Vec<_>>();
+			span_task_products_xmad(o, &sets, s, plan.stride, spec.data(plan.chunk * w.task()), shared);
+		} else {
+			let sets = (0..pass).map(|i| { let q = format!("{t}.r{i}"); let (quads, scales) = span_task_quads(o, w, &q, &format!("{t}.cl")); (q, quads, scales) }).collect::<Vec<_>>();
+			span_task_products(o, &sets, s, plan.stride, shared);
+		}
 		for i in 0..pass {
 			for q in 0..s {
 				emit!("{t}.r{i}.sum{q} = fadd float %{p}.acc{i}.{q}.u{j}, {t}.r{i}.d{q}\n%{p}.acc{i}.{q}.u{} = select i1 {t}.ok, float {t}.r{i}.sum{q}, float %{p}.acc{i}.{q}.u{j}", j + 1);
@@ -3062,6 +3075,105 @@ fn span_float(value: f64) -> String { format!("0x{:016X}", value.to_bits()) }
 /// Four decoded weights of a task, the staged offset of the four activations they
 /// multiply, the scale group whose sum they join, and the code that decodes them.
 struct SpanQuad { decode: String, weights: [String; 4], offset: String, group: usize }
+/// The bytes of `word` as i32 values, sign-extended when `signed`, else unsigned less `offset`.
+fn span_int_bytes(o: &mut String, q: &str, word: &str, signed: bool, offset: u32) -> [String; 4] {
+	std::array::from_fn(|b| {
+		if signed {
+			o.push_str(&format!("{q}.b{b}.shl = shl i32 {word}, {}\n{q}.b{b} = ashr i32 {q}.b{b}.shl, 24\n", 24 - 8 * b));
+		} else {
+			o.push_str(&format!("{q}.b{b}.shift = lshr i32 {word}, {}\n{q}.b{b}.byte = and i32 {q}.b{b}.shift, 255\n{q}.b{b} = sub i32 {q}.b{b}.byte, {offset}\n", 8 * b));
+		}
+		format!("{q}.b{b}")
+	})
+}
+/// The Q6_K scale step of each of task `t`'s four stripes (its scale times the stripe's int8 scale), and the task's staged slot.
+fn span_q6k_steps(o: &mut String, t: &str, cl: &str) -> Vec<String> {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	emit!("{t}.scale = fpext half {t}.scale.half to float\n{t}.sub = lshr i32 {t}.quarter, 1\n{t}.sub8 = shl i32 {t}.sub, 3\n{t}.sub8.far = add i32 {t}.sub8, 16");
+	let mut steps = Vec::new();
+	for (stripe, (word, shift)) in [("d.w0", "sub8"), ("d.w0", "sub8.far"), ("d.w1", "sub8"), ("d.w1", "sub8.far")].into_iter().enumerate() {
+		let q = format!("{t}.sc{stripe}");
+		emit!("{q}.shift = lshr i32 {t}.{word}, {t}.{shift}\n{q}.byte = and i32 {q}.shift, 255\n{q}.signed = xor i32 {q}.byte, 128\n{q}.bits = or i32 {q}.signed, 1258291200\n{q}.float = bitcast i32 {q}.bits to float\n{q}.value = fsub float {q}.float, {}\n{q}.step = fmul float {t}.scale, {q}.value", span_float(8388736.0));
+		steps.push(format!("{q}.step"));
+	}
+	emit!("{t}.local.block = lshr i32 {cl}, 3\n{t}.local.base = shl i32 {t}.local.block, 8\n{t}.local.gap = shl i32 {t}.local.block, 3\n{t}.half128 = shl i32 {t}.half, 7\n{t}.half4 = shl i32 {t}.half, 2");
+	emit!("{t}.slot0 = add i32 {t}.local.base, {t}.local.gap\n{t}.slot1 = add i32 {t}.slot0, {t}.half128\n{t}.slot2 = add i32 {t}.slot1, {t}.half4\n{t}.slot = add i32 {t}.slot2, {t}.quarter8");
+	steps
+}
+/// The four stripe words of Q6_K half `m` of task `t`, each holding the 6-bit codes of one stripe in its bytes.
+fn span_q6k_words(o: &mut String, t: &str, m: usize) -> [String; 4] {
+	let q = format!("{t}.m{m}");
+	let (a, b, c) = (format!("{t}.a.w{m}"), format!("{t}.b.w{m}"), format!("{t}.c.w{m}"));
+	o.push_str(&format!("{q}.c4 = shl i32 {c}, 4\n{q}.c2 = shl i32 {c}, 2\n{q}.cr2 = lshr i32 {c}, 2\n{q}.h0 = and i32 {q}.c4, 808464432\n{q}.h1 = and i32 {q}.c2, 808464432\n{q}.h2 = and i32 {c}, 808464432\n{q}.h3 = and i32 {q}.cr2, 808464432\n"));
+	o.push_str(&format!("{q}.al = and i32 {a}, 252645135\n{q}.bl = and i32 {b}, 252645135\n{q}.ar = lshr i32 {a}, 4\n{q}.ah = and i32 {q}.ar, 252645135\n{q}.br = lshr i32 {b}, 4\n{q}.bh = and i32 {q}.br, 252645135\n"));
+	o.push_str(&format!("{q}.r0 = or i32 {q}.al, {q}.h0\n{q}.r1 = or i32 {q}.bl, {q}.h1\n{q}.r2 = or i32 {q}.ah, {q}.h2\n{q}.r3 = or i32 {q}.bh, {q}.h3\n"));
+	std::array::from_fn(|stripe| format!("{q}.r{stripe}"))
+}
+/// The Q4_K and Q5_K scale steps and minimum bases of task `t`'s two 32-value halves, and its staged slot.
+fn span_q45k_scales(o: &mut String, t: &str, cl: &str) -> Vec<(String, String)> {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	emit!("{t}.head0 = extractelement <4 x i32> {t}.head, i32 0\n{t}.y = extractelement <4 x i32> {t}.head, i32 1\n{t}.z = extractelement <4 x i32> {t}.head, i32 2\n{t}.wd = extractelement <4 x i32> {t}.head, i32 3");
+	emit!("{t}.d.bits = trunc i32 {t}.head0 to i16\n{t}.d.half = bitcast i16 {t}.d.bits to half\n{t}.d = fpext half {t}.d.half to float\n{t}.dmin.shift = lshr i32 {t}.head0, 16\n{t}.dmin.bits = trunc i32 {t}.dmin.shift to i16\n{t}.dmin.half = bitcast i16 {t}.dmin.bits to half\n{t}.dmin = fpext half {t}.dmin.half to float");
+	emit!("{t}.low.pair = icmp ult i32 {t}.pair, 2\n{t}.pair.byte = and i32 {t}.pair, 1\n{t}.pair.shift = shl i32 {t}.pair.byte, 4");
+	for half in 0..2 {
+		let h = format!("{t}.s{half}");
+		emit!("{h}.shift = add i32 {t}.pair.shift, {}\n{h}.y0 = lshr i32 {t}.y, {h}.shift\n{h}.yb = and i32 {h}.y0, 255\n{h}.z0 = lshr i32 {t}.z, {h}.shift\n{h}.zb = and i32 {h}.z0, 255\n{h}.w0 = lshr i32 {t}.wd, {h}.shift\n{h}.wb = and i32 {h}.w0, 255", 8 * half);
+		emit!("{h}.sc.lo = and i32 {h}.yb, 63\n{h}.m.lo = and i32 {h}.zb, 63\n{h}.sc.hi0 = and i32 {h}.wb, 15\n{h}.sc.hi1 = lshr i32 {h}.yb, 6\n{h}.sc.hi2 = shl i32 {h}.sc.hi1, 4\n{h}.sc.hi = or i32 {h}.sc.hi0, {h}.sc.hi2");
+		emit!("{h}.m.hi0 = lshr i32 {h}.wb, 4\n{h}.m.hi1 = lshr i32 {h}.zb, 6\n{h}.m.hi2 = shl i32 {h}.m.hi1, 4\n{h}.m.hi = or i32 {h}.m.hi0, {h}.m.hi2\n{h}.sc = select i1 {t}.low.pair, i32 {h}.sc.lo, i32 {h}.sc.hi\n{h}.m = select i1 {t}.low.pair, i32 {h}.m.lo, i32 {h}.m.hi");
+		emit!("{h}.scf = uitofp i32 {h}.sc to float\n{h}.mf = uitofp i32 {h}.m to float\n{h}.step = fmul float {t}.d, {h}.scf\n{h}.base0 = fmul float {t}.dmin, {h}.mf\n{h}.base = fneg float {h}.base0");
+	}
+	emit!("{t}.bit.lo = shl i32 {t}.pair, 1\n{t}.bit.hi = add i32 {t}.bit.lo, 1\n{t}.slot = mul i32 {cl}, 68");
+	(0..2).map(|half| (format!("{t}.s{half}.step"), format!("{t}.s{half}.base"))).collect()
+}
+/// The IQ2_XS or IQ3_XXS runs of task `t`: each run's grid words, its scale group and its
+/// sign bits (the seven stored signs and their parity). Returns the runs and the float scale of each group.
+fn span_iq_prepare(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<(String, [String; 2], usize, String)>, Vec<String>) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	emit!("{t}.d = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
+	// Each 8-value run has a grid entry and seven sign bits whose parity completes the eighth.
+	let mut runs = Vec::new();
+	let scales = if w == SpanWeight::IQ2XS {
+		emit!("{t}.sc = zext i8 {t}.sc.byte to i32\n{t}.n0 = and i32 {t}.sc, 15\n{t}.n1 = lshr i32 {t}.sc, 4");
+		for g in 0..2 { emit!("{t}.n{g}.f = uitofp i32 {t}.n{g} to float\n{t}.n{g}.h = fadd float {t}.n{g}.f, 0.5\n{t}.n{g}.d = fmul float {t}.d, {t}.n{g}.h\n{t}.db{g} = fmul float {t}.n{g}.d, 0.25"); }
+		for l in 0..4 {
+			let r = format!("{t}.l{l}");
+			if l % 2 == 0 { emit!("{r}.e = and i32 {t}.q.w{}, 65535", l / 2); } else { emit!("{r}.e = lshr i32 {t}.q.w{}, 16", l / 2); }
+			emit!("{r}.index0 = and i32 {r}.e, 511\n{r}.index = zext i32 {r}.index0 to i64\n{r}.at = getelementptr [512 x i64], ptr addrspace(1) @span.iq2xs.grid, i64 0, i64 {r}.index\n{r}.grid = load i64, ptr addrspace(1) {r}.at, align 8, !invariant.load {SPAN_INVARIANT}");
+			emit!("{r}.lo = trunc i64 {r}.grid to i32\n{r}.hi.wide = lshr i64 {r}.grid, 32\n{r}.hi = trunc i64 {r}.hi.wide to i32\n{r}.signs7 = lshr i32 {r}.e, 9");
+			runs.push((r.clone(), [format!("{r}.lo"), format!("{r}.hi")], l / 2));
+		}
+		vec![format!("{t}.db0"), format!("{t}.db1")]
+	} else {
+		emit!("{t}.n = lshr i32 {t}.a.w0, 28\n{t}.n.f = uitofp i32 {t}.n to float\n{t}.n.h = fadd float {t}.n.f, 0.5\n{t}.n.d = fmul float {t}.d, {t}.n.h\n{t}.db = fmul float {t}.n.d, 0.5");
+		for l in 0..4 {
+			let r = format!("{t}.l{l}");
+			for h in 0..2 {
+				let byte = 2 * l + h;
+				emit!("{r}.i{h}.shift = lshr i32 {t}.q.w{}, {}\n{r}.i{h}.byte = and i32 {r}.i{h}.shift, 255\n{r}.i{h} = zext i32 {r}.i{h}.byte to i64\n{r}.g{h}.at = getelementptr [256 x i32], ptr addrspace(1) @span.iq3xxs.grid, i64 0, i64 {r}.i{h}\n{r}.g{h} = load i32, ptr addrspace(1) {r}.g{h}.at, align 4, !invariant.load {SPAN_INVARIANT}", byte / 4, 8 * (byte % 4));
+			}
+			emit!("{r}.signs.shift = lshr i32 {t}.a.w0, {}\n{r}.signs7 = and i32 {r}.signs.shift, 127", 7 * l);
+			runs.push((r.clone(), [format!("{r}.g0"), format!("{r}.g1")], 0));
+		}
+		vec![format!("{t}.db")]
+	};
+	let runs = runs.into_iter().map(|(r, words, group)| {
+		emit!("{r}.parity0 = call i32 @llvm.ctpop.i32(i32 {r}.signs7)\n{r}.parity1 = and i32 {r}.parity0, 1\n{r}.parity = shl i32 {r}.parity1, 7\n{r}.signs = or i32 {r}.signs7, {r}.parity");
+		let signs = format!("{r}.signs");
+		(r, words, group, signs)
+	}).collect();
+	(runs, scales)
+}
+/// The four IQ4_NL levels words of the level table, four level bytes to a word.
+fn span_iq4nl_words() -> [i32; 4] { std::array::from_fn(|i| i32::from_le_bytes(std::array::from_fn(|b| SPAN_IQ4NL[4 * i + b] as u8))) }
+/// The IQ4_NL level byte selected by code `b` of quad `quad` of task `t`, named `{t}.k{quad}.v{b}.level`.
+fn span_iq4nl_level(decode: &mut String, words: &[i32; 4], t: &str, quad: usize, b: usize) -> String {
+	let v = format!("{t}.k{quad}.v{b}");
+	let shift = format!("{t}.q.w{}", quad % 4);
+	decode.push_str(&format!("{v}.shift = lshr i32 {shift}, {}\n{v}.code = and i32 {v}.shift, 15\n{v}.word = lshr i32 {v}.code, 2\n{v}.odd = icmp eq i32 {v}.word, 1\n{v}.three = icmp eq i32 {v}.word, 3\n{v}.high = icmp uge i32 {v}.word, 2\n", 8 * b + 4 * (quad / 4)));
+	decode.push_str(&format!("{v}.low.pair = select i1 {v}.odd, i32 {}, i32 {}\n{v}.high.pair = select i1 {v}.three, i32 {}, i32 {}\n{v}.levels = select i1 {v}.high, i32 {v}.high.pair, i32 {v}.low.pair\n", words[1], words[0], words[3], words[2]));
+	decode.push_str(&format!("{v}.lane = and i32 {v}.code, 3\n{v}.lane8 = shl i32 {v}.lane, 3\n{v}.level0 = lshr i32 {v}.levels, {v}.lane8\n{v}.level = and i32 {v}.level0, 255\n"));
+	format!("{v}.level")
+}
 /// The quads of task `t`, whose loads `span_task_load` emitted, and the scale of each of
 /// their groups; `cl` is the task's index in the staged chunk.
 fn span_task_quads(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<SpanQuad>, Vec<Option<String>>) {
@@ -3106,17 +3218,7 @@ fn span_task_quads(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<Spa
 			vec![Some(format!("{t}.scale"))]
 		}
 		SpanWeight::Q4K | SpanWeight::Q5K => {
-			emit!("{t}.head0 = extractelement <4 x i32> {t}.head, i32 0\n{t}.y = extractelement <4 x i32> {t}.head, i32 1\n{t}.z = extractelement <4 x i32> {t}.head, i32 2\n{t}.wd = extractelement <4 x i32> {t}.head, i32 3");
-			emit!("{t}.d.bits = trunc i32 {t}.head0 to i16\n{t}.d.half = bitcast i16 {t}.d.bits to half\n{t}.d = fpext half {t}.d.half to float\n{t}.dmin.shift = lshr i32 {t}.head0, 16\n{t}.dmin.bits = trunc i32 {t}.dmin.shift to i16\n{t}.dmin.half = bitcast i16 {t}.dmin.bits to half\n{t}.dmin = fpext half {t}.dmin.half to float");
-			emit!("{t}.low.pair = icmp ult i32 {t}.pair, 2\n{t}.pair.byte = and i32 {t}.pair, 1\n{t}.pair.shift = shl i32 {t}.pair.byte, 4");
-			for half in 0..2 {
-				let h = format!("{t}.s{half}");
-				emit!("{h}.shift = add i32 {t}.pair.shift, {}\n{h}.y0 = lshr i32 {t}.y, {h}.shift\n{h}.yb = and i32 {h}.y0, 255\n{h}.z0 = lshr i32 {t}.z, {h}.shift\n{h}.zb = and i32 {h}.z0, 255\n{h}.w0 = lshr i32 {t}.wd, {h}.shift\n{h}.wb = and i32 {h}.w0, 255", 8 * half);
-				emit!("{h}.sc.lo = and i32 {h}.yb, 63\n{h}.m.lo = and i32 {h}.zb, 63\n{h}.sc.hi0 = and i32 {h}.wb, 15\n{h}.sc.hi1 = lshr i32 {h}.yb, 6\n{h}.sc.hi2 = shl i32 {h}.sc.hi1, 4\n{h}.sc.hi = or i32 {h}.sc.hi0, {h}.sc.hi2");
-				emit!("{h}.m.hi0 = lshr i32 {h}.wb, 4\n{h}.m.hi1 = lshr i32 {h}.zb, 6\n{h}.m.hi2 = shl i32 {h}.m.hi1, 4\n{h}.m.hi = or i32 {h}.m.hi0, {h}.m.hi2\n{h}.sc = select i1 {t}.low.pair, i32 {h}.sc.lo, i32 {h}.sc.hi\n{h}.m = select i1 {t}.low.pair, i32 {h}.m.lo, i32 {h}.m.hi");
-				emit!("{h}.scf = uitofp i32 {h}.sc to float\n{h}.mf = uitofp i32 {h}.m to float\n{h}.step = fmul float {t}.d, {h}.scf\n{h}.base0 = fmul float {t}.dmin, {h}.mf\n{h}.base = fneg float {h}.base0");
-			}
-			emit!("{t}.bit.lo = shl i32 {t}.pair, 1\n{t}.bit.hi = add i32 {t}.bit.lo, 1\n{t}.slot = mul i32 {cl}, 68");
+			span_q45k_scales(o, t, cl);
 			for m in 0..8 {
 				let (vector, lane) = if m < 4 { ("high0", m) } else { ("high1", m - 4) };
 				let (low_vector, low_lane) = if m < 4 { ("low0", m) } else { ("low1", m - 4) };
@@ -3144,87 +3246,48 @@ fn span_task_quads(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<Spa
 			vec![None]
 		}
 		SpanWeight::Q6K => {
-			emit!("{t}.scale = fpext half {t}.scale.half to float\n{t}.sub = lshr i32 {t}.quarter, 1\n{t}.sub8 = shl i32 {t}.sub, 3\n{t}.sub8.far = add i32 {t}.sub8, 16");
-			let mut steps = Vec::new();
-			for (stripe, (word, shift)) in [("d.w0", "sub8"), ("d.w0", "sub8.far"), ("d.w1", "sub8"), ("d.w1", "sub8.far")].into_iter().enumerate() {
-				let q = format!("{t}.sc{stripe}");
-				emit!("{q}.shift = lshr i32 {t}.{word}, {t}.{shift}\n{q}.byte = and i32 {q}.shift, 255\n{q}.signed = xor i32 {q}.byte, 128\n{q}.bits = or i32 {q}.signed, 1258291200\n{q}.float = bitcast i32 {q}.bits to float\n{q}.value = fsub float {q}.float, {}\n{q}.step = fmul float {t}.scale, {q}.value", span_float(8388736.0));
-				steps.push(Some(format!("{q}.step")));
-			}
-			emit!("{t}.local.block = lshr i32 {cl}, 3\n{t}.local.base = shl i32 {t}.local.block, 8\n{t}.local.gap = shl i32 {t}.local.block, 3\n{t}.half128 = shl i32 {t}.half, 7\n{t}.half4 = shl i32 {t}.half, 2");
-			emit!("{t}.slot0 = add i32 {t}.local.base, {t}.local.gap\n{t}.slot1 = add i32 {t}.slot0, {t}.half128\n{t}.slot2 = add i32 {t}.slot1, {t}.half4\n{t}.slot = add i32 {t}.slot2, {t}.quarter8");
+			let steps = span_q6k_steps(o, t, cl);
 			for m in 0..2 {
 				let q = format!("{t}.m{m}");
-				let (a, b, c) = (format!("{t}.a.w{m}"), format!("{t}.b.w{m}"), format!("{t}.c.w{m}"));
 				let mut decode = String::new();
-				code!(decode, "{q}.c4 = shl i32 {c}, 4\n{q}.c2 = shl i32 {c}, 2\n{q}.cr2 = lshr i32 {c}, 2\n{q}.h0 = and i32 {q}.c4, 808464432\n{q}.h1 = and i32 {q}.c2, 808464432\n{q}.h2 = and i32 {c}, 808464432\n{q}.h3 = and i32 {q}.cr2, 808464432");
-				code!(decode, "{q}.al = and i32 {a}, 252645135\n{q}.bl = and i32 {b}, 252645135\n{q}.ar = lshr i32 {a}, 4\n{q}.ah = and i32 {q}.ar, 252645135\n{q}.br = lshr i32 {b}, 4\n{q}.bh = and i32 {q}.br, 252645135");
-				code!(decode, "{q}.r0 = or i32 {q}.al, {q}.h0\n{q}.r1 = or i32 {q}.bl, {q}.h1\n{q}.r2 = or i32 {q}.ah, {q}.h2\n{q}.r3 = or i32 {q}.bh, {q}.h3");
+				span_q6k_words(&mut decode, t, m);
 				for stripe in 0..4 {
 					code!(decode, "{q}.r{stripe}.o = add i32 {t}.slot, {}", 32 * stripe + 4 * m);
 					let weights = span_bytes(&mut decode, &format!("{q}.r{stripe}c"), &format!("{q}.r{stripe}"), 32);
 					quads.push(SpanQuad { decode: std::mem::take(&mut decode), weights, offset: format!("{q}.r{stripe}.o"), group: stripe });
 				}
 			}
-			steps
+			steps.into_iter().map(Some).collect()
 		}
 		SpanWeight::IQ2XS | SpanWeight::IQ3XXS => {
-			emit!("{t}.d = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
-			// Each 8-value run has a grid entry and seven sign bits whose parity completes the eighth.
-			let mut runs = Vec::new();
-			let scales = if w == SpanWeight::IQ2XS {
-				emit!("{t}.sc = zext i8 {t}.sc.byte to i32\n{t}.n0 = and i32 {t}.sc, 15\n{t}.n1 = lshr i32 {t}.sc, 4");
-				for g in 0..2 { emit!("{t}.n{g}.f = uitofp i32 {t}.n{g} to float\n{t}.n{g}.h = fadd float {t}.n{g}.f, 0.5\n{t}.n{g}.d = fmul float {t}.d, {t}.n{g}.h\n{t}.db{g} = fmul float {t}.n{g}.d, 0.25"); }
-				for l in 0..4 {
-					let r = format!("{t}.l{l}");
-					if l % 2 == 0 { emit!("{r}.e = and i32 {t}.q.w{}, 65535", l / 2); } else { emit!("{r}.e = lshr i32 {t}.q.w{}, 16", l / 2); }
-					emit!("{r}.index0 = and i32 {r}.e, 511\n{r}.index = zext i32 {r}.index0 to i64\n{r}.at = getelementptr [512 x i64], ptr addrspace(1) @span.iq2xs.grid, i64 0, i64 {r}.index\n{r}.grid = load i64, ptr addrspace(1) {r}.at, align 8, !invariant.load {SPAN_INVARIANT}");
-					emit!("{r}.lo = trunc i64 {r}.grid to i32\n{r}.hi.wide = lshr i64 {r}.grid, 32\n{r}.hi = trunc i64 {r}.hi.wide to i32\n{r}.signs7 = lshr i32 {r}.e, 9");
-					runs.push((r.clone(), [format!("{r}.lo"), format!("{r}.hi")], l / 2));
-				}
-				vec![Some(format!("{t}.db0")), Some(format!("{t}.db1"))]
-			} else {
-				emit!("{t}.n = lshr i32 {t}.a.w0, 28\n{t}.n.f = uitofp i32 {t}.n to float\n{t}.n.h = fadd float {t}.n.f, 0.5\n{t}.n.d = fmul float {t}.d, {t}.n.h\n{t}.db = fmul float {t}.n.d, 0.5");
-				for l in 0..4 {
-					let r = format!("{t}.l{l}");
-					for h in 0..2 {
-						let byte = 2 * l + h;
-						emit!("{r}.i{h}.shift = lshr i32 {t}.q.w{}, {}\n{r}.i{h}.byte = and i32 {r}.i{h}.shift, 255\n{r}.i{h} = zext i32 {r}.i{h}.byte to i64\n{r}.g{h}.at = getelementptr [256 x i32], ptr addrspace(1) @span.iq3xxs.grid, i64 0, i64 {r}.i{h}\n{r}.g{h} = load i32, ptr addrspace(1) {r}.g{h}.at, align 4, !invariant.load {SPAN_INVARIANT}", byte / 4, 8 * (byte % 4));
-					}
-					emit!("{r}.signs.shift = lshr i32 {t}.a.w0, {}\n{r}.signs7 = and i32 {r}.signs.shift, 127", 7 * l);
-					runs.push((r.clone(), [format!("{r}.g0"), format!("{r}.g1")], 0));
-				}
-				vec![Some(format!("{t}.db"))]
-			};
-			for (l, (r, words, group)) in runs.into_iter().enumerate() {
-				emit!("{r}.parity0 = call i32 @llvm.ctpop.i32(i32 {r}.signs7)\n{r}.parity1 = and i32 {r}.parity0, 1\n{r}.parity = shl i32 {r}.parity1, 7\n{r}.signs = or i32 {r}.signs7, {r}.parity");
+			let (runs, scales) = span_iq_prepare(o, w, t, cl);
+			for (l, (r, words, group, signs)) in runs.into_iter().enumerate() {
 				for (h, word) in words.iter().enumerate() {
 					let mut decode = String::new();
 					code!(decode, "{r}.h{h}.o = add i32 {t}.slot, {}", 8 * l + 4 * h);
 					let magnitudes = span_bytes(&mut decode, &format!("{r}.h{h}.m"), word, 0);
 					let weights = std::array::from_fn(|b| {
 						let v = format!("{r}.h{h}.v{b}");
-						code!(decode, "{v}.sign0 = lshr i32 {r}.signs, {}\n{v}.sign1 = and i32 {v}.sign0, 1\n{v}.sign = shl i32 {v}.sign1, 31\n{v}.bits0 = bitcast float {} to i32\n{v}.bits = xor i32 {v}.bits0, {v}.sign\n{v} = bitcast i32 {v}.bits to float", 4 * h + b, magnitudes[b]);
+						code!(decode, "{v}.sign0 = lshr i32 {signs}, {}\n{v}.sign1 = and i32 {v}.sign0, 1\n{v}.sign = shl i32 {v}.sign1, 31\n{v}.bits0 = bitcast float {} to i32\n{v}.bits = xor i32 {v}.bits0, {v}.sign\n{v} = bitcast i32 {v}.bits to float", 4 * h + b, magnitudes[b]);
 						v
 					});
 					quads.push(SpanQuad { decode, weights, offset: format!("{r}.h{h}.o"), group });
 				}
 			}
-			scales
+			scales.into_iter().map(Some).collect()
 		}
 		SpanWeight::IQ4NL => {
 			emit!("{t}.d = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
 			// The sixteen IQ4_NL levels, four to a word, picked by each code.
-			let words: [i32; 4] = std::array::from_fn(|i| i32::from_le_bytes(std::array::from_fn(|b| SPAN_IQ4NL[4 * i + b] as u8)));
+			let words = span_iq4nl_words();
 			for quad in 0..8 {
 				let q = format!("{t}.k{quad}");
 				let mut decode = String::new();
 				code!(decode, "{q}.o = add i32 {t}.slot, {}", 4 * quad);
 				let weights = std::array::from_fn(|b| {
 					let v = format!("{q}.v{b}");
-					code!(decode, "{v}.shift = lshr i32 {t}.q.w{}, {}\n{v}.code = and i32 {v}.shift, 15\n{v}.word = lshr i32 {v}.code, 2\n{v}.odd = icmp eq i32 {v}.word, 1\n{v}.three = icmp eq i32 {v}.word, 3\n{v}.high = icmp uge i32 {v}.word, 2", quad % 4, 8 * b + 4 * (quad / 4));
-					code!(decode, "{v}.low.pair = select i1 {v}.odd, i32 {}, i32 {}\n{v}.high.pair = select i1 {v}.three, i32 {}, i32 {}\n{v}.levels = select i1 {v}.high, i32 {v}.high.pair, i32 {v}.low.pair", words[1], words[0], words[3], words[2]);
-					code!(decode, "{v}.lane = and i32 {v}.code, 3\n{v}.lane8 = shl i32 {v}.lane, 3\n{v}.level0 = lshr i32 {v}.levels, {v}.lane8\n{v}.level = and i32 {v}.level0, 255\n{v}.signed = xor i32 {v}.level, 128\n{v}.bits = or i32 {v}.signed, 1258291200\n{v}.float = bitcast i32 {v}.bits to float\n{v} = fsub float {v}.float, {}", span_float(8388736.0));
+					let level = span_iq4nl_level(&mut decode, &words, t, quad, b);
+					code!(decode, "{v}.signed = xor i32 {level}, 128\n{v}.bits = or i32 {v}.signed, 1258291200\n{v}.float = bitcast i32 {v}.bits to float\n{v} = fsub float {v}.float, {}", span_float(8388736.0));
 					v
 				});
 				quads.push(SpanQuad { decode, weights, offset: format!("{q}.o"), group: 0 });
@@ -3280,6 +3343,223 @@ fn span_task_products(o: &mut String, sets: &[(String, Vec<SpanQuad>, Vec<Option
 			emit!("{prefix}.d{position} = fadd float {total}, 0.0");
 		}
 	}
+}
+/// A scale group of an integer task: `step` multiplies the group's integer sum and `base`,
+/// when the format has group minimums, multiplies the group's activation sum. Both are
+/// scaled by the activation scale of the group's block, which is metadata `at`.
+struct XmadGroup { step: String, base: Option<String>, at: String }
+/// The scale group `g` of an integer task whose block is `block` within the task.
+fn span_xmad_group(o: &mut String, t: &str, g: usize, block: usize, step: String, base: Option<String>) -> XmadGroup {
+	o.push_str(&format!("{t}.mt{g} = add i32 {t}.blk2, {}\n", 2 * block));
+	XmadGroup { step, base, at: format!("{t}.mt{g}") }
+}
+/// The integer quads of task `t` (the XMAD form of `span_task_quads`): each weight decodes
+/// to a small integer, and each group's sum takes its float scales in `span_task_products_xmad`.
+fn span_task_quads_xmad(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<SpanQuad>, Vec<XmadGroup>) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	macro_rules! code { ($s:expr, $($arg:tt)*) => {{ $s.push_str(&format!($($arg)*)); $s.push('\n'); }} }
+	// The metadata of task `cl`'s blocks: two floats per 32-value block, from twice the block index.
+	emit!("{t}.blk2 = mul i32 {cl}, {}", 2 * (w.task() / 32));
+	let mut quads = Vec::new();
+	let mut groups = Vec::new();
+	match w {
+		SpanWeight::Q8_0 => {
+			emit!("{t}.scale = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
+			for m in 0..8 {
+				let mut decode = String::new();
+				code!(decode, "{t}.o{m} = add i32 {t}.slot, {}", 4 * m);
+				let weights = span_int_bytes(&mut decode, &format!("{t}.q{m}"), &format!("{t}.codes.w{m}"), true, 0);
+				quads.push(SpanQuad { decode, weights, offset: format!("{t}.o{m}"), group: 0 });
+			}
+			groups.push(span_xmad_group(o, t, 0, 0, format!("{t}.scale"), None));
+		}
+		SpanWeight::Q4K | SpanWeight::Q5K => {
+			let steps = span_q45k_scales(o, t, cl);
+			for m in 0..8 {
+				let (vector, lane) = if m < 4 { ("high0", m) } else { ("high1", m - 4) };
+				let (low_vector, low_lane) = if m < 4 { ("low0", m) } else { ("low1", m - 4) };
+				let q = format!("{t}.m{m}");
+				let mut decode = String::new();
+				code!(decode, "{q}.ql = extractelement <4 x i32> {t}.{low_vector}, i32 {low_lane}\n{q}.hi.n0 = lshr i32 {q}.ql, 4");
+				if w == SpanWeight::Q5K {
+					code!(decode, "{q}.qh = extractelement <4 x i32> {t}.{vector}, i32 {lane}");
+					code!(decode, "{q}.lo.n = and i32 {q}.ql, 252645135\n{q}.lo.h0 = lshr i32 {q}.qh, {t}.bit.lo\n{q}.lo.h1 = and i32 {q}.lo.h0, 16843009\n{q}.lo.h = shl i32 {q}.lo.h1, 4\n{q}.lo = or i32 {q}.lo.n, {q}.lo.h");
+					code!(decode, "{q}.hi.n = and i32 {q}.hi.n0, 252645135\n{q}.hi.h0 = lshr i32 {q}.qh, {t}.bit.hi\n{q}.hi.h1 = and i32 {q}.hi.h0, 16843009\n{q}.hi.h = shl i32 {q}.hi.h1, 4\n{q}.hi = or i32 {q}.hi.n, {q}.hi.h");
+				} else {
+					code!(decode, "{q}.lo = and i32 {q}.ql, 252645135\n{q}.hi = and i32 {q}.hi.n0, 252645135");
+				}
+				for (half, part) in [(0, "lo"), (1, "hi")] {
+					code!(decode, "{q}.{part}.o = add i32 {t}.slot, {}", 32 * half + 4 * m);
+					let weights = span_int_bytes(&mut decode, &format!("{q}.{part}c"), &format!("{q}.{part}"), false, 0);
+					quads.push(SpanQuad { decode: std::mem::take(&mut decode), weights, offset: format!("{q}.{part}.o"), group: half });
+				}
+			}
+			for (half, (step, base)) in steps.into_iter().enumerate() {
+				groups.push(span_xmad_group(o, t, half, half, step, Some(base)));
+			}
+		}
+		SpanWeight::Q6K => {
+			let steps = span_q6k_steps(o, t, cl);
+			for m in 0..2 {
+				let q = format!("{t}.m{m}");
+				let mut decode = String::new();
+				span_q6k_words(&mut decode, t, m);
+				for stripe in 0..4 {
+					code!(decode, "{q}.r{stripe}.o = add i32 {t}.slot, {}", 32 * stripe + 4 * m);
+					// The 6-bit codes are offset by 32.
+					let weights = span_int_bytes(&mut decode, &format!("{q}.r{stripe}c"), &format!("{q}.r{stripe}"), false, 32);
+					quads.push(SpanQuad { decode: std::mem::take(&mut decode), weights, offset: format!("{q}.r{stripe}.o"), group: stripe });
+				}
+			}
+			for (stripe, step) in steps.into_iter().enumerate() {
+				groups.push(span_xmad_group(o, t, stripe, 0, step, None));
+			}
+		}
+		SpanWeight::IQ2XS | SpanWeight::IQ3XXS => {
+			let (runs, steps) = span_iq_prepare(o, w, t, cl);
+			for (l, (r, words, group, signs)) in runs.into_iter().enumerate() {
+				for (h, word) in words.iter().enumerate() {
+					let mut decode = String::new();
+					code!(decode, "{r}.h{h}.o = add i32 {t}.slot, {}", 8 * l + 4 * h);
+					let magnitudes = span_int_bytes(&mut decode, &format!("{r}.h{h}.m"), word, false, 0);
+					// The sign of value b negates its magnitude: (m xor -s) - (-s) with s the sign bit.
+					let weights = std::array::from_fn(|b| {
+						let v = format!("{r}.h{h}.v{b}");
+						code!(decode, "{v}.sign0 = lshr i32 {signs}, {}\n{v}.sign1 = and i32 {v}.sign0, 1\n{v}.neg = sub i32 0, {v}.sign1\n{v}.x = xor i32 {}, {v}.neg\n{v} = sub i32 {v}.x, {v}.neg", 4 * h + b, magnitudes[b]);
+						v
+					});
+					quads.push(SpanQuad { decode, weights, offset: format!("{r}.h{h}.o"), group });
+				}
+			}
+			for (g, step) in steps.into_iter().enumerate() {
+				groups.push(span_xmad_group(o, t, g, 0, step, None));
+			}
+		}
+		SpanWeight::IQ4NL => {
+			emit!("{t}.d = fpext half {t}.scale.half to float\n{t}.slot = mul i32 {cl}, 36");
+			let words = span_iq4nl_words();
+			for quad in 0..8 {
+				let q = format!("{t}.k{quad}");
+				let mut decode = String::new();
+				code!(decode, "{q}.o = add i32 {t}.slot, {}", 4 * quad);
+				let weights = std::array::from_fn(|b| {
+					let v = format!("{q}.v{b}");
+					let level = span_iq4nl_level(&mut decode, &words, t, quad, b);
+					code!(decode, "{v}.signed = xor i32 {level}, 128\n{v} = sub i32 {v}.signed, 128");
+					v
+				});
+				quads.push(SpanQuad { decode, weights, offset: format!("{q}.o"), group: 0 });
+			}
+			groups.push(span_xmad_group(o, t, 0, 0, format!("{t}.d"), None));
+		}
+		SpanWeight::F32 | SpanWeight::F16 | SpanWeight::BF16 => unreachable!("float formats keep their matvec"),
+	}
+	(quads, groups)
+}
+/// Four staged int16 activations of position `position` at float offset `index` of the chunk,
+/// as i16 values for the XMAD products; named `{q}.h{i}`.
+fn span_activations_int(o: &mut String, q: &str, shared: &str, stride: usize, position: usize, index: &str) -> [String; 4] {
+	o.push_str(&format!("{q}.offset = add i32 {index}, {}\n{q}.at = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.offset\n{q} = load <4 x i32>, ptr addrspace(3) {q}.at, align 16\n", position * stride));
+	std::array::from_fn(|i| {
+		o.push_str(&format!("{q}.e{i} = extractelement <4 x i32> {q}, i32 {i}\n{q}.h{i} = trunc i32 {q}.e{i} to i16\n"));
+		format!("{q}.h{i}")
+	})
+}
+/// The integer form of `span_task_products`: each quad's weights multiply the staged int16
+/// activations into 32-bit chains, which XMAD runs as multiply-adds. Each group's chain sum
+/// then takes its float step, and its minimum when present, times the block's activation
+/// scale and sum at each position, read from the staged metadata.
+fn span_task_products_xmad(o: &mut String, sets: &[(String, Vec<SpanQuad>, Vec<XmadGroup>)], positions: usize, stride: usize, data: usize, shared: &str) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	let Some((first, quads, groups)) = sets.first() else { return };
+	// Two alternating chains per set, group and position keep consecutive products independent.
+	let mut chains: Vec<Vec<Vec<[String; 2]>>> = sets.iter().map(|_| vec![vec![["0".to_owned(), "0".to_owned()]; positions]; groups.len()]).collect();
+	let mut counts = vec![0usize; groups.len()];
+	for (n, quad) in quads.iter().enumerate() {
+		// A compiler fence per quad keeps the optimizer from hoisting every staged load
+		// of the task ahead of its products, which would hold them all in registers.
+		emit!("call void asm sideeffect \"\", \"~{{memory}}\"()");
+		for (_, set, _) in sets { o.push_str(&set[n].decode); }
+		for (prefix, set, _) in sets {
+			for i in 0..4 { emit!("{prefix}.n{n}.w{i}.h = trunc i32 {} to i16", set[n].weights[i]); }
+		}
+		let chain = counts[quad.group] % 2;
+		counts[quad.group] += 1;
+		for position in 0..positions {
+			let x = span_activations_int(o, &format!("{first}.x{position}.{n}"), shared, stride, position, &quad.offset);
+			for (row, (prefix, _, _)) in sets.iter().enumerate() {
+				for (i, value) in x.iter().enumerate() {
+					// One XMAD per product: the 16-bit operands multiply and the chain is the 32-bit addend.
+					let product = format!("{prefix}.p{position}.{n}.{i}");
+					emit!("{product} = call i32 asm \"mad.wide.s16 $0, $1, $2, $3;\", \"=r,h,h,r\"(i16 {prefix}.n{n}.w{i}.h, i16 {value}, i32 {})", chains[row][quad.group][position][chain]);
+					chains[row][quad.group][position][chain] = product;
+				}
+			}
+		}
+	}
+	// Each group's activation scale and sum at every position: loaded once, shared by the sets.
+	let mut scales: Vec<Vec<(String, String)>> = Vec::new();
+	for (g, group) in groups.iter().enumerate() {
+		let mut group_scales = Vec::new();
+		for position in 0..positions {
+			let at = format!("{first}.a{position}.{g}");
+			emit!("{at}.index = add i32 {}, {}\n{at}.ptr = getelementptr float, ptr addrspace(3) @{shared}, i32 {at}.index\n{at}.scale = load float, ptr addrspace(3) {at}.ptr, align 4", group.at, data + position * stride);
+			let sum = if group.base.is_some() {
+				emit!("{at}.sum.index = add i32 {at}.index, 1\n{at}.sum.ptr = getelementptr float, ptr addrspace(3) @{shared}, i32 {at}.sum.index\n{at}.sum = load float, ptr addrspace(3) {at}.sum.ptr, align 4");
+				format!("{at}.sum")
+			} else {
+				String::new()
+			};
+			group_scales.push((format!("{at}.scale"), sum));
+		}
+		scales.push(group_scales);
+	}
+	for (row, (prefix, _, row_groups)) in sets.iter().enumerate() {
+		for position in 0..positions {
+			let mut total = "0.0".to_owned();
+			for (g, group) in row_groups.iter().enumerate() {
+				let [first_chain, second_chain] = &chains[row][g][position];
+				let (scale, sum) = &scales[g][position];
+				let s = format!("{prefix}.s{position}.{g}");
+				emit!("{s}.i = add i32 {first_chain}, {second_chain}\n{s}.f = sitofp i32 {s}.i to float\n{s}.step = fmul float {}, {scale}", group.step);
+				let next = format!("{prefix}.t{position}.{g}");
+				emit!("{next}.f = call float @llvm.fmuladd.f32(float {s}.f, float {s}.step, float {total})");
+				match &group.base {
+					Some(base) => emit!("{s}.base0 = fmul float {base}, {scale}\n{s}.base = fmul float {s}.base0, {sum}\n{next} = fadd float {next}.f, {s}.base"),
+					None => emit!("{next} = fadd float {next}.f, 0.0"),
+				}
+				total = next;
+			}
+			emit!("{prefix}.d{position} = fadd float {total}, 0.0");
+		}
+	}
+}
+/// After a chunk is staged, quantizes each position's 32-value blocks to int16 in place. A
+/// block's scale is its largest magnitude over 32767, and its sum is the sum of its int16
+/// values; both are stored as floats in the metadata after the `data` floats of the plane.
+fn span_quantize(o: &mut String, p: &str, data: usize, stride: usize, task: usize, positions: usize, shared: &str, pad: usize) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	let (blocks, shift) = (task / 32, pad.trailing_zeros());
+	emit!("{p}.stage.done:\ncall void @llvm.nvvm.barrier0()\n%{p}.qn = mul i32 %{p}.ctasks, {blocks}\n%{p}.qitems = mul i32 %{p}.qn, {positions}\nbr label %{p}.quant");
+	emit!("{p}.quant:\n%{p}.qi = phi i32 [ %tid, %{p}.stage.done ], [ %{p}.qi.next, %{p}.quant.body ]\n%{p}.qi.more = icmp ult i32 %{p}.qi, %{p}.qitems\nbr i1 %{p}.qi.more, label %{p}.quant.body, label %{p}.quant.done");
+	emit!("{p}.quant.body:\n%{p}.qpos = udiv i32 %{p}.qi, %{p}.qn\n%{p}.qblk = urem i32 %{p}.qi, %{p}.qn\n%{p}.qk = shl i32 %{p}.qblk, 5\n%{p}.qper = lshr i32 %{p}.qk, {shift}\n%{p}.qgap = shl i32 %{p}.qper, 2\n%{p}.qslot = add i32 %{p}.qk, %{p}.qgap\n%{p}.qplane = mul i32 %{p}.qpos, {stride}\n%{p}.qbase = add i32 %{p}.qslot, %{p}.qplane");
+	for t in 0..32 {
+		emit!("%{p}.qv{t}.index = add i32 %{p}.qbase, {t}\n%{p}.qv{t}.at = getelementptr float, ptr addrspace(3) @{shared}, i32 %{p}.qv{t}.index\n%{p}.qv{t}.f = load float, ptr addrspace(3) %{p}.qv{t}.at, align 4\n%{p}.qa{t} = call float @llvm.fabs.f32(float %{p}.qv{t}.f)");
+	}
+	let mut top = format!("%{p}.qa0");
+	for t in 1..32 {
+		emit!("%{p}.qm{t} = call float @llvm.maxnum.f32(float {top}, float %{p}.qa{t})");
+		top = format!("%{p}.qm{t}");
+	}
+	emit!("%{p}.qzero = fcmp oeq float {top}, 0.0\n%{p}.qsafe = select i1 %{p}.qzero, float 1.0, float {top}\n%{p}.qinv0 = fdiv float 32767.0, %{p}.qsafe\n%{p}.qinv = select i1 %{p}.qzero, float 0.0, float %{p}.qinv0\n%{p}.qscale0 = fdiv float {top}, 32767.0\n%{p}.qscale = select i1 %{p}.qzero, float 0.0, float %{p}.qscale0");
+	for t in 0..32 {
+		emit!("%{p}.qr{t} = fmul float %{p}.qv{t}.f, %{p}.qinv\n%{p}.qround{t} = call float @llvm.round.f32(float %{p}.qr{t})\n%{p}.qq{t} = fptosi float %{p}.qround{t} to i32\nstore i32 %{p}.qq{t}, ptr addrspace(3) %{p}.qv{t}.at, align 4");
+	}
+	emit!("%{p}.qsum0 = add i32 %{p}.qq0, 0");
+	for t in 1..32 { emit!("%{p}.qsum{t} = add i32 %{p}.qsum{}, %{p}.qq{t}", t - 1); }
+	emit!("%{p}.qsumf = sitofp i32 %{p}.qsum31 to float");
+	emit!("%{p}.qmeta0 = shl i32 %{p}.qblk, 1\n%{p}.qmeta1 = add i32 %{p}.qmeta0, {data}\n%{p}.qmeta = add i32 %{p}.qmeta1, %{p}.qplane\n%{p}.qmeta.at = getelementptr float, ptr addrspace(3) @{shared}, i32 %{p}.qmeta\nstore float %{p}.qscale, ptr addrspace(3) %{p}.qmeta.at, align 4\n%{p}.qsum.index = add i32 %{p}.qmeta, 1\n%{p}.qsum.at = getelementptr float, ptr addrspace(3) @{shared}, i32 %{p}.qsum.index\nstore float %{p}.qsumf, ptr addrspace(3) %{p}.qsum.at, align 4");
+	emit!("%{p}.qi.next = add i32 %{p}.qi, %ntid\nbr label %{p}.quant\n{p}.quant.done:\ncall void @llvm.nvvm.barrier0()\nbr label %{p}.compute\n{p}.compute:");
 }
 const _: () = assert!(SPAN_TILE_FLOATS * 4 == PackedMatvec::SHARED_BYTES);
 /// The row planes of a decode contraction the position-batched matvec reads, each
