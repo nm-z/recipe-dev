@@ -33221,8 +33221,10 @@ impl Gpu {
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if self.backend==Backend::Nvidia && !graph.expert_layers.is_empty() {
-			// RECIPE_EXPERT_WAVES: warps per block for the expert-split model, 8 (256 threads) or 16 (512); 16 needs RECIPE_MAXRREG <= 128.
-			std::env::var("RECIPE_EXPERT_WAVES").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| matches!(value, 8 | 16)).unwrap_or(8)
+			// RECIPE_EXPERT_WAVES: warps per block for the expert-split model, 16 (512 threads, needs RECIPE_MAXRREG <= 128) or 8
+			// (256). With the leader-spin grid barrier, 16 took the main die's verify window from 100.5 to 95.8 ms, the sum of
+			// each op's median (20261013T073458-gputest-1 -> 20261013T073721-gputest-1).
+			std::env::var("RECIPE_EXPERT_WAVES").ok().and_then(|value| value.parse::<u32>().ok()).filter(|value| matches!(value, 8 | 16)).unwrap_or(16)
 		} else if cpu {
 			1
 		} else {
@@ -41433,11 +41435,24 @@ fn split_grid() -> String {
 	let published = ir.value("call i32 @split_local_publish(ptr addrspace(1) %s, ptr addrspace(1) %f, i32 %q, i64 %d)");
 	let needed = ir.value(format!("icmp ne i32 {published}, 0"));
 	ir.inst(format!("br i1 {needed}, label %wait, label %done"));
+	// Only each block's first thread spins on the flag and the rest wait at the block barrier: every thread spinning put
+	// 8192 loads on one word per worker die and cost 1.1 us a barrier at 32 blocks of 256 threads, 1.1 us at 16 of 512
+	// (span-bench gb, die 03, 50000 rounds with every thread checking a peer's write, no stale reads).
 	ir.label("wait");
+	let tid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.tid.x()");
+	let lead = ir.value(format!("icmp eq i32 {tid}, 0"));
+	ir.inst(format!("br i1 {lead}, label %spin, label %joined"));
+	ir.label("spin");
 	let receipt = ir.value("call i32 @split_local_wait(ptr addrspace(1) %f, i32 %q, i64 %d)");
+	ir.inst(format!("store i32 {receipt}, ptr addrspace(3) @split_grid_receipt, align 4"));
+	ir.inst("br label %joined");
+	ir.label("joined");
+	ir.inst("call void @llvm.nvvm.barrier0()");
+	let shared = ir.value("load i32, ptr addrspace(3) @split_grid_receipt, align 4");
+	ir.inst("fence syncscope(\"device\") seq_cst");
 	ir.inst("br label %done");
 	ir.label("done");
-	let result = ir.value(format!("phi i32 [ {published}, %entry ], [ {receipt}, %wait ]"));
+	let result = ir.value(format!("phi i32 [ {published}, %entry ], [ {shared}, %joined ]"));
 	ir.inst(format!("ret i32 {result}"));
 	ir.function("define i32 @split_grid(ptr addrspace(1) %s, ptr addrspace(1) %f, i32 %q, i64 %d)")
 }
@@ -43414,7 +43429,7 @@ fn expert_forward_declarations() -> String {
 const LL_READ: &str = "declare void @llvm.trap()\ndefine internal i32 @ll_read(ptr addrspace(1) %base, i32 %index, i32 %seq, i64 %deadline) #2 {\nentry:\n%wide = zext i32 %index to i64\n%at = getelementptr <2 x i32>, ptr addrspace(1) %base, i64 %wide\nbr label %poll\npoll:\n%word = load volatile <2 x i32>, ptr addrspace(1) %at, align 8\n%tag = extractelement <2 x i32> %word, i32 1\n%ready = icmp eq i32 %tag, %seq\nbr i1 %ready, label %done, label %late\nlate:\n%now = call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()\n%expired = icmp uge i64 %now, %deadline\nbr i1 %expired, label %fail, label %poll\nfail:\ncall void @llvm.trap()\nunreachable\ndone:\n%value = extractelement <2 x i32> %word, i32 0\nret i32 %value\n}\n";
 /// The module text for the expert forward device functions.
 pub fn expert_forward_ir() -> String {
-	let mut module = String::from("@scratch = external addrspace(3) global [0 x i8], align 16\n");
+	let mut module = String::from("@scratch = external addrspace(3) global [0 x i8], align 16\n@split_grid_receipt = internal addrspace(3) global i32 undef, align 4\n");
 	module += &expert_forward_declarations();
 	module += "\n";
 	module += LL_READ;
