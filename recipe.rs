@@ -13139,6 +13139,7 @@ mod bundle {
 use std::os::unix::{
 	ffi::OsStrExt,
 	fs::{OpenOptionsExt, PermissionsExt},
+	net::{UnixListener, UnixStream},
 };
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -13153,8 +13154,9 @@ use std::{
 	process::{Command, Stdio},
 	ptr,
 	sync::{
-		Arc, Mutex, OnceLock,
+		Arc, Condvar, Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
+		mpsc::{Receiver, SyncSender, sync_channel},
 	},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27989,7 +27991,27 @@ impl<R: Read, W: Write> Wire<R, W> {
 		}
 	}
 }
-type RemoteChannel = Wire<std::process::ChildStdout, std::process::ChildStdin>;
+struct RemoteReader {
+	pipe: std::process::ChildStdout,
+	deadline: Option<Instant>,
+}
+impl Read for RemoteReader {
+	fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+		#[cfg(unix)]
+		if let Some(deadline) = self.deadline {
+			use std::os::fd::AsRawFd;
+			loop {
+				let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "remote worker greeting timed out"))?;
+				let mut descriptor = PollFd { fd: self.pipe.as_raw_fd(), events: 1, revents: 0 };
+				let ready = unsafe { poll(&mut descriptor, 1, remaining.as_millis().min(i32::MAX as u128) as i32) };
+				if ready > 0 { break; }
+				if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted { return Err(std::io::Error::last_os_error()); }
+			}
+		}
+		self.pipe.read(bytes)
+	}
+}
+type RemoteChannel = Wire<RemoteReader, std::process::ChildStdin>;
 struct Remote {
 	channel: Mutex<RemoteChannel>,
 	wave: u32,
@@ -28802,16 +28824,43 @@ fn selected_gpu() -> Result<&'static Gpu> {
 struct RemoteDirectory {
 	host: String,
 	path: String,
+	environment: Option<Vec<(String, String)>>,
 }
 impl Drop for RemoteDirectory {
 	fn drop(&mut self) {
-		Command::new("ssh").args(["-o", "BatchMode=yes", &self.host, &format!("rm -rf -- {}", self.path)]).status().ok();
+		let mut command = remote_process("ssh", self.environment.as_deref());
+		command.args([&self.host, &format!("rm -rf -- {}", self.path)]);
+		remote_output(&mut command, "remove private worker directory").ok();
 	}
 }
-fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
-	let output = command.output().map_err(|error| RecipeError::new(format!("cannot {action}: {error}")))?;
-	require(output.status.success(), format!("cannot {action}: {}", String::from_utf8_lossy(&output.stderr)))?;
-	Ok(output.stdout)
+
+fn remote_process(program: &str, settings: Option<&[(String, String)]>) -> Command {
+	let mut command = Command::new(program);
+	if let Some(settings) = settings { command.env_clear().envs(settings.iter().map(|(key, value)| (key, value))); }
+	if matches!(program, "ssh" | "scp") {
+		command.args(["-o", "BatchMode=yes", "-o", &format!("ConnectTimeout={}", env!("RECIPE_RUNTIME_CONNECT_SECONDS"))]);
+	}
+	command
+}
+
+fn remote_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
+	let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| RecipeError::new(format!("cannot {action}: {error}")))?;
+	let read = |mut pipe: Box<dyn Read + Send>| std::thread::spawn(move || { let mut bytes = Vec::new(); pipe.read_to_end(&mut bytes).map(|_| bytes) });
+	let output = read(Box::new(child.stdout.take().unwrap()));
+	let error = read(Box::new(child.stderr.take().unwrap()));
+	let deadline = Instant::now() + Duration::from_secs(env!("RECIPE_RUNTIME_CONNECT_SECONDS").parse().expect("validated remote connection deadline"));
+	let status = loop {
+		if let Some(status) = child.try_wait().map_err(|error| RecipeError::new(format!("cannot wait to {action}: {error}")))? { break status; }
+		if Instant::now() >= deadline {
+			child.kill().ok(); child.wait().ok();
+			return Err(RecipeError::new(format!("timed out while attempting to {action}")));
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	};
+	let bytes = output.join().map_err(|_| RecipeError::new("remote output reader panicked"))?.map_err(|error| RecipeError::new(error.to_string()))?;
+	let errors = error.join().map_err(|_| RecipeError::new("remote error reader panicked"))?.map_err(|error| RecipeError::new(error.to_string()))?;
+	require(status.success(), format!("cannot {action}: {}", String::from_utf8_lossy(&errors).trim()))?;
+	Ok(bytes)
 }
 fn shell_argument(value: &str) -> String {
 	format!("'{}'", value.replace('\'', "'\\''"))
@@ -28849,7 +28898,10 @@ pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&
 			.status().map_err(|error| RecipeError::new(format!("cannot send runtime templates to {host}: {error}")))?;
 		require(status.success(), format!("cannot send runtime templates to {host}: {status}"))?;
 	}
-	let mut environment = std::env::vars().filter(|(name, _)| (name.starts_with("RECIPE_") || name.starts_with("RNJ_") || name == "TERM") && !matches!(name.as_str(), "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_CONFIG")).collect::<Vec<_>>();
+	let mut environment = std::env::vars().filter(|(name, _)| {
+		(name.starts_with("RECIPE_") || name.starts_with("RNJ_") || name == "TERM")
+			&& !matches!(name.as_str(), "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_CONFIG" | "RECIPE_RUNTIME_JOB")
+	}).collect::<Vec<_>>();
 	environment.push(("RECIPE_DEVICE".to_owned(), devices));
 	environment.push(("RECIPE_BINARY".to_owned(), remote_recipe));
 	environment.push(("RECIPE_TEMPLATE_ROOT".to_owned(), directory.path.clone()));
@@ -28869,9 +28921,12 @@ pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&
 	Ok(Some(status))
 }
 fn remote_directory(host: &str) -> Result<RemoteDirectory> {
-	let mut command = Command::new("ssh");
-	command.args(["-o", "BatchMode=yes", host, "umask 077; base=\"$HOME/.cache/recipe/native\"; mkdir -p -- \"$base\" && chmod 700 -- \"$base\" && mktemp -d \"$base/remote-worker.XXXXXXXX\""]);
-	let output = command_output(&mut command, &format!("create a private worker directory on {host}"))?;
+	remote_directory_configured(host, None)
+}
+fn remote_directory_configured(host: &str, settings: Option<&[(String, String)]>) -> Result<RemoteDirectory> {
+	let mut command = remote_process("ssh", settings);
+	command.args([host, "umask 077; base=\"$HOME/.cache/recipe/native\"; mkdir -p -- \"$base\" && chmod 700 -- \"$base\" && mktemp -d \"$base/remote-worker.XXXXXXXX\""]);
+	let output = remote_output(&mut command, &format!("create a private worker directory on {host}"))?;
 	let path = String::from_utf8(output).map_err(|error| RecipeError::new(format!("worker directory from {host} is invalid: {error}")))?.trim().to_owned();
 	let marker = "/.cache/recipe/native/remote-worker.";
 	let (prefix, suffix) = path.rsplit_once(marker).ok_or_else(|| RecipeError::new(format!("worker directory from {host} is unsafe: {path:?}")))?;
@@ -28885,40 +28940,39 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 			&& suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
 		format!("worker directory from {host} is unsafe: {path:?}"),
 	)?;
-	Ok(RemoteDirectory { host: host.to_owned(), path })
+	Ok(RemoteDirectory { host: host.to_owned(), path, environment: settings.map(<[_]>::to_vec) })
 }
 /// Uploads this build's `recipe` binary to the remote host, starts it as a
 /// device worker over SSH, and wraps the probed device as a local `Gpu` whose
 /// driver speaks the worker protocol.
 fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
+	connect_remote_configured(host, device_name, canonical, None)
+}
+fn connect_remote_configured(host: &str, device_name: &str, canonical: &str, settings: Option<&[(String, String)]>) -> Result<&'static Gpu> {
 	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
 	for (kind, value) in [("node", host), ("device", device_name)] {
 		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
 	}
-	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
-	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
+	if let Some(gpu) = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?.iter().find(|gpu| gpu.name == canonical) {
 		return Ok(gpu);
 	}
-	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach node {host:?}")))?;
+	let binary = if settings.is_some() { std::env::current_exe().map_err(|error| RecipeError::new(error.to_string()))? }
+		else { std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach node {host:?}")))? };
 	require(binary.is_file(), format!("recipe binary is absent at {}", binary.display()))?;
-	let directory = remote_directory(host)?;
+	let directory = remote_directory_configured(host, settings)?;
 	let remote_path = format!("{}/recipe", directory.path);
-	let copy = Command::new("scp")
-		.args(["-q", "-o", "BatchMode=yes"])
-		.arg(&binary)
-		.arg(format!("{host}:{remote_path}"))
-		.status()
-		.map_err(|error| RecipeError::new(format!("cannot copy the worker to {host}: {error}")))?;
-	require(copy.success(), format!("cannot copy the worker to {host}: {copy}"))?;
-	let mut local_hash = Command::new("sha256sum");
+	let mut copy = remote_process("scp", settings);
+	copy.arg("-q").arg(&binary).arg(format!("{host}:{remote_path}"));
+	remote_output(&mut copy, &format!("copy the worker to {host}"))?;
+	let mut local_hash = remote_process("sha256sum", settings);
 	local_hash.arg(&binary);
-	let local_hash = command_output(&mut local_hash, "hash the local worker")?;
-	let mut remote_hash = Command::new("ssh");
-	remote_hash.args(["-o", "BatchMode=yes", host, &format!("sha256sum {remote_path}")]);
-	let remote_hash = command_output(&mut remote_hash, &format!("hash the copied worker on {host}"))?;
+	let local_hash = remote_output(&mut local_hash, "hash the local worker")?;
+	let mut remote_hash = remote_process("ssh", settings);
+	remote_hash.args([host, &format!("sha256sum {remote_path}")]);
+	let remote_hash = remote_output(&mut remote_hash, &format!("hash the copied worker on {host}"))?;
 	require(local_hash.split(|byte| byte.is_ascii_whitespace()).next() == remote_hash.split(|byte| byte.is_ascii_whitespace()).next(), format!("copied worker hash differs on {host}"))?;
-	let mut child = Command::new("ssh")
-		.args(["-o", "BatchMode=yes", host, &format!("{remote_path} --device {device_name}")])
+	let mut child = remote_process("ssh", settings)
+		.args([host, &format!("{remote_path} --device {device_name}")])
 		.stdin(std::process::Stdio::piped())
 		.stdout(std::process::Stdio::piped())
 		.spawn()
@@ -28926,7 +28980,8 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let input = child.stdin.take().ok_or_else(|| RecipeError::new("remote worker stdin is absent"))?;
 	let output = child.stdout.take().ok_or_else(|| RecipeError::new("remote worker stdout is absent"))?;
 	std::thread::spawn(move || child.wait());
-	let mut channel = RemoteChannel { input: std::io::BufReader::new(output), output: std::io::BufWriter::new(input), role: "remote" };
+	let deadline = Instant::now() + Duration::from_secs(env!("RECIPE_RUNTIME_CONNECT_SECONDS").parse().expect("validated remote connection deadline"));
+	let mut channel = RemoteChannel { input: std::io::BufReader::new(RemoteReader { pipe: output, deadline: Some(deadline) }), output: std::io::BufWriter::new(input), role: "remote" };
 	channel.read_status(&format!("worker on {host}"))?;
 	let backend = match channel.read_u8()? {
 		1 => Backend::Amd,
@@ -28943,6 +28998,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let shared_limit = channel.read_u32()?;
 	let wave = channel.read_u32()?;
 	let worker_threads = channel.read_u32()?;
+	channel.input.get_mut().deadline = None;
 	require(worker_threads != 0, "remote worker thread count is empty")?;
 	drop(directory);
 	let native_target = match backend {
@@ -28950,6 +29006,8 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 		Backend::Amd => BackendTarget::Amd { architecture },
 		Backend::Nvidia => BackendTarget::Nvidia { architecture },
 	};
+	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
+	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) { return Ok(gpu); }
 	let gpu = Box::leak(Box::new(Gpu {
 		name: canonical.to_owned(),
 		backend,
@@ -37510,4 +37568,911 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+// ---------------------------------------------------------------------------
+// Authoritative runtime: a shared daemon that schedules independent Recipe
+// runs across discovered devices over a Unix socket.
+// ---------------------------------------------------------------------------
+
+const RUNTIME_SUBMIT: u8 = 12;
+const RUNTIME_QUEUED: u8 = 2;
+const RUNTIME_PREPARING: u8 = 3;
+const RUNTIME_RUNNING: u8 = 4;
+const RUNTIME_STDOUT: u8 = 5;
+const RUNTIME_STDERR: u8 = 6;
+const RUNTIME_COMPLETED: u8 = 7;
+const RUNTIME_FAILED: u8 = 8;
+const RUNTIME_STATUS: u8 = 9;
+const RUNTIME_INPUT: u8 = 10;
+const RUNTIME_INPUT_END: u8 = 11;
+const RUNTIME_HELLO: u8 = 13;
+const RUNTIME_RESIZE: u8 = 14;
+
+#[cfg(unix)]
+fn runtime_setting(name: &str) -> bool {
+	!matches!(name, "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_RUNTIME_JOB" | "RECIPE_RUNTIME_PARENT" | "RECIPE_RUNTIME_NODE" | "RECIPE_RUNTIME_TTY" | "RECIPE_RUNTIME_SIZE")
+}
+
+#[cfg(unix)]
+fn runtime_identity() -> Result<[u8; 8]> {
+	static IDENTITY: OnceLock<Result<[u8; 8]>> = OnceLock::new();
+	IDENTITY.get_or_init(|| {
+		#[cfg(target_os = "linux")]
+		let binary = fs::read("/proc/self/exe");
+		#[cfg(not(target_os = "linux"))]
+		let binary = std::env::current_exe().and_then(fs::read);
+		let binary = binary.map_err(|error| RecipeError::new(format!("cannot identify Recipe executable: {error}")))?;
+		Ok(binary.iter().fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)).to_le_bytes())
+	}).clone()
+}
+
+fn runtime_socket_path() -> PathBuf {
+	std::env::var("RECIPE_RUNTIME_SOCKET").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("RECIPE_RUNTIME_SOCKET")))
+}
+
+fn runtime_frame_limit() -> usize {
+	env!("RECIPE_RUNTIME_FRAME_BYTES").parse::<usize>().expect("validated runtime frame limit")
+}
+
+fn runtime_stream_limit() -> usize {
+	env!("RECIPE_RUNTIME_STREAM_BYTES").parse::<usize>().expect("validated runtime stream limit")
+}
+
+fn runtime_idle_seconds() -> u64 {
+	env!("RECIPE_RUNTIME_IDLE_SECONDS").parse::<u64>().expect("validated runtime idle period")
+}
+
+fn runtime_poll_interval() -> Duration {
+	Duration::from_millis(env!("RECIPE_RUNTIME_POLL_MILLISECONDS").parse().expect("validated runtime polling interval"))
+}
+
+#[cfg(unix)]
+fn runtime_lock_path() -> PathBuf {
+	std::env::var("RECIPE_RUNTIME_LOCK").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(env!("RECIPE_RUNTIME_LOCK")))
+}
+
+/// Framed message: [u8 verb][u32 length][bytes payload]
+#[cfg(unix)]
+fn runtime_send(stream: &mut UnixStream, verb: u8, payload: &[u8]) -> Result<()> {
+	let length = u32::try_from(payload.len()).map_err(|_| RecipeError::new("runtime frame too large"))?;
+	let mut header = [0_u8; 5];
+	header[0] = verb;
+	header[1..5].copy_from_slice(&length.to_le_bytes());
+	stream.write_all(&header).map_err(|e| RecipeError::new(format!("runtime send: {e}")))?;
+	stream.write_all(payload).map_err(|e| RecipeError::new(format!("runtime send: {e}")))?;
+	stream.flush().map_err(|e| RecipeError::new(format!("runtime flush: {e}")))
+}
+
+#[cfg(unix)]
+fn runtime_recv(stream: &mut UnixStream, limit: usize) -> Result<(u8, Vec<u8>)> {
+	let mut header = [0_u8; 5];
+	stream.read_exact(&mut header).map_err(|e| RecipeError::new(format!("runtime recv: {e}")))?;
+	let verb = header[0];
+	let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+	require(length <= limit, format!("runtime frame exceeds {limit} bytes"))?;
+	let mut payload = vec![0_u8; length];
+	stream.read_exact(&mut payload).map_err(|e| RecipeError::new(format!("runtime recv: {e}")))?;
+	Ok((verb, payload))
+}
+
+// --- Runtime daemon state ---
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RuntimeJobState {
+	Queued,
+	Preparing,
+	Running,
+	Completed,
+	Failed,
+}
+
+#[cfg(unix)]
+impl RuntimeJobState {
+	fn terminal(self) -> bool { matches!(self, Self::Completed | Self::Failed) }
+}
+
+#[cfg(unix)]
+struct RuntimeJob {
+	id: u64,
+	state: RuntimeJobState,
+	name: String,
+	source: String,
+	cwd: String,
+	requested: Vec<usize>,
+	devices: Vec<usize>,
+	arguments: Vec<String>,
+	settings: Vec<(String, String)>,
+	status: Option<i32>,
+	parent: Option<u64>,
+	terminal: Option<fs::File>,
+	input: Option<Receiver<Vec<u8>>>,
+	output: Option<SyncSender<RuntimeOutput>>,
+}
+
+#[cfg(unix)]
+struct RuntimeDevice {
+	name: String,
+	exclusive: bool,
+	owner: Option<u64>,
+}
+
+#[cfg(unix)]
+struct RuntimeState {
+	next_job: u64,
+	jobs: VecDeque<RuntimeJob>,
+	devices: Vec<RuntimeDevice>,
+}
+
+#[cfg(unix)]
+struct RuntimeBackend {
+	state: Mutex<RuntimeState>,
+	discovery: Mutex<()>,
+	discovered_all: AtomicBool,
+	changed: Condvar,
+	clients: AtomicUsize,
+}
+
+#[cfg(unix)]
+enum RuntimeOutput {
+	Bytes(u8, Vec<u8>),
+	Finished(i32),
+}
+
+#[cfg(unix)]
+fn runtime_discover_devices() -> Result<Vec<RuntimeDevice>> {
+	let host = local_host()?;
+	Ok(vec![RuntimeDevice { name: format!("{host}:cpu"), exclusive: false, owner: None }])
+}
+
+#[cfg(unix)]
+fn runtime_discover_request(backend: &RuntimeBackend, request: &str, settings: Option<&[(String, String)]>) -> Result<()> {
+	let host = local_host()?;
+	let names = if request.is_empty() { Vec::new() } else { device_names(request)? };
+	let mut local = Vec::new();
+	let mut found = Vec::new();
+	for name in names {
+		let canonical = if name.contains(':') { name } else { format!("{host}:{name}") };
+		if backend.state.lock().unwrap().devices.iter().any(|device| device.name == canonical) { continue; }
+		let (node, device) = canonical.split_once(':').unwrap();
+		if node == host { local.push(device.to_owned()); }
+		else {
+			let gpu = connect_remote_configured(node, device, &canonical, settings)?;
+			found.push(RuntimeDevice { name: canonical, exclusive: gpu.backend != Backend::Cpu, owner: None });
+		}
+	}
+	let discover_all = request.is_empty() && !backend.discovered_all.load(Ordering::Acquire);
+	if discover_all || !local.is_empty() {
+		let _discovery = backend.discovery.lock().unwrap();
+		for load in [load_amd as fn(Option<&[String]>) -> Result<Vec<Gpu>>, load_nvidia] {
+			for gpu in load(if discover_all { None } else { Some(&local) }).unwrap_or_default() {
+				found.push(RuntimeDevice { name: format!("{host}:{}", gpu.name), exclusive: true, owner: None });
+			}
+		}
+		if discover_all { backend.discovered_all.store(true, Ordering::Release); }
+	}
+	let mut state = backend.state.lock().unwrap();
+	for device in found {
+		if !state.devices.iter().any(|known| known.name == device.name) { state.devices.push(device); }
+	}
+	Ok(())
+}
+
+#[cfg(unix)]
+fn runtime_schedule(backend: &Arc<RuntimeBackend>) {
+	let mut dispatched = Vec::new();
+	{
+		let mut state = backend.state.lock().unwrap();
+		let job_count = state.jobs.len();
+		for i in 0..job_count {
+			if state.jobs[i].state != RuntimeJobState::Queued { continue; }
+			let requested = state.jobs[i].requested.clone();
+			// Unnamed accelerator jobs wait for a reservation instead of spilling into the CPU pool.
+			let eligible = if requested.is_empty() {
+				if state.devices.iter().any(|device| device.exclusive) {
+					state.devices.iter().position(|device| device.exclusive && device.owner.is_none())
+				} else { state.devices.iter().position(|device| !device.exclusive) }
+				.map(|index| vec![index])
+			} else {
+				requested.iter().all(|index| !state.devices[*index].exclusive || state.devices[*index].owner.is_none()).then_some(requested)
+			};
+			if let Some(indices) = eligible {
+				state.jobs[i].state = RuntimeJobState::Preparing;
+				state.jobs[i].devices = indices.clone();
+				let job_id = state.jobs[i].id;
+				for index in indices {
+					if state.devices[index].exclusive { state.devices[index].owner = Some(job_id); }
+				}
+				dispatched.push(job_id);
+			}
+		}
+		backend.changed.notify_all();
+	}
+
+	for job_id in dispatched {
+		let backend_clone = Arc::clone(backend);
+		std::thread::spawn(move || runtime_dispatch(&backend_clone, job_id));
+	}
+}
+
+#[cfg(unix)]
+fn runtime_dispatch(backend: &Arc<RuntimeBackend>, job_id: u64) {
+	let (source, cwd, device_name, arguments, settings, input, output) = {
+		let mut state = backend.state.lock().unwrap();
+		let index = state.jobs.iter().position(|job| job.id == job_id).unwrap();
+		let device_name = state.jobs[index].devices.iter().map(|device| state.devices[*device].name.as_str()).collect::<Vec<_>>().join(".");
+		let output = state.jobs[index].output.clone();
+		let input = state.jobs[index].input.take();
+		let job = &state.jobs[index];
+		(job.source.clone(), job.cwd.clone(), device_name, job.arguments.clone(), job.settings.clone(), input.unwrap(), output)
+	};
+	if let Some(output) = &output { output.send(RuntimeOutput::Bytes(RUNTIME_PREPARING, device_name.as_bytes().to_vec())).ok(); }
+	let result = runtime_run_job(backend, job_id, &source, &cwd, &device_name, &arguments, &settings, input, output.as_ref());
+	match result {
+		Ok(status) => runtime_finish(backend, job_id, output, status),
+		Err(message) => runtime_abort(backend, job_id, output, &message),
+	}
+}
+
+/// Runs one job as a child `recipe run` process. Output is forwarded while the
+/// child runs, so a large output cannot block the child on a full pipe.
+#[cfg(unix)]
+fn runtime_run_job(
+	backend: &RuntimeBackend, job_id: u64, source: &str, cwd: &str, device_name: &str, arguments: &[String], settings: &[(String, String)],
+	input: Receiver<Vec<u8>>, output: Option<&SyncSender<RuntimeOutput>>,
+) -> std::result::Result<i32, String> {
+	let binary = std::env::current_exe().map_err(|e| format!("cannot locate recipe: {e}"))?;
+	let terminal = settings.iter().find(|(name, _)| name == "RECIPE_RUNTIME_TTY").and_then(|(_, value)| value.parse::<u8>().ok()).unwrap_or(0);
+	let size = settings.iter().find(|(name, _)| name == "RECIPE_RUNTIME_SIZE").and_then(|(_, value)| value.split_once(','))
+		.and_then(|(rows, columns)| Some([rows.parse::<u16>().ok()?, columns.parse::<u16>().ok()?, 0, 0])).unwrap_or([0; 4]);
+	let mut pty = if terminal == 0 { None } else { Some(runtime_pty(size).map_err(|error| error.to_string())?) };
+	if let Some((master, _)) = &pty {
+		let mut state = backend.state.lock().unwrap();
+		if let Some(job) = state.jobs.iter_mut().find(|job| job.id == job_id) {
+			job.terminal = Some(master.try_clone().map_err(|error| error.to_string())?);
+			if let Some((_, size)) = job.settings.iter().find(|(name, _)| name == "RECIPE_RUNTIME_SIZE") {
+				if let Some((rows, columns)) = size.split_once(',').and_then(|(rows, columns)| Some((rows.parse::<u16>().ok()?, columns.parse::<u16>().ok()?))) {
+					runtime_resize_pty(master, [rows, columns, 0, 0]).map_err(|error| error.to_string())?;
+				}
+			}
+		}
+	}
+	let mut command = Command::new(&binary);
+	command.env_clear();
+	command.stdin(if terminal & 1 == 0 { Stdio::piped() } else { Stdio::from(pty.as_ref().unwrap().1.try_clone().map_err(|error| error.to_string())?) });
+	command.stdout(if terminal & 2 == 0 { Stdio::piped() } else { Stdio::from(pty.as_ref().unwrap().1.try_clone().map_err(|error| error.to_string())?) });
+	command.stderr(if terminal & 4 == 0 { Stdio::piped() } else { Stdio::from(pty.as_ref().unwrap().1.try_clone().map_err(|error| error.to_string())?) });
+	let mut child = command.arg("run")
+		.arg(source)
+		.arg("--device")
+		.arg(device_name)
+		.arg("--")
+		.args(arguments)
+		.current_dir(cwd)
+		.env_remove("RECIPE_DEVICE")
+		.envs(settings.iter().map(|(key, value)| (key, value)))
+		.env("RECIPE_RUNTIME_SOCKET", runtime_socket_path())
+		.env("RECIPE_RUNTIME_JOB", job_id.to_string())
+		.env("RECIPE_RUNTIME_NODE", local_host().map_err(|error| error.to_string())?)
+		.spawn()
+		.map_err(|e| format!("cannot start recipe run: {e}"))?;
+	let mut stdin: Box<dyn Write + Send> = if terminal & 1 == 0 { Box::new(child.stdin.take().ok_or("cannot capture job stdin")?) }
+		else { Box::new(pty.as_ref().unwrap().0.try_clone().map_err(|error| error.to_string())?) };
+	std::thread::spawn(move || {
+		for bytes in input { if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() { return; } }
+		if terminal & 1 != 0 { stdin.write_all(&[4, 4]).ok(); }
+	});
+	let stream_limit = runtime_stream_limit();
+	let (tx, rx) = sync_channel::<RuntimeOutput>(64);
+	let finished = Arc::new(AtomicBool::new(false));
+	let mut readers = Vec::new();
+	if let Some(stdout) = child.stdout.take() { readers.push(runtime_pipe(stdout, RUNTIME_STDOUT, stream_limit, tx.clone(), Arc::clone(&finished))); }
+	if let Some(stderr) = child.stderr.take() { readers.push(runtime_pipe(stderr, RUNTIME_STDERR, stream_limit, tx.clone(), Arc::clone(&finished))); }
+	if let Some((master, slave)) = pty.take() {
+		drop(slave);
+		readers.push(runtime_pipe(master, if terminal & 4 != 0 { RUNTIME_STDERR } else { RUNTIME_STDOUT }, stream_limit, tx.clone(), Arc::clone(&finished)));
+	}
+	let waiting = Arc::clone(&finished);
+	let waiter = std::thread::spawn(move || { let status = child.wait(); waiting.store(true, Ordering::Release); status });
+	drop(tx);
+	// Readers drain bytes available when the direct child exits. Descendants cannot retain its reservation through inherited pipes.
+	for message in rx {
+		if let Some(output) = output {
+			output.send(message).ok();
+		}
+	}
+	for reader in readers {
+		reader.join().ok();
+	}
+	let status = waiter.join().map_err(|_| "job waiter panicked")?.map_err(|e| format!("cannot wait for recipe run: {e}"))?;
+	use std::os::unix::process::ExitStatusExt;
+	Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
+}
+
+#[cfg(unix)]
+fn runtime_pipe<R: Read + std::os::fd::AsRawFd + Send + 'static>(mut pipe: R, verb: u8, limit: usize, tx: SyncSender<RuntimeOutput>, finished: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+	std::thread::spawn(move || {
+		let mut buffer = vec![0_u8; limit];
+		let mut remaining = None;
+		loop {
+			if remaining.is_none() && finished.load(Ordering::Acquire) {
+				unsafe extern "C" { fn ioctl(fd: i32, request: usize, ...) -> i32; }
+				let mut available = 0_i32;
+				#[cfg(target_os = "linux")]
+				const FIONREAD: usize = 0x541b;
+				#[cfg(not(target_os = "linux"))]
+				const FIONREAD: usize = 0x4004667f;
+				if unsafe { ioctl(pipe.as_raw_fd(), FIONREAD, &mut available) } < 0 { break; }
+				remaining = Some(available.max(0) as usize);
+			}
+			let count = remaining.map_or(limit, |count| count.min(limit));
+			if count == 0 { break; }
+			let mut descriptor = PollFd { fd: pipe.as_raw_fd(), events: 1, revents: 0 };
+			let ready = unsafe { poll(&mut descriptor, 1, runtime_poll_interval().as_millis().min(i32::MAX as u128) as i32) };
+			if ready == 0 { continue; }
+			if ready < 0 {
+				if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+				break;
+			}
+			match pipe.read(&mut buffer[..count]) {
+				Ok(0) | Err(_) => break,
+				Ok(n) => {
+					if let Some(count) = &mut remaining { *count -= n; }
+					if tx.send(RuntimeOutput::Bytes(verb, buffer[..n].to_vec())).is_err() {
+						break;
+					}
+				}
+			}
+		}
+	})
+}
+
+#[cfg(unix)]
+fn runtime_pty(size: [u16; 4]) -> std::io::Result<(fs::File, fs::File)> {
+	use std::os::fd::FromRawFd;
+	unsafe extern "C" { fn openpty(master: *mut i32, slave: *mut i32, name: *mut i8, settings: *const c_void, size: *const c_void) -> i32; }
+	let (mut master, mut slave) = (-1, -1);
+	if unsafe { openpty(&mut master, &mut slave, ptr::null_mut(), ptr::null(), size.as_ptr().cast()) } != 0 { return Err(std::io::Error::last_os_error()); }
+	let pair = unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };
+	#[cfg(target_os = "linux")]
+	{
+		let mut settings = ChatTermios::default();
+		if unsafe { tcgetattr(slave, &mut settings) } != 0 { return Err(std::io::Error::last_os_error()); }
+		settings.local &= !0o10;
+		settings.output &= !1;
+		if unsafe { tcsetattr(slave, 0, &settings) } != 0 { return Err(std::io::Error::last_os_error()); }
+	}
+	Ok(pair)
+}
+
+#[cfg(unix)]
+fn runtime_resize_pty(terminal: &fs::File, size: [u16; 4]) -> std::io::Result<()> {
+	use std::os::fd::AsRawFd;
+	unsafe extern "C" { fn ioctl(fd: i32, request: usize, ...) -> i32; }
+	#[cfg(target_os = "linux")]
+	const RESIZE: usize = 0x5414;
+	#[cfg(not(target_os = "linux"))]
+	const RESIZE: usize = 0x80087467;
+	if unsafe { ioctl(terminal.as_raw_fd(), RESIZE, size.as_ptr()) } != 0 { return Err(std::io::Error::last_os_error()); }
+	Ok(())
+}
+
+/// Reports a failure before the job ran, then releases its device.
+#[cfg(unix)]
+fn runtime_abort(backend: &Arc<RuntimeBackend>, job_id: u64, output: Option<SyncSender<RuntimeOutput>>, message: &str) {
+	if let Some(output) = &output {
+		output.send(RuntimeOutput::Bytes(RUNTIME_STDERR, format!("{message}\n").into_bytes())).ok();
+	}
+	runtime_finish(backend, job_id, output, 1);
+}
+
+#[cfg(unix)]
+fn runtime_finish(backend: &Arc<RuntimeBackend>, job_id: u64, output: Option<SyncSender<RuntimeOutput>>, status: i32) {
+	{
+		let mut state = backend.state.lock().unwrap();
+		let index = state.jobs.iter().position(|job| job.id == job_id);
+		if let Some(index) = index {
+			state.jobs[index].state = if status == 0 { RuntimeJobState::Completed } else { RuntimeJobState::Failed };
+			state.jobs[index].status = Some(status);
+			state.jobs[index].output = None;
+			state.jobs[index].terminal = None;
+		}
+		if let Some(index) = index {
+			for device_index in state.jobs[index].devices.clone() {
+				if state.devices[device_index].owner == Some(job_id) { state.devices[device_index].owner = None; }
+			}
+		}
+		let limit = env!("RECIPE_RUNTIME_HISTORY_JOBS").parse::<usize>().expect("validated runtime history limit");
+		while state.jobs.iter().filter(|job| job.state.terminal()).count() > limit {
+			let index = state.jobs.iter().position(|job| job.state.terminal()).unwrap();
+			state.jobs.remove(index);
+		}
+		backend.changed.notify_all();
+	}
+	// Release the device before reporting, so an immediate resubmission can take it.
+	runtime_schedule(backend);
+	if let Some(output) = output {
+		output.send(RuntimeOutput::Finished(status)).ok();
+	}
+}
+
+#[cfg(unix)]
+fn runtime_serve_client(backend: &Arc<RuntimeBackend>, mut stream: UnixStream) {
+	let frame_limit = runtime_frame_limit();
+	let (mut verb, mut payload) = match runtime_recv(&mut stream, frame_limit) {
+		Ok(frame) => frame,
+		Err(_) => return,
+	};
+	if verb == RUNTIME_HELLO {
+		let Ok(identity) = runtime_identity() else { return };
+		if runtime_send(&mut stream, RUNTIME_HELLO, &identity).is_err() || payload != identity { return; }
+		(verb, payload) = match runtime_recv(&mut stream, frame_limit) { Ok(frame) => frame, Err(_) => return };
+	}
+	if verb == RUNTIME_RUNNING && payload.len() == 8 {
+		let id = u64::from_le_bytes(payload.as_slice().try_into().unwrap());
+		let output = {
+			let mut state = backend.state.lock().unwrap();
+			let Some(index) = state.jobs.iter().position(|job| job.id == id && job.state == RuntimeJobState::Preparing) else { return };
+			state.jobs[index].state = RuntimeJobState::Running;
+			(state.jobs[index].output.clone(), state.jobs[index].devices.iter().map(|device| state.devices[*device].name.as_str()).collect::<Vec<_>>().join("."))
+		};
+		if let (Some(output), device) = output { output.send(RuntimeOutput::Bytes(RUNTIME_RUNNING, device.into_bytes())).ok(); }
+		runtime_send(&mut stream, RUNTIME_RUNNING, &payload).ok();
+		return;
+	}
+	if verb == RUNTIME_STATUS {
+		let state = backend.state.lock().unwrap();
+		let mut lines = Vec::new();
+		for (index, device) in state.devices.iter().enumerate() {
+			let owners = state.jobs.iter().filter(|job| !job.state.terminal() && job.devices.contains(&index)).map(|job| job.id.to_string()).collect::<Vec<_>>();
+			let status = if owners.is_empty() { "idle".to_owned() } else { format!("jobs {}", owners.join(",")) };
+			lines.push(format!("{}\t{}", device.name, status));
+		}
+		for job in &state.jobs {
+			lines.push(format!("job {}\t{:?}\t{}\t{}", job.id, job.state, job.name, job.status.map_or(String::new(), |status| format!("exit {status}"))));
+		}
+		let text = lines.join("\n");
+		drop(state);
+		runtime_send(&mut stream, RUNTIME_STATUS, text.as_bytes()).ok();
+		return;
+	}
+
+	if verb != RUNTIME_SUBMIT { return; }
+
+	// Each field is a length-prefixed blob. The source path preserves Rust module and include resolution.
+	let mut cursor = 0;
+	let read_blob = |cursor: &mut usize| -> Result<Vec<u8>> {
+		require(*cursor + 4 <= payload.len(), "runtime submit frame truncated")?;
+		let length = u32::from_le_bytes([payload[*cursor], payload[*cursor + 1], payload[*cursor + 2], payload[*cursor + 3]]) as usize;
+		*cursor += 4;
+		require(*cursor + length <= payload.len(), "runtime submit frame truncated")?;
+		let data = payload[*cursor..*cursor + length].to_vec();
+		*cursor += length;
+		Ok(data)
+	};
+	let name = match read_blob(&mut cursor).and_then(|b| String::from_utf8(b).map_err(|e| RecipeError::new(format!("job name: {e}")))) {
+		Ok(v) => v,
+		Err(_) => return,
+	};
+	let source = match read_blob(&mut cursor).and_then(|bytes| String::from_utf8(bytes).map_err(|e| RecipeError::new(format!("job source: {e}")))) {
+		Ok(v) => v,
+		Err(_) => return,
+	};
+	let cwd = match read_blob(&mut cursor).and_then(|b| String::from_utf8(b).map_err(|e| RecipeError::new(format!("job cwd: {e}")))) {
+		Ok(v) => v,
+		Err(_) => return,
+	};
+	let request = match read_blob(&mut cursor).and_then(|b| String::from_utf8(b).map_err(|e| RecipeError::new(format!("job request: {e}")))) {
+		Ok(v) => v,
+		Err(_) => return,
+	};
+	let mut arguments = Vec::new();
+	let mut settings = Vec::new();
+	let mut parent = None;
+	while cursor < payload.len() {
+		let field = match read_blob(&mut cursor).and_then(|bytes| String::from_utf8(bytes).map_err(|e| RecipeError::new(format!("job option: {e}")))) { Ok(field) => field, Err(_) => return };
+		if let Some(argument) = field.strip_prefix("arg=") { arguments.push(argument.to_owned()); }
+		else if let Some(value) = field.strip_prefix("parent=") { parent = value.parse::<u64>().ok(); if parent.is_none() { return; } }
+		else if let Some(value) = field.strip_prefix("tty=") { settings.push(("RECIPE_RUNTIME_TTY".to_owned(), value.to_owned())); }
+		else if let Some(value) = field.strip_prefix("size=") { settings.push(("RECIPE_RUNTIME_SIZE".to_owned(), value.to_owned())); }
+		else if let Some((key, value)) = field.strip_prefix("env=").and_then(|field| field.split_once('=')) {
+			if !runtime_setting(key) { return; }
+			settings.push((key.to_owned(), value.to_owned()));
+		} else { return; }
+	}
+	if !Path::new(&source).is_absolute() || !Path::new(&cwd).is_absolute() { return; }
+
+	// Reserve every named device together; a partial reservation could deadlock two chains.
+	let requested = (|| -> Result<Vec<usize>> {
+		if settings.iter().any(|(key, _)| key == "RECIPE_FORCE_CPU") {
+			require(device_names(&request)?.iter().all(|name| name.rsplit(':').next() == Some("cpu")), "CPU-only job cannot request an accelerator")?;
+		}
+		runtime_discover_request(backend, &request, Some(&settings))?;
+		let host = local_host()?;
+		let state = backend.state.lock().unwrap();
+		let mut ancestors = Vec::new();
+		let mut ancestor = parent;
+		while let Some(id) = ancestor {
+			let job = state.jobs.iter().find(|job| job.id == id).ok_or_else(|| RecipeError::new("nested job's parent is absent from this runtime"))?;
+			ancestors.push(id);
+			ancestor = job.parent;
+		}
+		if request.is_empty() {
+			let accelerators = state.devices.iter().filter(|device| device.exclusive).collect::<Vec<_>>();
+			require(accelerators.is_empty() || accelerators.iter().any(|device| device.owner.is_none_or(|id| !ancestors.contains(&id))), "nested job requires an ancestor's reserved device")?;
+			return Ok(Vec::new());
+		}
+		let names = device_names(&request)?;
+		let mut indices = Vec::new();
+		for name in names {
+			let name = if name.contains(':') { name } else { format!("{host}:{name}") };
+			let index = state.devices.iter().position(|device| device.name == name).ok_or_else(|| RecipeError::new(format!("No runtime device matches {name:?}")))?;
+			require(!indices.contains(&index), format!("runtime device {name:?} is selected twice"))?;
+			require(state.devices[index].owner.is_none_or(|id| !ancestors.contains(&id)), "nested job requests an ancestor's reserved device")?;
+			indices.push(index);
+		}
+		Ok(indices)
+	})();
+	let requested = match requested {
+		Ok(indices) => indices,
+		Err(error) => {
+			runtime_send(&mut stream, RUNTIME_STDERR, error.to_string().as_bytes()).ok();
+			runtime_send(&mut stream, RUNTIME_FAILED, &2_i32.to_le_bytes()).ok();
+			return;
+		}
+	};
+
+	// Create a channel for output forwarding.
+	let (tx, rx) = sync_channel::<RuntimeOutput>(64);
+	let (input_tx, input_rx) = sync_channel::<Vec<u8>>(1);
+
+	// Register the job.
+	let job_id = {
+		let mut state = backend.state.lock().unwrap();
+		let id = state.next_job;
+		state.next_job += 1;
+		state.jobs.push_back(RuntimeJob {
+			id,
+			state: RuntimeJobState::Queued,
+			name,
+			source,
+			cwd,
+			requested,
+			devices: Vec::new(),
+			arguments,
+			settings,
+			status: None,
+			parent,
+			terminal: None,
+			input: Some(input_rx),
+			output: Some(tx),
+		});
+		backend.changed.notify_all();
+		id
+	};
+
+	// Tell the client it is queued.
+	let id_bytes = job_id.to_le_bytes();
+	if runtime_send(&mut stream, RUNTIME_QUEUED, &id_bytes).is_err() {
+		runtime_cancel(backend, job_id);
+		return;
+	}
+	let mut reader = match stream.try_clone() { Ok(reader) => reader, Err(_) => { runtime_cancel(backend, job_id); return; } };
+	let monitor = Arc::clone(backend);
+	let disconnect = reader.try_clone().unwrap();
+	let cancellation = Arc::clone(backend);
+	std::thread::spawn(move || {
+		use std::os::fd::AsRawFd;
+		let mut descriptor = PollFd { fd: disconnect.as_raw_fd(), events: 0, revents: 0 };
+		loop {
+			let ready = unsafe { poll(&mut descriptor, 1, -1) };
+			if ready > 0 || (ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted) { break; }
+		}
+		runtime_cancel(&cancellation, job_id);
+	});
+	std::thread::spawn(move || {
+		let mut input_tx = Some(input_tx);
+		loop {
+			match runtime_recv(&mut reader, runtime_stream_limit()) {
+				Ok((RUNTIME_INPUT, bytes)) => { if input_tx.as_ref().is_none_or(|input| input.send(bytes).is_err()) { break; } }
+				Ok((RUNTIME_INPUT_END, _)) => { input_tx = None; }
+				Ok((RUNTIME_RESIZE, bytes)) if bytes.len() == 4 => {
+					let rows = u16::from_le_bytes([bytes[0], bytes[1]]);
+					let columns = u16::from_le_bytes([bytes[2], bytes[3]]);
+					let mut state = monitor.state.lock().unwrap();
+					if let Some(job) = state.jobs.iter_mut().find(|job| job.id == job_id && !job.state.terminal()) {
+						job.settings.retain(|(name, _)| name != "RECIPE_RUNTIME_SIZE");
+						job.settings.push(("RECIPE_RUNTIME_SIZE".to_owned(), format!("{rows},{columns}")));
+						if let Some(terminal) = &job.terminal { runtime_resize_pty(terminal, [rows, columns, 0, 0]).ok(); }
+					}
+				}
+				_ => break,
+			}
+		}
+		runtime_cancel(&monitor, job_id);
+	});
+
+	// Trigger scheduling.
+	runtime_schedule(backend);
+
+	// Stream events to the client until the job reaches a terminal state.
+	loop {
+		match rx.recv() {
+			Ok(RuntimeOutput::Bytes(verb, data)) => {
+				if runtime_send(&mut stream, verb, &data).is_err() {
+					runtime_cancel(backend, job_id);
+					return;
+				}
+			}
+			Ok(RuntimeOutput::Finished(status)) => {
+				let verb = if status == 0 { RUNTIME_COMPLETED } else { RUNTIME_FAILED };
+				runtime_send(&mut stream, verb, &status.to_le_bytes()).ok();
+				break;
+			}
+			Err(_) => {
+				runtime_send(&mut stream, RUNTIME_FAILED, &1_i32.to_le_bytes()).ok();
+				break;
+			}
+		}
+	}
+	stream.shutdown(std::net::Shutdown::Both).ok();
+}
+
+#[cfg(unix)]
+fn runtime_cancel(backend: &Arc<RuntimeBackend>, job_id: u64) {
+	let mut state = backend.state.lock().unwrap();
+	// A running job keeps its device until its child exits. Only a queued job can be withdrawn.
+	state.jobs.retain(|job| job.id != job_id || job.state != RuntimeJobState::Queued);
+	backend.changed.notify_all();
+}
+
+/// Starts the runtime daemon: listens on the configured Unix socket, schedules
+/// jobs across discovered devices, and exits after an idle timeout.
+#[cfg(unix)]
+pub fn runtime_daemon() -> ! {
+	let socket_path = runtime_socket_path();
+	let lock_path = runtime_lock_path();
+	let idle_seconds = runtime_idle_seconds();
+
+	// Acquire the file lock to ensure one daemon per socket.
+	unsafe extern "C" {
+		fn flock(fd: i32, operation: i32) -> i32;
+	}
+	const LOCK_EXCLUSIVE: i32 = 2;
+	const LOCK_NONBLOCKING: i32 = 4;
+	let lock_file = fs::OpenOptions::new().create(true).read(true).write(true).open(&lock_path).unwrap_or_else(|e| {
+		eprintln!("recipe runtime: cannot open lock {}: {e}", lock_path.display());
+		std::process::exit(1);
+	});
+	use std::os::unix::io::AsRawFd;
+	if unsafe { flock(lock_file.as_raw_fd(), LOCK_EXCLUSIVE | LOCK_NONBLOCKING) } != 0 {
+		eprintln!("recipe runtime: another daemon holds {}", lock_path.display());
+		std::process::exit(1);
+	}
+
+	// Remove a stale socket.
+	fs::remove_file(&socket_path).ok();
+
+	let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
+		eprintln!("recipe runtime: cannot bind {}: {e}", socket_path.display());
+		std::process::exit(1);
+	});
+	// Jobs run as the daemon's user, so only that user may connect.
+	fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).ok();
+
+	let devices = runtime_discover_devices().unwrap_or_else(|e| {
+		eprintln!("recipe runtime: device discovery failed: {e}");
+		std::process::exit(1);
+	});
+	unsafe { std::env::set_var("RECIPE_BINARY", std::env::current_exe().expect("cannot locate Recipe runtime")); }
+	let device_names: Vec<_> = devices.iter().map(|d| d.name.as_str()).collect();
+	eprintln!("recipe runtime {} devices [{}]", socket_path.display(), device_names.join(", "));
+
+	let backend = Arc::new(RuntimeBackend {
+		state: Mutex::new(RuntimeState {
+			next_job: 1,
+			jobs: VecDeque::new(),
+			devices,
+		}),
+		discovery: Mutex::new(()),
+		discovered_all: AtomicBool::new(false),
+		changed: Condvar::new(),
+		clients: AtomicUsize::new(0),
+	});
+	if std::env::var_os("RECIPE_FORCE_CPU").is_none() {
+		runtime_discover_request(&backend, &std::env::var("RECIPE_DEVICE").unwrap_or_default(), None).unwrap_or_else(|error| {
+			eprintln!("recipe runtime: device discovery failed: {error}");
+			std::process::exit(1);
+		});
+	}
+
+	// Set a non-blocking accept timeout for idle detection.
+	listener.set_nonblocking(true).ok();
+
+	let mut last_activity = Instant::now();
+	loop {
+		match listener.accept() {
+			Ok((stream, _)) => {
+				last_activity = Instant::now();
+				backend.clients.fetch_add(1, Ordering::AcqRel);
+				let backend_clone = Arc::clone(&backend);
+				std::thread::spawn(move || {
+					stream.set_nonblocking(false).ok();
+					runtime_serve_client(&backend_clone, stream);
+					backend_clone.clients.fetch_sub(1, Ordering::AcqRel);
+				});
+			}
+			Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+				std::thread::sleep(runtime_poll_interval());
+				let clients = backend.clients.load(Ordering::Acquire);
+				let has_active = backend.state.lock().unwrap().jobs.iter().any(|job| !job.state.terminal());
+				// The idle period starts when the last client or job finishes, not when it was accepted.
+				if clients > 0 || has_active {
+					last_activity = Instant::now();
+				} else if last_activity.elapsed() > Duration::from_secs(idle_seconds) {
+					eprintln!("recipe runtime idle, exiting");
+					fs::remove_file(&socket_path).ok();
+					std::process::exit(0);
+				}
+			}
+			Err(_) => {
+				std::thread::sleep(Duration::from_millis(100));
+			}
+		}
+	}
+}
+
+/// Connects to the runtime daemon, spawning it if it is not running.
+/// Multiple clients may race to spawn the daemon; the file lock ensures only
+/// one succeeds, and the others retry until the socket is available.
+#[cfg(unix)]
+fn runtime_connect() -> Result<UnixStream> {
+	let socket_path = runtime_socket_path();
+	let nested = std::env::var_os("RECIPE_RUNTIME_PARENT").is_some();
+	if nested && let Ok(node) = std::env::var("RECIPE_RUNTIME_NODE") {
+		require(node == local_host()?, format!("nested run requires its parent's runtime on node {node}"))?;
+	}
+	let deadline = Instant::now() + Duration::from_secs(env!("RECIPE_RUNTIME_CONNECT_SECONDS").parse().expect("validated runtime connection deadline"));
+	let mut spawned = false;
+	loop {
+		if let Ok(stream) = UnixStream::connect(&socket_path) {
+			let mut stream = stream;
+			runtime_send(&mut stream, RUNTIME_HELLO, &runtime_identity()?)?;
+			let (verb, identity) = runtime_recv(&mut stream, runtime_frame_limit()).map_err(|_| RecipeError::new("Recipe runtime does not support executable identity checks"))?;
+			require(verb == RUNTIME_HELLO && identity == runtime_identity()?, "Recipe runtime uses another executable; select a separate runtime socket and lock")?;
+			return Ok(stream);
+		}
+		require(!nested, format!("nested run cannot reach its parent's runtime at {}", socket_path.display()))?;
+		require(Instant::now() < deadline, format!("cannot reach the Recipe runtime at {}", socket_path.display()))?;
+		if !spawned {
+			if let Some(binary) = std::env::current_exe().ok().filter(|p| p.exists()) {
+				let mut command = Command::new(&binary);
+				command.arg("--runtime");
+				command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+				use std::os::unix::process::CommandExt;
+				unsafe extern "C" { fn setsid() -> i32; }
+				unsafe { command.pre_exec(|| if setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }); }
+				// Another client may have already started the daemon. Spawn
+				// failures are not fatal: keep retrying the connection.
+				command.spawn().ok();
+				spawned = true;
+			}
+		}
+		std::thread::sleep(runtime_poll_interval());
+	}
+}
+
+/// Submits a job to the runtime daemon and streams its output to the terminal.
+/// Returns the process exit code.
+#[cfg(unix)]
+pub fn runtime_submit(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) -> Result<i32> {
+	let source = fs::canonicalize(source).map_err(|e| RecipeError::new(format!("cannot locate {}: {e}", source.display())))?;
+	let name = source.file_name().and_then(|n| n.to_str()).unwrap_or("declaration").to_owned();
+	let cwd = std::env::current_dir().map_err(|e| RecipeError::new(format!("cannot resolve working directory: {e}")))?;
+	let cwd_str = cwd.to_str().ok_or_else(|| RecipeError::new("working directory is not UTF-8"))?.to_owned();
+	let mut request = device.map(str::to_owned).or_else(|| std::env::var("RECIPE_DEVICE").ok()).unwrap_or_default();
+	if request.is_empty() && std::env::var_os("RECIPE_FORCE_CPU").is_some() { request = "cpu".to_owned(); }
+
+	// Build the submission frame.
+	let mut frame = Vec::new();
+	let write_blob = |frame: &mut Vec<u8>, data: &[u8]| {
+		frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+		frame.extend_from_slice(data);
+	};
+	write_blob(&mut frame, name.as_bytes());
+	write_blob(&mut frame, source.to_str().ok_or_else(|| RecipeError::new("source path is not UTF-8"))?.as_bytes());
+	write_blob(&mut frame, cwd_str.as_bytes());
+	write_blob(&mut frame, request.as_bytes());
+	let mut selected_settings = std::env::vars().filter(|(key, _)| runtime_setting(key)).collect::<Vec<_>>();
+	if let Some(config) = config { selected_settings.retain(|(key, _)| key != "RECIPE_CONFIG"); selected_settings.push(("RECIPE_CONFIG".to_owned(), config.to_owned())); }
+	for (key, value) in settings { selected_settings.retain(|(name, _)| name != key); selected_settings.push((key.clone(), value.clone())); }
+	for (key, value) in selected_settings { write_blob(&mut frame, format!("env={key}={value}").as_bytes()); }
+	for argument in arguments { write_blob(&mut frame, format!("arg={argument}").as_bytes()); }
+	if let Ok(parent) = std::env::var("RECIPE_RUNTIME_PARENT") { write_blob(&mut frame, format!("parent={parent}").as_bytes()); }
+	let terminal = u8::from(std::io::stdin().is_terminal()) | (u8::from(std::io::stdout().is_terminal()) << 1) | (u8::from(std::io::stderr().is_terminal()) << 2);
+	write_blob(&mut frame, format!("tty={terminal}").as_bytes());
+	if let Some((rows, columns)) = ChatTerminal::size() { write_blob(&mut frame, format!("size={rows},{columns}").as_bytes()); }
+	require(frame.len() <= runtime_frame_limit(), "runtime submission exceeds the configured frame limit")?;
+
+	let mut stream = runtime_connect()?;
+	runtime_send(&mut stream, RUNTIME_SUBMIT, &frame)?;
+	let input = Arc::new(Mutex::new(stream.try_clone().map_err(|e| RecipeError::new(format!("cannot forward stdin: {e}")))?));
+	let alive = Arc::new(());
+	if terminal != 0 {
+		let lifetime = Arc::downgrade(&alive);
+		let resizing = Arc::clone(&input);
+		std::thread::spawn(move || {
+			let mut previous = ChatTerminal::size();
+			while lifetime.upgrade().is_some() {
+				std::thread::sleep(runtime_poll_interval());
+				let size = ChatTerminal::size();
+				if size != previous && let Some((rows, columns)) = size {
+					let bytes = [(rows as u16).to_le_bytes(), (columns as u16).to_le_bytes()].concat();
+					if runtime_send(&mut resizing.lock().unwrap(), RUNTIME_RESIZE, &bytes).is_err() { break; }
+				}
+				previous = size;
+			}
+		});
+	}
+	std::thread::spawn(move || {
+		let mut buffer = vec![0; runtime_stream_limit()];
+		loop {
+			match std::io::stdin().read(&mut buffer) {
+				Ok(0) | Err(_) => { runtime_send(&mut input.lock().unwrap(), RUNTIME_INPUT_END, &[]).ok(); break; }
+				Ok(count) => { if runtime_send(&mut input.lock().unwrap(), RUNTIME_INPUT, &buffer[..count]).is_err() { break; } }
+			}
+		}
+	});
+
+	let frame_limit = runtime_frame_limit();
+	loop {
+		let (verb, payload) = runtime_recv(&mut stream, frame_limit)?;
+		match verb {
+			RUNTIME_QUEUED => {
+				require(payload.len() == 8, "runtime queued result has no valid job ID")?;
+				let id = u64::from_le_bytes(payload.as_slice().try_into().unwrap());
+				eprintln!("queued job {id}");
+			}
+			RUNTIME_RUNNING => {
+				let device = String::from_utf8_lossy(&payload);
+				eprintln!("running on {device}");
+			}
+			RUNTIME_PREPARING => { eprintln!("preparing on {}", String::from_utf8_lossy(&payload)); }
+			RUNTIME_STDOUT => {
+				std::io::stdout().write_all(&payload).ok();
+				std::io::stdout().flush().ok();
+			}
+			RUNTIME_STDERR => {
+				std::io::stderr().write_all(&payload).ok();
+				std::io::stderr().flush().ok();
+			}
+			RUNTIME_COMPLETED | RUNTIME_FAILED => {
+				require(payload.len() == 4, "runtime terminal result has no valid exit code")?;
+				return Ok(i32::from_le_bytes(payload.as_slice().try_into().unwrap()));
+			}
+			_ => return Err(RecipeError::new(format!("unexpected runtime response {verb}"))),
+		}
+	}
+}
+
+/// Publishes the transition after Rust compilation succeeds and before the model starts.
+#[cfg(unix)]
+pub fn runtime_started() -> Result<()> {
+	let Ok(id) = std::env::var("RECIPE_RUNTIME_JOB") else { return Ok(()) };
+	let id = id.parse::<u64>().map_err(|e| RecipeError::new(format!("invalid runtime job ID: {e}")))?.to_le_bytes();
+	let mut stream = UnixStream::connect(runtime_socket_path()).map_err(|e| RecipeError::new(format!("cannot report running job: {e}")))?;
+	runtime_send(&mut stream, RUNTIME_RUNNING, &id)?;
+	let (verb, payload) = runtime_recv(&mut stream, runtime_frame_limit())?;
+	require(verb == RUNTIME_RUNNING && payload == id, "runtime rejected the running transition")
+}
+
+/// Queries the runtime daemon for the current job and device state.
+#[cfg(unix)]
+pub fn runtime_status() -> Result<String> {
+	let mut stream = runtime_connect()?;
+	runtime_send(&mut stream, RUNTIME_STATUS, &[])?;
+	let (verb, payload) = runtime_recv(&mut stream, runtime_frame_limit())?;
+	require(verb == RUNTIME_STATUS, "unexpected runtime status response")?;
+	String::from_utf8(payload).map_err(|e| RecipeError::new(format!("runtime status: {e}")))
 }
