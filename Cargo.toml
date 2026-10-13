@@ -13,7 +13,13 @@ path = "cli.rs"
 
 [dependencies] # AI-slop hedge reward hack show-off flaunt header
 
+[features] # one build-wide switch, not a per-node option
+# every inference key-value cache in every model stores TurboQuant records; no other cache format is in the binary
+kv-turboquant = []
+
 [package.metadata.recipe] # backend trash, and perf tuners
+# bits per coordinate of a kv-turboquant cache: 3, 3.5 or 4
+kv-turboquant-bits = 3.5
 dependency-allowlist = []
 multi-device = "auto"
 device-split = "auto"
@@ -125,6 +131,11 @@ huber-threshold = 1.0
 output-tolerance = 0.00000001
 gradient-tolerance = 0.00001
 backend-tolerance = 0.00001
+# a logit comparison fails when any logit is off by more than this share of the reference's logit range at its position
+logit-error-bound = 0.1
+# and, over a run of at least logit-error-growth-positions positions, when the fitted error rises by more than this share of that range
+logit-error-growth = 0.02
+logit-error-growth-positions = 1024
 
 [encoding] # [sign, exp, man]
 fp8-e4m3 = [1, 4, 3]

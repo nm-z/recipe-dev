@@ -64,6 +64,12 @@ fn main() {
 			println!("word {:?} {} {:.12}", word.text, word.tokens, word.logprob);
 		}
 		println!("total {:.12} tokens {} perplexity {:.6}", score.logprob, score.tokens.len(), score.perplexity);
+		if let Some(comparison) = &score.comparison {
+			comparison.lines().iter().for_each(|line| println!("{line}"));
+			if !comparison.ok() {
+				std::process::exit(1);
+			}
+		}
 	}
 	for timing in &report.timings {
 		let predicted = timing.predicted_seconds.map_or_else(|| "n/a".to_owned(), |seconds| format!("{seconds:.6} s"));
