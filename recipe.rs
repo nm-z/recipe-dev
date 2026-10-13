@@ -2696,6 +2696,8 @@ const SPAN_TILE_FLOATS: usize = 10240;
 /// The planning grid: one 256-thread workgroup per SM of a 16-SM die. Any grid runs the plan.
 const SPAN_WORKGROUPS: usize = 16;
 const SPAN_WARPS: usize = 8;
+/// Warps of the main die's 512-thread blocks (RECIPE_EXPERT_WAVES), which run the fixed-row planes.
+const SPAN_MAIN_WARPS: usize = 16;
 fn span_lanes(tasks: usize) -> usize {
 	[32, 16, 8, 4, 2].into_iter().find(|&lanes| tasks * 100 >= 85 * lanes * tasks.div_ceil(lanes)).unwrap_or(1)
 }
@@ -2737,7 +2739,13 @@ impl SpanSpec {
 		let chunk = tasks.div_ceil(chunks).next_multiple_of(granule);
 		let chunks = tasks.div_ceil(chunk);
 		let lanes = span_lanes(chunk);
-		SpanPlan { lanes, chunk, chunks, last: tasks - (chunks - 1) * chunk, group, groups: self.rows.div_ceil(group), stride: self.data(chunk * w.task()).next_multiple_of(4), pass: w.pass(group >= 2 * SPAN_WARPS * 32 / lanes) }
+		// An unsplit input takes two rows a slot only when that leaves no more row slots idle than one does, counted on the main
+		// die's blocks that run these planes: a 640-row group of 256 slots fills 640 of 1024 row slots two at a time and 640 of
+		// 768 one at a time (hyper 320 -> 10240 Q8_0, 61.3 -> 56.6 us, 20261013T080659-gputest-1). A split input keeps two rows
+		// a slot whenever its group holds twice the slots: one row a slot took hyper 10240 -> 320 from 63.0 to 66.9 us.
+		let slots = SPAN_MAIN_WARPS * 32 / lanes;
+		let filled = |pass: usize| group * 1000 / (group.div_ceil(slots * pass) * slots * pass);
+		SpanPlan { lanes, chunk, chunks, last: tasks - (chunks - 1) * chunk, group, groups: self.rows.div_ceil(group), stride: self.data(chunk * w.task()).next_multiple_of(4), pass: w.pass(if chunks == 1 { filled(2) >= filled(1) } else { group >= 2 * SPAN_WARPS * 32 / lanes }) }
 	}
 	fn counter_bytes(plan: &SpanPlan) -> usize { (plan.groups * 4).next_multiple_of(16) }
 	/// Global scratch one call needs: arrival counters per row group and, when the
