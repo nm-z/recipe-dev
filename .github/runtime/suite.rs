@@ -166,10 +166,15 @@ fn write_stepper_checkpoint(path: &Path) {
 			gguf_text(&mut metadata, value);
 		}
 	}
+	gguf_text(&mut metadata, "tokenizer.ggml.suppress_tokens");
+	metadata.extend_from_slice(&9u32.to_le_bytes());
+	metadata.extend_from_slice(&4u32.to_le_bytes());
+	metadata.extend_from_slice(&1u64.to_le_bytes());
+	metadata.extend_from_slice(&0u32.to_le_bytes());
 	let mut out = b"GGUF".to_vec();
 	out.extend_from_slice(&3u32.to_le_bytes());
 	out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-	out.extend_from_slice(&12u64.to_le_bytes());
+	out.extend_from_slice(&13u64.to_le_bytes());
 	out.extend(metadata);
 	let mut data = Vec::new();
 	for (name, values) in &tensors {
@@ -213,6 +218,10 @@ fn main() {
 	let work = PathBuf::from(environment("RECIPE_SUITE_WORK"));
 	let evidence = PathBuf::from(environment("RECIPE_EVIDENCE"));
 	std::fs::create_dir_all(&work).expect("cannot create the suite work directory");
+	if let Ok(mode) = std::env::var("RECIPE_SUITE_CONTRACT") {
+		contract_child(&mode, &root, &work);
+		return;
+	}
 	let trace_path = std::env::var_os("RECIPE_TRACE_PATH").map(PathBuf::from).unwrap_or_else(|| work.join("phases.log"));
 	// Set the log destination before Recipe starts any workers.
 	unsafe { std::env::set_var("RECIPE_TRACE_PATH", &trace_path); }
@@ -369,6 +378,10 @@ fn main() {
 		splits_match &= prediction_bits(&logits) == prediction_bits(&whole);
 	}
 	report.record("ple_prefill_steps_match_whole", splits_match && whole.iter().all(|value| value.is_finite()), format!("positions=160 logits={}", whole.len()));
+	let mut sampler = recipe.sampler().temperature(0.0);
+	let generated = placed.decode(&[0], &mut sampler, &[], 8);
+	let excludes = whole[0] > whole[1] && sampler.suppressed() == [0] && generated.ids.len() == 9 && generated.ids[1..].iter().all(|id| !sampler.suppressed().contains(id));
+	report.record("sampler_suppression", excludes, format!("suppressed={:?} generated={:?}", sampler.suppressed(), &generated.ids[1..]));
 
 
 	// 9. A gated delta model trains at each precision: it is not refused, its loss is finite and falls,
@@ -382,6 +395,7 @@ fn main() {
 		report.record(name, falls && repeats, format!("initial_loss={:.9} final_loss={:.9} final_bits={:016x} repeats={repeats}", first.initial_loss(), first.final_loss(), first.final_loss().to_bits()));
 	}
 
+	additional_contracts(&mut report, &root, &work);
 	// The shared device-clock writer must preserve full-window and step outputs.
 	let _ = recipe.infer().log([debug]);
 	let traced = file.place(&stepped_model, 160, &[]);
@@ -397,7 +411,11 @@ fn main() {
 	let measured = !stamps.is_empty() && stamps.iter().all(|field| field.split_once(':').is_some_and(|(_, ticks)| ticks.parse::<u64>().is_ok()))
 		&& seconds.is_some_and(|seconds| seconds.is_finite() && seconds > 0.0) && window.is_some_and(|line| line.contains("device=")) && clocks.is_some_and(|line| line.contains("device="));
 	report.record("traced_window_and_step", unchanged && measured, format!("output_bits_equal={unchanged} node_clocks={} window_seconds={seconds:?}", stamps.len()));
-	report.record("single_device_has_no_exchange", !trace.lines().any(|line| line.starts_with("exchange phase ")), "ordinary placement has no exchange phase records".to_owned());
+	if traced.split().len() == 1 {
+		report.record("single_device_has_no_exchange", !trace.lines().any(|line| line.starts_with("exchange phase ")), "ordinary placement has no exchange phase records".to_owned());
+	} else {
+		println!("check single_device_has_no_exchange SKIP {} selected devices", traced.split().len());
+	}
 
 	let failed: Vec<&str> = report.checks.iter().filter(|check| !check.passed).map(|check| check.name).collect();
 	let body = report
@@ -428,4 +446,286 @@ fn write_document(path: &Path, document: &str) {
 		std::fs::create_dir_all(parent).expect("cannot create the evidence directory");
 	}
 	std::fs::write(path, document).unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+}
+fn write_features(path: &Path) {
+	let mut csv = (0..32).map(|column| format!("x{column}")).collect::<Vec<_>>().join(",");
+	csv.push_str(",target\n");
+	for row in 0..64 {
+		let values = (0..32).map(|column| ((row * (column * 2 + 1) + column) % 31) as f64 / 32.0 - 0.5).collect::<Vec<_>>();
+		let target = values.iter().sum::<f64>() / 32.0;
+		csv.push_str(&values.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+		csv.push_str(&format!(",{target}\n"));
+	}
+	std::fs::write(path, csv).expect("cannot write 32-feature data");
+}
+
+fn write_large(path: &Path) {
+	let mut csv = String::from("x,target\n");
+	for index in -64..64 {
+		let x = f64::from(index) / 8.0;
+		csv.push_str(&format!("{},{}\n", x * 256.0, (LINEAR_SLOPE * x + LINEAR_INTERCEPT) * 256.0));
+	}
+	std::fs::write(path, csv).expect("cannot write large-gradient data");
+}
+
+fn contract_model(kind: &str, bits: u8, brain: bool) -> Model {
+	let format = |model: Model| if brain { model.bf(16) } else { model.fp(bits) };
+	let block_format = |block: Block| if brain { block.bf(16) } else { block.fp(bits) };
+	let model = match kind {
+		"attention" => format(format(recipe.model().layer(4)).res([block_format(attn(1)) * block_format(layer(4).sigmoid())])).last().layer(1),
+		"rnn" => format(recipe.model().rnn(4)).last().layer(1),
+		"gru" => format(recipe.model().gru(4)).last().layer(1),
+		"lstm" => format(recipe.model().lstm(4)).last().layer(1),
+		"normalization" => format(recipe.model().layer(32)).norm(rms).layer(1),
+		_ => panic!("unknown narrow contract {kind}"),
+	};
+	format(model).scale(NARROW_SCALE).fp(32).loss(mse)
+}
+
+fn compare_narrow(report: &mut Report, data: &Data, kind: &'static str, names: [&'static str; 2]) {
+	let wide = recipe.train().seed(SEED).lr(0.01).epochs(40).run(&contract_model(kind, 32, false), data);
+	for (name, brain) in names.into_iter().zip([false, true]) {
+		let narrow = recipe.train().seed(SEED).lr(0.01).epochs(40).run(&contract_model(kind, 16, brain), data);
+		let bound = wide.final_loss() * 4.0 + 1e-12;
+		let passes = narrow.initial_loss().is_finite() && narrow.final_loss().is_finite()
+			&& narrow.final_loss() < narrow.initial_loss() && narrow.final_loss() <= bound;
+		report.record(name, passes, format!("initial_loss={:.9e} final_loss={:.9e} fp32_loss={:.9e} bound={bound:.9e}", narrow.initial_loss(), narrow.final_loss(), wide.final_loss()));
+	}
+}
+
+fn run_child(mode: &str, profile: Option<&str>, device: Option<&str>) -> std::process::Output {
+	let mut command = std::process::Command::new(std::env::current_exe().expect("cannot locate suite executable"));
+	command.env("RECIPE_SUITE_CONTRACT", mode);
+	if let Some(profile) = profile { command.env("RECIPE_CONFIG", profile); }
+	if let Some(device) = device { command.env("RECIPE_DEVICE", device); }
+	command.output().expect("cannot execute contract in a separate process")
+}
+
+fn child_pass(report: &mut Report, name: &'static str, mode: &str, profile: Option<&str>) {
+	let output = run_child(mode, profile, None);
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	report.record(name, output.status.success(), format!("status={} {} {}", output.status, stdout.trim(), stderr.trim()));
+}
+
+fn suffix_model(brain_cache: bool) -> Model {
+	let model = recipe.model().layer(32).fp(32).attn(1).int(8).kv(1);
+	let model = if brain_cache { model.bf(16) } else { model.fp(16) };
+	model.qk(rms).fp(16).rope(neox, 32, 10000.0).fp(32).last().layer(1).fp(32).loss(mse)
+}
+
+fn contract_child(mode: &str, root: &Path, work: &Path) {
+	match mode {
+		"quantized" => quantized_contract(work),
+		"rope" => rope_contract(work),
+		"missing-train" => {
+			let path = work.join("features32.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
+			recipe.train().seed(SEED).epochs(1).run(&model, &data);
+		},
+		"fp8-change" => {
+			let path = root.join("data/linear.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			let model = recipe.model().layer(1).fp(8).loss(mse);
+			recipe.train().seed(SEED).epochs(1).resume(work.join("fp8.ogdl")).run(&model, &data);
+		},
+		"suffix" => {
+			let path = work.join("features32.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			let model = suffix_model(true);
+			let bundle = work.join("attention-suffix.ogdl");
+			let trained = recipe.train().seed(SEED).lr(0.01).epochs(4).save(&bundle).run(&model, &data);
+			let resumed = recipe.train().seed(SEED).lr(0.01).epochs(1).resume(&bundle).run(&model, &data);
+			let tolerance = 0.02 * trained.final_loss().abs().max(1e-6);
+			assert!((resumed.initial_loss() - trained.final_loss()).abs() <= tolerance, "attention suffix resume loss differs");
+			println!("saved_loss={:.9e} resumed_loss={:.9e} tolerance={tolerance:.9e}", trained.final_loss(), resumed.initial_loss());
+		}
+		"suffix-change" => {
+			let path = work.join("features32.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			let bundle = work.join("attention-suffix.ogdl");
+			let model = suffix_model(false);
+			recipe.train().seed(SEED).lr(0.01).epochs(1).resume(&bundle).run(&model, &data);
+		}
+		"double" => {
+			let path = root.join("data/small.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			for (name, model) in [("fp16", recipe.model().layer(1).fp(16).loss(mse)), ("bf16", recipe.model().layer(1).bf(16).loss(mse))] {
+				let run = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).run(&model, &data);
+				assert!(run.final_loss().is_finite() && run.final_loss() < run.initial_loss(), "double accumulator loss does not fall");
+				std::fs::write(work.join(format!("double-{name}.loss")), run.final_loss().to_string()).unwrap();
+				println!("{name}_loss={:.9e}", run.final_loss());
+			}
+		}
+		"fp8" => {
+			let path = root.join("data/linear.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			let model = recipe.model().layer(1).fp(8).loss(mse);
+			let bundle = work.join("fp8.ogdl");
+			let run = recipe.train().seed(SEED).lr(0.01).epochs(10).save(&bundle).run(&model, &data);
+			let resumed = recipe.train().seed(SEED).lr(0.01).epochs(1).resume(&bundle).run(&model, &data);
+			assert!(resumed.initial_loss().is_finite() && (resumed.initial_loss() - run.final_loss()).abs() <= 0.1 * run.final_loss().abs().max(1e-6));
+		}
+		"shard" => {
+			let path = work.join("features32.csv");
+			let data = recipe.data(path.to_str().unwrap()).target("target");
+			for (name, model) in [("fp16", recipe.model().no(bias).layer(1).fp(16).loss(mse)), ("bf16", recipe.model().no(bias).layer(1).bf(16).loss(mse))] {
+				let bundle = work.join(format!("shard-{name}.ogdl"));
+				let trained = recipe.train().seed(SEED).lr(0.01).epochs(10).save(&bundle).run(&model, &data);
+				let selected = recipe::device_names(&environment("RECIPE_DEVICE")).unwrap().len();
+				assert_eq!(trained.memory.len(), selected, "training does not execute on every selected device");
+				let weights = (0..32).map(|column| { let mut basis = vec![0.0; 32]; basis[column] = 1.0; recipe.predict(&bundle, &basis)[0].to_string() }).collect::<Vec<_>>().join(" ");
+				println!("{name} {weights}");
+			}
+		}
+		_ => panic!("unknown suite contract {mode}"),
+	}
+}
+
+fn additional_contracts(report: &mut Report, root: &Path, work: &Path) {
+	let features = work.join("features32.csv");
+	write_features(&features);
+	let data32 = recipe.data(features.to_str().unwrap()).target("target");
+	for (name, bits) in [("canonical_int4", 4), ("canonical_int8", 8), ("canonical_int16", 16), ("canonical_int32", 32)] {
+		let model = recipe.model().no(bias).layer(1).int(bits).loss(mse);
+		let run = recipe.train().seed(SEED).lr(0.01).epochs(20).run(&model, &data32);
+		report.record(name, run.initial_loss().is_finite() && run.final_loss().is_finite() && run.final_loss() < run.initial_loss(), format!("features=32 initial_loss={:.9e} final_loss={:.9e}", run.initial_loss(), run.final_loss()));
+	}
+	let narrow_path = work.join("narrow-sequence.csv");
+	let source = std::fs::read_to_string(root.join("data/multi.csv")).unwrap();
+	let mut rows = source.lines();
+	let mut narrow_csv = format!("{}\n", rows.next().unwrap());
+	for row in rows {
+		let (inputs, target) = row.rsplit_once(',').unwrap();
+		narrow_csv.push_str(&format!("{inputs},{}\n", target.parse::<f64>().unwrap() * NARROW_SCALE));
+	}
+	std::fs::write(&narrow_path, narrow_csv).unwrap();
+	let narrow_data = recipe.data(narrow_path.to_str().unwrap()).target("target");
+	compare_narrow(report, &narrow_data, "attention", ["attention_fp16", "attention_bf16"]);
+	compare_narrow(report, &narrow_data, "rnn", ["rnn_fp16", "rnn_bf16"]);
+	compare_narrow(report, &narrow_data, "gru", ["gru_fp16", "gru_bf16"]);
+	compare_narrow(report, &narrow_data, "lstm", ["lstm_fp16", "lstm_bf16"]);
+	compare_narrow(report, &narrow_data, "normalization", ["normalization_fp16", "normalization_bf16"]);
+	let large_path = work.join("large.csv");
+	write_large(&large_path);
+	let large = recipe.data(large_path.to_str().unwrap()).target("target");
+	for (name, model) in [("large_fp16", recipe.model().layer(1).fp(16).scale(256.0).fp(32).loss(mse)), ("large_bf16", recipe.model().layer(1).bf(16).scale(256.0).fp(32).loss(mse))] {
+		let run = recipe.train().seed(SEED).lr(0.02).epochs(800).run(&model, &large);
+		let wanted = linear_targets().into_iter().map(|value| value * 256.0).collect::<Vec<_>>();
+		let worst = worst_absolute(&sorted(run.predictions().iter().copied()), &sorted(wanted)) / 256.0;
+		report.record(name, run.final_loss().is_finite() && run.final_loss() < run.initial_loss() && worst <= 1.0, format!("scale=256 worst_abs_err_in_y={worst:.9} tolerance=1 initial_loss={:.9e} final_loss={:.9e}", run.initial_loss(), run.final_loss()));
+	}
+	child_pass(report, "attention_suffix_resume", "suffix", None);
+	child_pass(report, "quantized_source_conversion", "quantized", None);
+	child_pass(report, "proportional_rope_factors", "rope", None);
+	let changed = run_child("suffix-change", None, None);
+	let reason = String::from_utf8_lossy(&changed.stderr);
+	report.record("attention_suffix_mismatch", !changed.status.success() && reason.contains("model mismatch not overwritten"), format!("status={} {}", changed.status, reason.trim()));
+	child_pass(report, "double_accumulator", "double", Some("check64"));
+	let small_path = root.join("data/small.csv");
+	let small = recipe.data(small_path.to_str().unwrap()).target("target");
+	for (name, label, model) in [("double_fp16_matches_fp32_accumulator", "fp16", recipe.model().layer(1).fp(16).loss(mse)), ("double_bf16_matches_fp32_accumulator", "bf16", recipe.model().layer(1).bf(16).loss(mse))] {
+		let baseline = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).run(&model, &small);
+		let wide = std::fs::read_to_string(work.join(format!("double-{label}.loss"))).unwrap().parse::<f64>().unwrap();
+		report.record(name, wide.is_finite() && wide <= baseline.final_loss() * 1.01 + 1e-15, format!("fp64_accumulator_loss={wide:.9e} fp32_accumulator_loss={:.9e}", baseline.final_loss()));
+	}
+	let selection = std::env::var("RECIPE_DEVICE").unwrap_or_else(|_| "cpu".to_owned());
+	let devices = recipe::device_names(&selection).expect("invalid selected devices");
+	let fp8 = run_child("fp8", None, None);
+	let reason = String::from_utf8_lossy(&fp8.stderr);
+	if !fp8.status.success() && reason.contains("no fp8 instruction") {
+		report.record("fp8_e4m3_capability_error", !fp8.status.success() && reason.contains("no fp8 instruction") && reason.contains("Matrix: none"), format!("device={selection} status={} {}", fp8.status, reason.trim()));
+		let other = run_child("fp8", Some("e5m2"), None);
+		let reason = String::from_utf8_lossy(&other.stderr);
+		report.record("fp8_e5m2_capability_error", !other.status.success() && reason.contains("no fp8 instruction") && reason.contains("Matrix: none"), format!("device={selection} status={} {}", other.status, reason.trim()));
+	} else {
+		report.record("fp8_saved_encoding", fp8.status.success(), format!("status={} {}", fp8.status, reason.trim()));
+		if fp8.status.success() {
+			let changed = run_child("fp8-change", Some("e5m2"), None);
+			let reason = String::from_utf8_lossy(&changed.stderr);
+			report.record("fp8_encoding_mismatch", !changed.status.success() && reason.contains("saved precision profile"), format!("status={} {}", changed.status, reason.trim()));
+		}
+	}
+	let absent = run_child("missing-train", Some("inference"), None);
+	let reason = String::from_utf8_lossy(&absent.stderr);
+	report.record("integer_training_requires_float_precision", !absent.status.success() && reason.contains("integer checkpoint blocks require an explicit train ="), format!("status={} {}", absent.status, reason.trim()));
+	if devices.len() < 2 {
+		println!("check narrow_sharded_training SKIP one selected device: {selection}");
+	} else {
+		let single = run_child("shard", None, Some(&devices[0]));
+		let sharded = run_child("shard", None, None);
+		let parse = |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).lines().filter(|line| line.starts_with("fp16 ") || line.starts_with("bf16 ")).flat_map(|line| line.split_whitespace().skip(1).map(|value| value.parse::<f64>().unwrap()).collect::<Vec<_>>()).collect::<Vec<_>>();
+		let (want, got) = (parse(&single), parse(&sharded));
+		let relative = got.iter().zip(&want).map(|(got, want)| (got - want).abs() / want.abs().max(1e-12)).fold(0.0_f64, f64::max);
+		report.record("narrow_sharded_training", single.status.success() && sharded.status.success() && want.len() == 64 && got.len() == want.len() && relative <= 2e-5, format!("selected={selection} weights={} worst_relative={relative:.9e} tolerance=2e-5", got.len()));
+	}
+}
+fn write_contract_gguf(path: &Path, tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)>) {
+	let mut out = b"GGUF".to_vec();
+	out.extend_from_slice(&3u32.to_le_bytes());
+	out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+	out.extend_from_slice(&1u64.to_le_bytes());
+	gguf_text(&mut out, "general.architecture");
+	out.extend_from_slice(&8u32.to_le_bytes());
+	gguf_text(&mut out, "llama");
+	let mut data = Vec::new();
+	for (name, shape, kind, bytes) in tensors {
+		gguf_text(&mut out, name);
+		out.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+		for dimension in shape { out.extend_from_slice(&dimension.to_le_bytes()); }
+		out.extend_from_slice(&kind.to_le_bytes());
+		out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+		data.extend(bytes);
+		while data.len() % 32 != 0 { data.push(0); }
+	}
+	while out.len() % 32 != 0 { out.push(0); }
+	out.extend(data);
+	std::fs::write(path, out).expect("cannot write contract GGUF");
+}
+
+fn quantized_contract(work: &Path) {
+	let path = work.join("q4-source.gguf");
+	let mut bytes = 0x3800u16.to_le_bytes().to_vec();
+	bytes.extend((0u8..16).map(|code| code | (code << 4)));
+	write_contract_gguf(&path, vec![("source.weight", vec![32, 1], 2, bytes)]);
+	let file = recipe.gguf(path.to_str().unwrap());
+	let model = recipe.model().no(bias).layer(1).int(4);
+	let plan = file.plan().named(&file, "source.weight");
+	let got = file.infer(&model, &plan, &[1.0; 32], 32);
+	let want = 2.0 * (0..16).map(|code| f64::from(code - 8) * 0.5).sum::<f64>();
+	assert!(got.len() == 1 && (got[0] - want).abs() <= 1e-5, "q4_0 conversion produces {got:?}, expected {want}");
+	println!("q4_0_to_int4={:.9} analytic={want:.9} tolerance=1e-5", got[0]);
+}
+
+fn rope_contract(work: &Path) {
+	let path = work.join("rope-factors.gguf");
+	let identity = (0..16).flat_map(|index| (if index / 4 == index % 4 { 1f32 } else { 0f32 }).to_le_bytes()).collect::<Vec<_>>();
+	let factors = [1f32, 2f32].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+	write_contract_gguf(&path, vec![
+		("blk.0.attn_q.weight", vec![4, 4], 0, identity.clone()),
+		("blk.0.attn_k.weight", vec![4, 4], 0, identity.clone()),
+		("blk.0.attn_v.weight", vec![4, 4], 0, identity.clone()),
+		("blk.0.attn_output.weight", vec![4, 4], 0, identity),
+		("rope_freqs.weight", vec![2], 0, factors),
+	]);
+	let file = recipe.gguf(path.to_str().unwrap());
+	let model = recipe.model().no(bias).attn(1).fp(32).rope(neox, 4, 4.0).fp(32).last();
+	let plan = file.plan().node(&[file.tensor("blk.0.attn_q.weight").unwrap().clone(), file.tensor("blk.0.attn_k.weight").unwrap().clone(), file.tensor("blk.0.attn_v.weight").unwrap().clone()])
+		.named(&file, "rope_freqs.weight").named(&file, "blk.0.attn_output.weight");
+	let got = file.infer(&model, &plan, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], 4);
+	let first = [0.1, 0.3, 0.5, 0.7];
+	let last = [0.2, 0.4, 0.6, 0.8];
+	let mut query = last;
+	for (pair, angle) in [1.0_f64, 0.25].into_iter().enumerate() {
+		query[pair] = last[pair] * angle.cos() - last[pair + 2] * angle.sin();
+		query[pair + 2] = last[pair + 2] * angle.cos() + last[pair] * angle.sin();
+	}
+	let cross = query.iter().zip(first).map(|(q, k)| q * k).sum::<f64>() / 2.0;
+	let own = last.iter().map(|value| value * value).sum::<f64>() / 2.0;
+	let previous = 1.0 / (1.0 + (own - cross).exp());
+	let want = first.into_iter().zip(last).map(|(a, b)| previous * a + (1.0 - previous) * b).collect::<Vec<_>>();
+	let worst = worst_absolute(&got, &want);
+	assert!(worst <= 1e-5, "proportional rotary attention produces {got:?}, expected {want:?}, error={worst}");
+	println!("analytic_attention_worst_abs={worst:.9e} factors=[1,2] tolerance=1e-5");
 }

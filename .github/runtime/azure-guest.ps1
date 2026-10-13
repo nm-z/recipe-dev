@@ -360,15 +360,17 @@ try {
 	if ($null -ne $exitCode -and $exitCode -ne 0) { throw "the runtime suite failed with exit code $exitCode" }
 	Pop-Location
 
-	if ($log -notmatch "SUITE PASS executed=8") { throw "the suite did not report eight passing checks" }
+	if ($log -notmatch "SUITE PASS") { throw "the suite did not report passing checks" }
 	$route = ([regex]::Match($log, '(?m)^suite device (\S+)')).Groups[1].Value
 	if (-not $route) { throw "no suite device: training did not report its device" }
 	$device = $route.Split(':')[-1]
 	if ($device -notlike "nv*") { throw "expected an nv device, got '$device'; CPU fallback is a failure" }
 	$evidence = Get-Content -Raw -LiteralPath (Join-Path $work "evidence\suite.json") | ConvertFrom-Json
-	if ($evidence.executed -ne 8 -or $evidence.failed -ne 0) { throw "the suite evidence does not contain eight passing checks" }
+	if ($evidence.executed -lt 40 -or $evidence.failed -ne 0 -or $evidence.checks.Count -ne $evidence.executed -or @($evidence.checks | Where-Object { $_.passed -ne $true }).Count -ne 0) {
+		throw "the suite evidence is incomplete or has a failed check"
+	}
 	$exitLabel = if ($null -eq $exitCode) { "unavailable" } else { [string]$exitCode }
-	Report-Phase "suite-ready checks=8 exit=$exitLabel"
+	Report-Phase "suite-ready checks=$($evidence.executed) exit=$exitLabel"
 	Write-Output "executed on $route"
 
 	Write-Output "SUITE-EVIDENCE-BEGIN"

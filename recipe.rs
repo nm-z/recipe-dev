@@ -19452,6 +19452,8 @@ pub struct Sampler {
 	suppressed: Vec<u32>,
 }
 impl Sampler {
+	/// Token ids excluded by the placed checkpoint during the most recent decode.
+	pub fn suppressed(&self) -> &[u32] { &self.suppressed }
 	pub fn temperature(mut self, value: f64) -> Self {
 		self.temperature = value;
 		self

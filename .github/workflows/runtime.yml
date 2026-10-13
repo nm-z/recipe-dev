@@ -420,7 +420,7 @@ jobs:
         run: |
           set -euo pipefail
           if bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"; then
-            jq -e '.executed == 8 and .failed == 0 and (.checks | length) == 8 and all(.checks[]; .passed == true)' evidence/suite.json >/dev/null
+            jq -e '.executed >= 40 and .failed == 0 and .executed == (.checks | length) and all(.checks[]; .passed == true)' evidence/suite.json >/dev/null
             echo 'gpu_passed=true' >> "$GITHUB_OUTPUT"
           else
             result=$?
