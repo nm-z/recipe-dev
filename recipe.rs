@@ -2787,9 +2787,14 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 		let mut cases = Vec::new();
 		for &k in widths {
 			for (code, weight) in SPAN_SPLIT_FORMATS {
-				// Quantized formats run the least-instruction XMAD kernel, which stages any number of positions in batches.
+				// One kernel per format and width, the faster one as measured on the M60 (nv6, 7 experts, 2026-10-13): the XMAD
+				// kernel for the 640-input expert down matrices (IQ4_NL 91 us against 181 us for the span matvec) and for inputs
+				// the span matvec cannot stage at three positions (5120, 6144); the span matvec for 2560-input matrices (IQ2_XS
+				// gate 93 us against 106 us at one position, 125 us against 282 us at three; dense slices 92-172 us against 172-310).
 				let name = format!("width_split.{code}.k{k}");
-				if let Some(function) = width_split_function(code, k, &name, shared) {
+				let span_stages = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false }.whole(3);
+				let xmad_faster = k == 640 || !span_stages;
+				if let Some(function) = xmad_faster.then(|| width_split_function(code, k, &name, shared)).flatten() {
 					if names.insert(name.clone()) { functions.push_str(&function); }
 					cases.push((code, k, SPECULATIVE_POSITIONS, name));
 					continue;
@@ -24796,6 +24801,8 @@ struct ExpertExecution {
 	weights: ExpertSplitWeights,
 	control: Buffer,
 	main_scratch: Vec<Buffer>,
+	/// The main die's dense phase timestamps (`expert_main::TRACE`): eight u64 per layer of a window.
+	main_trace: Buffer,
 	main_descriptors: Vec<Buffer>,
 	channel_tables: Vec<Buffer>,
 	workers: Vec<ExpertWorker>,
@@ -24854,7 +24861,8 @@ impl ExpertExecution {
 		let main_sync=PeerPacket::new(&main.name)?;
 		control.write_bytes(32,&native_words(&[main_sync.completion_address(),main_sync.sequence_address()+4]))?;
 		let pick_path=std::env::var_os("RECIPE_EXPERT_PICK_LOG").map(PathBuf::from).unwrap_or_else(||directory.join("router-picks.csv"));
-		let mut value = Self { pick_counts,pick_path,worker_path:cubin.clone(),failed:false, main_sync, weights, control, main_scratch, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
+		let main_trace = Buffer::zeroed(main,(sequence*layers.len()*64).max(64))?;
+		let mut value = Self { pick_counts,pick_path,worker_path:cubin.clone(),failed:false, main_sync, weights, control, main_scratch, main_trace, main_descriptors: Vec::new(), channel_tables: Vec::new(), workers: Vec::new(), layers, sequence };
 		for die in (0..DIES).filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
 			let gpu = device(Some(&die_name(die)))?;
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*expert_job::BYTES)?;
@@ -24962,6 +24970,7 @@ impl ExpertExecution {
 			record.resize(expert_main::RETURNS,0);record.extend(return_table.as_ref().map_or(0,|table|table.pointer).to_ne_bytes());
 			debug_assert_eq!(record.len(),expert_main::RETURN_COUNT);record.extend(((returns.len()/3) as u32).to_ne_bytes());
 			debug_assert_eq!(record.len(),expert_main::TERMINAL);record.extend(u32::from(layer.terminal).to_ne_bytes());
+			debug_assert_eq!(record.len(),expert_main::TRACE);record.extend(value.main_trace.pointer.to_ne_bytes());
 			if let Some(table)=return_table {value.channel_tables.push(table);}
 			debug_assert_eq!(record.len(),expert_main::BYTES);value.main_descriptors.push(Buffer::upload(main,&record)?);value.channel_tables.push(channels);
 			if let Some(table)=layer_responses {value.channel_tables.push(table);}
@@ -25019,9 +25028,24 @@ impl ExpertExecution {
 				}
 			}
 		}
-		Ok(OperationRecord::Experts { first,layers,begin,end,capacity,receipts:receipts.into_iter().enumerate().map(|(index,(_,reports))|(index,reports)).collect() })
+		let trace=self.main_trace.download_range::<u64>(0,phases*8)?;
+		Ok(OperationRecord::Experts { first,layers,begin,end,capacity,receipts:receipts.into_iter().enumerate().map(|(index,(_,reports))|(index,reports)).collect(),trace })
 	}
-	fn observations(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32, receipts: Vec<(usize,Vec<u32>)>, observations: &mut Vec<OperationReport>) -> Result<()> {
+	fn observations(&self, first: usize, layers: usize, begin: u32, end: u32, capacity: u32, receipts: Vec<(usize,Vec<u32>)>, trace: &[u64], observations: &mut Vec<OperationReport>) -> Result<()> {
+		// The main die's phases of each dense operation, from its trace stamps.
+		let main_gpu=self.workers.iter().find(|worker|worker.die==self.weights.plan.main_die).ok_or_else(||RecipeError::new("the main die has no worker entry"))?.gpu;
+		let main_device=device_label(main_gpu)?;
+		for (phase,stamps) in trace.chunks_exact(8).enumerate() {
+			let layer=&self.layers[first+phase%layers];
+			if !layer.dense() || stamps[0]==0 {continue;}
+			let start=begin+(phase/layers) as u32*capacity; let stop=(start+capacity).min(end);
+			for (index,name) in ["Gather","Send","Local","Wait","Scatter"].into_iter().enumerate() {
+				let ticks=stamps[index+1].saturating_sub(stamps[index]);
+				observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],span_calls:0,
+					device:main_device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:format!("DenseMain{name}"),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
+					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
+			}
+		}
 		for (index,reports) in receipts {
 			let worker=&self.workers[index];
 			let device=device_label(worker.gpu)?;
@@ -30153,7 +30177,7 @@ impl LookupRows {
 enum OperationRecord {
 	Report(OperationReport),
 	Nodes { begin: u32, end: u32, retained_begin: u32, cache_begin: u32, clocks: Vec<u64>, fingerprints: Vec<u64>, cache_fingerprints: Vec<u64>, packed_routes: Vec<u32>, cache_channels: Vec<(usize, Vec<(u32, u64)>)> },
-	Experts { first: usize, layers: usize, begin: u32, end: u32, capacity: u32, receipts: Vec<(usize, Vec<u32>)> },
+	Experts { first: usize, layers: usize, begin: u32, end: u32, capacity: u32, receipts: Vec<(usize, Vec<u32>)>, trace: Vec<u64> },
 }
 struct NativeTape {
 	expert_execution: Option<Arc<Mutex<ExpertExecution>>>,
@@ -30909,9 +30933,9 @@ impl NativeTape {
 		for record in records {
 			match record {
 				OperationRecord::Report(report) => operations.push(report),
-				OperationRecord::Experts { first, layers, begin, end, capacity, receipts } => {
+				OperationRecord::Experts { first, layers, begin, end, capacity, receipts, trace } => {
 					let execution = self.expert_execution.as_ref().ok_or_else(|| RecipeError::new("expert receipts have no execution"))?;
-					execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))?.observations(first, layers, begin, end, capacity, receipts, &mut operations)?;
+					execution.lock().map_err(|_| RecipeError::new("expert execution is poisoned"))?.observations(first, layers, begin, end, capacity, receipts, &trace, &mut operations)?;
 				}
 				OperationRecord::Nodes { begin, end, retained_begin, cache_begin, clocks, fingerprints, cache_fingerprints, packed_routes, mut cache_channels } => {
 					for (index, (node, clocks)) in self.nodes.iter().zip(clocks.chunks_exact(3)).enumerate() {
@@ -42096,7 +42120,7 @@ fn split_dense_layer() -> String {
 /// Byte layout of the 128-byte main-die descriptor the host writes once per layer. Pointer fields occupy
 /// 0..72, dimensions 72..96, the pick-count pointer 96, the dense flag 104, and the staged returns 112..128.
 pub mod expert_main {
-	pub const BYTES: usize = 128;
+	pub const BYTES: usize = 136;
 	pub const CONTROL: usize = 0;
 	pub const CHANNELS: usize = 8;
 	pub const RESPONSES: usize = 16;
@@ -42118,6 +42142,8 @@ pub mod expert_main {
 	pub const RETURNS: usize = 112;
 	pub const RETURN_COUNT: usize = 120;
 	pub const TERMINAL: usize = 124;
+	/// The main die's phase timestamps of each dense operation: eight u64 per layer of the window, indexed like the reports.
+	pub const TRACE: usize = 128;
 }
 
 /// Cache-global load at a constant byte offset. LLVM has no `.cg` qualifier, so this one instruction is inline asm.
@@ -42171,6 +42197,17 @@ fn split_dense_forward() -> String {
 	let sequence = ir.value(format!("add i32 {sequence_base}, 1"));
 	ir.set("r18", I32, &layer);
 	ir.set("r19", I32, &sequence);
+	// Phase stamps of this operation: entry, inputs gathered, sends published, own slice done, replies in, scattered.
+	let trace = word_address(&mut ir, "%desc", TRACE, false);
+	let trace_row = element(&mut ir, &trace, &layer, 64);
+	let stamp = |ir: &mut Ir, slot: usize| {
+		when(ir, &leader, |ir| {
+			let now = timer(ir);
+			let at = gep(ir, &trace_row, &(8 * slot).to_string());
+			st(ir, I64, &now, &at, false);
+		});
+	};
+	stamp(&mut ir, 0);
 	let gather_bound = ir.value(format!("mul i32 {r6}, %cols"));
 	ir.set("r20", I32, &gid);
 	ir.inst("br label %df.gather");
@@ -42195,6 +42232,7 @@ fn split_dense_forward() -> String {
 	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
 	let ready = grid(&mut ir, &a8, &a9, &ready_seq, &deadline);
 	leave_unless(&mut ir, &ready, 411, "r26", "df.failed");
+	stamp(&mut ir, 1);
 	ir.set("r20", I32, "0");
 	let padded_width = ir.value(format!("add i32 {r6}, 3"));
 	let row_pad = ir.value(format!("and i32 {padded_width}, -4"));
@@ -42203,14 +42241,12 @@ fn split_dense_forward() -> String {
 	ir.label("df.send");
 	let peer = ir.get("r20", I32);
 	let more = ir.value(format!("icmp ult i32 {peer}, {r5}"));
-	ir.inst(format!("br i1 {more}, label %df.send.body, label %df.local"));
+	ir.inst(format!("br i1 {more}, label %df.send.body, label %df.publish"));
 	ir.label("df.send.body");
 	let peer_wide = byte_offset(&mut ir, &peer, 48);
 	let entry = gep(&mut ir, &channels, &peer_wide);
 	let request = word_address(&mut ir, &entry, 0, false);
 	let request_seq = word_address(&mut ir, &entry, 8, false);
-	let response = word_address(&mut ir, &entry, 24, false);
-	let response_seq = word_address(&mut ir, &entry, 32, false);
 	when(&mut ir, &leader, |ir| {
 		let output = ir.value("ptrtoint ptr addrspace(1) %output to i64");
 		st(ir, I64, &output, &request_seq, true);
@@ -42302,16 +42338,43 @@ fn split_dense_forward() -> String {
 	ir.label(&scalar_exit);
 	ir.inst(format!("br label %{published}"));
 	ir.label(&published);
-	let tag_base = ir.value(format!("mul i32 {sequence}, 64"));
-	let tag_row = ir.value(format!("add i32 {tag_base}, 32"));
-	let tag = ir.value(format!("add i32 {tag_row}, {peer}"));
-	let sent = ir.value(format!("call i32 @p2p_publish_tagged(ptr addrspace(1) {response}, ptr addrspace(1) {response_seq}, i32 {tag}, i32 {sequence}, i64 {deadline})"));
-	leave_unless(&mut ir, &sent, 412, "r26", "df.failed");
 	let peer_next = ir.get("r20", I32);
 	let advanced = ir.value(format!("add i32 {peer_next}, 1"));
 	ir.set("r20", I32, &advanced);
 	ir.inst("br label %df.send");
+	// Every peer's input is written: one completion gather over the first channel's slots publishes them all. Each thread's
+	// system fence in the gather orders its copies to every peer, so after it the first thread raises the other peers' flags.
+	ir.label("df.publish");
+	let first_entry = gep(&mut ir, &channels, "0");
+	let first_slots = word_address(&mut ir, &first_entry, 24, false);
+	let first_flag = word_address(&mut ir, &first_entry, 32, false);
+	let tag_base = ir.value(format!("mul i32 {sequence}, 64"));
+	let tag = ir.value(format!("add i32 {tag_base}, 32"));
+	let sent = ir.value(format!("call i32 @p2p_publish_tagged(ptr addrspace(1) {first_slots}, ptr addrspace(1) {first_flag}, i32 {tag}, i32 {sequence}, i64 {deadline})"));
+	leave_unless(&mut ir, &sent, 412, "r26", "df.failed");
+	when(&mut ir, &leader, |ir| {
+		ir.inst("fence seq_cst");
+		ir.set("r21", I32, "1");
+		while_loop(
+			ir,
+			|ir| {
+				let flagged = ir.get("r21", I32);
+				ir.value(format!("icmp ult i32 {flagged}, {r5}"))
+			},
+			|ir| {
+				let flagged = ir.get("r21", I32);
+				let wide = byte_offset(ir, &flagged, 48);
+				let entry = gep(ir, &channels, &wide);
+				let flag = word_address(ir, &entry, 32, false);
+				st(ir, I32, &sequence, &flag, true);
+				let next = ir.value(format!("add i32 {flagged}, 1"));
+				ir.set("r21", I32, &next);
+			},
+		);
+	});
+	ir.inst("br label %df.local");
 	ir.label("df.local");
+	stamp(&mut ir, 2);
 	let report_at_layer = word_address(&mut ir, &local_job, 120, false);
 	let layer_index = ir.get("r18", I32);
 	let report = element(&mut ir, &report_at_layer, &layer_index, 128);
@@ -42322,6 +42385,7 @@ fn split_dense_forward() -> String {
 	let receive_block = ir.fresh("df.receive");
 	ir.inst(format!("br i1 {local_ok}, label %df.failed, label %{receive_block}"));
 	ir.label(&receive_block);
+	stamp(&mut ir, 3);
 	let responses = word_address(&mut ir, "%desc", RESPONSES, false);
 	ir.set("r20", I32, "0");
 	let wait_head = ir.fresh("df.wait.head");
@@ -42342,6 +42406,7 @@ fn split_dense_forward() -> String {
 	ir.set("r20", I32, &waiting_next);
 	ir.inst(format!("br label %{wait_head}"));
 	ir.label(&wait_exit);
+	stamp(&mut ir, 4);
 	// Every peer has replied: scatter each staged slice ([position][row] floats) into the activation.
 	// A terminal single-column layer with at most eight rows per position keeps its padded direct return.
 	let return_table = word_address(&mut ir, "%desc", RETURNS, false);
@@ -42400,6 +42465,7 @@ fn split_dense_forward() -> String {
 			ir.set("r28", I32, &next_entry);
 		},
 	);
+	stamp(&mut ir, 5);
 	ir.set("r26", I32, "1");
 	ir.inst("br label %df.success");
 	ir.label("df.success");
