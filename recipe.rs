@@ -2623,7 +2623,7 @@ impl SpanWeight {
 	/// Byte alignment the weight lines need beyond the format's own.
 	fn alignment(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 | Self::Q4K | Self::Q5K => 16, Self::Q8_0 | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 2 } }
 	/// Whether the integer matvec (`RECIPE_XMAD_MATVEC=1`) multiplies this format's weights as integers with XMAD.
-	fn xmad(self) -> bool { matches!(self, Self::Q8_0 | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ2XS | Self::IQ4NL) && std::env::var("RECIPE_XMAD_MATVEC").as_deref() == Ok("1") }
+	fn xmad(self) -> bool { matches!(self, Self::Q8_0 | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL) && std::env::var("RECIPE_XMAD_MATVEC").as_deref() == Ok("1") }
 	fn name(self) -> &'static str { match self { Self::F32 => "f32", Self::F16 => "f16", Self::BF16 => "bf16", Self::Q8_0 => "q8_0", Self::Q4K => "q4k", Self::Q5K => "q5k", Self::Q6K => "q6k", Self::IQ2XS => "iq2xs", Self::IQ3XXS => "iq3xxs", Self::IQ4NL => "iq4nl" } }
 }
 /// Where a plane's activations and outputs live.
@@ -21062,13 +21062,13 @@ impl Infer {
 						writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{rate}\t{}\t{}\t{}\t{}\t{}", request.input, request.out, request.cached, request.pp_seconds,
 							request.tg_seconds, request.mtp.drafted, request.mtp.accepted, request.mtp.verify_seconds, request.mtp.step_seconds, request.mtp.draft_seconds)?;
 					}
-					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\tselected_experts\tweight_bytes\tpacked_calls\tdirect_format\tdirect_shape\tdirect_schedule\tpacked_rejected\n");
+					text.push_str("request\tmodel\tdevice\tblock\tnode\toperation\tbegin\tend\tpositions\tticks\tseconds\tselected_experts\tweight_bytes\tpacked_calls\tdirect_format\tdirect_shape\tdirect_schedule\tpacked_rejected\tspan_calls\n");
 					for (index, request) in request_history.iter().enumerate() {
 						for operation in &request.operations {
 							writeln!(text, "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", operation.model, operation.device, operation.block,
 								operation.node, operation.operation, operation.begin, operation.end, operation.positions, operation.ticks,
 								operation.seconds.map_or_else(String::new, |seconds| seconds.to_string()), operation.selected_experts,
-								format!("{}\t{}\t{}\t{}\t{}\t{}",operation.weight_bytes,operation.packed_calls,operation.packed_fallbacks[0],operation.packed_fallbacks[1],operation.packed_fallbacks[2],operation.packed_fallbacks[3]))?;
+								format!("{}\t{}\t{}\t{}\t{}\t{}\t{}",operation.weight_bytes,operation.packed_calls,operation.packed_fallbacks[0],operation.packed_fallbacks[1],operation.packed_fallbacks[2],operation.packed_fallbacks[3],operation.span_calls))?;
 						}
 					}
 					if let Some(path) = line.trim().strip_prefix("/report ") {
@@ -21955,6 +21955,8 @@ pub struct OperationReport {
 	pub packed_calls: usize,
 	/// Executed direct format, shape, and schedule calls, followed by rejected packed calls.
 	pub packed_fallbacks: [usize; 4],
+	/// Executed position-batched (span) matvec calls of a split operation; `packed_calls` then counts only the packed ones.
+	pub span_calls: usize,
 	/// Logical position and output-bit fingerprint from a reference run.
 	/// These cover the final bounded window and position-preserving outputs,
 	/// including a final length-one output. Other outputs have no fingerprints.
@@ -23326,7 +23328,7 @@ impl ExpertExecution {
 				let layer=&self.layers[first+phase%layers]; let experts=report[14] as usize;
 				let start=begin+(phase/layers) as u32*capacity; let stop=(start+capacity).min(end);
 				observations.push(OperationReport { selected_experts:if layer.dense(){0}else{experts},weight_bytes:if layer.dense(){worker.read_bytes[layer.global]}else{experts*worker.read_bytes[layer.global]},
-					packed_calls:report[8] as usize,packed_fallbacks:[report[9] as usize,report[10] as usize,report[11] as usize,report[12] as usize],
+					packed_calls:report[8] as usize,packed_fallbacks:[report[9] as usize,0,report[11] as usize,report[12] as usize],span_calls:report[10] as usize,
 					device:device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:if layer.dense(){"DenseRowSplit"}else{"ExpertSplit"}.to_owned(),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 				// The same receipt also times the wait for the main die's request and the setup before the matvec.
@@ -23334,7 +23336,7 @@ impl ExpertExecution {
 				let mut phases=vec![("Wait",clock(2).saturating_sub(clock(0))),("Setup",clock(4).saturating_sub(clock(2)))];
 				if !layer.dense() {phases.extend([("Prewave",u64::from(report[13])),("GateUp",u64::from(report[15]))]);}
 				for (suffix,ticks) in phases {
-					observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],
+					observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],span_calls:0,
 						device:device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:format!("{name}Split{suffix}"),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 						ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 				}
@@ -29166,7 +29168,7 @@ impl NativeTape {
 			device: self.device_label()?, model: String::new(), block: 0, node: usize::MAX, operation: "ForwardWindow".to_owned(), begin, end,
 			positions: (end - begin) as usize, ticks: ticks[1].wrapping_sub(ticks[0]).max(0) as u64,
 			seconds: (self.program.gpu.backend != Backend::Cpu).then_some(seconds), selected_experts: 0, weight_bytes: 0, packed_calls: 0,
-			packed_fallbacks: [0; 4], fingerprints: Vec::new(), cache_fingerprints: Vec::new(), cache_channel_fingerprints: Vec::new(),
+			packed_fallbacks: [0; 4], span_calls: 0, fingerprints: Vec::new(), cache_fingerprints: Vec::new(), cache_channel_fingerprints: Vec::new(),
 		}));
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
@@ -29218,7 +29220,7 @@ impl NativeTape {
 							device: device.clone(), model: String::new(), block: node.block_index, node: index,
 							operation: node.primitive_name().to_owned(), begin, end, positions: clocks[2] as usize, ticks: clocks[1],
 							packed_calls: routes[0] as usize,
-							packed_fallbacks: [routes[1] as usize, routes[2] as usize, routes[3] as usize, routes[4] as usize],
+							packed_fallbacks: [routes[1] as usize, routes[2] as usize, routes[3] as usize, routes[4] as usize], span_calls: 0,
 							seconds: (self.program.gpu.backend != Backend::Cpu).then_some(clocks[1] as f64 / 1e9),
 							fingerprints: fingerprints.chunks_exact(self.nodes.len()).enumerate().filter_map(|(row, hashes)| {
 								let position = retained_begin + row as u32;
@@ -40204,7 +40206,8 @@ fn split_dense_layer() -> String {
 			leave_unless(ir, &receipt, 404, "r11", "dl.done");
 			ir.inst(format!("br label %{joined}"));
 			ir.label(&span_block);
-			route_count(ir, &r6, 0, &spanned);
+			// Field 2 counts span calls; field 0 counts packed calls.
+			route_count(ir, &r6, 2, &spanned);
 			ir.inst(format!("br label %{joined}"));
 			ir.label(&dense_block);
 			ir.inst(format!("call void @split_dense_typed(ptr addrspace(1) {weights}, i32 {ty}, ptr addrspace(1) {a6}, ptr addrspace(1) {a10}, i32 {rows_k}, i32 {rows_m}, i32 %cols)"));
@@ -41374,7 +41377,8 @@ fn split_expert_layer() -> String {
 			ir.inst(format!("br i1 {gate_taken}, label %{up_span_block}, label %{packed_block}, !prof !{MODERATE_BRANCH}"));
 			ir.label(&up_span_block);
 			let up_span = span_split_expert(ir, &ty_up, &r2, &r3, &w_up, &a7, &up_scratch, &active, &mask, &rank, &rounds);
-			route_count(ir, &rank, 0, "1");
+			// Field 2 counts span calls (here the gate); field 0 counts packed calls.
+			route_count(ir, &rank, 2, "1");
 			let up_missed = ir.value(format!("icmp eq i32 {up_span}, 0"));
 			ir.inst(format!("br i1 {up_missed}, label %{up_mv_block}, label %{spanned_block}, !prof !{MILD_BRANCH}"));
 			ir.label(&up_mv_block);
@@ -41384,7 +41388,7 @@ fn split_expert_layer() -> String {
 			note_status(ir, &up_mv_zero, 205);
 			ir.inst(format!("br label %{gate_done}"));
 			ir.label(&spanned_block);
-			route_count(ir, &rank, 0, "1");
+			route_count(ir, &rank, 2, "1");
 			ir.inst(format!("br label %{gate_done}"));
 			ir.label(&packed_block);
 			ir.inst(format!("br i1 {fused}, label %{fused_block}, label %{separate_block}"));
@@ -41500,7 +41504,7 @@ fn split_expert_layer() -> String {
 			note_status(ir, &down_zero, 209);
 			ir.inst(format!("br label %{down_done}"));
 			ir.label(&down_spanned);
-			route_count(ir, &rank, 0, "1");
+			route_count(ir, &rank, 2, "1");
 			ir.inst(format!("br label %{down_done}"));
 			ir.label(&down_done);
 			let scatter_seq = bump(ir, "r22", "1");
