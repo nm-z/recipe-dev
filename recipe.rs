@@ -2725,7 +2725,7 @@ fn span_matvec_declarations(ir: &str) -> String {
 		("@llvm.ctpop.i32(", "declare i32 @llvm.ctpop.i32(i32)"),
 		("@llvm.fabs.f32(", "declare float @llvm.fabs.f32(float)"),
 		("@llvm.maxnum.f32(", "declare float @llvm.maxnum.f32(float, float)"),
-		("@llvm.round.f32(", "declare float @llvm.round.f32(float)"),
+		("@llvm.copysign.f32(", "declare float @llvm.copysign.f32(float, float)"),
 	].into_iter().filter(|(name, _)| !ir.lines().any(|line| line.starts_with("declare") && line.contains(name))).map(|(_, line)| format!("{line}\n")).collect()
 }
 /// The metadata node marking weight loads invariant, so they use the read-only path.
@@ -3523,10 +3523,12 @@ fn span_task_products_xmad(o: &mut String, sets: &[(String, Vec<SpanQuad>, Vec<X
 				let s = format!("{prefix}.s{position}.{g}");
 				emit!("{s}.i = add i32 {first_chain}, {second_chain}\n{s}.f = sitofp i32 {s}.i to float\n{s}.step = fmul float {}, {scale}", group.step);
 				let next = format!("{prefix}.t{position}.{g}");
-				emit!("{next}.f = call float @llvm.fmuladd.f32(float {s}.f, float {s}.step, float {total})");
 				match &group.base {
-					Some(base) => emit!("{s}.base0 = fmul float {base}, {scale}\n{s}.base = fmul float {s}.base0, {sum}\n{next} = fadd float {next}.f, {s}.base"),
-					None => emit!("{next} = fadd float {next}.f, 0.0"),
+					Some(base) => {
+						emit!("{next}.f = call float @llvm.fmuladd.f32(float {s}.f, float {s}.step, float {total})");
+						emit!("{s}.base0 = fmul float {base}, {scale}\n{s}.base = fmul float {s}.base0, {sum}\n{next} = fadd float {next}.f, {s}.base");
+					}
+					None => emit!("{next} = call float @llvm.fmuladd.f32(float {s}.f, float {s}.step, float {total})"),
 				}
 				total = next;
 			}
@@ -3553,7 +3555,8 @@ fn span_quantize(o: &mut String, p: &str, data: usize, stride: usize, task: usiz
 	}
 	emit!("%{p}.qzero = fcmp oeq float {top}, 0.0\n%{p}.qsafe = select i1 %{p}.qzero, float 1.0, float {top}\n%{p}.qinv0 = fdiv float 32767.0, %{p}.qsafe\n%{p}.qinv = select i1 %{p}.qzero, float 0.0, float %{p}.qinv0\n%{p}.qscale0 = fdiv float {top}, 32767.0\n%{p}.qscale = select i1 %{p}.qzero, float 0.0, float %{p}.qscale0");
 	for t in 0..32 {
-		emit!("%{p}.qr{t} = fmul float %{p}.qv{t}.f, %{p}.qinv\n%{p}.qround{t} = call float @llvm.round.f32(float %{p}.qr{t})\n%{p}.qq{t} = fptosi float %{p}.qround{t} to i32\nstore i32 %{p}.qq{t}, ptr addrspace(3) %{p}.qv{t}.at, align 4");
+		// Round half away from zero: truncate the scaled value plus half, with the value's sign.
+		emit!("%{p}.qr{t} = fmul float %{p}.qv{t}.f, %{p}.qinv\n%{p}.qhalf{t} = call float @llvm.copysign.f32(float 0.5, float %{p}.qr{t})\n%{p}.qround{t} = fadd float %{p}.qr{t}, %{p}.qhalf{t}\n%{p}.qq{t} = fptosi float %{p}.qround{t} to i32\nstore i32 %{p}.qq{t}, ptr addrspace(3) %{p}.qv{t}.at, align 4");
 	}
 	emit!("%{p}.qsum0 = add i32 %{p}.qq0, 0");
 	for t in 1..32 { emit!("%{p}.qsum{t} = add i32 %{p}.qsum{}, %{p}.qq{t}", t - 1); }
