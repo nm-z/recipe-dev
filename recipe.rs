@@ -41297,7 +41297,6 @@ pub mod expert_job {
 	pub const F_DENSE: usize = 0;
 	pub const F_LAST_ONLY: usize = 1;
 	pub const F_STRIDE: usize = 2;
-	pub const F_TYPED: usize = 3;
 }
 
 /// Packed-matvec operand selection and the device grid size; the host sizes its scratch from these too.
@@ -41473,97 +41472,6 @@ fn split_route_count() -> String {
 	ir.label("done");
 	ir.inst("ret void");
 	ir.function("define void @split_route_count(ptr addrspace(1) %report, i32 %rank, i32 %field, i32 %receipt)")
-}
-
-/// Dense slice product on one die: each warp owns output rows, lanes stride the inner dimension, and a
-/// butterfly reduction leaves the row sum in lane 0. Typed weights are f32 or bf16 (type 30).
-fn split_dense_typed() -> String {
-	let mut ir = Ir::new();
-	let tid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.tid.x()");
-	let ctaid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()");
-	let ntid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()");
-	let nctaid = ir.value("call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()");
-	let lane = ir.value(format!("and i32 {tid}, 31"));
-	let warp = ir.value(format!("lshr i32 {tid}, 5"));
-	let warps = ir.value(format!("lshr i32 {ntid}, 5"));
-	let first_block = ir.value(format!("mul i32 {ctaid}, {warps}"));
-	let first = ir.value(format!("add i32 {first_block}, {warp}"));
-	let stride = ir.value(format!("mul i32 {warps}, {nctaid}"));
-	let total = ir.value("mul i32 %m, %c");
-	ir.inst("br label %row");
-	ir.label("row");
-	let row = ir.value(format!("phi i32 [ {first}, %entry ], [ %row.next, %row.end ]"));
-	let more = ir.value(format!("icmp ult i32 {row}, {total}"));
-	ir.inst(format!("br i1 {more}, label %row.body, label %exit"));
-	ir.label("row.body");
-	let out_row = ir.value(format!("urem i32 {row}, %m"));
-	let in_row = ir.value(format!("udiv i32 {row}, %m"));
-	ir.inst("br label %kloop");
-	ir.label("kloop");
-	let kk = ir.value(format!("phi i32 [ {lane}, %row.body ], [ %k.next, %fma ]"));
-	let acc = ir.value("phi float [ 0.000000e+00, %row.body ], [ %fma.value, %fma ]");
-	// Forward references to %fma.value, %k.next, %offset.next and %partial.next are named literally.
-	let kdone = ir.value(format!("icmp uge i32 {kk}, %k"));
-	ir.inst(format!("br i1 {kdone}, label %sum, label %k.body"));
-	// The k loop label is kloop; the parameter %k keeps its name.
-	ir.label("k.body");
-	let weight_index = ir.value(format!("mul i32 {out_row}, %k"));
-	let weight_at = ir.value(format!("add i32 {weight_index}, {kk}"));
-	let input_index = ir.value(format!("mul i32 {in_row}, %k"));
-	let input_at = ir.value(format!("add i32 {input_index}, {kk}"));
-	let input_wide = ir.value(format!("zext i32 {input_at} to i64"));
-	let input_bytes = ir.value(format!("mul i64 {input_wide}, 4"));
-	let input_ptr = ir.value(format!("getelementptr i8, ptr addrspace(1) %x, i64 {input_bytes}"));
-	let input = ir.value(format!("load float, ptr addrspace(1) {input_ptr}, align 4"));
-	let bf = ir.value("icmp eq i32 %t, 30");
-	ir.inst(format!("br i1 {bf}, label %bf, label %f32"));
-	ir.label("f32");
-	let weight_wide = ir.value(format!("zext i32 {weight_at} to i64"));
-	let weight_bytes = ir.value(format!("mul i64 {weight_wide}, 4"));
-	let weight_ptr = ir.value(format!("getelementptr i8, ptr addrspace(1) %w, i64 {weight_bytes}"));
-	let weight32 = ir.value(format!("load float, ptr addrspace(1) {weight_ptr}, align 4"));
-	ir.inst("br label %fma");
-	ir.label("bf");
-	let weight_wide16 = ir.value(format!("zext i32 {weight_at} to i64"));
-	let weight_bytes16 = ir.value(format!("mul i64 {weight_wide16}, 2"));
-	let weight_ptr16 = ir.value(format!("getelementptr i8, ptr addrspace(1) %w, i64 {weight_bytes16}"));
-	let raw = ir.value(format!("load i16, ptr addrspace(1) {weight_ptr16}, align 2"));
-	let widened = ir.value(format!("zext i16 {raw} to i32"));
-	let shifted = ir.value(format!("shl i32 {widened}, 16"));
-	let weight16 = ir.value(format!("bitcast i32 {shifted} to float"));
-	ir.inst("br label %fma");
-	ir.label("fma");
-	let weight = ir.value(format!("phi float [ {weight32}, %f32 ], [ {weight16}, %bf ]"));
-	ir.inst(format!("%fma.value = call float @llvm.fma.f32(float {input}, float {weight}, float {acc})"));
-	ir.inst(format!("%k.next = add i32 {kk}, 32"));
-	ir.inst("br label %kloop");
-	ir.label("sum");
-	ir.inst("br label %shuffle");
-	ir.label("shuffle");
-	let offset = ir.value("phi i32 [ 16, %sum ], [ %offset.next, %shuffle ]");
-	let partial = ir.value(format!("phi float [ {acc}, %sum ], [ %partial.next, %shuffle ]"));
-	let bits = ir.value(format!("bitcast float {partial} to i32"));
-	let other_bits = ir.value(format!("call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 {bits}, i32 {offset}, i32 31)"));
-	let other = ir.value(format!("bitcast i32 {other_bits} to float"));
-	ir.inst(format!("%partial.next = fadd float {partial}, {other}"));
-	ir.inst(format!("%offset.next = lshr i32 {offset}, 1"));
-	let again = ir.value("icmp ne i32 %offset.next, 0");
-	ir.inst(format!("br i1 {again}, label %shuffle, label %store, !llvm.loop !{UNROLL_DISABLED}"));
-	ir.label("store");
-	let writer = ir.value(format!("icmp eq i32 {lane}, 0"));
-	ir.inst(format!("br i1 {writer}, label %write, label %row.end"));
-	ir.label("write");
-	let out_wide = ir.value(format!("zext i32 {row} to i64"));
-	let out_bytes = ir.value(format!("mul i64 {out_wide}, 4"));
-	let out_ptr = ir.value(format!("getelementptr i8, ptr addrspace(1) %o, i64 {out_bytes}"));
-	ir.inst(format!("store float %partial.next, ptr addrspace(1) {out_ptr}, align 4"));
-	ir.inst("br label %row.end");
-	ir.label("row.end");
-	ir.inst(format!("%row.next = add i32 {row}, {stride}"));
-	ir.inst("br label %row");
-	ir.label("exit");
-	ir.inst("ret void");
-	ir.function("define void @split_dense_typed(ptr addrspace(1) %w, i32 %t, ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %k, i32 %m, i32 %c)")
 }
 
 const I32: &str = "i32";
@@ -41924,20 +41832,12 @@ fn advance(ir: &mut Ir) -> String {
 	next
 }
 
-/// Index of the highest set bit of the power-of-two `value`.
-fn log2_of(ir: &mut Ir, value: &str) -> String {
-	let leading = ir.value(format!("call i32 @llvm.ctlz.i32(i32 {value}, i1 false)"));
-	ir.value(format!("sub i32 31, {leading}"))
-}
-
 /// Dense-layer completion: the last partial row group publishes and the device waits on the grid.
 fn split_dense_layer() -> String {
 	use expert_job::*;
 	let mut ir = Ir::new();
 	let a3 = word_address(&mut ir, "%desc", pointer(P_REQUEST), false);
 	let a6 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_A), false);
-	let a7 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_B), false);
-	let a8 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_C), false);
 	let a9 = word_address(&mut ir, "%desc", pointer(P_TABLE), false);
 	let a10 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_E), false);
 	let a11 = word_address(&mut ir, "%desc", pointer(P_REQUEST_COMPLETION), false);
@@ -42015,14 +41915,6 @@ fn split_dense_layer() -> String {
 	ir.set("r20", I32, &grid_seq);
 	let published = grid(&mut ir, &a11, &a12, &grid_seq, &deadline);
 	leave_unless(&mut ir, &published, 402, "r11", "dl.done");
-	let typed_flag = field(&mut ir, "%desc", flag(F_TYPED), I32);
-	let prepare = ir.value(format!("icmp ne i32 {typed_flag}, 0"));
-	when(&mut ir, &prepare, |ir| {
-		ir.inst(format!("call void @packed_prepare(ptr addrspace(1) {a6}, ptr addrspace(1) {a7}, ptr addrspace(1) {a8}, i32 {r2}, i32 %cols, i32 %cols, i32 {r6}, i32 {r8})"));
-	});
-	let next_seq = advance(&mut ir);
-	let ready = grid(&mut ir, &a11, &a12, &next_seq, &deadline);
-	leave_unless(&mut ir, &ready, 403, "r11", "dl.done");
 	when(&mut ir, &leader, |ir| {
 		let at = timer(ir);
 		let slot = gep(ir, "%report", "16");
@@ -42034,13 +41926,6 @@ fn split_dense_layer() -> String {
 	let staging = word_address(&mut ir, "%desc", STAGING, false);
 	let staging_bits = ir.value(format!("ptrtoint ptr addrspace(1) {staging} to i64"));
 	let staged = ir.value(format!("icmp ne i64 {staging_bits}, 0"));
-	let cap_gt1 = ir.value("icmp ugt i32 %cols, 1");
-	let cap_gt2 = ir.value("icmp ugt i32 %cols, 2");
-	let cap_gt4 = ir.value("icmp ugt i32 %cols, 4");
-	let cap2 = ir.value(format!("select i1 {cap_gt1}, i32 2, i32 1"));
-	let cap4 = ir.value(format!("select i1 {cap_gt2}, i32 4, i32 {cap2}"));
-	let cap = ir.value(format!("select i1 {cap_gt4}, i32 8, i32 {cap4}"));
-	ir.set("r22", I32, &cap);
 	while_loop(
 		&mut ir,
 		|ir| {
@@ -42055,48 +41940,13 @@ fn split_dense_layer() -> String {
 			let rows_k = table_field(ir, &entry, 12);
 			let rows_m = table_field(ir, &entry, 16);
 			let scales = word_address(ir, &entry, 32, false);
-			let cap = ir.get("r22", I32);
 			let slice_started = timer(ir);
-			let dense_block = ir.fresh("dl.typed");
-			let packed_block = format!("{dense_block}.packed");
-			let joined = format!("{dense_block}.computed");
-			// A slice with a position-batched matvec reads its weights once for every column.
+			// Every dense slice's format and width has a position-batched matvec (the worker is built for them), which reads its
+			// weights once for every column; a declined slice is a failure.
 			let spanned = span_split_dense(ir, &ty, &rows_k, &rows_m, &weights, &a6, &a10);
-			let span_block = format!("{dense_block}.span");
-			let scan_block = format!("{dense_block}.scan");
-			let span_missed = ir.value(format!("icmp eq i32 {spanned}, 0"));
-			ir.inst(format!("br i1 {span_missed}, label %{scan_block}, label %{span_block}, !prof !{MILD_BRANCH}"));
-			ir.label(&scan_block);
-			let typed_zero = ir.value(format!("icmp eq i32 {ty}, 0"));
-			let typed_bf = ir.value(format!("icmp eq i32 {ty}, 30"));
-			let typed = ir.value(format!("or i1 {typed_zero}, {typed_bf}"));
-			let untyped = ir.value(format!("xor i1 {typed}, true"));
-			ir.inst(format!("br i1 {untyped}, label %{packed_block}, label %{dense_block}, !prof !{MILD_BRANCH}"));
-			ir.label(&packed_block);
-			let meta = field(ir, &entry, 24, I32);
-			let log2 = log2_of(ir, &cap);
-			let shift = ir.value(format!("mul i32 {log2}, 8"));
-			let shifted = ir.value(format!("lshr i32 {meta}, {shift}"));
-			let lanes = ir.value(format!("and i32 {shifted}, 255"));
-			let is17 = ir.value(format!("icmp eq i32 {ty}, 17"));
-			let cap8 = ir.value(format!("icmp eq i32 {cap}, 8"));
-			let gated = ir.value(format!("and i1 {is17}, {cap8}"));
-			let kind = ir.value(format!("select i1 {gated}, i32 2, i32 0"));
-			let receipt = ir.value(format!(
-				"call i32 @packed_matvec(i32 {ty}, i32 {cap}, i32 %cols, i32 {kind}, i32 {lanes}, i32 0, ptr addrspace(1) {weights}, ptr addrspace(1) {a7}, ptr addrspace(1) {a8}, ptr addrspace(1) {a10}, i32 {rows_k}, i32 {rows_m}, i32 {r6}, i32 {r8})"
-			));
-			ir.inst(format!("call void @split_route_count(ptr addrspace(1) %report, i32 {r6}, i32 0, i32 {receipt})"));
-			leave_unless(ir, &receipt, 404, "r11", "dl.done");
-			ir.inst(format!("br label %{joined}"));
-			ir.label(&span_block);
-			// Field 2 counts span calls; field 0 counts packed calls.
+			// Field 2 counts span calls.
 			route_count(ir, &r6, 2, &spanned);
-			ir.inst(format!("br label %{joined}"));
-			ir.label(&dense_block);
-			ir.inst(format!("call void @split_dense_typed(ptr addrspace(1) {weights}, i32 {ty}, ptr addrspace(1) {a6}, ptr addrspace(1) {a10}, i32 {rows_k}, i32 {rows_m}, i32 %cols)"));
-			ir.inst(format!("call void @split_route_count(ptr addrspace(1) %report, i32 {r6}, i32 1, i32 1)"));
-			ir.inst(format!("br label %{joined}"));
-			ir.label(&joined);
+			leave_unless(ir, &spanned, 404, "r11", "dl.done");
 			let slice_computed = timer(ir);
 			add_ticks(ir, "52", &slice_started, &slice_computed);
 			let first_thread = ir.value(format!("icmp eq i32 {r5}, 0"));
@@ -43584,7 +43434,6 @@ pub fn expert_forward_ir() -> String {
 		split_grid(),
 		split_mv(),
 		split_route_count(),
-		split_dense_typed(),
 		split_dense_layer(),
 		split_dense_forward(),
 		split_expert_layer(),
