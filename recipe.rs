@@ -10683,6 +10683,7 @@ mod tokenizer {
 		alphabet: [char; 256],
 		byte_of: HashMap<char, u8>,
 		family: Family,
+		gemma4: bool,
 		template: Option<String>,
 		add_bos: bool,
 		/// Whether `encode` prepends a space to the text at the start and after each added token, as llama.cpp does for a `llama` vocabulary.
@@ -10697,9 +10698,10 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
+			let gemma4 = kind == "gemma4";
 			// `llama` vocabularies prefix by default; a file turns it off with `tokenizer.ggml.add_space_prefix`, and `gemma4` never prefixes.
 			let add_prefix = kind == "llama" && !matches!(model.value("tokenizer.ggml.add_space_prefix"), Some(GgufValue::Bool(false)));
-			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
+			let family = if gemma4 || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
 			};
@@ -10755,6 +10757,7 @@ mod tokenizer {
 				is_added,
 				bytes,
 				family,
+				gemma4,
 				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
 				add_bos: adds_bos_token(model),
 				add_prefix,
@@ -10889,7 +10892,7 @@ mod tokenizer {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
-			if self.family == Family::SentencePiece {
+			if self.gemma4 {
 				let mut prompt = String::new();
 				for (role, content) in messages {
 					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
