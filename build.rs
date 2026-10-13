@@ -2026,6 +2026,8 @@ fn main() -> BuildResult<()> {
 		("schedule-budget", "RECIPE_SCHEDULE_BUDGET"),
 		("schedule-warmups", "RECIPE_SCHEDULE_WARMUPS"),
 		("schedule-minimum-improvement", "RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"),
+		("rat-repeat-penalty", "RECIPE_RAT_REPEAT_PENALTY"),
+		("rat-repeat-window", "RECIPE_RAT_REPEAT_WINDOW"),
 		("random-seed", "RECIPE_RANDOM_SEED"),
 		("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"),
 		("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),

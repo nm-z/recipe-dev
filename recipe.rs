@@ -1419,6 +1419,7 @@ struct ScheduleRat {
 	gpu: &'static Gpu,
 	samples: Vec<f64>,
 	seconds: Vec<f64>,
+	repeat: RepeatPenalty,
 }
 
 impl ScheduleRat {
@@ -1441,7 +1442,7 @@ impl ScheduleRat {
 		};
 		let model = recipe.model().layer(config.surrogate_width).arithmetic(config.precision).tanh().arithmetic(config.precision).layer(SCHEDULE_RAT_ACTION).arithmetic(config.precision);
 		let proposer = compile(&model, &data, &data.targets, 1, gpu, config, true)?;
-		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new() })
+		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new(), repeat: RepeatPenalty::new(config.rat_repeat_penalty, config.rat_repeat_window)? })
 	}
 
 	fn observe(&mut self, candidate: &ScheduleCandidate, seconds: f64) -> Result<()> {
@@ -1533,17 +1534,26 @@ impl ScheduleRat {
 		tape.forward(ForwardMode::Inference)?;
 		let proposals = tape.predictions()?;
 		require(proposals.len() == groups.len() * SCHEDULE_RAT_ACTION, "native RAT proposer output has the wrong shape")?;
-		Ok(groups
-			.iter()
-			.enumerate()
-			.map(|(group, value)| {
-				let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
-				value.unmeasured.iter().enumerate().min_by(|left, right| {
-					distance(proposal, &schedule_candidate_features(&value.candidates[*left.1]))
-						.total_cmp(&distance(proposal, &schedule_candidate_features(&value.candidates[*right.1])))
-				}).map(|(position, _)| position)
-			})
-			.collect())
+		// Closer to the proposal is more favorable; a candidate that repeats a recent pick is penalized.
+		let mut picks = Vec::with_capacity(groups.len());
+		for (group, value) in groups.iter().enumerate() {
+			let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
+			let mut best: Option<(usize, f64, f64)> = None;
+			for (position, candidate) in value.unmeasured.iter().enumerate() {
+				let features = schedule_candidate_features(&value.candidates[*candidate]);
+				let distance = distance(proposal, &features);
+				let favor = self.repeat.candidate_favor(&features, 1.0 / (1.0 + distance), value.candidates.len());
+				if favor == 0.0 { continue; }
+				if best.is_none_or(|(_, score, previous)| favor > score || (favor == score && distance < previous)) {
+					best = Some((position, favor, distance));
+				}
+			}
+			if let Some((position, _, _)) = best {
+				self.repeat.push(&schedule_candidate_features(&value.candidates[value.unmeasured[position]]));
+			}
+			picks.push(best.map(|(position, _, _)| position));
+		}
+		Ok(picks)
 	}
 }
 struct ScheduleMeasurement {
@@ -13329,6 +13339,7 @@ struct LaneTuner {
 	random: u64,
 	window: usize,
 	temperature: f64,
+	repeat: Vec<RepeatPenalty>,
 }
 impl LaneTuner {
 	fn new(graph: &Graph) -> Result<Self> {
@@ -13347,15 +13358,27 @@ impl LaneTuner {
 		}
 		let window = natural("lane tuning window", env!("RECIPE_LANE_TUNING_WINDOW"))?.max(1);
 		let temperature = env!("RECIPE_LANE_TUNING_TEMPERATURE").parse::<f64>().map_err(|_| RecipeError::new("lane tuning temperature is not a number"))?;
-		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature })
+		let config = Config::load()?;
+		let repeat = vec![RepeatPenalty::new(config.rat_repeat_penalty, config.rat_repeat_window)?; keys.len()];
+		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature, repeat })
 	}
 	/// The width each class runs next, and the table of one i32 per node slot.
 	fn choose(&mut self) -> Vec<u8> {
 		for (class, runs) in self.history.iter().enumerate() {
 			let means = runs.iter().map(|window| (!window.is_empty()).then(|| window.iter().sum::<f64>() / window.len() as f64)).collect::<Vec<_>>();
 			let best = means.iter().flatten().copied().fold(f64::INFINITY, f64::min);
-			let weights = means.iter().map(|mean| if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 }).collect::<Vec<_>>();
+			let weights = means.iter().enumerate().map(|(candidate, mean)| {
+				let weight = if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 };
+				self.repeat[class].candidate_favor(&[candidate as f64], weight, LANE_TEAMS.len())
+			}).collect::<Vec<_>>();
 			let total = weights.iter().sum::<f64>();
+			if total == 0.0 {
+				// Every width is already measured. Keep the best without proposing it again.
+				if let Some((candidate, _)) = means.iter().enumerate().filter_map(|(index, mean)| mean.map(|mean| (index, mean))).min_by(|left, right| left.1.total_cmp(&right.1)) {
+					self.chosen[class] = candidate;
+				}
+				continue;
+			}
 			let mut draw = (next_random(&mut self.random) >> 11) as f64 / (1_u64 << 53) as f64 * total;
 			let mut pick = weights.len() - 1;
 			for (candidate, weight) in weights.iter().enumerate() {
@@ -13366,6 +13389,7 @@ impl LaneTuner {
 				draw -= weight;
 			}
 			self.chosen[class] = pick;
+			self.repeat[class].push(&[pick as f64]);
 		}
 		// Slot n + 1 holds node n's knob: the kernels number nodes from one.
 		let mut table = vec![0_u8; (self.classes.len() + 2) * 4];
@@ -16997,7 +17021,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, repeat: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -19436,6 +19460,51 @@ impl Builder<'_> {
 		}
 		self.slot(planes);
 		Ok(())
+	}
+}
+/// Repetition penalty shared by every RAT proposer. It applies the token sampler's
+/// rule: the favorability of a candidate that matches one of the last `window`
+/// proposals is divided by `penalty` when positive and multiplied when negative.
+/// A penalty of one changes nothing.
+#[derive(Clone)]
+struct RepeatPenalty {
+	penalty: f64,
+	window: usize,
+	recent: VecDeque<Vec<f64>>,
+}
+impl RepeatPenalty {
+	fn new(penalty: f64, window: usize) -> Result<Self> {
+		require(penalty.is_finite() && penalty >= 1.0, "RAT repeat penalty must be finite and at least one")?;
+		Ok(Self { penalty, window, recent: VecDeque::new() })
+	}
+	fn repeats(&self, key: &[f64]) -> bool {
+		self.penalty != 1.0 && self.recent.iter().any(|recent| recent == key)
+	}
+	fn favor(&self, key: &[f64], favorability: f64) -> f64 {
+		if self.repeats(key) { if favorability > 0.0 { favorability / self.penalty } else { favorability * self.penalty } } else { favorability }
+	}
+	/// A window covering a finite choice set retains every proposal, so a
+	/// recent choice is excluded until the proposer exhausts that set.
+	fn candidate_favor(&self, key: &[f64], favorability: f64, choices: usize) -> f64 {
+		if self.window >= choices && self.repeats(key) { 0.0 } else { self.favor(key, favorability) }
+	}
+	/// A command score is better the closer it is to `target`, so the favorability
+	/// is the negated distance and a repeat moves the score away from the target.
+	fn score(&self, key: &[f64], score: f64, target: f64) -> f64 {
+		if !self.repeats(key) {
+			return score;
+		}
+		let offset = score - target;
+		target - self.favor(key, -offset.abs()) * offset.signum()
+	}
+	fn push(&mut self, key: &[f64]) {
+		if self.window == 0 || self.penalty == 1.0 {
+			return;
+		}
+		if self.recent.len() == self.window {
+			self.recent.pop_front();
+		}
+		self.recent.push_back(key.to_vec());
 	}
 }
 /// One id at a time from a model's logits: a repetition penalty over the
@@ -24323,6 +24392,8 @@ struct Config {
 	schedule_budget: usize,
 	schedule_warmups: usize,
 	schedule_minimum_improvement: f64,
+	rat_repeat_penalty: f64,
+	rat_repeat_window: usize,
 	initial: f64,
 	beta1: f64,
 	beta2: f64,
@@ -24374,6 +24445,8 @@ impl Config {
 			schedule_budget: count("schedule budget", env!("RECIPE_SCHEDULE_BUDGET"))?,
 			schedule_warmups: natural("schedule warmups", env!("RECIPE_SCHEDULE_WARMUPS"))?,
 			schedule_minimum_improvement: fraction("schedule minimum improvement", env!("RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"))?,
+			rat_repeat_penalty: number("RAT repeat penalty", env!("RECIPE_RAT_REPEAT_PENALTY"))?,
+			rat_repeat_window: count("RAT repeat window", env!("RECIPE_RAT_REPEAT_WINDOW"))?,
 			progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?,
 			random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?,
 			initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?,
@@ -31185,7 +31258,7 @@ fn native_device_identity(gpu: &Gpu, config: Config, allocation: usize) -> Strin
 		Driver::Remote(remote) => format!("remote;wave={};workers={}", remote.wave, remote.worker_threads),
 	};
 	format!(
-		"schedule-v3;device={label};backend={:?};target={};memory={};shared={};driver={driver};candidates={};measurements={};warmups={};budget={};allocation={allocation};minimum_improvement={:016x};surrogate_epochs={};surrogate_width={};surrogate_rate={:016x};random_seed={}",
+		"schedule-v3;device={label};backend={:?};target={};memory={};shared={};driver={driver};candidates={};measurements={};warmups={};budget={};allocation={allocation};minimum_improvement={:016x};surrogate_epochs={};surrogate_width={};surrogate_rate={:016x};random_seed={};rat_repeat_penalty={:016x};rat_repeat_window={}",
 		gpu.backend,
 		native_target_label(&gpu.native_target),
 		gpu.memory,
@@ -31199,6 +31272,8 @@ fn native_device_identity(gpu: &Gpu, config: Config, allocation: usize) -> Strin
 		config.surrogate_width,
 		config.surrogate_rate.to_bits(),
 		config.random_seed,
+		config.rat_repeat_penalty.to_bits(),
+		config.rat_repeat_window,
 	)
 }
 fn native_schedule_cache_path(artifact: &NativeArtifact, identity: &str) -> Result<PathBuf> {
@@ -35997,9 +36072,9 @@ impl RatSession {
 	}
 }
 impl RatState {
-	/// The valid choice nearest the proposal, each column scaled by the range
-	/// the choices span in it.
-	fn select(&self, proposal: &[f64]) -> Result<Vec<f64>> {
+	/// The valid choice nearest the proposal after repetition adjustment, with
+	/// each column scaled by the range the choices span in it.
+	fn select(&self, proposal: &[f64], repeat: &mut RepeatPenalty) -> Result<Vec<f64>> {
 		require(proposal.len() == self.outputs.len() && proposal.iter().all(|value| value.is_finite()), "RAT proposal shape or values are invalid")?;
 		let ranges = (0..proposal.len())
 			.map(|column| {
@@ -36008,7 +36083,7 @@ impl RatState {
 				(low, high)
 			})
 			.collect::<Vec<_>>();
-		let mut best = None;
+		let (mut best, mut nearest) = (None, None);
 		for choice in &self.choices {
 			let mut distance = 0.0;
 			for (column, (low, high)) in ranges.iter().copied().enumerate() {
@@ -36020,11 +36095,25 @@ impl RatState {
 				distance += difference * difference;
 			}
 			require(distance.is_finite(), "RAT candidate distance overflow")?;
-			if best.as_ref().is_none_or(|(previous, _)| distance < *previous) {
-				best = Some((distance, choice));
+			if nearest.as_ref().is_none_or(|(previous, _)| distance < *previous) {
+				nearest = Some((distance, choice));
+			}
+			let key = self.values.iter().chain(choice).copied().collect::<Vec<_>>();
+			let favor = repeat.candidate_favor(&key, 1.0 / (1.0 + distance), self.choices.len());
+			if favor > 0.0 && best.as_ref().is_none_or(|(previous, _)| favor > *previous) {
+				best = Some((favor, choice));
 			}
 		}
-		Ok(best.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone())
+		if repeat.penalty == 1.0 || repeat.window == 0 {
+			return Ok(nearest.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone());
+		}
+		if let Some((_, choice)) = best {
+			repeat.push(&self.values.iter().chain(choice).copied().collect::<Vec<_>>());
+			Ok(choice.clone())
+		} else {
+			// The finite choice set is exhausted; reuse a choice without a new proposal.
+			Ok(nearest.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone())
+		}
 	}
 }
 struct RatEpisode {
@@ -36033,9 +36122,9 @@ struct RatEpisode {
 	action: Vec<f64>,
 }
 /// One episode of a stateful evaluator: the proposer answers every state with
-/// the nearest valid choice until the evaluator scores the episode. Every
+/// a repetition-adjusted valid choice until the evaluator scores the episode. Every
 /// observation is the state followed by the raw proposal.
-fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize) -> Result<RatEpisode> {
+fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize, repeat: &mut RepeatPenalty) -> Result<RatEpisode> {
 	let mut state = first;
 	let mut observations = Vec::new();
 	loop {
@@ -36043,7 +36132,7 @@ fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outp
 		tape.samples.write_float_bytes(0, &state.values, tape.program.artifact.layout.input_precision)?;
 		tape.forward(ForwardMode::Inference)?;
 		let proposal = tape.predictions_at(proposal_node as i32, outputs.len())?;
-		let action = state.select(&proposal)?;
+		let action = state.select(&proposal, repeat)?;
 		observations.push(state.values.iter().chain(&proposal).copied().collect());
 		session.send(&format!("choose {}", outputs.iter().zip(&action).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",")))?;
 		match session.frame()? {
@@ -36484,6 +36573,7 @@ pub struct Train {
 	seed: Option<usize>,
 	rat: Option<RatCommand>,
 	rat_target: Option<f64>,
+	repeat: Option<(f64, usize)>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -36639,6 +36729,15 @@ impl Train {
 		self.rat_target = Some(value);
 		self
 	}
+	/// The `Sampler::repeat` rule over the last `window` RAT proposals. Repeated
+	/// command scores move away from `.target()` before evaluator fitting;
+	/// stateful choice favorability is adjusted before selecting an action.
+	/// Defaults come from `rat-repeat-penalty` and `rat-repeat-window` in `Cargo.toml`.
+	pub fn repeat(mut self, penalty: f64, window: usize) -> Self {
+		assert!(penalty.is_finite() && penalty >= 1.0, "RAT repeat penalty must be finite and at least one");
+		self.repeat = Some((penalty, window));
+		self
+	}
 	fn print_rat(&self, model: &Model, loss: &str, run: u64, epoch: usize, epochs: usize, value: f64, r2: f64, seconds: f64, schedule: &str, score: f64, window: usize, choices: usize) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
@@ -36684,7 +36783,10 @@ impl Train {
 		composition.proposer.state.training_rows = 1;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
-		let objectives = vec![self.rat_target.unwrap_or(0.0); proposal_rows];
+		let target = self.rat_target.unwrap_or(0.0);
+		let (penalty, window) = self.repeat.unwrap_or((config.rat_repeat_penalty, config.rat_repeat_window));
+		let mut repeat = RepeatPenalty::new(penalty, window)?;
+		let objectives = vec![target; proposal_rows];
 		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(samples), samples, &objectives, gpu, config.precision, Some(composition.loss))?;
 		let initial_composed = tape.metric_launch(config)?;
 		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
@@ -36702,7 +36804,10 @@ impl Train {
 			f64::NAN
 		} else {
 			let initial_observation = observation(samples, &initial_predictions)?;
-			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
+			let raw = command.evaluate(&input_names, &initial_observation)?[0];
+			let scored = repeat.score(&initial_predictions, raw, target);
+			repeat.push(&initial_predictions);
+			replay.observe(&initial_observation, scored)?
 		};
 		// The `Loss` field reports the evaluator model's loss. The external
 		// command score is reported separately through `Score`; it is not a
@@ -36737,7 +36842,10 @@ impl Train {
 					.collect::<Vec<_>>();
 				let scores = command.evaluate(&input_names, &observed)?;
 				for (row, value) in observed.chunks_exact(observation_width).zip(scores) {
-					replay.observe(row, value)?;
+					let key = &row[prepared.features..];
+					let scored = repeat.score(key, value, target);
+					repeat.push(key);
+					replay.observe(row, scored)?;
 				}
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
@@ -36761,7 +36869,9 @@ impl Train {
 			} else {
 				let observed = observation(sample, &predictions)?;
 				let raw_score = command.evaluate(&input_names, &observed)?[0];
-				(raw_score, replay.observe(&observed, raw_score)?)
+				let scored = repeat.score(&predictions, raw_score, target);
+				repeat.push(&predictions);
+				(raw_score, replay.observe(&observed, scored)?)
 			};
 			if iteration == 0 {
 				let before_fit = before_fit.unwrap_or(evaluated);
@@ -36794,7 +36904,10 @@ impl Train {
 				.collect::<Vec<_>>();
 			let scores = command.evaluate(&input_names, &observed)?;
 			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) {
-				replay.observe(row, value)?;
+				let key = &row[prepared.features..];
+				let scored = repeat.score(key, value, target);
+				repeat.push(key);
+				replay.observe(row, scored)?;
 			}
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
@@ -36883,8 +36996,10 @@ impl Train {
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
 		let width = names.len() + outputs.len();
 		let mut replay = RatReplay::new(width, usize::MAX)?;
+		let (penalty, window) = self.repeat.unwrap_or((config.rat_repeat_penalty, config.rat_repeat_window));
+		let mut repeat = RepeatPenalty::new(penalty, window)?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
-		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal, &mut repeat)?;
 		let initial_predictions = episode.action.clone();
 		let initial_reward = episode.score;
 		let initial_predicted_reward = tape.predictions()?[0];
@@ -36936,7 +37051,7 @@ impl Train {
 				RatFrame::State(state) => state,
 				RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT reset did not produce a decision state")),
 			};
-			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal, &mut repeat)?;
 			predicted_reward = episode.observations.last().map(|observation| fitting.measure(observation, &[episode.score], config).map(EpochMetrics::predicted_mean)).transpose()?.unwrap_or(f64::NAN);
 			let epoch = iteration + 1;
 			let rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward: episode.score }, pred: RatModelPoint { r2: f64::NAN, reward: predicted_reward } };
