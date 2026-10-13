@@ -2837,7 +2837,10 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 				// gate 93 us against 106 us at one position, 125 us against 282 us at three; dense slices 92-172 us against 172-310).
 				let name = format!("width_split.{code}.k{k}");
 				let span_stages = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false }.whole(3);
-				let xmad_faster = k == 640 || !span_stages;
+				// Q6_K is the exception: its 210-byte blocks leave the XMAD kernel's records only word-aligned, and a 512-row k6144
+				// slice took 160 us at one position and 204 us at three (16 GB/s, span-bench 2026-10-13), so it takes the span matvec
+				// one position per grid group.
+				let xmad_faster = k == 640 || !span_stages && weight != SpanWeight::Q6K;
 				if let Some(function) = xmad_faster.then(|| width_split_function(code, k, &name, shared)).flatten() {
 					if names.insert(name.clone()) { functions.push_str(&function); }
 					// The positions it stages at once; a dense call with more columns splits the grid by position group.
