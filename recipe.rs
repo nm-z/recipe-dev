@@ -9029,7 +9029,7 @@ impl NativeModelIr {
 		self.emit_topk_shared(backend, &mut ir)?;
 		self.emit_delta_tiles(backend, &mut ir)?;
 		self.emit_span_matvecs(backend, &mut ir)?;
-		let mut ir = prune_internal_definitions(ir);
+		let mut ir = outline_operation_classes(prune_internal_definitions(ir))?;
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
 		}
@@ -10112,6 +10112,316 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	}
 	if ir.contains("split_main_forward") {parts.push(b"expert-device-link-O1-v1");}
 	Ok(format!("recipe-native-{:016x}", native_fnv1a(&parts)))
+}
+
+/// One per-node operation definition, as the outlining emitted it.
+struct OperationDefinition {
+	index: usize,
+	start: usize,
+	end: usize,
+	parameters: String,
+	body: String,
+}
+
+/// Replaces each per-node operation function with one class function per distinct body. A node's own
+/// names become `self` and its source's become `source`. Integer operands of noinline helper calls with
+/// more than one caller become trailing class arguments that each node passes, so one body serves every
+/// node with the same shape. Alwaysinline helpers and single-caller helpers keep their literals, and every
+/// other constant stays in the body.
+fn outline_operation_classes(module: String) -> Result<String> {
+	const OPERATION: &str = "define internal void @recipe_operation_n";
+	const CALL: &str = "call void @recipe_operation_n";
+	const ENTRY: &str = ") #3 {\nentry:\n";
+	if !module.contains(OPERATION) {
+		return Ok(module);
+	}
+	let (attributes, calls) = helper_attributes_and_calls(&module)?;
+	let varying = varying_helper_arguments(&module, &attributes, &calls)?;
+	let mut operations = Vec::new();
+	for (start, _) in module.match_indices(OPERATION) {
+		let digits_at = start + OPERATION.len();
+		let digits = module[digits_at..].bytes().take_while(u8::is_ascii_digit).count();
+		let index = module[digits_at..digits_at + digits].parse::<usize>().map_err(|_| RecipeError::new("operation index is not a number"))?;
+		let parameters_at = digits_at + digits + 1;
+		let close = parameters_at + module[parameters_at..].find(ENTRY).ok_or_else(|| RecipeError::new("operation definition has no entry"))?;
+		let body_at = close + ENTRY.len();
+		let end = body_at + module[body_at..].find("\n}\n").ok_or_else(|| RecipeError::new("operation definition is unterminated"))? + 3;
+		let body = module[body_at..end - 2].strip_suffix("ret void\n").ok_or_else(|| RecipeError::new("operation definition does not end with ret void"))?.to_owned();
+		operations.push(OperationDefinition { index, start, end, parameters: module[parameters_at..close].to_owned(), body });
+	}
+	let position_of = operations.iter().enumerate().map(|(position, operation)| (operation.index, position)).collect::<HashMap<_, _>>();
+	let mut classes = BTreeMap::<String, String>::new();
+	let mut class_calls = Vec::with_capacity(operations.len());
+	for operation in &operations {
+		let own = format!("n{}", operation.index);
+		let source = operation_source(&operation.parameters, operation.index);
+		let source_name = source.map(|source| format!("n{source}"));
+		require(![operation.parameters.as_str(), operation.body.as_str()].iter().any(|text| text.contains("%self") || text.contains("%source") || text.contains("%operand")), "operation names collide with class names")?;
+		let (body, literals) = class_literals(&operation.body, &varying)?;
+		let mut parameters = operation.parameters.split(", ").map(|parameter| rename_operation_names(parameter, &own, source_name.as_deref())).collect::<Result<Vec<_>>>()?;
+		parameters.extend(literals.iter().enumerate().map(|(position, (ty, _))| format!("{ty} %operand{position}")));
+		let body = rename_operation_names(&body, &own, source_name.as_deref())?;
+		let signature = parameters.join(", ");
+		let class = format!("recipe_class_{:016x}", native_fnv1a(&[signature.as_bytes(), body.as_bytes()]));
+		let definition = format!("define internal void @{class}({signature}) #3 {{\nentry:\n{body}ret void\n}}\n");
+		match classes.get(&class) {
+			Some(existing) => require(existing == &definition, "operation class hash collides")?,
+			None => {
+				classes.insert(class.clone(), definition);
+			}
+		}
+		let operands = literals.iter().map(|(ty, value)| format!(", {ty} {value}")).collect::<String>();
+		class_calls.push((class, operands));
+	}
+	let mut edits = operations.iter().map(|operation| (operation.start, operation.end, String::new())).collect::<Vec<_>>();
+	for (start, _) in module.match_indices(CALL) {
+		let digits_at = start + CALL.len();
+		let digits = module[digits_at..].bytes().take_while(u8::is_ascii_digit).count();
+		let index = module[digits_at..digits_at + digits].parse::<usize>().map_err(|_| RecipeError::new("operation call index is not a number"))?;
+		let position = *position_of.get(&index).ok_or_else(|| RecipeError::new("operation call has no definition"))?;
+		let expected = &operations[position].parameters;
+		let arguments_at = digits_at + digits + 1;
+		require(module[arguments_at..].starts_with(expected.as_str()) && module[arguments_at + expected.len()..].starts_with(")\n"), "operation call does not match its definition")?;
+		let (class, operands) = &class_calls[position];
+		edits.push((start, arguments_at + expected.len() + 1, format!("call void @{class}({expected}{operands})")));
+	}
+	edits.sort_by_key(|edit| edit.0);
+	let mut out = String::with_capacity(module.len());
+	let mut cursor = 0;
+	for (start, end, replacement) in edits {
+		require(start >= cursor, "operation edits overlap")?;
+		out.push_str(&module[cursor..start]);
+		out.push_str(&replacement);
+		cursor = end;
+	}
+	out.push_str(&module[cursor..]);
+	for definition in classes.values() {
+		out.push_str(definition);
+	}
+	Ok(out)
+}
+
+fn is_name_byte(byte: u8) -> bool {
+	byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'$' | b'-')
+}
+
+/// The inline attribute of each defined function and the number of calls to each function in the module.
+fn helper_attributes_and_calls(module: &str) -> Result<(HashMap<String, u32>, HashMap<String, usize>)> {
+	let bytes = module.as_bytes();
+	let (mut attributes, mut calls) = (HashMap::new(), HashMap::new());
+	for (at, _) in module.match_indices('@') {
+		let length = bytes[at + 1..].iter().take_while(|&&byte| is_name_byte(byte)).count();
+		let open = at + 1 + length;
+		if length == 0 || bytes.get(open) != Some(&b'(') {
+			continue;
+		}
+		let name = &module[at + 1..open];
+		let line = module[..at].rfind('\n').map_or(0, |newline| newline + 1);
+		if module[line..at].starts_with("declare ") {
+			continue;
+		}
+		if module[line..at].starts_with("define ") {
+			let attribute = open + module[open..].find(") #").ok_or_else(|| RecipeError::new(format!("definition {name} has no attribute")))? + 3;
+			let number = module[attribute..].bytes().take_while(u8::is_ascii_digit).count();
+			attributes.insert(name.to_owned(), module[attribute..attribute + number].parse::<u32>().map_err(|_| RecipeError::new(format!("definition {name} has no attribute number")))?);
+		} else {
+			*calls.entry(name.to_owned()).or_insert(0usize) += 1;
+		}
+	}
+	Ok((attributes, calls))
+}
+
+/// The source node a Last operation reads, from its `%n<source>.end` parameter.
+fn operation_source(parameters: &str, index: usize) -> Option<usize> {
+	parameters.match_indices("%n").find_map(|(at, _)| {
+		let digits = parameters[at + 2..].bytes().take_while(u8::is_ascii_digit).count();
+		let source = parameters[at + 2..at + 2 + digits].parse::<usize>().ok()?;
+		(source != index && parameters[at + 2 + digits..].starts_with('.')).then_some(source)
+	})
+}
+
+/// Moves the byte offsets of `getelementptr i8` address computations into `%operand` class parameters.
+fn offset_operands(body: &str, literals: &mut Vec<(String, String)>) -> String {
+	let mut out = String::with_capacity(body.len());
+	let mut cursor = 0;
+	for (at, _) in body.match_indices("getelementptr ") {
+		if at < cursor {
+			continue;
+		}
+		let mut type_at = at + "getelementptr ".len();
+		if body[type_at..].starts_with("inbounds ") {
+			type_at += "inbounds ".len();
+		}
+		if !body[type_at..].starts_with("i8, ") {
+			continue;
+		}
+		let base_at = type_at + "i8, ".len();
+		let Some(separator) = body[base_at..].find(", ") else { continue };
+		let index_at = base_at + separator + 2;
+		if body[base_at..index_at].contains('\n') {
+			continue;
+		}
+		let Some(ty) = ["i32 ", "i64 "].into_iter().find(|ty| body[index_at..].starts_with(*ty)) else { continue };
+		let value_at = index_at + ty.len();
+		let sign = usize::from(body[value_at..].starts_with('-'));
+		let count = body[value_at + sign..].bytes().take_while(u8::is_ascii_digit).count();
+		if count == 0 {
+			continue;
+		}
+		let end = value_at + sign + count;
+		out.push_str(&body[cursor..value_at]);
+		out.push_str(&format!("%operand{}", literals.len()));
+		literals.push((ty.trim_end().to_owned(), body[value_at..end].to_owned()));
+		cursor = end;
+	}
+	out.push_str(&body[cursor..]);
+	out
+}
+
+/// Moves the byte offsets and the integer operands of qualifying helper calls into `%operand` class
+/// parameters and returns them with their type and value, in order.
+fn class_literals(body: &str, varying: &HashMap<String, Vec<bool>>) -> Result<(String, Vec<(String, String)>)> {
+	let mut literals = Vec::new();
+	let body = offset_operands(body, &mut literals);
+	let bytes = body.as_bytes();
+	let (mut out, mut cursor) = (String::with_capacity(body.len()), 0);
+	for (at, _) in body.match_indices('@') {
+		if at < cursor {
+			continue;
+		}
+		let length = bytes[at + 1..].iter().take_while(|&&byte| is_name_byte(byte)).count();
+		let open = at + 1 + length;
+		if length == 0 || bytes.get(open) != Some(&b'(') {
+			continue;
+		}
+		let name = &body[at + 1..open];
+		let Some(flags) = varying.get(name) else {
+			continue;
+		};
+		let (close, parts) = call_arguments(&body, open)?;
+		out.push_str(&body[cursor..open + 1]);
+		let rewritten = parts
+			.iter()
+			.enumerate()
+			.map(|(position, part)| {
+				let operand = part.trim();
+				match literal_operand(operand).filter(|_| flags.get(position) == Some(&true)) {
+					Some((ty, value)) => {
+						let index = literals.len();
+						literals.push((ty.to_owned(), value.to_owned()));
+						part.replacen(operand, &format!("{ty} %operand{index}"), 1)
+					}
+					None => (*part).to_owned(),
+				}
+			})
+			.collect::<Vec<_>>();
+		out.push_str(&rewritten.join(","));
+		cursor = close;
+	}
+	out.push_str(&body[cursor..]);
+	Ok((out, literals))
+}
+
+/// The closing paren of the call whose `(` is at `open`, and its top-level arguments as written.
+fn call_arguments(text: &str, open: usize) -> Result<(usize, Vec<&str>)> {
+	let bytes = text.as_bytes();
+	let mut depth = 0usize;
+	let close = (open..bytes.len()).find(|&position| {
+		match bytes[position] {
+			b'(' => depth += 1,
+			b')' => depth -= 1,
+			_ => {}
+		}
+		depth == 0
+	});
+	let close = close.ok_or_else(|| RecipeError::new("call is unterminated"))?;
+	let inner = &text[open + 1..close];
+	let (mut parts, mut level, mut start) = (Vec::new(), 0i32, 0);
+	for (offset, byte) in inner.bytes().enumerate() {
+		match byte {
+			b'(' => level += 1,
+			b')' => level -= 1,
+			b',' if level == 0 => {
+				parts.push(&inner[start..offset]);
+				start = offset + 1;
+			}
+			_ => {}
+		}
+	}
+	parts.push(&inner[start..]);
+	Ok((close, parts))
+}
+
+/// For each noinline helper called more than once, whether each argument position differs across its call
+/// sites. A position that every call fills with the same literal keeps it, so LLVM still propagates the
+/// constant into the helper; a position with differing or non-literal arguments is a class parameter.
+fn varying_helper_arguments(module: &str, attributes: &HashMap<String, u32>, calls: &HashMap<String, usize>) -> Result<HashMap<String, Vec<bool>>> {
+	let bytes = module.as_bytes();
+	let mut columns = HashMap::<String, Vec<Vec<String>>>::new();
+	for (at, _) in module.match_indices('@') {
+		let length = bytes[at + 1..].iter().take_while(|&&byte| is_name_byte(byte)).count();
+		let open = at + 1 + length;
+		if length == 0 || bytes.get(open) != Some(&b'(') {
+			continue;
+		}
+		let name = &module[at + 1..open];
+		if attributes.get(name) != Some(&3) || calls.get(name).copied().unwrap_or(0) < 2 {
+			continue;
+		}
+		let line = module[..at].rfind('\n').map_or(0, |newline| newline + 1);
+		if module[line..at].starts_with("define ") || module[line..at].starts_with("declare ") {
+			continue;
+		}
+		let (_, arguments) = call_arguments(module, open)?;
+		let columns = columns.entry(name.to_owned()).or_default();
+		for (position, argument) in arguments.iter().enumerate() {
+			if columns.len() <= position {
+				columns.push(Vec::new());
+			}
+			columns[position].push(argument.trim().to_owned());
+		}
+	}
+	Ok(columns
+		.into_iter()
+		.map(|(name, columns)| {
+			let varying = columns.iter().map(|column| !column.iter().all(|text| text == &column[0] && literal_operand(text).is_some())).collect();
+			(name, varying)
+		})
+		.collect())
+}
+
+/// An `i32` or `i64` integer operand, as its type and value.
+fn literal_operand(operand: &str) -> Option<(&str, &str)> {
+	let (ty, value) = operand.split_once(' ')?;
+	let digits = value.strip_prefix('-').unwrap_or(value);
+	(matches!(ty, "i32" | "i64") && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).then_some((ty, value))
+}
+
+/// Renames the node's own names to `self` and its source's to `source`, in `%` names and labels only.
+fn rename_operation_names(text: &str, own: &str, source: Option<&str>) -> Result<String> {
+	let bytes = text.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut at = 0;
+	while at < bytes.len() {
+		let local = bytes[at] == b'%';
+		let label = (at == 0 || bytes[at - 1] == b'\n') && is_name_byte(bytes[at]);
+		if local || label {
+			let begin = if local { at + 1 } else { at };
+			let end = begin + bytes[begin..].iter().take_while(|&&byte| is_name_byte(byte)).count();
+			if local || bytes.get(end) == Some(&b':') {
+				if local {
+					out.push(b'%');
+				}
+				let renamed = text[begin..end].split('.').map(|segment| if segment == own { "self" } else if Some(segment) == source { "source" } else { segment }).collect::<Vec<_>>().join(".");
+				out.extend_from_slice(renamed.as_bytes());
+				at = end;
+				continue;
+			}
+		}
+		out.push(bytes[at]);
+		at += 1;
+	}
+	String::from_utf8(out).map_err(|_| RecipeError::new("operation names are not UTF-8"))
 }
 
 /// FNV-1a over length-prefixed parts, so the same bytes split differently hash apart.
