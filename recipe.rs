@@ -3456,8 +3456,8 @@ fn span_task_quads_xmad(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Ve
 	}
 	(quads, groups)
 }
-/// Four staged int16 activations of position `position` at float offset `index` of the chunk,
-/// as i16 values for the XMAD products; named `{q}.h{i}`.
+/// Four staged int8 activations of position `position` at float offset `index` of the chunk,
+/// as i16 lanes for the XMAD products; named `{q}.h{i}`.
 fn span_activations_int(o: &mut String, q: &str, shared: &str, stride: usize, position: usize, index: &str) -> [String; 4] {
 	o.push_str(&format!("{q}.offset = add i32 {index}, {}\n{q}.at = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.offset\n{q} = load <4 x i32>, ptr addrspace(3) {q}.at, align 16\n", position * stride));
 	std::array::from_fn(|i| {
@@ -3465,7 +3465,7 @@ fn span_activations_int(o: &mut String, q: &str, shared: &str, stride: usize, po
 		format!("{q}.h{i}")
 	})
 }
-/// The integer form of `span_task_products`: each quad's weights multiply the staged int16
+/// The integer form of `span_task_products`: each quad's weights multiply the staged int8
 /// activations into 32-bit chains, which XMAD runs as multiply-adds. Each group's chain sum
 /// then takes its float step, and its minimum when present, times the block's activation
 /// scale and sum at each position, read from the staged metadata.
@@ -3536,8 +3536,8 @@ fn span_task_products_xmad(o: &mut String, sets: &[(String, Vec<SpanQuad>, Vec<X
 		}
 	}
 }
-/// After a chunk is staged, quantizes each position's 32-value blocks to int16 in place. A
-/// block's scale is its largest magnitude over 32767, and its sum is the sum of its int16
+/// After a chunk is staged, quantizes each position's 32-value blocks to int8 in place. A
+/// block's scale is its largest magnitude over 127, and its sum is the sum of its int8
 /// values; both are stored as floats in the metadata after the `data` floats of the plane.
 fn span_quantize(o: &mut String, p: &str, data: usize, stride: usize, task: usize, positions: usize, shared: &str, pad: usize) {
 	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
@@ -3553,7 +3553,7 @@ fn span_quantize(o: &mut String, p: &str, data: usize, stride: usize, task: usiz
 		emit!("%{p}.qm{t} = call float @llvm.maxnum.f32(float {top}, float %{p}.qa{t})");
 		top = format!("%{p}.qm{t}");
 	}
-	emit!("%{p}.qzero = fcmp oeq float {top}, 0.0\n%{p}.qsafe = select i1 %{p}.qzero, float 1.0, float {top}\n%{p}.qinv0 = fdiv float 32767.0, %{p}.qsafe\n%{p}.qinv = select i1 %{p}.qzero, float 0.0, float %{p}.qinv0\n%{p}.qscale0 = fdiv float {top}, 32767.0\n%{p}.qscale = select i1 %{p}.qzero, float 0.0, float %{p}.qscale0");
+	emit!("%{p}.qzero = fcmp oeq float {top}, 0.0\n%{p}.qsafe = select i1 %{p}.qzero, float 1.0, float {top}\n%{p}.qinv0 = fdiv float 127.0, %{p}.qsafe\n%{p}.qinv = select i1 %{p}.qzero, float 0.0, float %{p}.qinv0\n%{p}.qscale0 = fdiv float {top}, 127.0\n%{p}.qscale = select i1 %{p}.qzero, float 0.0, float %{p}.qscale0");
 	for t in 0..32 {
 		// Round half away from zero: truncate the scaled value plus half, with the value's sign.
 		emit!("%{p}.qr{t} = fmul float %{p}.qv{t}.f, %{p}.qinv\n%{p}.qhalf{t} = call float @llvm.copysign.f32(float 0.5, float %{p}.qr{t})\n%{p}.qround{t} = fadd float %{p}.qr{t}, %{p}.qhalf{t}\n%{p}.qq{t} = fptosi float %{p}.qround{t} to i32\nstore i32 %{p}.qq{t}, ptr addrspace(3) %{p}.qv{t}.at, align 4");
@@ -23331,7 +23331,9 @@ impl ExpertExecution {
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 				// The same receipt also times the wait for the main die's request and the setup before the matvec.
 				let name=if layer.dense(){"Dense"}else{"Expert"};
-				for (suffix,ticks) in [("Wait",clock(2).saturating_sub(clock(0))),("Setup",clock(4).saturating_sub(clock(2)))] {
+				let mut phases=vec![("Wait",clock(2).saturating_sub(clock(0))),("Setup",clock(4).saturating_sub(clock(2)))];
+				if !layer.dense() {phases.extend([("Prewave",u64::from(report[13])),("GateUp",u64::from(report[15]))]);}
+				for (suffix,ticks) in phases {
 					observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],
 						device:device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:format!("{name}Split{suffix}"),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 						ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
@@ -41293,6 +41295,14 @@ fn split_expert_layer() -> String {
 	let prepared_seq = bump(&mut ir, "r22", "1");
 	let prepared = grid(&mut ir, &a14, &a15, &prepared_seq, &deadline);
 	leave_unless(&mut ir, &prepared, 103, "r12", "split.done");
+	// Word 13 of the receipt: nanoseconds from the request to the first expert wave.
+	when(&mut ir, &leader, |ir| {
+		let now = timer(ir);
+		let since = ir.value(format!("sub i64 {now}, {copied}"));
+		let narrow = ir.value(format!("trunc i64 {since} to i32"));
+		let at = gep(ir, "%report", "52");
+		st(ir, I32, &narrow, &at, false);
+	});
 	let groups_at = gep(&mut ir, &a5, "1024");
 	let groups = ld(&mut ir, I32, &groups_at, true);
 	ir.set("r23", I32, &groups);
@@ -41408,6 +41418,16 @@ fn split_expert_layer() -> String {
 			ir.set("r22", I32, &tag);
 			let gate_seq = grid(ir, &a14, &a15, &tag, &deadline);
 			leave_unless(ir, &gate_seq, 106, "r12", "split.done");
+			// Word 15: nanoseconds from the request to the end of the first wave's gate and up products.
+			let first_wave = ir.value(format!("icmp eq i32 {wave}, 0"));
+			let stamp = ir.value(format!("and i1 {first_wave}, {leader}"));
+			when(ir, &stamp, |ir| {
+				let now = timer(ir);
+				let since = ir.value(format!("sub i64 {now}, {copied}"));
+				let narrow = ir.value(format!("trunc i64 {since} to i32"));
+				let at = gep(ir, "%report", "60");
+				st(ir, I32, &narrow, &at, false);
+			});
 			let product_bound = ir.value(format!("mul i32 {r3}, 8"));
 			let product_cols = ir.value(format!("mul i32 {r3}, {active}"));
 			let product_stride = ir.value(format!("mul i32 {rounds}, {ntid}"));
