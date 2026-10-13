@@ -19985,6 +19985,11 @@ fn width_split_function(kind: u32, k: usize, name: &str, shared: &str) -> Option
 	emit!("row.done:\n%rr.next = add i32 %rr, 1\nbr label %rows.head\nrows.done:\n%b0.next = add i32 %b0, %nb\nbr label %batch.head\nexit:\nret void\n}}");
 	Some(o)
 }
+/// Byte offset in the main die's first scratch buffer (`5 * 10240` floats) of a dense input's wire form, past the gathered
+/// floats of up to five positions of 6144 inputs (`DENSE_WIRE_WIDTH`); their wire form (34560 bytes) ends inside the buffer.
+const DENSE_WIRE_AT: usize = 131072;
+/// The widest dense split input the wire form serves; widths are also multiples of 128, so a position's wire form is whole quads.
+const DENSE_WIRE_WIDTH: usize = 6144;
 /// The `k0` argument of the K-format decoders: the low-nibble byte mask, passed at run time as `width_check` passes it.
 const WIDTH_NIBBLES: i32 = 0x0F0F0F0F;
 /// The unroll-disable loop metadata the split matvecs' row loops carry, defined by `WIDTH_SPLIT_METADATA`.
@@ -24832,7 +24837,7 @@ impl ExpertExecution {
 		Ok(format!(".version 7.4\n.target sm_52\n.address_size 64\n{}\n{}\n{}\n{}\n{}\n{span}\n{}", peer, local, expert_split_functions()?, MtpBatch::ptx()?, PackedMatvec::ptx(), native_nvidia_functions("expert-forward", &expert_forward::expert_forward_ir())?))
 	}
 	fn new(plan: ExpertSplitPlan, target: &Gguf, head: Option<&Gguf>, layers: Vec<ExpertLayer>, sequence: usize) -> Result<Self> {
-		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=10240}),"split worker dimensions differ from supported real matrices")?;
+		require(layers.iter().all(|layer|if let SplitWork::Expert(tensors)=&layer.work {tensors[0].shape[..2]==[2560,640] && tensors[1].shape[..2]==[2560,640] && tensors[2].shape[..2]==[640,2560]} else {layer.input_width()<=DENSE_WIRE_WIDTH && layer.input_width()%128==0}),"split worker dimensions differ from supported real matrices")?;
 		let main = device(Some(&format!("nv{}", plan.main_die)))?;
 		let dense = span_split_widths(layers.iter().filter(|layer| layer.dense()).map(ExpertLayer::input_width));
 		let experts = span_split_widths(layers.iter().filter(|layer| !layer.dense()).flat_map(|layer| [layer.input_width(), layer.hidden()]));
@@ -41651,6 +41656,7 @@ fn align_of(ty: &str) -> usize {
 	match ty {
 		"i64" => 8,
 		"i16" => 2,
+		"i8" => 1,
 		V4F32 | V4I32 => 16,
 		_ => 4,
 	}
@@ -41786,7 +41792,6 @@ fn split_dense_layer() -> String {
 	let a13 = word_address(&mut ir, "%desc", pointer(P_RESPONSE_SEQUENCE), false);
 	let r2 = field(&mut ir, "%desc", dimension(D_INPUT_WIDTH), I32);
 	let r3 = field(&mut ir, "%desc", dimension(D_SLICES), I32);
-	let r4 = field(&mut ir, "%desc", flag(F_STRIDE), I32);
 	let r5 = sreg(&mut ir, "tid.x");
 	let r6 = sreg(&mut ir, "ctaid.x");
 	let r7 = sreg(&mut ir, "ntid.x");
@@ -41843,13 +41848,27 @@ fn split_dense_layer() -> String {
 			ir.value(format!("icmp ult i32 {index}, {copy_bound}"))
 		},
 		|ir| {
+			// The request holds the input's wire form (see `split_dense_forward`): per position, int8 values then a float
+			// scale per 32 values, `width * 9 / 8` bytes.
 			let index = ir.get("r15", I32);
 			let row = ir.value(format!("udiv i32 {index}, {r2}"));
 			let column = ir.value(format!("urem i32 {index}, {r2}"));
-			let source_row = ir.value(format!("mul i32 {row}, {r4}"));
-			let source = ir.value(format!("add i32 {source_row}, {column}"));
-			let from = element(ir, &a3, &source, 4);
-			let value = ld(ir, F32, &from, true);
+			let eighth = ir.value(format!("lshr i32 {r2}, 3"));
+			let wire_stride = ir.value(format!("add i32 {r2}, {eighth}"));
+			let row_bytes = ir.value(format!("mul i32 {row}, {wire_stride}"));
+			let value_byte = ir.value(format!("add i32 {row_bytes}, {column}"));
+			let value_byte = ir.value(format!("zext i32 {value_byte} to i64"));
+			let value_at = gep(ir, &a3, &value_byte);
+			let code = ld(ir, "i8", &value_at, true);
+			let code = ir.value(format!("sitofp i8 {code} to float"));
+			let block = ir.value(format!("lshr i32 {column}, 5"));
+			let block_bytes = ir.value(format!("shl i32 {block}, 2"));
+			let scales_at = ir.value(format!("add i32 {row_bytes}, {r2}"));
+			let scale_byte = ir.value(format!("add i32 {scales_at}, {block_bytes}"));
+			let scale_byte = ir.value(format!("zext i32 {scale_byte} to i64"));
+			let scale_at = gep(ir, &a3, &scale_byte);
+			let scale = ld(ir, F32, &scale_at, true);
+			let value = ir.value(format!("fmul float {code}, {scale}"));
 			let to = element(ir, &a6, &index, 4);
 			st(ir, F32, &value, &to, false);
 			let next = ir.value(format!("add i32 {index}, {stride}"));
@@ -42232,11 +42251,81 @@ fn split_dense_forward() -> String {
 	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
 	let ready = grid(&mut ir, &a8, &a9, &ready_seq, &deadline);
 	leave_unless(&mut ir, &ready, 411, "r26", "df.failed");
+	// The wire form of the input: per position, its int8 values (one per input, scale = largest magnitude / 127 per 32 values,
+	// rounded half away from zero) then one float scale per 32 values, `width * 9 / 8` bytes; peers decode it back to floats.
+	let wire = gep(&mut ir, &scratch, &crate::DENSE_WIRE_AT.to_string());
+	let wire_blocks = ir.value(format!("lshr i32 {r6}, 5"));
+	let wire_eighth = ir.value(format!("lshr i32 {r6}, 3"));
+	let wire_stride = ir.value(format!("add i32 {r6}, {wire_eighth}"));
+	let wire_total = ir.value(format!("mul i32 {wire_blocks}, %cols"));
+	ir.set("r20", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let block = ir.get("r20", I32);
+			ir.value(format!("icmp ult i32 {block}, {wire_total}"))
+		},
+		|ir| {
+			let block = ir.get("r20", I32);
+			let position = ir.value(format!("udiv i32 {block}, {wire_blocks}"));
+			let within = ir.value(format!("urem i32 {block}, {wire_blocks}"));
+			let first_row = ir.value(format!("mul i32 {position}, {r6}"));
+			let first_lane = ir.value(format!("shl i32 {within}, 5"));
+			let first = ir.value(format!("add i32 {first_row}, {first_lane}"));
+			let values: Vec<String> = (0..32).map(|lane| {
+				let index = ir.value(format!("add i32 {first}, {lane}"));
+				let at = element(ir, &scratch, &index, 4);
+				ld(ir, F32, &at, false)
+			}).collect();
+			let mut top = "0.0".to_owned();
+			for value in &values {
+				let magnitude = ir.value(format!("call float @llvm.fabs.f32(float {value})"));
+				top = ir.value(format!("call float @llvm.maxnum.f32(float {top}, float {magnitude})"));
+			}
+			let zero = ir.value(format!("fcmp oeq float {top}, 0.0"));
+			let safe = ir.value(format!("select i1 {zero}, float 1.0, float {top}"));
+			let inverse_any = ir.value(format!("fdiv float 127.0, {safe}"));
+			let inverse = ir.value(format!("select i1 {zero}, float 0.0, float {inverse_any}"));
+			let scale = ir.value(format!("fdiv float {top}, 127.0"));
+			let row_bytes = ir.value(format!("mul i32 {position}, {wire_stride}"));
+			let mut words = Vec::new();
+			for word in 0..8 {
+				let mut packed = "0".to_owned();
+				for byte in 0..4 {
+					let scaled = ir.value(format!("fmul float {}, {inverse}", values[4 * word + byte]));
+					let half = ir.value(format!("call float @llvm.copysign.f32(float 0.5, float {scaled})"));
+					let rounded = ir.value(format!("fadd float {scaled}, {half}"));
+					let integer = ir.value(format!("fptosi float {rounded} to i32"));
+					let low = ir.value(format!("and i32 {integer}, 255"));
+					let placed = ir.value(format!("shl i32 {low}, {}", 8 * byte));
+					packed = ir.value(format!("or i32 {packed}, {placed}"));
+				}
+				words.push(packed);
+			}
+			let values_at = ir.value(format!("add i32 {row_bytes}, {first_lane}"));
+			for half in 0..2 {
+				let mut vector = "undef".to_owned();
+				for lane in 0..4 { vector = ir.value(format!("insertelement {V4I32} {vector}, i32 {}, i32 {lane}", words[4 * half + lane])); }
+				let offset = ir.value(format!("add i32 {values_at}, {}", 16 * half));
+				let offset = ir.value(format!("zext i32 {offset} to i64"));
+				let at = gep(ir, &wire, &offset);
+				ir.inst(format!("store {V4I32} {vector}, ptr addrspace(1) {at}, align 16"));
+			}
+			let scale_lane = ir.value(format!("shl i32 {within}, 2"));
+			let scale_base = ir.value(format!("add i32 {row_bytes}, {r6}"));
+			let scale_offset = ir.value(format!("add i32 {scale_base}, {scale_lane}"));
+			let scale_offset = ir.value(format!("zext i32 {scale_offset} to i64"));
+			let scale_at = gep(ir, &wire, &scale_offset);
+			st(ir, F32, &scale, &scale_at, false);
+			let next = ir.value(format!("add i32 {block}, {stride}"));
+			ir.set("r20", I32, &next);
+		},
+	);
+	let wired_seq = ir.value(format!("add i32 {ready_seq}, 2"));
+	let wired = grid(&mut ir, &a8, &a9, &wired_seq, &deadline);
+	leave_unless(&mut ir, &wired, 414, "r26", "df.failed");
 	stamp(&mut ir, 1);
 	ir.set("r20", I32, "0");
-	let padded_width = ir.value(format!("add i32 {r6}, 3"));
-	let row_pad = ir.value(format!("and i32 {padded_width}, -4"));
-	ir.set("r24", I32, &row_pad);
 	ir.inst("br label %df.send");
 	ir.label("df.send");
 	let peer = ir.get("r20", I32);
@@ -42255,22 +42344,13 @@ fn split_dense_forward() -> String {
 		let begin_at = gep(ir, &request_seq, "12");
 		st(ir, I32, "%begin", &begin_at, true);
 	});
-	// Packets are 16-byte vector copies when the width and both buffers allow it, otherwise scalar copies.
-	let width_rem = ir.value(format!("and i32 {r6}, 3"));
-	let width_bad = ir.value(format!("icmp ne i32 {width_rem}, 0"));
-	let scratch_bits = ir.value(format!("ptrtoint ptr addrspace(1) {scratch} to i64"));
-	let response_bits = ir.value(format!("ptrtoint ptr addrspace(1) {request} to i64"));
-	let both_bits = ir.value(format!("or i64 {scratch_bits}, {response_bits}"));
-	let aligned_bits = ir.value(format!("and i64 {both_bits}, 15"));
-	let misaligned = ir.value(format!("icmp ne i64 {aligned_bits}, 0"));
-	let scalar = ir.value(format!("or i1 {width_bad}, {misaligned}"));
+	// The wire form is contiguous and a whole number of 16-byte quads (widths are multiples of 128).
 	let quad_block = ir.fresh("df.quad");
-	let scalar_block = format!("{quad_block}.scalar");
 	let published = format!("{quad_block}.publish");
-	ir.inst(format!("br i1 {scalar}, label %{scalar_block}, label %{quad_block}"));
+	ir.inst(format!("br label %{quad_block}"));
 	ir.label(&quad_block);
-	let quad_width = ir.value(format!("lshr i32 {r6}, 2"));
-	let quad_bound = ir.value(format!("mul i32 {quad_width}, %cols"));
+	let wire_bytes = ir.value(format!("mul i32 {wire_stride}, %cols"));
+	let quad_bound = ir.value(format!("lshr i32 {wire_bytes}, 4"));
 	ir.set("r21", I32, &gid);
 	ir.set("r22", I32, &quad_bound);
 	let quad_head = ir.fresh("df.quad.head");
@@ -42283,59 +42363,15 @@ fn split_dense_forward() -> String {
 	let quad_exit = format!("{quad_head}.exit");
 	ir.inst(format!("br i1 {quad_more}, label %{quad_body}, label %{quad_exit}"));
 	ir.label(&quad_body);
-	let quad_row = ir.value(format!("udiv i32 {quad_index}, {quad_width}"));
-	let quad_col = ir.value(format!("urem i32 {quad_index}, {quad_width}"));
-	let quad_lane = ir.value(format!("shl i32 {quad_col}, 2"));
-	let read_row = ir.value(format!("mul i32 {quad_row}, {r6}"));
-	let read_index = ir.value(format!("add i32 {read_row}, {quad_lane}"));
-	let read_at = element(&mut ir, &scratch, &read_index, 4);
-	let vector = ir.value(format!("load {V4F32}, ptr addrspace(1) {read_at}, align 16"));
-	let write_row = ir.value(format!("mul i32 {quad_row}, {row_pad}"));
-	let write_index = ir.value(format!("add i32 {write_row}, {quad_lane}"));
-	let write_at = element(&mut ir, &request, &write_index, 4);
-	ir.inst(format!("store volatile {V4F32} {vector}, ptr addrspace(1) {write_at}, align 16"));
+	let quad_at = byte_offset(&mut ir, &quad_index, 16);
+	let read_at = gep(&mut ir, &wire, &quad_at);
+	let vector = ir.value(format!("load {V4I32}, ptr addrspace(1) {read_at}, align 16"));
+	let write_at = gep(&mut ir, &request, &quad_at);
+	ir.inst(format!("store volatile {V4I32} {vector}, ptr addrspace(1) {write_at}, align 16"));
 	let quad_next = ir.value(format!("add i32 {quad_index}, {stride}"));
 	ir.set("r21", I32, &quad_next);
 	ir.inst(format!("br label %{quad_head}"));
 	ir.label(&quad_exit);
-	ir.inst(format!("br label %{published}"));
-	ir.label(&scalar_block);
-	let scalar_end = ir.value(format!("mul i32 {row_pad}, %cols"));
-	ir.set("r21", I32, &gid);
-	ir.set("r22", I32, &scalar_end);
-	let scalar_head = ir.fresh("df.scalar.head");
-	ir.inst(format!("br label %{scalar_head}"));
-	ir.label(&scalar_head);
-	let scalar_index = ir.get("r21", I32);
-	let scalar_limit = ir.get("r22", I32);
-	let scalar_more = ir.value(format!("icmp ult i32 {scalar_index}, {scalar_limit}"));
-	let scalar_body = format!("{scalar_head}.body");
-	let scalar_exit = format!("{scalar_head}.exit");
-	ir.inst(format!("br i1 {scalar_more}, label %{scalar_body}, label %{scalar_exit}"));
-	ir.label(&scalar_body);
-	let scalar_row = ir.value(format!("udiv i32 {scalar_index}, {row_pad}"));
-	let scalar_col = ir.value(format!("urem i32 {scalar_index}, {row_pad}"));
-	let inside = ir.value(format!("icmp ult i32 {scalar_col}, {r6}"));
-	ir.set("df.value", F32, "0.0");
-	let fetch = ir.fresh("df.fetch");
-	let fetch_done = format!("{fetch}.done");
-	ir.inst(format!("br i1 {inside}, label %{fetch}, label %{fetch_done}"));
-	ir.label(&fetch);
-	let fetch_row = ir.value(format!("mul i32 {scalar_row}, {r6}"));
-	let fetch_index = ir.value(format!("add i32 {fetch_row}, {scalar_col}"));
-	let fetch_at = element(&mut ir, &scratch, &fetch_index, 4);
-	let fetched = ld(&mut ir, F32, &fetch_at, false);
-	ir.set("df.value", F32, &fetched);
-	ir.inst(format!("br label %{fetch_done}"));
-	ir.label(&fetch_done);
-	let scalar_value = ir.get("df.value", F32);
-	let scalar_write_row = ir.value(format!("mul i32 {scalar_index}, 1"));
-	let scalar_write_at = element(&mut ir, &request, &scalar_write_row, 4);
-	st(&mut ir, F32, &scalar_value, &scalar_write_at, true);
-	let scalar_next = ir.value(format!("add i32 {scalar_index}, {stride}"));
-	ir.set("r21", I32, &scalar_next);
-	ir.inst(format!("br label %{scalar_head}"));
-	ir.label(&scalar_exit);
 	ir.inst(format!("br label %{published}"));
 	ir.label(&published);
 	let peer_next = ir.get("r20", I32);
