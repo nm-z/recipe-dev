@@ -20419,6 +20419,14 @@ struct ExchangeBuffer {
 	/// The first die's buffer the others reach directly, or zero.
 	device: u64,
 	gpu: &'static Gpu,
+	/// The allocated bytes, in device memory or pinned machine RAM.
+	bytes: usize,
+}
+impl ExchangeBuffer {
+	/// The video memory this buffer holds on `gpu`; pinned machine RAM holds none.
+	fn resident_bytes(&self, gpu: &Gpu) -> usize {
+		if self.device != 0 && std::ptr::eq(gpu, self.gpu) { self.bytes } else { 0 }
+	}
 }
 // The buffer is plain pinned memory; each die reaches it through its own mapping.
 unsafe impl Send for ExchangeBuffer {}
@@ -20469,13 +20477,13 @@ impl Gpu {
 					let mut device = 0_u64;
 					driver_status(Backend::Nvidia, (driver.allocate)(&mut device, bytes), "exchange allocation")?;
 					driver_status(Backend::Nvidia, (driver.clear)(device, 0, bytes), "exchange clear")?;
-					return Ok(ExchangeBuffer { pointer: ptr::null_mut(), device, gpu: self });
+					return Ok(ExchangeBuffer { pointer: ptr::null_mut(), device, gpu: self, bytes });
 				}
 				let mut pointer = ptr::null_mut();
 				// Portable to every context, and mapped into each device's addresses.
 				driver_status(Backend::Nvidia, (driver.host_alloc)(&mut pointer, bytes, 0x01 | 0x02), "exchange allocation")?;
 				ptr::write_bytes(pointer.cast::<u8>(), 0, bytes);
-				Ok(ExchangeBuffer { pointer, device: 0, gpu: self })
+				Ok(ExchangeBuffer { pointer, device: 0, gpu: self, bytes })
 			},
 			_ => Err(RecipeError::new(format!("{} cannot hold a tensor split's exchange", self.name))),
 		}
@@ -20582,7 +20590,7 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 	}
 	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest, devices)?;
 	tapes.iter().try_for_each(|tape| tape.bind_exchange(&buffer))?;
-	let resident = tapes.iter().map(NativeTape::resident_bytes).collect();
+	let resident = tapes.iter().map(|tape| tape.resident_bytes() + buffer.resident_bytes(tape.program.gpu)).collect();
 	Ok((tapes, buffer, resident))
 }
 /// The saved statistics a batch normalization carries into inference, as the
@@ -21445,7 +21453,7 @@ impl Placed {
 	pub fn memory(&self) -> Vec<DeviceMemory> {
 		self.tapes.iter().flatten().map(|tape| DeviceMemory {
 			device: tape.program.gpu.name.clone(), input: tape.samples.bytes, weights: tape.weights.bytes,
-			values: tape.values.bytes, contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
+			values: tape.values.bytes + self.exchange.as_ref().map_or(0, |buffer| buffer.resident_bytes(tape.program.gpu)), contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
 		}).collect()
 	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {

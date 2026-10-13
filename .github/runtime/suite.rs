@@ -355,6 +355,17 @@ fn main() {
 	let stream = recipe.model().no(bias).embed(2, 1).fp(64).ple(&table).ple_math(embedding_math).fp(64);
 	let stepped_model = stream.res([attn(1).fp(64)]).fp(64).res([(gate * up).fp(64), layer(1).fp(64)]).fp(64).layer(2).fp(64);
 	let placed = file.place(&stepped_model, 160, &[]);
+	let memory = placed.memory();
+	let memory_total: usize = memory.iter().map(|row| row.total().expect("invalid placement memory total")).sum();
+	let resident_total: usize = placed.resident_bytes().iter().sum();
+	report.record("placed_memory_matches_resident", memory_total == resident_total, format!("memory_bytes={memory_total} resident_bytes={resident_total} devices={}", placed.resident_bytes().len()));
+	if let Ok(expected) = std::env::var("RECIPE_SUITE_EXCHANGE_BYTES") {
+		let expected: usize = expected.parse().expect("RECIPE_SUITE_EXCHANGE_BYTES is not an unsigned integer");
+		let matches = memory.first().zip(memory.get(1)).is_some_and(|(owner, peer)| {
+			owner.values == peer.values + expected && owner.total().unwrap() == peer.total().unwrap() + expected
+		});
+		report.record("placed_exchange_bytes", matches, format!("expected_bytes={expected} values={:?} resident_bytes={:?}", memory.iter().map(|row| row.values).collect::<Vec<_>>(), placed.resident_bytes()));
+	}
 	let ids: Vec<u32> = (0..160).map(|index| (index % 2) as u32).collect();
 	let whole = placed.infer(&ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>());
 	let direct = placed.prefill(&ids[..13]);
