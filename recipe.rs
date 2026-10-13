@@ -8194,8 +8194,9 @@ impl NativeModelIr {
 		let mean_exit = if mode.per_row() { format!("%{prefix}.mean.reduce.loop") } else { format!("%{prefix}.variance.loop") };
 		let variance_start = if mode.per_row() { wave_lane.clone() } else { "0".to_owned() };
 		let variance_exit = if mode.per_row() { format!("%{prefix}.variance.reduce.loop") } else { format!("%{prefix}.store") };
-		let variance_entry = if mode.per_row() { format!("%{prefix}.mean.reduce.done") } else { format!("%{prefix}.mean.loop") };
 		let zero_mean = matches!(mode, program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2);
+		// RMS and L2 never use the mean, so their mean block only enters the variance loop.
+		let variance_entry = if mode.per_row() && !zero_mean { format!("%{prefix}.mean.reduce.done") } else { format!("%{prefix}.mean.loop") };
 		let mean_broadcast = format!("%{prefix}.mean.broadcast");
 		// Per-row sums use 32 interleaved partials and a fixed tree on every
 		// backend. CPU vectors own all partials; GPUs assign each group of 32
@@ -8263,9 +8264,15 @@ impl NativeModelIr {
 			if zero_mean { String::new() } else { format!("%{prefix}.variance.centered = call {state_ty} @recipe.state.sub{v}({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n") };
 		let mean_next = if per_row { format!("%{prefix}.mean.p.next") } else { format!("%{prefix}.mean.next") };
 		let variance_next = if per_row { format!("%{prefix}.variance.p.next") } else { format!("%{prefix}.variance.next") };
-		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n{mean_phi}%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
-		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
-		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_update}{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop, !llvm.loop {NORMALIZE_UNROLL}\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n{variance_phi}{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
+		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n", group_loop = group_loop));
+		if zero_mean {
+			ir.push_str(&format!("br label %{prefix}.variance.loop\n"));
+		} else {
+			ir.push_str(&format!("%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n{mean_phi}%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", mean_entry = mean_entry, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
+			emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
+			ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_update}{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop, !llvm.loop {NORMALIZE_UNROLL}\n{mean_reduce_code}", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, align = alignment(ty), mean_reduce_code = mean_reduce_code));
+		}
+		ir.push_str(&format!("{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n{variance_phi}{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", items = items, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
 		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.variance.model)\n{centered_code}", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_code = centered_code, align = alignment(ty)));
 		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
@@ -10317,6 +10324,9 @@ fn shared_tile_name(ir: &str) -> Result<String> {
 
 /// The warps of a state tile split a head's key rows into this many bands.
 const DELTA_TILE_BANDS: usize = 8;
+/// Positions a state tile stages at once: their keys, queries, gates and values load together, one round of global reads
+/// for a decode window instead of one per position.
+const DELTA_TILE_STEPS: usize = 4;
 
 /// The key rows of one value column each lane of a state-tile decode holds in
 /// registers, when the node decodes in tiles: an NVIDIA inference layout whose
@@ -10336,8 +10346,9 @@ fn delta_tile_rows(backend: Backend, inference: bool, key_width: i32, width: i32
 /// and the live state is written back only when no slot holds it: with slots,
 /// every call restores from a slot, so the live state is never read again. Key
 /// reductions sum each lane's rows in order, then the band partials in band
-/// order. One lane evaluates each position's gates while the others stage its
-/// keys and queries, and the workgroup reads them from the shared tile. A launch whose
+/// order. Positions go in chunks of `DELTA_TILE_STEPS`: lane `j` evaluates the gates of
+/// the chunk's position `j` while the others stage every position's keys and queries
+/// and each lane loads its values, and the workgroup reads them from the shared tile. A launch whose
 /// geometry or shared tile cannot hold the layout returns false having touched
 /// nothing, and the caller walks columns instead.
 fn delta_tile_body(v: &str, s: &str, align: usize, rows: usize, shared: &str) -> String {
@@ -10364,7 +10375,18 @@ fn delta_tile_body(v: &str, s: &str, align: usize, rows: usize, shared: &str) ->
 	};
 	let restore = each(&|j| format!("{}%restored.{j} = load {s}, ptr addrspace(1) %restore.at.{j}, align {align}\n", at("restore.at", "%restore.pointer", j)));
 	let initial = each(&|j| format!("%initial.{j} = phi {s} [ %zero, %item.body ], [ %restored.{j}, %item.restore ]\n"));
-	let cells = each(&|j| format!("%cell.{j} = phi {s} [ %initial.{j}, %item.ready ], [ %updated.{j}, %latch ]\n"));
+	let chunk_cells = each(&|j| format!("%batch.cell.{j} = phi {s} [ %initial.{j}, %item.ready ], [ %cell.{j}, %batch.latch ]\n"));
+	let cells = each(&|j| format!("%cell.{j} = phi {s} [ %batch.cell.{j}, %stage.done ], [ %updated.{j}, %latch ]\n"));
+	// Each lane's value column at every staged position, loaded together; positions past the window repeat the first.
+	let steps = DELTA_TILE_STEPS;
+	let values = (0..steps).map(|j| format!(
+		"%value.time.{j}.raw = add i32 %batch, {j}\n%value.ok.{j} = icmp ult i32 {j}, %batch.steps\n%value.time.{j} = select i1 %value.ok.{j}, i32 %value.time.{j}.raw, i32 %batch\n%value.time.{j}.wide = zext i32 %value.time.{j} to i64\n%value.index.{j} = add i64 %v.column, %value.time.{j}.wide\n%value.{j} = call {s} @delta_model_load{v}(ptr addrspace(1) %input, i64 %value.index.{j})\n"
+	)).collect::<String>();
+	let pick = (0..steps - 1).rev().fold((String::new(), format!("%value.{}", steps - 1)), |(text, previous), j| {
+		let name = if j == 0 { "%value".to_owned() } else { format!("%value.pick.{j}") };
+		(format!("{text}%value.is.{j} = icmp eq i32 %step, {j}\n{name} = select i1 %value.is.{j}, {s} %value.{j}, {s} {previous}\n"), name)
+	}).0;
+	let (staged_pairs, scalar_count) = (2 * steps, 3 * steps);
 	// Decay the old state before predicting the value the delta update removes.
 	let read = each(&|j| {
 		format!(
@@ -10379,7 +10401,7 @@ fn delta_tile_body(v: &str, s: &str, align: usize, rows: usize, shared: &str) ->
 		)
 	});
 	let save = each(&|j| format!("{}store {s} %updated.{j}, ptr addrspace(1) %save.at.{j}, align {align}\n", at("save.at", "%save.pointer", j)));
-	let keep = each(&|j| format!("{}store {s} %cell.{j}, ptr addrspace(1) %keep.at.{j}, align {align}\n", at("keep.at", "%work.pointer", j)));
+	let keep = each(&|j| format!("{}store {s} %batch.cell.{j}, ptr addrspace(1) %keep.at.{j}, align {align}\n", at("keep.at", "%work.pointer", j)));
 	let last = rows - 1;
 	let prediction = band_sum("prediction", "%read.gather");
 	let output = band_sum("output", "%out.gather");
@@ -10405,9 +10427,10 @@ entry:
 %span.rest = urem i32 %vwidth, %span
 %span.fits = icmp eq i32 %span.rest, 0
 %keys.fit = icmp eq i32 %kwidth, {key_width}
-%shared.values = add i32 %kwidth, %width
-%shared.pairs = shl i32 %shared.values, 1
-%shared.count = add i32 %shared.pairs, 3
+%shared.staged = mul i32 %kwidth, {staged_pairs}
+%shared.outs = shl i32 %width, 1
+%shared.values = add i32 %shared.staged, %shared.outs
+%shared.count = add i32 %shared.values, {scalar_count}
 %shared.bytes = mul i32 %shared.count, {align}
 %tile.bytes = call i32 @recipe.tile.bytes()
 %shared.fits = icmp ule i32 %shared.bytes, %tile.bytes
@@ -10450,17 +10473,14 @@ start:
 %restore.slot = urem i32 %previous, %divisor
 %restore.slot.wide = zext i32 %restore.slot to i64
 %keys = getelementptr i8, ptr addrspace(3) @{shared}, i64 0
-%queries = getelementptr {s}, ptr addrspace(3) %keys, i64 %kwidth.wide
-%reads = getelementptr {s}, ptr addrspace(3) %queries, i64 %kwidth.wide
+%staged.values = mul i64 %kwidth.wide, {staged_pairs}
+%reads = getelementptr {s}, ptr addrspace(3) %keys, i64 %staged.values
 %width.wide = zext i32 %width to i64
 %outs = getelementptr {s}, ptr addrspace(3) %reads, i64 %width.wide
 %lid.wide = zext i32 %lid to i64
 %read.mine = getelementptr {s}, ptr addrspace(3) %reads, i64 %lid.wide
 %out.mine = getelementptr {s}, ptr addrspace(3) %outs, i64 %lid.wide
-%scalar.query = getelementptr {s}, ptr addrspace(3) %outs, i64 %width.wide
-%scalar.decay = getelementptr {s}, ptr addrspace(3) %scalar.query, i64 1
-%scalar.write = getelementptr {s}, ptr addrspace(3) %scalar.query, i64 2
-%gating = icmp eq i32 %lid, 0
+%scalars = getelementptr {s}, ptr addrspace(3) %outs, i64 %width.wide
 %sub.lanes = mul i32 %sub, {lanes}
 %gather = add i32 %sub.lanes, %lane
 %gather.wide = zext i32 %gather to i64
@@ -10468,8 +10488,6 @@ start:
 %out.gather = getelementptr {s}, ptr addrspace(3) %outs, i64 %gather.wide
 %first = mul i32 %band, {rows}
 %first.wide = zext i32 %first to i64
-%key.band = getelementptr {s}, ptr addrspace(3) %keys, i64 %first.wide
-%query.band = getelementptr {s}, ptr addrspace(3) %queries, i64 %first.wide
 %sub.columns = mul i32 %sub, 32
 %column.offset = add i32 %sub.columns, %lane
 %leader = icmp eq i32 %band, 0
@@ -10528,37 +10546,49 @@ br i1 %fresh, label %item.ready, label %item.restore
 item.restore:
 {restore}br label %item.ready
 item.ready:
-{initial}br label %time.loop
-time.loop:
-%time = phi i32 [ %begin, %item.ready ], [ %time.next, %latch ]
-{cells}%time.more = icmp ult i32 %time, %end
-br i1 %time.more, label %step, label %item.finish
-step:
-%time.wide = zext i32 %time to i64
-%value.index = add i64 %v.column, %time.wide
-%value = call {s} @delta_model_load{v}(ptr addrspace(1) %input, i64 %value.index)
-br i1 %gating, label %gate, label %stage.loop
+{initial}br label %batch.loop
+batch.loop:
+%batch = phi i32 [ %begin, %item.ready ], [ %batch.next, %batch.latch ]
+{chunk_cells}%batch.more = icmp ult i32 %batch, %end
+br i1 %batch.more, label %batch.stage, label %item.finish
+batch.stage:
+%batch.left = sub i32 %end, %batch
+%batch.few = icmp ult i32 %batch.left, {steps}
+%batch.steps = select i1 %batch.few, i32 %batch.left, i32 {steps}
+%stage.total = mul i32 %stage.count, %batch.steps
+{values}%gate.mine = icmp ult i32 %lid, %batch.steps
+br i1 %gate.mine, label %gate, label %stage.loop
 gate:
-%parameters = call <3 x {s}> @delta_parameters{v}(ptr addrspace(1) %gates, i64 %a.base, i64 %b.base, i32 %kwidth, i32 %time, {s} %decay.scale)
+%gate.time = add i32 %batch, %lid
+%parameters = call <3 x {s}> @delta_parameters{v}(ptr addrspace(1) %gates, i64 %a.base, i64 %b.base, i32 %kwidth, i32 %gate.time, {s} %decay.scale)
 %parameter.query = extractelement <3 x {s}> %parameters, i32 0
 %parameter.decay = extractelement <3 x {s}> %parameters, i32 1
 %parameter.write = extractelement <3 x {s}> %parameters, i32 2
-store {s} %parameter.query, ptr addrspace(3) %scalar.query, align {align}
-store {s} %parameter.decay, ptr addrspace(3) %scalar.decay, align {align}
-store {s} %parameter.write, ptr addrspace(3) %scalar.write, align {align}
+%gate.slot = mul i32 %lid, 3
+%gate.slot.wide = zext i32 %gate.slot to i64
+%gate.query = getelementptr {s}, ptr addrspace(3) %scalars, i64 %gate.slot.wide
+%gate.decay = getelementptr {s}, ptr addrspace(3) %gate.query, i64 1
+%gate.write = getelementptr {s}, ptr addrspace(3) %gate.query, i64 2
+store {s} %parameter.query, ptr addrspace(3) %gate.query, align {align}
+store {s} %parameter.decay, ptr addrspace(3) %gate.decay, align {align}
+store {s} %parameter.write, ptr addrspace(3) %gate.write, align {align}
 br label %stage.loop
 stage.loop:
-%stage = phi i32 [ %lid, %step ], [ %lid, %gate ], [ %stage.next, %stage.body ]
-%stage.more = icmp ult i32 %stage, %stage.count
+%stage = phi i32 [ %lid, %batch.stage ], [ %lid, %gate ], [ %stage.next, %stage.body ]
+%stage.more = icmp ult i32 %stage, %stage.total
 br i1 %stage.more, label %stage.body, label %stage.done
 stage.body:
-%stage.query = icmp uge i32 %stage, %kwidth
-%stage.shifted = sub i32 %stage, %kwidth
-%stage.channel = select i1 %stage.query, i32 %stage.shifted, i32 %stage
+%stage.step = udiv i32 %stage, %stage.count
+%stage.in = urem i32 %stage, %stage.count
+%stage.query = icmp uge i32 %stage.in, %kwidth
+%stage.shifted = sub i32 %stage.in, %kwidth
+%stage.channel = select i1 %stage.query, i32 %stage.shifted, i32 %stage.in
 %stage.channel.wide = zext i32 %stage.channel to i64
 %stage.plane = select i1 %stage.query, i64 %q.base, i64 %k.base
 %stage.row = mul i64 %stage.channel.wide, %length.wide
-%stage.offset = add i64 %stage.row, %time.wide
+%stage.time = add i32 %batch, %stage.step
+%stage.time.wide = zext i32 %stage.time to i64
+%stage.offset = add i64 %stage.row, %stage.time.wide
 %stage.index = add i64 %stage.plane, %stage.offset
 %stage.value = call {s} @delta_model_load{v}(ptr addrspace(1) %input, i64 %stage.index)
 %stage.wide = zext i32 %stage to i64
@@ -10568,6 +10598,24 @@ store {s} %stage.value, ptr addrspace(3) %stage.at, align {align}
 br label %stage.loop
 stage.done:
 call void @llvm.nvvm.barrier0()
+br label %time.loop
+time.loop:
+%step = phi i32 [ 0, %stage.done ], [ %step.next, %latch ]
+{cells}%time.more = icmp ult i32 %step, %batch.steps
+br i1 %time.more, label %step.body, label %batch.latch
+step.body:
+%time = add i32 %batch, %step
+%time.wide = zext i32 %time to i64
+{pick}%step.staged = mul i32 %step, %stage.count
+%step.first = add i32 %step.staged, %first
+%step.first.wide = zext i32 %step.first to i64
+%key.band = getelementptr {s}, ptr addrspace(3) %keys, i64 %step.first.wide
+%query.band = getelementptr {s}, ptr addrspace(3) %key.band, i64 %kwidth.wide
+%step.slot = mul i32 %step, 3
+%step.slot.wide = zext i32 %step.slot to i64
+%scalar.query = getelementptr {s}, ptr addrspace(3) %scalars, i64 %step.slot.wide
+%scalar.decay = getelementptr {s}, ptr addrspace(3) %scalar.query, i64 1
+%scalar.write = getelementptr {s}, ptr addrspace(3) %scalar.query, i64 2
 %decay = load {s}, ptr addrspace(3) %scalar.decay, align {align}
 {read}store {s} %read.sum.{last}, ptr addrspace(3) %read.mine, align {align}
 call void @llvm.nvvm.barrier0()
@@ -10595,8 +10643,11 @@ emit:
 call void @delta_model_store{v}(ptr addrspace(1) %output, i64 %output.index, {s} %output.{final_band})
 br label %latch
 latch:
-%time.next = add i32 %time, 1
+%step.next = add i32 %step, 1
 br label %time.loop
+batch.latch:
+%batch.next = add i32 %batch, %batch.steps
+br label %batch.loop
 item.finish:
 br i1 %checkpointing, label %item.done, label %item.keep
 item.keep:
