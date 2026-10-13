@@ -2663,9 +2663,10 @@ impl SpanWeight {
 	/// their own multiply-add chains (a Q5_K k2560 slice issued at IPC 2.2 with 55% of
 	/// stalls on execution dependencies, nvprof 2026-10-13), so two rows give each slot two
 	/// independent chains per position and share each staged-activation read; every row
-	/// still sums in its own order.
+	/// still sums in its own order. Q5_K and Q6_K, whose tasks already hold the most bytes,
+	/// were slower with two (Q5_K dense slices 59 -> 72 us; 20261013T061416-gputest-1).
 	fn pass(self, many: bool) -> usize {
-		if many && !matches!(self, Self::F32 | Self::F16 | Self::BF16) { 2 } else { 1 }
+		if many && matches!(self, Self::Q8_0 | Self::Q4K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL) { 2 } else { 1 }
 	}
 	/// Byte alignment the weight lines need beyond the format's own.
 	fn alignment(self) -> usize { match self { Self::F32 | Self::F16 | Self::BF16 | Self::Q4K | Self::Q5K => 16, Self::Q8_0 | Self::Q6K | Self::IQ2XS | Self::IQ3XXS | Self::IQ4NL => 2 } }
@@ -2769,6 +2770,7 @@ fn span_matvec_declarations(ir: &str) -> String {
 		("@llvm.fabs.f32(", "declare float @llvm.fabs.f32(float)"),
 		("@llvm.maxnum.f32(", "declare float @llvm.maxnum.f32(float, float)"),
 		("@llvm.copysign.f32(", "declare float @llvm.copysign.f32(float, float)"),
+		("@llvm.nvvm.prmt(", "declare i32 @llvm.nvvm.prmt(i32, i32, i32)"),
 	].into_iter().filter(|(name, _)| !ir.lines().any(|line| line.starts_with("declare") && line.contains(name))).map(|(_, line)| format!("{line}\n")).collect()
 }
 /// The metadata node marking weight loads invariant, so they use the read-only path.
@@ -2815,9 +2817,9 @@ const SPAN_SPLIT_FORMATS: [(u32, SpanWeight); 7] = [
 /// The IQ4_NL levels.
 const SPAN_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 /// The split entries, for planes whose format and width have a position-batched
-/// matvec and whose columns fit the staged input; any other returns 0 and keeps its
-/// previous kernel. Columns are position-major, as the split stages them, and rows
-/// come at run time.
+/// matvec: a dense call takes any column count (groups of columns share the grid), an
+/// expert call only columns its matvec stages at once; any other returns 0. Columns are
+/// position-major, as the split stages them, and rows come at run time.
 /// `i32 @span_split_dense(type, k, rows, weights, x, y, columns)` runs a dense slice
 /// (`dense` widths) on every workgroup; `i32 @span_split_expert(type, k, rows,
 /// weights, x, y, columns, mask, rank, count)` runs one expert matrix (`experts`
@@ -2861,7 +2863,9 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 	for (entry, cases, extra) in [("dense", dense, ""), ("expert", experts, ", i32 %mask, i32 %rank, i32 %count")] {
 		ir.push_str(&format!("define i32 @span_split_{entry}(i32 %type, i32 %k, i32 %rows, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %columns{extra}) #3 {{\nentry:\n%some = icmp ne i32 %columns, 0\nbr label %case0\n"));
 		for (n, (code, k, widest, name, stage)) in cases.iter().enumerate() {
-			ir.push_str(&format!("case{n}:\n%case{n}.type = icmp eq i32 %type, {code}\n%case{n}.k = icmp eq i32 %k, {k}\n%case{n}.fits = icmp ule i32 %columns, {widest}\n%case{n}.a = and i1 %case{n}.type, %case{n}.k\n%case{n}.b = and i1 %case{n}.a, %case{n}.fits\n%case{n}.run = and i1 %case{n}.b, %some\nbr i1 %case{n}.run, label %case{n}.call, label %case{}\ncase{n}.call:\n", n + 1));
+			// A dense call with more columns than one group stages splits the grid by position group, so it takes any count.
+			let fits = if extra.is_empty() { SPECULATIVE_POSITIONS } else { *widest };
+			ir.push_str(&format!("case{n}:\n%case{n}.type = icmp eq i32 %type, {code}\n%case{n}.k = icmp eq i32 %k, {k}\n%case{n}.fits = icmp ule i32 %columns, {fits}\n%case{n}.a = and i1 %case{n}.type, %case{n}.k\n%case{n}.b = and i1 %case{n}.a, %case{n}.fits\n%case{n}.run = and i1 %case{n}.b, %some\nbr i1 %case{n}.run, label %case{n}.call, label %case{}\ncase{n}.call:\n", n + 1));
 			if extra.is_empty() && *stage < SPECULATIVE_POSITIONS {
 				// The kernel stages `stage` positions at once, so each group of `stage` columns takes its own share of the grid at
 				// the same time: the groups read the same rows together and the repeat reads hit L2, instead of the whole grid
@@ -3128,11 +3132,12 @@ fn span_activations(o: &mut String, q: &str, shared: &str, stride: usize, positi
 	o.push_str(&format!("{q}.offset = add i32 {index}, {}\n{q}.at = getelementptr float, ptr addrspace(3) @{shared}, i32 {q}.offset\n{q} = load <4 x float>, ptr addrspace(3) {q}.at, align 16\n", position * stride));
 	std::array::from_fn(|i| { o.push_str(&format!("{q}.e{i} = extractelement <4 x float> {q}, i32 {i}\n")); format!("{q}.e{i}") })
 }
-/// The exact float of each byte of a word, less `bias`: or-ing the byte into the
-/// mantissa of 2^23 and subtracting 2^23 + `bias`.
+/// The exact float of each byte of a word, less `bias`: one byte permute sets the byte
+/// in the mantissa of 2^23, and subtracting 2^23 + `bias` leaves its value.
 fn span_bytes(o: &mut String, q: &str, word: &str, less: u32) -> [String; 4] {
 	std::array::from_fn(|b| {
-		o.push_str(&format!("{q}.b{b}.shift = lshr i32 {word}, {}\n{q}.b{b}.byte = and i32 {q}.b{b}.shift, 255\n{q}.b{b}.bits = or i32 {q}.b{b}.byte, 1258291200\n{q}.b{b}.float = bitcast i32 {q}.b{b}.bits to float\n{q}.b{b} = fsub float {q}.b{b}.float, {}\n", 8 * b, span_float(8388608.0 + f64::from(less))));
+		// Result bytes, low first: byte `b` of `word`, then 0x00, 0x00, 0x4B from 2^23's bits.
+		o.push_str(&format!("{q}.b{b}.bits = call i32 @llvm.nvvm.prmt(i32 {word}, i32 1258291200, i32 {})\n{q}.b{b}.float = bitcast i32 {q}.b{b}.bits to float\n{q}.b{b} = fsub float {q}.b{b}.float, {}\n", 0x7540 | b, span_float(8388608.0 + f64::from(less))));
 		format!("{q}.b{b}")
 	})
 }
@@ -3323,7 +3328,8 @@ fn span_task_quads(o: &mut String, w: SpanWeight, t: &str, cl: &str) -> (Vec<Spa
 					let magnitudes = span_bytes(&mut decode, &format!("{r}.h{h}.m"), word, 0);
 					let weights = std::array::from_fn(|b| {
 						let v = format!("{r}.h{h}.v{b}");
-						code!(decode, "{v}.sign0 = lshr i32 {signs}, {}\n{v}.sign1 = and i32 {v}.sign0, 1\n{v}.sign = shl i32 {v}.sign1, 31\n{v}.bits0 = bitcast float {} to i32\n{v}.bits = xor i32 {v}.bits0, {v}.sign\n{v} = bitcast i32 {v}.bits to float", 4 * h + b, magnitudes[b]);
+						// The weight's sign bit moved straight to the float's sign.
+						code!(decode, "{v}.sign0 = shl i32 {signs}, {}\n{v}.sign = and i32 {v}.sign0, -2147483648\n{v}.bits0 = bitcast float {} to i32\n{v}.bits = xor i32 {v}.bits0, {v}.sign\n{v} = bitcast i32 {v}.bits to float", 31 - (4 * h + b), magnitudes[b]);
 						v
 					});
 					quads.push(SpanQuad { decode, weights, offset: format!("{r}.h{h}.o"), group });
@@ -20155,13 +20161,13 @@ fn width_split_block_source(o: &mut String, index: &str, p: &str, blocks: usize,
 	emit!("%{p}.pos = udiv i32 {index}, {blocks}\n%{p}.blk = urem i32 {index}, {blocks}\n%{p}.j = add i32 %b0, %{p}.pos\n%{p}.bit = call i32 @width.split.column(i32 %mask, i32 %{p}.j)\n%{p}.col = select i1 %all, i32 %{p}.j, i32 %{p}.bit");
 	emit!("%{p}.col.wide = zext i32 %{p}.col to i64\n%{p}.position = add i64 %begin.wide, %{p}.col.wide\n%{p}.row = mul i64 %{p}.position, {k}\n%{p}.blk.wide = zext i32 %{p}.blk to i64\n%{p}.blk.off = mul i64 %{p}.blk.wide, 32\n%{p}.off = add i64 %{p}.row, %{p}.blk.off\n%{p}.src = getelementptr float, ptr addrspace(1) %x, i64 %{p}.off");
 }
-/// What a module holding split matvecs needs beside them, given the module text so far: the column helper, the byte-permute
-/// declaration and the unroll-disable metadata, each unless the module already has it.
+/// What a module holding split matvecs needs beside them, given the module text so far: the column helper and the
+/// unroll-disable metadata, each unless the module already has it. Their byte-permute declaration comes with
+/// `span_matvec_declarations`.
 fn width_split_support(module: &str) -> String {
 	if !module.contains("@width_split.") { return String::new(); }
 	let mut text = String::new();
 	if !module.contains("define internal i32 @width.split.column(") { text.push_str(WIDTH_SPLIT_COLUMN); }
-	if !module.contains("declare i32 @llvm.nvvm.prmt(") { text.push_str("declare i32 @llvm.nvvm.prmt(i32, i32, i32)\n"); }
 	if !module.contains(&format!("\n{WIDTH_UNROLL_OFF} = ")) { text.push_str(WIDTH_SPLIT_METADATA); }
 	text
 }
