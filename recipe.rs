@@ -8262,7 +8262,7 @@ impl NativeModelIr {
 		let variance_next = if per_row { format!("%{prefix}.variance.p.next") } else { format!("%{prefix}.variance.next") };
 		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n{mean_phi}%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
 		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
-		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_update}{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n{variance_phi}{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
+		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_update}{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop, !llvm.loop {NORMALIZE_UNROLL}\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n{variance_phi}{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
 		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.variance.model)\n{centered_code}", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_code = centered_code, align = alignment(ty)));
 		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
@@ -8305,7 +8305,7 @@ impl NativeModelIr {
 			format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n")
 		};
 		ir.push_str(&format!(
-			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_update}{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
+			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_update}{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop, !llvm.loop {NORMALIZE_UNROLL}\n",
 			prefix = prefix,
 			state_ty = state_ty,
 			centered_model = if wide_sum_only && !zero_mean { format!("%{prefix}.variance.centered.model = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.centered)\n") } else { String::new() },
@@ -9423,6 +9423,7 @@ impl NativeModelIr {
 		self.emit_topk_shared(backend, &mut ir)?;
 		self.emit_delta_tiles(backend, &mut ir)?;
 		self.emit_span_matvecs(backend, &mut ir)?;
+		if ir.contains(&format!("!llvm.loop {NORMALIZE_UNROLL}")) && !ir.contains(&format!("\n{NORMALIZE_UNROLL} = ")) { ir.push_str(NORMALIZE_UNROLL_METADATA); }
 		let mut ir = outline_operation_classes(prune_internal_definitions(ir))?;
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
@@ -20315,6 +20316,10 @@ const DENSE_WIRE_WIDTH: usize = 6144;
 /// The `k0` argument of the K-format decoders: the low-nibble byte mask, passed at run time as `width_check` passes it.
 const WIDTH_NIBBLES: i32 = 0x0F0F0F0F;
 /// The unroll-disable loop metadata the split matvecs' row loops carry, defined by `WIDTH_SPLIT_METADATA`.
+/// The loop metadata the normalize statistics loops carry: each lane's sequential sum walks its row 32 values apart with one
+/// load per step, so unrolling by eight issues eight loads ahead while the additions keep their order.
+const NORMALIZE_UNROLL: &str = "!8187";
+const NORMALIZE_UNROLL_METADATA: &str = "!8187 = distinct !{!8187, !8186}\n!8186 = !{!\"llvm.loop.unroll.count\", i32 8}\n";
 const WIDTH_UNROLL_OFF: &str = "!8189";
 const WIDTH_SPLIT_METADATA: &str = "!8189 = distinct !{!8189, !8188}\n!8188 = !{!\"llvm.loop.unroll.disable\"}\n";
 /// The address `{p}.src` of the 32 input floats of staged block `index` of a batch (position-major, `blocks` per position):
