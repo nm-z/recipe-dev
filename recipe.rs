@@ -41622,17 +41622,21 @@ fn grid(ir: &mut Ir, sl: &str, fl: &str, sequence: &str, deadline: &str) -> Stri
 	ir.value(format!("call i32 @split_grid(ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline})"))
 }
 
-/// The wire form of `cols` positions of `width` floats at `scratch` (position-major): per position, its int8 values (scale =
-/// largest magnitude / 127 per 32 values, rounded half away from zero) then one float scale per 32 values, `width * 9 / 8` bytes,
-/// written `DENSE_WIRE_AT` bytes past `scratch`. Every thread of the grid takes 32-value blocks `gid`, `gid + stride`, ...; the
-/// caller's grid barrier publishes it. Returns the wire's address and its length in 4-byte words.
-fn wire_encode(ir: &mut Ir, scratch: &str, width: &str, cols: &str, gid: &str, stride: &str) -> (String, String) {
+/// The wire form of `cols` positions of `width` floats, value (position, channel) as `load` reads it: per position, its int8
+/// values (scale = largest magnitude / 127 per 32 values, rounded half away from zero) then one float scale per 32 values,
+/// `width * 9 / 8` bytes, written `DENSE_WIRE_AT` bytes past `scratch`. Each warp of the grid takes 32-value blocks `warp`,
+/// `warp + warps`, ..., one value a lane: the lanes meet on the block's largest magnitude, and each four lanes pack their bytes
+/// into one word. The caller's grid barrier publishes it. Returns the wire's address and its length in 4-byte words.
+fn wire_encode(ir: &mut Ir, scratch: &str, width: &str, cols: &str, gid: &str, stride: &str, load: &dyn Fn(&mut Ir, &str, &str) -> String) -> (String, String) {
 	let wire = gep(ir, scratch, &crate::DENSE_WIRE_AT.to_string());
 	let blocks = ir.value(format!("lshr i32 {width}, 5"));
 	let eighth = ir.value(format!("lshr i32 {width}, 3"));
 	let wire_stride = ir.value(format!("add i32 {width}, {eighth}"));
 	let total = ir.value(format!("mul i32 {blocks}, {cols}"));
-	ir.set("wire.block", I32, gid);
+	let lane = ir.value(format!("and i32 {gid}, 31"));
+	let warp = ir.value(format!("lshr i32 {gid}, 5"));
+	let warps = ir.value(format!("lshr i32 {stride}, 5"));
+	ir.set("wire.block", I32, &warp);
 	while_loop(
 		ir,
 		|ir| {
@@ -41643,55 +41647,52 @@ fn wire_encode(ir: &mut Ir, scratch: &str, width: &str, cols: &str, gid: &str, s
 			let block = ir.get("wire.block", I32);
 			let position = ir.value(format!("udiv i32 {block}, {blocks}"));
 			let within = ir.value(format!("urem i32 {block}, {blocks}"));
-			let first_row = ir.value(format!("mul i32 {position}, {width}"));
 			let first_lane = ir.value(format!("shl i32 {within}, 5"));
-			let first = ir.value(format!("add i32 {first_row}, {first_lane}"));
-			let values: Vec<String> = (0..32).map(|lane| {
-				let index = ir.value(format!("add i32 {first}, {lane}"));
-				let at = element(ir, scratch, &index, 4);
-				ld(ir, F32, &at, false)
-			}).collect();
-			let mut top = "0.0".to_owned();
-			for value in &values {
-				let magnitude = ir.value(format!("call float @llvm.fabs.f32(float {value})"));
-				top = ir.value(format!("call float @llvm.maxnum.f32(float {top}, float {magnitude})"));
+			let channel = ir.value(format!("add i32 {first_lane}, {lane}"));
+			let value = load(ir, &position, &channel);
+			let mut top = ir.value(format!("call float @llvm.fabs.f32(float {value})"));
+			for offset in [16, 8, 4, 2, 1] {
+				let bits = ir.value(format!("bitcast float {top} to i32"));
+				let partner_bits = ir.value(format!("call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 {bits}, i32 {offset}, i32 31)"));
+				let partner = ir.value(format!("bitcast i32 {partner_bits} to float"));
+				top = ir.value(format!("call float @llvm.maxnum.f32(float {top}, float {partner})"));
 			}
 			let zero = ir.value(format!("fcmp oeq float {top}, 0.0"));
 			let safe = ir.value(format!("select i1 {zero}, float 1.0, float {top}"));
 			let inverse_any = ir.value(format!("fdiv float 127.0, {safe}"));
 			let inverse = ir.value(format!("select i1 {zero}, float 0.0, float {inverse_any}"));
 			let scale = ir.value(format!("fdiv float {top}, 127.0"));
-			let row_bytes = ir.value(format!("mul i32 {position}, {wire_stride}"));
-			let mut words = Vec::new();
-			for word in 0..8 {
-				let mut packed = "0".to_owned();
-				for byte in 0..4 {
-					let scaled = ir.value(format!("fmul float {}, {inverse}", values[4 * word + byte]));
-					let half = ir.value(format!("call float @llvm.copysign.f32(float 0.5, float {scaled})"));
-					let rounded = ir.value(format!("fadd float {scaled}, {half}"));
-					let integer = ir.value(format!("fptosi float {rounded} to i32"));
-					let low = ir.value(format!("and i32 {integer}, 255"));
-					let placed = ir.value(format!("shl i32 {low}, {}", 8 * byte));
-					packed = ir.value(format!("or i32 {packed}, {placed}"));
-				}
-				words.push(packed);
+			let scaled = ir.value(format!("fmul float {value}, {inverse}"));
+			let half = ir.value(format!("call float @llvm.copysign.f32(float 0.5, float {scaled})"));
+			let rounded = ir.value(format!("fadd float {scaled}, {half}"));
+			let integer = ir.value(format!("fptosi float {rounded} to i32"));
+			let low = ir.value(format!("and i32 {integer}, 255"));
+			let byte = ir.value(format!("and i32 {lane}, 3"));
+			let shift = ir.value(format!("shl i32 {byte}, 3"));
+			let mut packed = ir.value(format!("shl i32 {low}, {shift}"));
+			for offset in [1, 2] {
+				let partner = ir.value(format!("call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 {packed}, i32 {offset}, i32 31)"));
+				packed = ir.value(format!("or i32 {packed}, {partner}"));
 			}
+			let row_bytes = ir.value(format!("mul i32 {position}, {wire_stride}"));
 			let values_at = ir.value(format!("add i32 {row_bytes}, {first_lane}"));
-			for half in 0..2 {
-				let mut vector = "undef".to_owned();
-				for lane in 0..4 { vector = ir.value(format!("insertelement {V4I32} {vector}, i32 {}, i32 {lane}", words[4 * half + lane])); }
-				let offset = ir.value(format!("add i32 {values_at}, {}", 16 * half));
+			let owner = ir.value(format!("icmp eq i32 {byte}, 0"));
+			when(ir, &owner, |ir| {
+				let offset = ir.value(format!("add i32 {values_at}, {lane}"));
 				let offset = ir.value(format!("zext i32 {offset} to i64"));
 				let at = gep(ir, &wire, &offset);
-				ir.inst(format!("store {V4I32} {vector}, ptr addrspace(1) {at}, align 16"));
-			}
-			let scale_lane = ir.value(format!("shl i32 {within}, 2"));
-			let scale_base = ir.value(format!("add i32 {row_bytes}, {width}"));
-			let scale_offset = ir.value(format!("add i32 {scale_base}, {scale_lane}"));
-			let scale_offset = ir.value(format!("zext i32 {scale_offset} to i64"));
-			let scale_at = gep(ir, &wire, &scale_offset);
-			st(ir, F32, &scale, &scale_at, false);
-			let next = ir.value(format!("add i32 {block}, {stride}"));
+				st(ir, I32, &packed, &at, false);
+			});
+			let leads = ir.value(format!("icmp eq i32 {lane}, 0"));
+			when(ir, &leads, |ir| {
+				let scale_lane = ir.value(format!("shl i32 {within}, 2"));
+				let scale_base = ir.value(format!("add i32 {row_bytes}, {width}"));
+				let scale_offset = ir.value(format!("add i32 {scale_base}, {scale_lane}"));
+				let scale_offset = ir.value(format!("zext i32 {scale_offset} to i64"));
+				let scale_at = gep(ir, &wire, &scale_offset);
+				st(ir, F32, &scale, &scale_at, false);
+			});
+			let next = ir.value(format!("add i32 {block}, {warps}"));
 			ir.set("wire.block", I32, &next);
 		},
 	);
@@ -42260,32 +42261,17 @@ fn split_dense_forward() -> String {
 		});
 	};
 	stamp(&mut ir, 0);
-	let gather_bound = ir.value(format!("mul i32 {r6}, %cols"));
-	ir.set("r20", I32, &gid);
-	ir.inst("br label %df.gather");
-	ir.label("df.gather");
-	let index = ir.get("r20", I32);
-	let more = ir.value(format!("icmp ult i32 {index}, {gather_bound}"));
-	ir.inst(format!("br i1 {more}, label %df.gather.body, label %df.ready"));
-	ir.label("df.gather.body");
-	let row = ir.value(format!("udiv i32 {index}, {r6}"));
-	let column = ir.value(format!("urem i32 {index}, {r6}"));
-	let source_row = ir.value(format!("mul i32 {column}, %length"));
-	let source_begin = ir.value(format!("add i32 {source_row}, {row}"));
-	let source_index = ir.value(format!("add i32 {source_begin}, %begin"));
-	let from = element(&mut ir, "%source", &source_index, 4);
-	let value = ld(&mut ir, F32, &from, false);
-	let to = element(&mut ir, &scratch, &index, 4);
-	st(&mut ir, F32, &value, &to, false);
-	let next = ir.value(format!("add i32 {index}, {stride}"));
-	ir.set("r20", I32, &next);
-	ir.inst("br label %df.gather");
-	ir.label("df.ready");
 	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
-	let ready = grid(&mut ir, &a8, &a9, &ready_seq, &deadline);
-	leave_unless(&mut ir, &ready, 411, "r26", "df.failed");
-	// The wire form of the input, which peers decode back to floats (see `wire_encode`).
-	let (wire, wire_words) = wire_encode(&mut ir, &scratch, &r6, "%cols", &gid, &stride);
+	// The wire form of the input, which peers decode back to floats (see `wire_encode`), read straight from the source tape
+	// (channel-major, `%length` positions a channel), which the forward's barrier before this node published.
+	let source = |ir: &mut Ir, position: &str, channel: &str| -> String {
+		let row = ir.value(format!("mul i32 {channel}, %length"));
+		let at = ir.value(format!("add i32 {row}, {position}"));
+		let index = ir.value(format!("add i32 {at}, %begin"));
+		let from = element(ir, "%source", &index, 4);
+		ld(ir, F32, &from, false)
+	};
+	let (wire, wire_words) = wire_encode(&mut ir, &scratch, &r6, "%cols", &gid, &stride, &source);
 	let wired_seq = ir.value(format!("add i32 {ready_seq}, 2"));
 	let wired = grid(&mut ir, &a8, &a9, &wired_seq, &deadline);
 	leave_unless(&mut ir, &wired, 414, "r26", "df.failed");
@@ -42710,7 +42696,13 @@ fn split_main_forward() -> String {
 	leave_unless(&mut ir, &ready, 301, "r30", "main.failed");
 	stamp(&mut ir, 1);
 	// The wire form of the hidden rows (see `wire_encode`).
-	let (wire, wire_words) = wire_encode(&mut ir, &x, &r6, "%cols", &gid, &stride);
+	let hidden = |ir: &mut Ir, position: &str, channel: &str| -> String {
+		let row = ir.value(format!("mul i32 {position}, {r6}"));
+		let index = ir.value(format!("add i32 {row}, {channel}"));
+		let from = element(ir, &x, &index, 4);
+		ld(ir, F32, &from, false)
+	};
+	let (wire, wire_words) = wire_encode(&mut ir, &x, &r6, "%cols", &gid, &stride, &hidden);
 	// Every peer's request is a stream of low-latency words (see `LL_READ`): per position a header of 1 + 2 * top_k words (how
 	// many of the position's selected experts the peer owns, their ids, then their coefficients, in selection order), then the
 	// wire form. No fence or flag publishes it. Each header word scans the position's selection, so the grid computes every
