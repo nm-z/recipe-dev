@@ -2787,6 +2787,13 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 		let mut cases = Vec::new();
 		for &k in widths {
 			for (code, weight) in SPAN_SPLIT_FORMATS {
+				// Quantized formats run the least-instruction XMAD kernel, which stages any number of positions in batches.
+				let name = format!("width_split.{code}.k{k}");
+				if let Some(function) = width_split_function(code, k, &name, shared) {
+					if names.insert(name.clone()) { functions.push_str(&function); }
+					cases.push((code, k, SPECULATIVE_POSITIONS, name));
+					continue;
+				}
 				let spec = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
 				let Some(widest) = (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last().filter(|_| spec.valid()) else { continue };
 				let name = format!("span_split.{}", spec.key());
@@ -3629,6 +3636,7 @@ fn span_split_ptx(dense: &[usize], experts: &[usize], target: &BackendTarget) ->
 	let feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
 	let mut functions = span_split_ir(dense, experts, "scratch");
 	if functions.contains("@span.iq") { functions.push_str(&span_grids_ir(PackedMatvec::ptx()).ok_or_else(|| RecipeError::new("packed PTX lacks the IQ grids"))?); }
+	functions.push_str(&width_split_support(&functions));
 	let ir = format!("target triple = \"nvptx64-nvidia-cuda\"\n@scratch = external addrspace(3) global [0 x float], align 16\nattributes #1 = {{ alwaysinline nounwind }}\nattributes #3 = {{ noinline nounwind }}\n{}{functions}{SPAN_INVARIANT} = !{{}}\n", span_matvec_declarations(""));
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
@@ -8563,6 +8571,8 @@ impl NativeModelIr {
 				.flat_map(|plan| [plan.node.input.channels, plan.node.argument[2] as usize]));
 			functions.push_str(&span_split_ir(&dense, &experts, &shared));
 			if functions.contains("@span.iq") { functions.push_str(&span_grids_ir(PackedMatvec::ptx()).ok_or_else(|| RecipeError::new("packed PTX lacks the IQ grids"))?); }
+			let support = width_split_support(&format!("{ir}{functions}"));
+			functions.push_str(&support);
 		}
 		ir.push_str(&span_matvec_declarations(ir));
 		ir.push_str(&functions);
@@ -19306,15 +19316,14 @@ fn width_levels() -> [u32; 4] {
 }
 /// Q8_0: four blocks of 34 bytes (two for the narrow kernel, which loads by words) whose two-byte scale leaves the data on alternate
 /// two-byte offsets; one signed byte-permute aligns and sign-extends four weights into two 16-bit lane operands.
-fn width_body_q8_0(b: &mut WidthIr, narrow: bool, w: &str, x: &str, facc: &str) -> String {
+fn width_body_q8_0(b: &mut WidthIr, narrow: bool, w: &str, xs: &[String], faccs: &[String]) -> Vec<String> {
 	let raw = if narrow { b.words_narrow(w, 17) } else { b.words_double(w, 17) };
 	let blocks = if narrow { 2 } else { 4 };
-	let mut total = facc.to_owned();
+	let mut totals = faccs.to_vec();
 	for block in 0..blocks {
 		let (pair, odd) = (17 * (block / 2), block % 2 == 1);
-		let mut acc = "0".to_owned();
+		let mut accs = vec!["0".to_owned(); xs.len()];
 		for line in 0..4 {
-			let staged = b.staged(x, 16 * block + 4 * line);
 			for half in 0..2 {
 				let m = 2 * line + half;
 				let (even, odd_lanes) = if odd {
@@ -19322,33 +19331,37 @@ fn width_body_q8_0(b: &mut WidthIr, narrow: bool, w: &str, x: &str, facc: &str) 
 				} else {
 					(b.prmt(&raw[pair + m], &raw[pair + m + 1], 0xC4A2), b.prmt(&raw[pair + m], &raw[pair + m + 1], 0xD5B3))
 				};
-				acc = b.mac(&acc, &even, true, &staged[2 * half], true);
-				acc = b.mac(&acc, &odd_lanes, true, &staged[2 * half + 1], true);
+				for (acc, x) in accs.iter_mut().zip(xs) {
+					let staged = b.staged(x, 16 * block + 4 * line);
+					*acc = b.mac(acc, &even, true, &staged[2 * half], true);
+					*acc = b.mac(acc, &odd_lanes, true, &staged[2 * half + 1], true);
+				}
 			}
 		}
 		let d = b.half_at(&raw, 34 * block);
-		let ds = b.staged_float(x, 16 * blocks + block);
-		let scale = b.fmul(&d, &ds);
-		let sum = b.float_of(&acc);
-		total = b.fma(&sum, &scale, &total);
+		for ((total, acc), x) in totals.iter_mut().zip(&accs).zip(xs) {
+			let ds = b.staged_float(x, 16 * blocks + block);
+			let scale = b.fmul(&d, &ds);
+			let sum = b.float_of(acc);
+			*total = b.fma(&sum, &scale, total);
+		}
 	}
-	total
+	totals
 }
 /// IQ4_NL: four blocks of 18 bytes. Each nibble selects one of sixteen levels with two byte-permute lookups into eight levels each
 /// (the nibbles' low three bits as the selector, four nibbles per permute), chosen between by the nibbles' top bits.
-fn width_body_iq4nl(b: &mut WidthIr, w: &str, x: &str, facc: &str) -> String {
+fn width_body_iq4nl(b: &mut WidthIr, w: &str, xs: &[String], faccs: &[String]) -> Vec<String> {
 	let raw = b.words_double(w, 9);
 	let levels = width_levels().map(width_k);
-	let mut total = facc.to_owned();
+	let mut totals = faccs.to_vec();
 	for block in 0..4 {
 		let (pair, odd) = (9 * (block / 2), block % 2 == 1);
-		let mut acc = "0".to_owned();
+		let mut accs = vec!["0".to_owned(); xs.len()];
 		for m in 0..4 {
 			let q = if odd { raw[pair + 5 + m].clone() } else { b.prmt(&raw[pair + m], &raw[pair + m + 1], 0x5432) };
 			let indices = b.and(&q, 0x77777777);
 			let upper = b.shr(&indices, 16);
 			let shifted = b.shl(&q, 4);
-			let staged = b.staged(x, 16 * block + 4 * m);
 			for (half, selector, flags) in [(0, &indices, 0xD9C8), (1, &upper, 0xFBEA)] {
 				let low = b.permute(&levels[0], &levels[1], selector);
 				let high = b.permute(&levels[2], &levels[3], selector);
@@ -19358,23 +19371,28 @@ fn width_body_iq4nl(b: &mut WidthIr, w: &str, x: &str, facc: &str) -> String {
 				let level = b.xor(&low, &chosen);
 				let first = b.prmt(&level, "0", 0xA280);
 				let second = b.prmt(&level, "0", 0xB391);
-				acc = b.mac(&acc, &first, true, &staged[2 * half], true);
-				acc = b.mac(&acc, &second, true, &staged[2 * half + 1], true);
+				for (acc, x) in accs.iter_mut().zip(xs) {
+					let staged = b.staged(x, 16 * block + 4 * m);
+					*acc = b.mac(acc, &first, true, &staged[2 * half], true);
+					*acc = b.mac(acc, &second, true, &staged[2 * half + 1], true);
+				}
 			}
 		}
 		let d = b.half_at(&raw, 18 * block);
-		let ds = b.staged_float(x, 64 + block);
-		let scale = b.fmul(&d, &ds);
-		let sum = b.float_of(&acc);
-		total = b.fma(&sum, &scale, &total);
+		for ((total, acc), x) in totals.iter_mut().zip(&accs).zip(xs) {
+			let ds = b.staged_float(x, 64 + block);
+			let scale = b.fmul(&d, &ds);
+			let sum = b.float_of(acc);
+			*total = b.fma(&sum, &scale, total);
+		}
 	}
-	total
+	totals
 }
 /// Q4_K and Q5_K: a chunk is eight groups of 32 whose nibbles, masked in place, make 16-bit lane operands scaled by 1, 256, 16 or 4096
 /// (Q5_K gathers the fifth bit into each lane instead). The activations of the unscaled lanes carry 256, so each group sums into one
 /// integer at a common scale and is converted to float once, times its 6-bit scale; the minimums multiply the activation sums of
 /// their groups in integers.
-fn width_body_k(b: &mut WidthIr, kind: u32, w: &str, x: &str, facc: &str) -> String {
+fn width_body_k(b: &mut WidthIr, kind: u32, w: &str, xs: &[String], faccs: &[String]) -> Vec<String> {
 	let five = kind == 13;
 	let raw = b.words_wide(w, if five { 11 } else { 9 });
 	let qs_at = if five { 12 } else { 4 };
@@ -19393,16 +19411,20 @@ fn width_body_k(b: &mut WidthIr, kind: u32, w: &str, x: &str, facc: &str) -> Str
 		(sc0, sc1, m0, m1)
 	};
 	// The minimum term: minimum x sum of the activations of the group, in pairs of groups.
-	let (first, second) = (b.staged(x, 0), b.staged(x, 4));
-	let sums = [first[1].clone(), first[2].clone(), first[3].clone(), second[0].clone()];
-	let mut minimum = "0".to_owned();
-	for (index, (word, odd)) in [(&m0, false), (&m0, true), (&m1, false), (&m1, true)].into_iter().enumerate() {
-		let lanes = b.prmt(word, "0", if odd { 0x4341 } else { 0x4240 });
-		minimum = b.mac(&minimum, &lanes, false, &sums[index], true);
+	let pairs = [(&m0, false), (&m0, true), (&m1, false), (&m1, true)].map(|(word, odd)| b.prmt(word, "0", if odd { 0x4341 } else { 0x4240 }));
+	let mut minimums = Vec::new();
+	for x in xs {
+		let (first, second) = (b.staged(x, 0), b.staged(x, 4));
+		let sums = [first[1].clone(), first[2].clone(), first[3].clone(), second[0].clone()];
+		let mut minimum = "0".to_owned();
+		for (lanes, sum) in pairs.iter().zip(&sums) {
+			minimum = b.mac(&minimum, lanes, false, sum, true);
+		}
+		minimums.push(minimum);
 	}
-	let mut totals = ["0.0".to_owned(), "0.0".to_owned()];
+	let mut totals = vec![["0.0".to_owned(), "0.0".to_owned()]; xs.len()];
 	for run in 0..4 {
-		let mut accs = ["0".to_owned(), "0".to_owned()];
+		let mut accs = vec![["0".to_owned(), "0".to_owned()]; xs.len()];
 		for m in 0..8 {
 			let word = raw[qs_at + 8 * run + m].clone();
 			let lanes = if five {
@@ -19421,44 +19443,50 @@ fn width_body_k(b: &mut WidthIr, kind: u32, w: &str, x: &str, facc: &str) -> Str
 			} else {
 				vec![b.and(&word, 0x000F000F), b.and(&word, 0x0F000F00), b.and(&word, 0x00F000F0), b.and(&word, 0xF000F000)]
 			};
-			for group in 0..2 {
-				let staged = b.staged(x, 8 + 16 * (2 * run + group) + 4 * (m / 2));
-				let (even, odd) = (&staged[2 * (m % 2)], &staged[2 * (m % 2) + 1]);
-				accs[group] = b.mac(&accs[group], &lanes[2 * group], false, even, true);
-				accs[group] = b.mac(&accs[group], &lanes[2 * group + 1], false, odd, true);
+			for (position, x) in xs.iter().enumerate() {
+				for group in 0..2 {
+					let staged = b.staged(x, 8 + 16 * (2 * run + group) + 4 * (m / 2));
+					let (even, odd) = (&staged[2 * (m % 2)], &staged[2 * (m % 2) + 1]);
+					accs[position][group] = b.mac(&accs[position][group], &lanes[2 * group], false, even, true);
+					accs[position][group] = b.mac(&accs[position][group], &lanes[2 * group + 1], false, odd, true);
+				}
 			}
 		}
 		for group in 0..2 {
 			let index = 2 * run + group;
 			let scale = b.byte_float(if index < 4 { &sc0 } else { &sc1 }, index % 4, false);
-			let sum = b.float_of(&accs[group]);
-			totals[group] = b.fma(&sum, &scale, &totals[group]);
+			for position in 0..xs.len() {
+				let sum = b.float_of(&accs[position][group]);
+				totals[position][group] = b.fma(&sum, &scale, &totals[position][group]);
+			}
 		}
 	}
 	let d = b.half_at(&raw, 0);
 	let dmin = b.half_at(&raw, 2);
-	let ds = b.staged_float(x, 0);
 	let d_low = b.fmul(&d, &width_f(1.0 / 256.0));
 	let d_high = b.fmul(&d, &width_f(if five { 1.0 / 256.0 } else { 1.0 / 4096.0 }));
-	let minimum = b.float_of(&minimum);
 	let negative = b.value(format!("fneg float {dmin}"));
-	let t = b.fmul(&totals[0], &d_low);
-	let t = b.fma(&totals[1], &d_high, &t);
-	let t = b.fma(&negative, &minimum, &t);
-	b.fma(&t, &ds, facc)
+	let mut results = Vec::new();
+	for (position, x) in xs.iter().enumerate() {
+		let ds = b.staged_float(x, 0);
+		let minimum = b.float_of(&minimums[position]);
+		let t = b.fmul(&totals[position][0], &d_low);
+		let t = b.fma(&totals[position][1], &d_high, &t);
+		let t = b.fma(&negative, &minimum, &t);
+		results.push(b.fma(&t, &ds, &faccs[position]));
+	}
+	results
 }
 /// Q6_K: two chunks of 210 bytes. Each 16-weight group's integer sum (unsigned 6-bit lanes, the offset of 32 taken out through the
 /// activation sums) is converted once and multiplied by its signed scale.
-fn width_body_q6k(b: &mut WidthIr, w: &str, x: &str, facc: &str) -> String {
+fn width_body_q6k(b: &mut WidthIr, w: &str, xs: &[String], faccs: &[String]) -> Vec<String> {
 	let raw = b.words_narrow(w, 105);
-	let mut total = facc.to_owned();
+	let mut totals = faccs.to_vec();
 	for chunk in 0..2 {
 		let base = 210 * chunk;
 		let record = 144 * chunk;
-		let head = [b.staged(x, record), b.staged(x, record + 4), b.staged(x, record + 8)];
-		let sums: Vec<String> = (1..9).map(|index| head[index / 4][index % 4].clone()).collect();
 		let scales: Vec<String> = (0..4).map(|index| b.view(&raw, base + 192 + 4 * index)).collect();
-		let mut accs: Vec<String> = vec!["0".to_owned(); 16];
+		let mut accs: Vec<Vec<String>> = vec![vec!["0".to_owned(); 16]; xs.len()];
 		for n in 0..2 {
 			for m in 0..8 {
 				let a = b.view(&raw, base + 64 * n + 4 * m);
@@ -19467,38 +19495,43 @@ fn width_body_q6k(b: &mut WidthIr, w: &str, x: &str, facc: &str) -> String {
 				let (a4, c4) = (b.shr(&a, 4), b.shr(&c, 4));
 				let planes = [b.shl(&h, 4), b.shl(&h, 2), h.clone(), b.shr(&h, 2)];
 				let sources = [&a, &c, &a4, &c4];
-				let staged = [b.staged(x, record + 16 + 8 * (8 * n + m)), b.staged(x, record + 16 + 8 * (8 * n + m) + 4)];
 				for quarter in 0..4 {
 					let bytes = b.merge(sources[quarter], &planes[quarter], "%k0");
 					let (field_e, field_o) = (b.and(&bytes, 0x003F003F), b.and(&bytes, 0x3F003F00));
 					let group = 8 * n + 2 * quarter + m / 4;
-					let words = &staged[quarter / 2];
-					accs[group] = b.mac(&accs[group], &field_e, false, &words[2 * (quarter % 2)], true);
-					accs[group] = b.mac(&accs[group], &field_o, false, &words[2 * (quarter % 2) + 1], true);
+					for (position, x) in xs.iter().enumerate() {
+						let words = b.staged(x, record + 16 + 8 * (8 * n + m) + 4 * (quarter / 2));
+						accs[position][group] = b.mac(&accs[position][group], &field_e, false, &words[2 * (quarter % 2)], true);
+						accs[position][group] = b.mac(&accs[position][group], &field_o, false, &words[2 * (quarter % 2) + 1], true);
+					}
 				}
 			}
 		}
-		let mut sum = "0.0".to_owned();
-		for group in 0..16 {
-			let scale = b.byte_float(&scales[group / 4], group % 4, true);
-			let part = b.float_of(&accs[group]);
-			sum = b.fma(&part, &scale, &sum);
-		}
-		let mut offsets = "0".to_owned();
-		for k in 0..4 {
-			let (even, odd) = (b.prmt(&scales[k], "0", 0xA280), b.prmt(&scales[k], "0", 0xB391));
-			offsets = b.mac(&offsets, &even, true, &sums[2 * k], true);
-			offsets = b.mac(&offsets, &odd, true, &sums[2 * k + 1], true);
-		}
+		let signed: Vec<String> = (0..16).map(|group| b.byte_float(&scales[group / 4], group % 4, true)).collect();
+		let pairs: Vec<(String, String)> = (0..4).map(|k| (b.prmt(&scales[k], "0", 0xA280), b.prmt(&scales[k], "0", 0xB391))).collect();
 		let d = b.half_at(&raw, base + 208);
-		let ds = b.staged_float(x, record);
-		let offsets = b.float_of(&offsets);
-		let scaled = b.fmul(&sum, &width_f(1.0 / 256.0));
-		let t = b.fma(&offsets, &width_f(-32.0), &scaled);
-		let factor = b.fmul(&d, &ds);
-		total = b.fma(&t, &factor, &total);
+		for (position, x) in xs.iter().enumerate() {
+			let head = [b.staged(x, record), b.staged(x, record + 4), b.staged(x, record + 8)];
+			let sums: Vec<String> = (1..9).map(|index| head[index / 4][index % 4].clone()).collect();
+			let mut sum = "0.0".to_owned();
+			for group in 0..16 {
+				let part = b.float_of(&accs[position][group]);
+				sum = b.fma(&part, &signed[group], &sum);
+			}
+			let mut offsets = "0".to_owned();
+			for (k, (even, odd)) in pairs.iter().enumerate() {
+				offsets = b.mac(&offsets, even, true, &sums[2 * k], true);
+				offsets = b.mac(&offsets, odd, true, &sums[2 * k + 1], true);
+			}
+			let ds = b.staged_float(x, record);
+			let offsets = b.float_of(&offsets);
+			let scaled = b.fmul(&sum, &width_f(1.0 / 256.0));
+			let t = b.fma(&offsets, &width_f(-32.0), &scaled);
+			let factor = b.fmul(&d, &ds);
+			totals[position] = b.fma(&t, &factor, &totals[position]);
+		}
 	}
-	total
+	totals
 }
 /// Applies the sign bits of eight weights to their eight magnitude bytes in two words, one table entry of negation masks and carries
 /// per sign pattern, and splits each word into the sign-extended even and odd lane operands.
@@ -19514,19 +19547,20 @@ fn width_signed_lanes(b: &mut WidthIr, magnitudes: [&str; 2], signs: &[String]) 
 }
 /// IQ2_XS: two chunks of 74 bytes. Each 16-bit code is a 9-bit index into the grid of eight magnitudes and a 7-bit index into the
 /// sign table; the grid and sign tables sit in shared memory. Each group of 16 sums in integers and is scaled by its 4-bit scale.
-fn width_body_iq2xs(b: &mut WidthIr, w: &str, x: &str, t: &str, facc: &str) -> String {
+fn width_body_iq2xs(b: &mut WidthIr, w: &str, xs: &[String], t: &str, faccs: &[String]) -> Vec<String> {
 	let raw = b.words_narrow(w, 37);
 	let signs_at = b.shared();
 	let signs_base = b.value(format!("getelementptr i8, {signs_at} {t}, i32 4096"));
-	let mut total = facc.to_owned();
+	let mut totals = faccs.to_vec();
 	for chunk in 0..2 {
 		let (base, record) = (74 * chunk, 132 * chunk);
 		let codes: Vec<String> = (0..16).map(|index| b.view(&raw, base + 2 + 4 * index)).collect();
 		let scales: Vec<String> = (0..2).map(|index| b.view(&raw, base + 66 + 4 * index)).collect();
-		let (mut weighted, mut plain) = ("0.0".to_owned(), "0".to_owned());
+		let mut weighted = vec!["0.0".to_owned(); xs.len()];
+		let mut plain = vec!["0".to_owned(); xs.len()];
 		for block in 0..8 {
 			for half in 0..2 {
-				let mut acc = "0".to_owned();
+				let mut accs = vec!["0".to_owned(); xs.len()];
 				for run in 0..2 {
 					let code = 4 * block + 2 * half + run;
 					let (word, high) = (&codes[code / 2], code % 2 == 1);
@@ -19544,44 +19578,51 @@ fn width_body_iq2xs(b: &mut WidthIr, w: &str, x: &str, t: &str, facc: &str) -> S
 					let signs = b.load_shared_at(&signs_base, &sign_at, "<4 x i32>", 16);
 					let signs: Vec<String> = (0..4).map(|index| b.element(&signs, 4, index)).collect();
 					let lanes = width_signed_lanes(b, [&magnitudes[0], &magnitudes[1]], &signs);
-					let staged = b.staged(x, record + 4 + 4 * code);
-					for (lane, word) in lanes.iter().zip(&staged) {
-						acc = b.mac(&acc, lane, true, word, true);
+					for (acc, x) in accs.iter_mut().zip(xs) {
+						let staged = b.staged(x, record + 4 + 4 * code);
+						for (lane, word) in lanes.iter().zip(&staged) {
+							*acc = b.mac(acc, lane, true, word, true);
+						}
 					}
 				}
 				let scale_byte = &scales[block / 4];
 				let shifted = if block % 4 == 0 && half == 0 { scale_byte.clone() } else { b.shr(scale_byte, (8 * (block % 4) + 4 * half) as u32) };
 				let scale = b.and(&shifted, 15);
 				let scale = b.float_of(&scale);
-				let sum = b.float_of(&acc);
-				weighted = b.fma(&sum, &scale, &weighted);
-				plain = b.add(&plain, &acc);
+				for position in 0..xs.len() {
+					let sum = b.float_of(&accs[position]);
+					weighted[position] = b.fma(&sum, &scale, &weighted[position]);
+					plain[position] = b.add(&plain[position], &accs[position]);
+				}
 			}
 		}
 		let d = b.half_at(&raw, base);
-		let ds = b.staged_float(x, record);
-		let plain = b.float_of(&plain);
-		let sum = b.fma(&plain, &width_f(0.5), &weighted);
-		let factor = b.fmul(&d, &ds);
-		let factor = b.fmul(&factor, &width_f(0.25));
-		total = b.fma(&sum, &factor, &total);
+		for (position, x) in xs.iter().enumerate() {
+			let ds = b.staged_float(x, record);
+			let plain = b.float_of(&plain[position]);
+			let sum = b.fma(&plain, &width_f(0.5), &weighted[position]);
+			let factor = b.fmul(&d, &ds);
+			let factor = b.fmul(&factor, &width_f(0.25));
+			totals[position] = b.fma(&sum, &factor, &totals[position]);
+		}
 	}
-	total
+	totals
 }
 /// IQ3_XXS: two chunks of 98 bytes. Each byte of the 64 grid indices selects four magnitudes from a 256-entry shared table; the
 /// 4-bit scale and four 7-bit sign indices of each group of 32 share one word.
-fn width_body_iq3xxs(b: &mut WidthIr, w: &str, x: &str, t: &str, facc: &str) -> String {
+fn width_body_iq3xxs(b: &mut WidthIr, w: &str, xs: &[String], t: &str, faccs: &[String]) -> Vec<String> {
 	let raw = b.words_narrow(w, 49);
 	let signs_at = b.shared();
 	let signs_base = b.value(format!("getelementptr i8, {signs_at} {t}, i32 1024"));
-	let mut total = facc.to_owned();
+	let mut totals = faccs.to_vec();
 	for chunk in 0..2 {
 		let (base, record) = (98 * chunk, 132 * chunk);
 		let indices: Vec<String> = (0..16).map(|index| b.view(&raw, base + 2 + 4 * index)).collect();
 		let auxiliary: Vec<String> = (0..8).map(|index| b.view(&raw, base + 66 + 4 * index)).collect();
-		let (mut weighted, mut plain) = ("0.0".to_owned(), "0".to_owned());
+		let mut weighted = vec!["0.0".to_owned(); xs.len()];
+		let mut plain = vec!["0".to_owned(); xs.len()];
 		for block in 0..8 {
-			let mut acc = "0".to_owned();
+			let mut accs = vec!["0".to_owned(); xs.len()];
 			for run in 0..4 {
 				let mut grids = Vec::new();
 				for part in 0..2 {
@@ -19609,44 +19650,39 @@ fn width_body_iq3xxs(b: &mut WidthIr, w: &str, x: &str, t: &str, facc: &str) -> 
 				let signs = b.load_shared_at(&signs_base, &sign_at, "<4 x i32>", 16);
 				let signs: Vec<String> = (0..4).map(|index| b.element(&signs, 4, index)).collect();
 				let lanes = width_signed_lanes(b, [&grids[0], &grids[1]], &signs);
-				let staged = b.staged(x, record + 4 + 4 * (4 * block + run));
-				for (lane, word) in lanes.iter().zip(&staged) {
-					acc = b.mac(&acc, lane, true, word, true);
+				for (acc, x) in accs.iter_mut().zip(xs) {
+					let staged = b.staged(x, record + 4 + 4 * (4 * block + run));
+					for (lane, word) in lanes.iter().zip(&staged) {
+						*acc = b.mac(acc, lane, true, word, true);
+					}
 				}
 			}
 			let scale = b.shr(&auxiliary[block], 28);
 			let scale = b.float_of(&scale);
-			let sum = b.float_of(&acc);
-			weighted = b.fma(&sum, &scale, &weighted);
-			plain = b.add(&plain, &acc);
+			for position in 0..xs.len() {
+				let sum = b.float_of(&accs[position]);
+				weighted[position] = b.fma(&sum, &scale, &weighted[position]);
+				plain[position] = b.add(&plain[position], &accs[position]);
+			}
 		}
 		let d = b.half_at(&raw, base);
-		let ds = b.staged_float(x, record);
-		let plain = b.float_of(&plain);
-		let sum = b.fma(&plain, &width_f(0.5), &weighted);
-		let factor = b.fmul(&d, &ds);
-		let factor = b.fmul(&factor, &width_f(0.5));
-		total = b.fma(&sum, &factor, &total);
+		for (position, x) in xs.iter().enumerate() {
+			let ds = b.staged_float(x, record);
+			let plain = b.float_of(&plain[position]);
+			let sum = b.fma(&plain, &width_f(0.5), &weighted[position]);
+			let factor = b.fmul(&d, &ds);
+			let factor = b.fmul(&factor, &width_f(0.5));
+			totals[position] = b.fma(&sum, &factor, &totals[position]);
+		}
 	}
-	total
+	totals
 }
 /// The kernel of one weight format as a module: `@width_dot(w, x, t, n)` sums `n` loop iterations of one row against the staged
 /// activations, `x`, with the lookup tables `t` in shared memory. For the PTX target a kernel entry runs it over shared memory;
 /// for the CPU target the entry takes flat pointers.
 fn width_module(kind: u32, target: WidthTarget) -> Option<String> {
-	let shape = width_loop(kind)?;
-	let mut b = WidthIr::new(target);
-	let (global, shared) = (b.global(), b.shared());
-	let facc = "%facc";
-	let result = match kind {
-		8 | WIDTH_Q8_0_NARROW => width_body_q8_0(&mut b, kind == WIDTH_Q8_0_NARROW, "%wp", "%xp", facc),
-		12 | 13 => width_body_k(&mut b, kind, "%wp", "%xp", facc),
-		14 => width_body_q6k(&mut b, "%wp", "%xp", facc),
-		17 => width_body_iq2xs(&mut b, "%wp", "%xp", "%t", facc),
-		18 => width_body_iq3xxs(&mut b, "%wp", "%xp", "%t", facc),
-		20 => width_body_iq4nl(&mut b, "%wp", "%xp", facc),
-		_ => return None,
-	};
+	let definition = width_dot_definition(kind, target, "width_dot", "!0", "!1", "alwaysinline")?;
+	let (global, shared) = { let b = WidthIr::new(target); (b.global(), b.shared()) };
 	let mut module = String::new();
 	if target == WidthTarget::Ptx {
 		module.push_str("target triple = \"nvptx64-nvidia-cuda\"\n@widthshared = external addrspace(3) global [0 x i32], align 16\ndeclare i32 @llvm.nvvm.prmt(i32, i32, i32)\n");
@@ -19654,15 +19690,7 @@ fn width_module(kind: u32, target: WidthTarget) -> Option<String> {
 		module.push_str(WIDTH_CPU_PRMT);
 	}
 	module.push_str("declare float @llvm.fmuladd.f32(float, float, float)\n!0 = !{}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.disable\"}\n");
-	module.push_str(&format!(
-		"define internal float @width_dot({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0) alwaysinline {{\nentry:\nbr label %loop\nloop:\n%i = phi i32 [ 0, %entry ], [ %i.next, %loop ]\n%facc = phi float [ 0.0, %entry ], [ {result}, %loop ]\n%wp = phi {global} [ %w, %entry ], [ %wp.next, %loop ]\n%xp = phi {shared} [ %x, %entry ], [ %xp.next, %loop ]\n"
-	));
-	// The body was built before the header so its names are fresh; it belongs after the phis.
-	module.push_str(&b.text);
-	module.push_str(&format!(
-		"%i.next = add i32 %i, 1\n%wp.next = getelementptr i8, {global} %wp, i32 {}\n%xp.next = getelementptr i8, {shared} %xp, i32 {}\n%more = icmp ult i32 %i.next, %n\nbr i1 %more, label %loop, label %done, !llvm.loop !1\ndone:\nret float {result}\n}}\n",
-		shape.weight_bytes, shape.staged_bytes
-	));
+	module.push_str(&definition);
 	if target == WidthTarget::Ptx {
 		module.push_str(&format!(
 			"define ptx_kernel void @width_kernel({global} %w, {global} %out, i32 %n, i32 %k0) {{\nentry:\n%x = getelementptr i8, {shared} @widthshared, i32 0\n%t = getelementptr i8, {shared} @widthshared, i32 16384\n%r = call float @width_dot({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0)\nstore float %r, {global} %out, align 4\nret void\n}}\n!nvvm.annotations = !{{!3}}\n!3 = !{{ptr @width_kernel, !\"kernel\", i32 1}}\n"
@@ -19672,6 +19700,310 @@ fn width_module(kind: u32, target: WidthTarget) -> Option<String> {
 	}
 	Some(module)
 }
+/// One format's row dot product as a function, `@{name}(w, x, t, n, k0)`: `n` loop iterations of one row against the staged
+/// activations `x` with the lookup tables `t`. `invariant` and `unroll` name the module's invariant-load metadata and its
+/// unroll-disable loop metadata, so the definition can join a module that numbers its metadata otherwise.
+fn width_dot_definition(kind: u32, target: WidthTarget, name: &str, invariant: &str, unroll: &str, inline: &str) -> Option<String> {
+	let shape = width_loop(kind)?;
+	let mut b = WidthIr::new(target);
+	let (global, shared) = (b.global(), b.shared());
+	let result = width_body(&mut b, kind, &["%xp".to_owned()], &["%facc".to_owned()])?.remove(0);
+	// The body was built before the header so its names are fresh; it belongs after the phis.
+	let body = b.text.replace("!invariant.load !0", &format!("!invariant.load {invariant}"));
+	Some(format!(
+		"define internal float @{name}({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0) {inline} {{\nentry:\nbr label %loop\nloop:\n%i = phi i32 [ 0, %entry ], [ %i.next, %loop ]\n%facc = phi float [ 0.0, %entry ], [ {result}, %loop ]\n%wp = phi {global} [ %w, %entry ], [ %wp.next, %loop ]\n%xp = phi {shared} [ %x, %entry ], [ %xp.next, %loop ]\n{body}%i.next = add i32 %i, 1\n%wp.next = getelementptr i8, {global} %wp, i32 {}\n%xp.next = getelementptr i8, {shared} %xp, i32 {}\n%more = icmp ult i32 %i.next, %n\nbr i1 %more, label %loop, label %done, !llvm.loop {unroll}\ndone:\nret float {result}\n}}\n",
+		shape.weight_bytes, shape.staged_bytes
+	))
+}
+/// One pass of the format's kernel over weights `%wp` (tables `%t`, mask `%k0`) against every staged position of `xs`, adding to
+/// `faccs`: each decoded lane word multiplies every position before the next is decoded.
+fn width_body(b: &mut WidthIr, kind: u32, xs: &[String], faccs: &[String]) -> Option<Vec<String>> {
+	Some(match kind {
+		8 | WIDTH_Q8_0_NARROW => width_body_q8_0(b, kind == WIDTH_Q8_0_NARROW, "%wp", xs, faccs),
+		12 | 13 => width_body_k(b, kind, "%wp", xs, faccs),
+		14 => width_body_q6k(b, "%wp", xs, faccs),
+		17 => width_body_iq2xs(b, "%wp", xs, "%t", faccs),
+		18 => width_body_iq3xxs(b, "%wp", xs, "%t", faccs),
+		20 => width_body_iq4nl(b, "%wp", xs, faccs),
+		_ => return None,
+	})
+}
+/// The row dot product of `positions` staged positions at once, `@{name}(w, x, t, n, k0) -> [positions x float]`: `n` loop
+/// iterations, each advancing `lanes` passes, against positions `position_bytes` apart from `x`: one decode of each weight group,
+/// multiplied into every position's chain before the next group.
+fn width_dot_multi(kind: u32, positions: usize, lanes: usize, position_bytes: usize, name: &str, invariant: &str, unroll: &str, inline: &str) -> Option<String> {
+	let shape = width_loop(kind)?;
+	let mut b = WidthIr::new(WidthTarget::Ptx);
+	let (global, shared) = (b.global(), b.shared());
+	let xs: Vec<String> = (0..positions).map(|p| format!("%xp{p}")).collect();
+	let faccs: Vec<String> = (0..positions).map(|p| format!("%facc{p}")).collect();
+	let results = width_body(&mut b, kind, &xs, &faccs)?;
+	let body = b.text.replace("!invariant.load !0", &format!("!invariant.load {invariant}"));
+	let phis: String = results.iter().enumerate().map(|(p, result)| format!("%facc{p} = phi float [ 0.0, %entry ], [ {result}, %loop ]\n")).collect();
+	let offsets: String = (0..positions).map(|p| format!("%xp{p} = getelementptr i8, {shared} %xp, i32 {}\n", p * position_bytes)).collect();
+	let ty = format!("[{positions} x float]");
+	let mut packed = "undef".to_owned();
+	let mut fold = String::new();
+	for (p, result) in results.iter().enumerate() {
+		fold.push_str(&format!("%out{p} = insertvalue {ty} {packed}, float {result}, {p}\n"));
+		packed = format!("%out{p}");
+	}
+	Some(format!(
+		"define internal {ty} @{name}({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0) {inline} {{\nentry:\n%none = icmp eq i32 %n, 0\nbr i1 %none, label %empty, label %loop\nloop:\n%i = phi i32 [ 0, %entry ], [ %i.next, %loop ]\n{phis}%wp = phi {global} [ %w, %entry ], [ %wp.next, %loop ]\n%xp = phi {shared} [ %x, %entry ], [ %xp.next, %loop ]\n{offsets}{body}%i.next = add i32 %i, 1\n%wp.next = getelementptr i8, {global} %wp, i32 {}\n%xp.next = getelementptr i8, {shared} %xp, i32 {}\n%more = icmp ult i32 %i.next, %n\nbr i1 %more, label %loop, label %done, !llvm.loop {unroll}\ndone:\n{fold}ret {ty} {packed}\nempty:\nret {ty} zeroinitializer\n}}\n",
+		lanes * shape.weight_bytes, lanes * shape.staged_bytes
+	))
+}
+/// One word of a staged record, as `width_stage` writes it: two activation lanes (value indices within the record, each times
+/// 256 when set), a 32-value block's activation scale, the sums of two value groups (of 16 values, or of 32 when `wide`), or zero.
+#[derive(Clone, Copy)]
+enum WidthStaged {
+	Lanes(usize, bool, usize, bool),
+	Scale(usize),
+	Sums(usize, usize, bool),
+	Zero,
+}
+/// The words of one staged record of `kind`, in the order and layout `width_stage` builds them.
+fn width_stage_plan(kind: u32) -> Vec<WidthStaged> {
+	use WidthStaged::*;
+	let mut words = vec![Zero; width_staged_words(kind)];
+	match kind {
+		8 | WIDTH_Q8_0_NARROW => {
+			let blocks = width_record_values(kind) / 32;
+			for block in 0..blocks {
+				for m in 0..8 {
+					let p = 32 * block + 4 * m;
+					words[16 * block + 2 * m] = Lanes(p, false, p + 2, false);
+					words[16 * block + 2 * m + 1] = Lanes(p + 1, false, p + 3, false);
+				}
+				words[16 * blocks + block] = Scale(block);
+			}
+		}
+		20 => {
+			for block in 0..4 {
+				for m in 0..4 {
+					let (p, base) = (32 * block + 4 * m, 16 * block + 4 * m);
+					words[base] = Lanes(p, false, p + 1, false);
+					words[base + 1] = Lanes(p + 16, false, p + 17, false);
+					words[base + 2] = Lanes(p + 2, false, p + 3, false);
+					words[base + 3] = Lanes(p + 18, false, p + 19, false);
+				}
+				words[64 + block] = Scale(block);
+			}
+		}
+		12 | 13 => {
+			words[0] = Scale(0);
+			words[1] = Sums(0, 2, true);
+			words[2] = Sums(1, 3, true);
+			words[3] = Sums(4, 6, true);
+			words[4] = Sums(5, 7, true);
+			for group in 0..8 {
+				for m in 0..8 {
+					let p = 32 * group + 4 * m;
+					words[8 + 16 * group + 2 * m] = Lanes(p, true, p + 2, true);
+					words[8 + 16 * group + 2 * m + 1] = Lanes(p + 1, false, p + 3, false);
+				}
+			}
+		}
+		14 => {
+			words[0] = Scale(0);
+			for k in 0..4 {
+				words[1 + 2 * k] = Sums(4 * k, 4 * k + 2, false);
+				words[2 + 2 * k] = Sums(4 * k + 1, 4 * k + 3, false);
+			}
+			for n in 0..2 {
+				for m in 0..8 {
+					for quarter in 0..4 {
+						let (p, base) = (128 * n + 32 * quarter + 4 * m, 16 + 8 * (8 * n + m) + 2 * quarter);
+						words[base] = Lanes(p, true, p + 2, true);
+						words[base + 1] = Lanes(p + 1, false, p + 3, false);
+					}
+				}
+			}
+		}
+		17 | 18 => {
+			words[0] = Scale(0);
+			for run in 0..32 {
+				let p = 8 * run;
+				words[4 + 4 * run] = Lanes(p, false, p + 2, false);
+				words[4 + 4 * run + 1] = Lanes(p + 1, false, p + 3, false);
+				words[4 + 4 * run + 2] = Lanes(p + 4, false, p + 6, false);
+				words[4 + 4 * run + 3] = Lanes(p + 5, false, p + 7, false);
+			}
+		}
+		_ => unreachable!(),
+	}
+	words
+}
+/// A staged word as one i32 the device decodes: bits 0..2 the kind (0 zero, 1 lanes, 2 scale, 3 sums); lanes put the first index in
+/// bits 2..11, its times-256 flag in bit 11, the second index in bits 12..21 and its flag in bit 21; a scale puts its block in bits
+/// 2..11; sums put their groups in bits 2..11 and 12..21 and the 32-value flag in bit 22.
+fn width_stage_code(word: WidthStaged) -> u32 {
+	match word {
+		WidthStaged::Zero => 0,
+		WidthStaged::Lanes(a, a256, b, b256) => 1 | (a as u32) << 2 | u32::from(a256) << 11 | (b as u32) << 12 | u32::from(b256) << 21,
+		WidthStaged::Scale(block) => 2 | (block as u32) << 2,
+		WidthStaged::Sums(a, b, wide) => 3 | (a as u32) << 2 | (b as u32) << 12 | u32::from(wide) << 22,
+	}
+}
+/// Bytes of dynamic shared memory the split worker gives each matvec.
+const WIDTH_SPLIT_SHARED: usize = 40960;
+/// The split worker's matvec of GGML type `kind` over `k` inputs with the least-instruction XMAD kernels, with the span matvec's
+/// arguments: `@{name}(x, w, y, scratch, begin, rows, span)` on every workgroup and `@{name}.group(..., cta, ncta, mask)` on
+/// workgroups `cta` of `ncta`. Positions are position-major columns of `k` floats in `x` (column j, or the j-th set bit of a
+/// nonzero `mask`); outputs land at `y[row + (begin + j) * rows]`. The workgroup stages as many positions as the shared tile holds
+/// (int8 activations in 16-bit lanes: one scale per 256 values for K and IQ formats, per 32 for Q8_0 and IQ4_NL, and the group
+/// sums the K formats need), then each thread computes whole rows; further positions repeat. `None` when `k` is not a whole number
+/// of the format's passes or one position does not fit the tile.
+fn width_split_function(kind: u32, k: usize, name: &str, shared: &str) -> Option<String> {
+	let kid = width_kernel_for(kind, k)?;
+	let shape = width_loop(kid)?;
+	let weight = width_span_weight(kind)?;
+	let (rv, words) = (width_record_values(kid), width_staged_words(kid));
+	let records = k / rv;
+	let passes = k / (shape.records * rv);
+	let row_bytes = k / weight.block() * weight.stride();
+	let tables = width_tables(kid).ok()?;
+	let table_bytes = tables.len().next_multiple_of(16);
+	let blocks = k / 32;
+	let position_bytes = records * words * 4;
+	// Per staged position: its records, its int8 values, two floats per 32-value block, and one sum per 16 values.
+	let per_position = position_bytes + k.next_multiple_of(16) + 8 * blocks + 4 * (k / 16);
+	let fit = ((WIDTH_SPLIT_SHARED - table_bytes) / per_position).min(SPECULATIVE_POSITIONS);
+	if fit == 0 { return None; }
+	let (stage_at, q_at) = (table_bytes, table_bytes + fit * position_bytes);
+	let max_at = q_at + fit * k.next_multiple_of(16);
+	let scale_at = max_at + 4 * fit * blocks;
+	let sum_at = scale_at + 4 * fit * blocks;
+	let record_scaled = !matches!(kid, 8 | 20 | WIDTH_Q8_0_NARROW);
+	let plan = width_stage_plan(kid).into_iter().map(|word| format!("i32 {}", width_stage_code(word) as i32)).collect::<Vec<_>>().join(", ");
+	let table_words = tables.chunks(4).map(|chunk| { let mut word = [0_u8; 4]; word[..chunk.len()].copy_from_slice(chunk); format!("i32 {}", i32::from_le_bytes(word)) }).collect::<Vec<_>>();
+	let table_count = table_words.len();
+	// Lanes per row: the widest power of two up to eight that every lane has a pass for; lane l takes passes l, l + lanes, ...
+	let lanes = [8, 4, 2, 1].into_iter().find(|&lanes| lanes <= passes).unwrap_or(1);
+	let mut o = String::new();
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	for positions in 1..=fit {
+		// Not inlined: each position count gets its own register allocation, so the one-position path never pays for five.
+		o.push_str(&width_dot_multi(kid, positions, lanes, position_bytes, &format!("{name}.dot{positions}"), SPAN_INVARIANT, WIDTH_UNROLL_OFF, "#3")?);
+	}
+	emit!("@{name}.plan = internal addrspace(1) constant [{words} x i32] [{plan}], align 4");
+	emit!("@{name}.tables = internal addrspace(1) constant [{table_count} x i32] [{}], align 4", table_words.join(", "));
+	let arguments = "ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) %scratch, i32 %begin, i32 %rows";
+	emit!("define internal void @{name}({arguments}, i32 %span) #1 {{\nentry:\n%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()\n%ncta = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()\ncall void @{name}.group({arguments}, i32 %span, i32 %cta, i32 %ncta, i32 0)\nret void\n}}");
+	emit!("define internal void @{name}.group({arguments}, i32 %span, i32 %cta, i32 %ncta, i32 %mask) #3 {{\nentry:");
+	emit!("%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n%ntid = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()\n%base = getelementptr i8, ptr addrspace(3) @{shared}, i32 0");
+	emit!("%tables = getelementptr i8, ptr addrspace(3) %base, i32 0\n%stage = getelementptr i8, ptr addrspace(3) %base, i32 {stage_at}\n%q = getelementptr i8, ptr addrspace(3) %base, i32 {q_at}\n%max = getelementptr i8, ptr addrspace(3) %base, i32 {max_at}\n%scale = getelementptr i8, ptr addrspace(3) %base, i32 {scale_at}\n%sum = getelementptr i8, ptr addrspace(3) %base, i32 {sum_at}");
+	emit!("%begin.wide = zext i32 %begin to i64\n%rows.wide = zext i32 %rows to i64\n%all = icmp eq i32 %mask, 0");
+	// The lookup tables, once per call.
+	emit!("call void @llvm.nvvm.barrier0()\nbr label %tab\ntab:\n%ti = phi i32 [ %tid, %entry ], [ %ti.next, %tab.body ]\n%ti.more = icmp ult i32 %ti, {table_count}\nbr i1 %ti.more, label %tab.body, label %batch.head\ntab.body:\n%ti.from = getelementptr i32, ptr addrspace(1) @{name}.tables, i32 %ti\n%ti.v = load i32, ptr addrspace(1) %ti.from, align 4\n%ti.to = getelementptr i32, ptr addrspace(3) %tables, i32 %ti\nstore i32 %ti.v, ptr addrspace(3) %ti.to, align 4\n%ti.next = add i32 %ti, %ntid\nbr label %tab");
+	// Batches of positions.
+	emit!("batch.head:\n%b0 = phi i32 [ 0, %tab ], [ %b0.next, %rows.done ]\n%b0.more = icmp ult i32 %b0, %span\nbr i1 %b0.more, label %batch, label %exit\nbatch:\n%left = sub i32 %span, %b0\n%few = icmp ult i32 %left, {fit}\n%nb = select i1 %few, i32 %left, i32 {fit}\ncall void @llvm.nvvm.barrier0()");
+	// Phase 1: each 32-value block's largest magnitude.
+	emit!("%blocks.all = mul i32 %nb, {blocks}\nbr label %p1\np1:\n%j1 = phi i32 [ %tid, %batch ], [ %j1.next, %p1.body ]\n%j1.more = icmp ult i32 %j1, %blocks.all\nbr i1 %j1.more, label %p1.body, label %p1.done\np1.body:");
+	width_split_block_source(&mut o, "%j1", "a", blocks, k);
+	let mut top = "0.0".to_owned();
+	for i in 0..32 {
+		emit!("%a.v{i}.at = getelementptr float, ptr addrspace(1) %a.src, i32 {i}\n%a.v{i} = load float, ptr addrspace(1) %a.v{i}.at, align 4\n%a.m{i}.abs = call float @llvm.fabs.f32(float %a.v{i})\n%a.m{i} = call float @llvm.maxnum.f32(float {top}, float %a.m{i}.abs)");
+		top = format!("%a.m{i}");
+	}
+	emit!("%j1.max.at = getelementptr float, ptr addrspace(3) %max, i32 %j1\nstore float {top}, ptr addrspace(3) %j1.max.at, align 4\n%j1.next = add i32 %j1, %ntid\nbr label %p1\np1.done:\ncall void @llvm.nvvm.barrier0()");
+	// Phase 2: the scale of each block (its record's largest magnitude for K and IQ formats), its int8 values and 16-value sums.
+	emit!("br label %p2\np2:\n%j2 = phi i32 [ %tid, %p1.done ], [ %j2.next, %p2.body ]\n%j2.more = icmp ult i32 %j2, %blocks.all\nbr i1 %j2.more, label %p2.body, label %p2.done\np2.body:");
+	width_split_block_source(&mut o, "%j2", "b", blocks, k);
+	if record_scaled {
+		emit!("%b.first = and i32 %j2, -8");
+		let mut top = "0.0".to_owned();
+		for i in 0..8 {
+			emit!("%b.r{i}.index = add i32 %b.first, {i}\n%b.r{i}.at = getelementptr float, ptr addrspace(3) %max, i32 %b.r{i}.index\n%b.r{i} = load float, ptr addrspace(3) %b.r{i}.at, align 4\n%b.t{i} = call float @llvm.maxnum.f32(float {top}, float %b.r{i})");
+			top = format!("%b.t{i}");
+		}
+		emit!("%b.top = fadd float {top}, 0.0");
+	} else {
+		emit!("%b.top.at = getelementptr float, ptr addrspace(3) %max, i32 %j2\n%b.top = load float, ptr addrspace(3) %b.top.at, align 4");
+	}
+	emit!("%b.zero = fcmp oeq float %b.top, 0.0\n%b.safe = select i1 %b.zero, float 1.0, float %b.top\n%b.inv0 = fdiv float 127.0, %b.safe\n%b.inv = select i1 %b.zero, float 0.0, float %b.inv0\n%b.d = fdiv float %b.top, 127.0");
+	emit!("%b.d.at = getelementptr float, ptr addrspace(3) %scale, i32 %j2\nstore float %b.d, ptr addrspace(3) %b.d.at, align 4\n%b.q.first = mul i32 %j2, 32");
+	for half in 0..2 {
+		let mut sum = "0".to_owned();
+		for i in 16 * half..16 * half + 16 {
+			// Round half away from zero, as the reference's activation quantization does.
+			emit!("%b.v{i}.at = getelementptr float, ptr addrspace(1) %b.src, i32 {i}\n%b.v{i} = load float, ptr addrspace(1) %b.v{i}.at, align 4\n%b.s{i} = fmul float %b.v{i}, %b.inv\n%b.h{i} = call float @llvm.copysign.f32(float 0.5, float %b.s{i})\n%b.r{i}.f = fadd float %b.s{i}, %b.h{i}\n%b.q{i} = fptosi float %b.r{i}.f to i32\n%b.q{i}.byte = trunc i32 %b.q{i} to i8\n%b.q{i}.index = add i32 %b.q.first, {i}\n%b.q{i}.at = getelementptr i8, ptr addrspace(3) %q, i32 %b.q{i}.index\nstore i8 %b.q{i}.byte, ptr addrspace(3) %b.q{i}.at, align 1\n%b.sum{i} = add i32 {sum}, %b.q{i}");
+			sum = format!("%b.sum{i}");
+		}
+		emit!("%b.half{half}.index0 = shl i32 %j2, 1\n%b.half{half}.index = add i32 %b.half{half}.index0, {half}\n%b.half{half}.at = getelementptr i32, ptr addrspace(3) %sum, i32 %b.half{half}.index\nstore i32 {sum}, ptr addrspace(3) %b.half{half}.at, align 4");
+	}
+	emit!("%j2.next = add i32 %j2, %ntid\nbr label %p2\np2.done:\ncall void @llvm.nvvm.barrier0()");
+	// Phase 3: the staged words of every record of the batch.
+	let record_blocks = rv / 32;
+	emit!("%words.all = mul i32 %nb, {}\nbr label %p3\np3:\n%j3 = phi i32 [ %tid, %p2.done ], [ %j3.next, %p3.store ]\n%j3.more = icmp ult i32 %j3, %words.all\nbr i1 %j3.more, label %p3.body, label %p3.done\np3.body:", records * words);
+	emit!("%c.pos = udiv i32 %j3, {}\n%c.inpos = urem i32 %j3, {}\n%c.rec = udiv i32 %c.inpos, {words}\n%c.word = urem i32 %c.inpos, {words}", records * words, records * words);
+	emit!("%c.code.at = getelementptr i32, ptr addrspace(1) @{name}.plan, i32 %c.word\n%c.code = load i32, ptr addrspace(1) %c.code.at, align 4, !invariant.load {SPAN_INVARIANT}\n%c.kind = and i32 %c.code, 3\n%c.f0.s = lshr i32 %c.code, 2\n%c.f0 = and i32 %c.f0.s, 511\n%c.g0 = and i32 %c.code, 2048\n%c.f1.s = lshr i32 %c.code, 12\n%c.f1 = and i32 %c.f1.s, 511\n%c.g1 = and i32 %c.code, 2097152\n%c.wide = and i32 %c.code, 4194304");
+	emit!("%c.qrec0 = mul i32 %c.pos, {k}\n%c.qrec1 = mul i32 %c.rec, {rv}\n%c.qrec = add i32 %c.qrec0, %c.qrec1");
+	// Lanes: two int8 values, each times 256 when flagged, in the low and high halves.
+	for (lane, (field, flag)) in [("%c.f0", "%c.g0"), ("%c.f1", "%c.g1")].into_iter().enumerate() {
+		emit!("%c.l{lane}.index = add i32 %c.qrec, {field}\n%c.l{lane}.at = getelementptr i8, ptr addrspace(3) %q, i32 %c.l{lane}.index\n%c.l{lane}.byte = load i8, ptr addrspace(3) %c.l{lane}.at, align 1\n%c.l{lane}.v = sext i8 %c.l{lane}.byte to i32\n%c.l{lane}.big = shl i32 %c.l{lane}.v, 8\n%c.l{lane}.on = icmp ne i32 {flag}, 0\n%c.l{lane}.w = select i1 %c.l{lane}.on, i32 %c.l{lane}.big, i32 %c.l{lane}.v\n%c.l{lane}.lo = and i32 %c.l{lane}.w, 65535");
+	}
+	emit!("%c.l1.hi = shl i32 %c.l1.lo, 16\n%c.lanes = or i32 %c.l0.lo, %c.l1.hi");
+	// Scale: the activation scale of a 32-value block of the record.
+	emit!("%c.sblk0 = mul i32 %c.pos, {blocks}\n%c.sblk1 = mul i32 %c.rec, {record_blocks}\n%c.sblk2 = add i32 %c.sblk0, %c.sblk1\n%c.sblk = add i32 %c.sblk2, %c.f0\n%c.s.at = getelementptr float, ptr addrspace(3) %scale, i32 %c.sblk\n%c.s = load float, ptr addrspace(3) %c.s.at, align 4\n%c.sbits = bitcast float %c.s to i32");
+	// Sums: two groups of 16 values (each two adjacent 16-value sums for 32-value groups), packed as 16-bit halves.
+	emit!("%c.srec0 = mul i32 %c.pos, {}\n%c.srec1 = mul i32 %c.rec, {}\n%c.srec = add i32 %c.srec0, %c.srec1", k / 16, rv / 16);
+	for (side, field) in [("a", "%c.f0"), ("b", "%c.f1")] {
+		emit!("%c.{side}.w2 = shl i32 {field}, 1\n%c.{side}.on = icmp ne i32 %c.wide, 0\n%c.{side}.first = select i1 %c.{side}.on, i32 %c.{side}.w2, i32 {field}\n%c.{side}.i0 = add i32 %c.srec, %c.{side}.first\n%c.{side}.at0 = getelementptr i32, ptr addrspace(3) %sum, i32 %c.{side}.i0\n%c.{side}.v0 = load i32, ptr addrspace(3) %c.{side}.at0, align 4\n%c.{side}.i1 = add i32 %c.{side}.i0, 1\n%c.{side}.at1 = getelementptr i32, ptr addrspace(3) %sum, i32 %c.{side}.i1\n%c.{side}.v1 = load i32, ptr addrspace(3) %c.{side}.at1, align 4\n%c.{side}.both = add i32 %c.{side}.v0, %c.{side}.v1\n%c.{side}.v = select i1 %c.{side}.on, i32 %c.{side}.both, i32 %c.{side}.v0\n%c.{side}.lo = and i32 %c.{side}.v, 65535");
+	}
+	emit!("%c.b.hi = shl i32 %c.b.lo, 16\n%c.sums = or i32 %c.a.lo, %c.b.hi");
+	emit!("%c.is1 = icmp eq i32 %c.kind, 1\n%c.is2 = icmp eq i32 %c.kind, 2\n%c.is3 = icmp eq i32 %c.kind, 3\n%c.v3 = select i1 %c.is3, i32 %c.sums, i32 0\n%c.v2 = select i1 %c.is2, i32 %c.sbits, i32 %c.v3\n%c.v = select i1 %c.is1, i32 %c.lanes, i32 %c.v2");
+	emit!("br label %p3.store\np3.store:\n%c.to.at = getelementptr i32, ptr addrspace(3) %stage, i32 %j3\nstore i32 %c.v, ptr addrspace(3) %c.to.at, align 4\n%j3.next = add i32 %j3, %ntid\nbr label %p3\np3.done:\ncall void @llvm.nvvm.barrier0()");
+	// Rows: `lanes` adjacent threads share a row, each taking every lanes-th pass, and sum by butterfly shuffles. Every thread of
+	// the workgroup runs the same rounds (the workgroup's first row decides), so the shuffles see whole groups.
+	let shift = lanes.trailing_zeros();
+	emit!("%r.lane = and i32 %tid, {}\n%r.slot = lshr i32 %tid, {shift}\n%r.slots = lshr i32 %ntid, {shift}\n%r.cta0 = mul i32 %cta, %r.slots\n%r.first = add i32 %r.cta0, %r.slot\n%r.step = mul i32 %ncta, %r.slots", lanes - 1);
+	emit!("%r.n0 = sub i32 {passes}, %r.lane\n%r.n1 = add i32 %r.n0, {}\n%r.n = lshr i32 %r.n1, {shift}\n%r.wlane = mul i32 %r.lane, {}\n%r.xlane = mul i32 %r.lane, {}\n%r.x = getelementptr i8, ptr addrspace(3) %stage, i32 %r.xlane\n%r.leader = icmp eq i32 %r.lane, 0", lanes - 1, shape.weight_bytes, shape.staged_bytes);
+	emit!("br label %rows.head\nrows.head:\n%rr = phi i32 [ 0, %p3.done ], [ %rr.next, %row.done ]\n%rr.step = mul i32 %rr, %r.step\n%rr.base = add i32 %r.cta0, %rr.step\n%rr.more = icmp ult i32 %rr.base, %rows\nbr i1 %rr.more, label %row, label %rows.done\nrow:\n%r = add i32 %r.first, %rr.step\n%r.valid = icmp ult i32 %r, %rows\n%r.wide = zext i32 %r to i64\n%r.bytes0 = mul i64 %r.wide, {row_bytes}\n%r.wlane.wide = zext i32 %r.wlane to i64\n%r.bytes = add i64 %r.bytes0, %r.wlane.wide\n%r.w = getelementptr i8, ptr addrspace(1) %w, i64 %r.bytes\n%r.count = select i1 %r.valid, i32 %r.n, i32 0\nswitch i32 %nb, label %row.done [");
+	for positions in 1..=fit { emit!("i32 {positions}, label %row.p{positions}"); }
+	emit!("]");
+	for positions in 1..=fit {
+		let p = format!("%row.p{positions}");
+		emit!("row.p{positions}:\n{p}.dots = call [{positions} x float] @{name}.dot{positions}(ptr addrspace(1) %r.w, ptr addrspace(3) %r.x, ptr addrspace(3) %tables, i32 %r.count, i32 {WIDTH_NIBBLES})");
+		for position in 0..positions {
+			let mut value = format!("{p}.v{position}");
+			emit!("{value} = extractvalue [{positions} x float] {p}.dots, {position}");
+			for step in 0..shift {
+				let offset = 1 << step;
+				emit!("{value}.b{step} = bitcast float {value} to i32\n{value}.s{step} = call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 {value}.b{step}, i32 {offset}, i32 31)\n{value}.f{step} = bitcast i32 {value}.s{step} to float\n{value}.a{step} = fadd float {value}, {value}.f{step}");
+				value = format!("{value}.a{step}");
+			}
+			emit!("{p}.c{position} = add i32 %b0, {position}\n{p}.c{position}.wide = zext i32 {p}.c{position} to i64\n{p}.pos{position} = add i64 %begin.wide, {p}.c{position}.wide\n{p}.col{position} = mul i64 {p}.pos{position}, %rows.wide\n{p}.at{position} = add i64 {p}.col{position}, %r.wide\n{p}.to{position} = getelementptr float, ptr addrspace(1) %y, i64 {p}.at{position}\n{p}.keep{position} = and i1 %r.valid, %r.leader\nbr i1 {p}.keep{position}, label %row.p{positions}.s{position}, label %row.p{positions}.k{position}\nrow.p{positions}.s{position}:\nstore float {value}, ptr addrspace(1) {p}.to{position}, align 4\nbr label %row.p{positions}.k{position}\nrow.p{positions}.k{position}:");
+		}
+		emit!("br label %row.done");
+	}
+	emit!("row.done:\n%rr.next = add i32 %rr, 1\nbr label %rows.head\nrows.done:\n%b0.next = add i32 %b0, %nb\nbr label %batch.head\nexit:\nret void\n}}");
+	Some(o)
+}
+/// The `k0` argument of the K-format decoders: the low-nibble byte mask, passed at run time as `width_check` passes it.
+const WIDTH_NIBBLES: i32 = 0x0F0F0F0F;
+/// The unroll-disable loop metadata the split matvecs' row loops carry, defined by `WIDTH_SPLIT_METADATA`.
+const WIDTH_UNROLL_OFF: &str = "!8189";
+const WIDTH_SPLIT_METADATA: &str = "!8189 = distinct !{!8189, !8188}\n!8188 = !{!\"llvm.loop.unroll.disable\"}\n";
+/// The address `{p}.src` of the 32 input floats of staged block `index` of a batch (position-major, `blocks` per position):
+/// position `b0 + index / blocks` reads input column j, or the j-th set bit of a nonzero `%mask`.
+fn width_split_block_source(o: &mut String, index: &str, p: &str, blocks: usize, k: usize) {
+	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	emit!("%{p}.pos = udiv i32 {index}, {blocks}\n%{p}.blk = urem i32 {index}, {blocks}\n%{p}.j = add i32 %b0, %{p}.pos\n%{p}.bit = call i32 @width.split.column(i32 %mask, i32 %{p}.j)\n%{p}.col = select i1 %all, i32 %{p}.j, i32 %{p}.bit");
+	emit!("%{p}.col.wide = zext i32 %{p}.col to i64\n%{p}.position = add i64 %begin.wide, %{p}.col.wide\n%{p}.row = mul i64 %{p}.position, {k}\n%{p}.blk.wide = zext i32 %{p}.blk to i64\n%{p}.blk.off = mul i64 %{p}.blk.wide, 32\n%{p}.off = add i64 %{p}.row, %{p}.blk.off\n%{p}.src = getelementptr float, ptr addrspace(1) %x, i64 %{p}.off");
+}
+/// What a module holding split matvecs needs beside them, given the module text so far: the column helper, the byte-permute
+/// declaration and the unroll-disable metadata, each unless the module already has it.
+fn width_split_support(module: &str) -> String {
+	if !module.contains("@width_split.") { return String::new(); }
+	let mut text = String::new();
+	if !module.contains("define internal i32 @width.split.column(") { text.push_str(WIDTH_SPLIT_COLUMN); }
+	if !module.contains("declare i32 @llvm.nvvm.prmt(") { text.push_str("declare i32 @llvm.nvvm.prmt(i32, i32, i32)\n"); }
+	if !module.contains(&format!("\n{WIDTH_UNROLL_OFF} = ")) { text.push_str(WIDTH_SPLIT_METADATA); }
+	text
+}
+/// `@width.split.column(mask, j)`: the index of the j-th set bit of `mask`.
+const WIDTH_SPLIT_COLUMN: &str = "define internal i32 @width.split.column(i32 %mask, i32 %j) #1 {\nentry:\nbr label %loop\nloop:\n%m = phi i32 [ %mask, %entry ], [ %m.next, %loop ]\n%i = phi i32 [ 0, %entry ], [ %i.next, %loop ]\n%m.less = sub i32 %m, 1\n%m.next = and i32 %m, %m.less\n%i.next = add i32 %i, 1\n%more = icmp ult i32 %i, %j\nbr i1 %more, label %loop, label %done\ndone:\n%bit = call i32 @llvm.cttz.i32(i32 %m, i1 false)\nret i32 %bit\n}\n";
 /// The host stand-in for the byte permute: bytes of the eight bytes of its first two operands picked by the nibbles of the third,
 /// repeating the picked byte's sign where a nibble's high bit is set.
 const WIDTH_CPU_PRMT: &str = "define internal i32 @recipe.prmt(i32 %a, i32 %b, i32 %s) alwaysinline {\nentry:\n%low = zext i32 %a to i64\n%high.wide = zext i32 %b to i64\n%high = shl i64 %high.wide, 32\n%pair = or i64 %low, %high\n%p0 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 0)\n%p1 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 1)\n%p2 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 2)\n%p3 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 3)\n%q1 = shl i32 %p1, 8\n%q2 = shl i32 %p2, 16\n%q3 = shl i32 %p3, 24\n%r0 = or i32 %p0, %q1\n%r1 = or i32 %r0, %q2\n%r2 = or i32 %r1, %q3\nret i32 %r2\n}\ndefine internal i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 %slot) alwaysinline {\nentry:\n%shift = mul i32 %slot, 4\n%nibble.all = lshr i32 %s, %shift\n%nibble = and i32 %nibble.all, 15\n%index = and i32 %nibble, 7\n%bits = mul i32 %index, 8\n%bits.wide = zext i32 %bits to i64\n%moved = lshr i64 %pair, %bits.wide\n%byte = trunc i64 %moved to i8\n%sign = ashr i8 %byte, 7\n%flag = and i32 %nibble, 8\n%repeat = icmp ne i32 %flag, 0\n%chosen = select i1 %repeat, i8 %sign, i8 %byte\n%result = zext i8 %chosen to i32\nret i32 %result\n}\n";
