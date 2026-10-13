@@ -23046,6 +23046,13 @@ impl ExpertExecution {
 					packed_calls:report[8] as usize,packed_fallbacks:[report[9] as usize,report[10] as usize,report[11] as usize,report[12] as usize],
 					device:device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:if layer.dense(){"DenseRowSplit"}else{"ExpertSplit"}.to_owned(),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
+				// The same receipt also times the wait for the main die's request and the setup before the matvec.
+				let name=if layer.dense(){"Dense"}else{"Expert"};
+				for (suffix,ticks) in [("Wait",clock(2).saturating_sub(clock(0))),("Setup",clock(4).saturating_sub(clock(2)))] {
+					observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],
+						device:device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:format!("{name}Split{suffix}"),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
+						ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
+				}
 			}
 		}
 		Ok(())
