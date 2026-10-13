@@ -25064,14 +25064,17 @@ impl ExpertExecution {
 		let main_device=device_label(main_gpu)?;
 		for (phase,stamps) in trace.chunks_exact(8).enumerate() {
 			let layer=&self.layers[first+phase%layers];
-			if !layer.dense() || stamps[0]==0 {continue;}
+			if stamps[0]==0 {continue;}
 			let start=begin+(phase/layers) as u32*capacity; let stop=(start+capacity).min(end);
-			// Slots 6 and 7 split the send: copies issued, then the completion gather published.
-			let spans=[("Gather",0,1),("Send",1,2),("Local",2,3),("Wait",3,4),("Scatter",4,5),("SendCopy",1,6),("SendPublish",6,7),("SendFlags",7,2)];
-			for (name,from,to) in spans {
+			// Dense slots 6 and 7 split the send: copies issued, then the completion gather published. Expert slots: entry,
+			// routed, wired, sent, own experts done, combined.
+			let dense=[("Gather",0,1),("Send",1,2),("Local",2,3),("Wait",3,4),("Scatter",4,5),("SendCopy",1,6),("SendPublish",6,7),("SendFlags",7,2)];
+			let expert=[("Route",0,1),("Wire",1,2),("Send",2,3),("Local",3,4),("Combine",4,5)];
+			let (prefix,spans):(&str,&[(&str,usize,usize)])=if layer.dense() {("DenseMain",&dense)} else {("ExpertMain",&expert)};
+			for &(name,from,to) in spans {
 				let ticks=stamps[to].saturating_sub(stamps[from]);
 				observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],span_calls:0,
-					device:main_device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:format!("DenseMain{name}"),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
+					device:main_device.clone(),model:String::new(),block:layer.layer,node:layer.node,operation:format!("{prefix}{name}"),begin:start,end:stop,positions:if layer.last_only {1}else{(stop-start) as usize},
 					ticks,seconds:Some(ticks as f64/1e9),fingerprints:Vec::new(),cache_fingerprints:Vec::new(),cache_channel_fingerprints:Vec::new()});
 			}
 		}
@@ -25525,15 +25528,12 @@ const EXPERT_SPLIT_RETURN_TAG_OFFSET: u32 = 63;
 /// One combine record: a worker's payload address followed by its sequence address.
 const EXPERT_SPLIT_RESPONSE_BYTES: usize = 16;
 
-/// Peer functions the appended module already defines through `p2p_functions()`.
+/// The intrinsics the expert split module calls.
 const EXPERT_SPLIT_DECLARATIONS: &str = r#"declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
 declare float @llvm.fma.f32(float, float, float)
-declare i32 @p2p_publish(i64, i64, i32, i64)
-declare i32 @p2p_publish_tagged(i64, i64, i32, i32, i64)
-declare i32 @p2p_wait(i64, i32, i64)
 
 "#;
 
@@ -25554,139 +25554,6 @@ fn expert_split_load(result: &str, element: &str, pointer: &str, offset: usize) 
 	let (llvm, constraint) = match element { "u32" => ("i32", "=r"), "u64" => ("i64", "=l"), _ => ("float", "=f") };
 	let at = if offset == 0 { String::new() } else { format!("+{offset}") };
 	format!("\t{result} = call {llvm} asm sideeffect \"ld.global.cg.{element} $0, [$1{at}];\", \"{constraint},l,~{{memory}}\"(ptr addrspace(1) {pointer})\n")
-}
-
-/// Pushes each token's routed rows to the owning die's packet. Thread 0 of CTA 0
-/// records the owned slots and their coefficients; the copy spreads the rows.
-fn expert_split_send_ir() -> String {
-	let mut ir = format!(
-		r#"define external i32 @split_send(ptr addrspace(1) %hidden, ptr addrspace(1) %selected, ptr addrspace(1) %coefficients, ptr addrspace(1) %owners, ptr addrspace(1) %request, ptr addrspace(1) %records, ptr addrspace(1) %routing, i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline, i32 %die, i32 %experts, i32 %top_k, i32 %rows, i32 %positions, i32 %packet_rows) {{
-entry:
-{EXPERT_SPLIT_GRID}	%lead = or i32 %tid, %cta
-	%thread0 = icmp eq i32 %lead, 0
-	%record.stride = add i32 %top_k, 1
-	%bad.top.zero = icmp eq i32 %top_k, 0
-	%bad.top = icmp ugt i32 %top_k, {EXPERT_SPLIT_MAX_TOP_K}
-	%bad.packet.high = icmp ugt i32 %packet_rows, {EXPERT_SPLIT_PACKET_ROWS}
-	%bad.packet.low = icmp ult i32 %packet_rows, {EXPERT_SPLIT_MIN_PACKET_ROWS}
-	%bad.rows.zero = icmp eq i32 %rows, 0
-	%bad.rows = icmp ugt i32 %rows, %packet_rows
-	%bad.positions.zero = icmp eq i32 %positions, 0
-	%bad.positions = icmp ugt i32 %positions, {SPECULATIVE_POSITIONS}
-	%bad.die = icmp uge i32 %die, {DIES}
-	%bad.0 = or i1 %bad.top.zero, %bad.top
-	%bad.1 = or i1 %bad.0, %bad.packet.high
-	%bad.2 = or i1 %bad.1, %bad.packet.low
-	%bad.3 = or i1 %bad.2, %bad.rows.zero
-	%bad.4 = or i1 %bad.3, %bad.rows
-	%bad.5 = or i1 %bad.4, %bad.positions.zero
-	%bad.6 = or i1 %bad.5, %bad.positions
-	%bad.7 = or i1 %bad.6, %bad.die
-	br i1 %bad.7, label %reject, label %position
-position:
-	%pos = phi i32 [0, %entry], [%pos.next, %position.done]
-	%record = mul i32 %pos, %record.stride
-	%record.ptr = getelementptr i32, ptr addrspace(1) %selected, i32 %record
-"#
-	);
-	ir.push_str(&expert_split_load("%count", "u32", "%record.ptr", 0));
-	ir.push_str(
-		r#"	%bad.count = icmp ugt i32 %count, %top_k
-	br i1 %bad.count, label %reject, label %slot.start
-slot.start:
-	br label %slot
-slot:
-	%slot.index = phi i32 [0, %slot.start], [%slot.next, %slot.latch]
-	%compact = phi i32 [0, %slot.start], [%compact.next, %slot.latch]
-	%slot.more = icmp ult i32 %slot.index, %count
-	br i1 %slot.more, label %slot.body, label %slot.done
-slot.body:
-	%slot.ptr = getelementptr i32, ptr addrspace(1) %record.ptr, i32 %slot.index
-"#,
-	);
-	ir.push_str(&expert_split_load("%expert", "u32", "%slot.ptr", 4));
-	ir.push_str(
-		r#"	%bad.expert = icmp uge i32 %expert, %experts
-	br i1 %bad.expert, label %reject, label %owner
-owner:
-	%owner.ptr = getelementptr i32, ptr addrspace(1) %owners, i32 %expert
-"#,
-	);
-	ir.push_str(&expert_split_load("%owner.id", "u32", "%owner.ptr", 0));
-	ir.push_str(
-		r#"	%mine = icmp eq i32 %owner.id, %die
-	br i1 %mine, label %owned, label %slot.latch
-owned:
-	br i1 %thread0, label %owned.write, label %owned.count
-owned.write:
-	%write.index = add i32 %record, %compact
-	%write.slot = getelementptr i32, ptr addrspace(1) %records, i32 %write.index
-	%write.expert = getelementptr i8, ptr addrspace(1) %write.slot, i64 4
-	store volatile i32 %expert, ptr addrspace(1) %write.expert, align 4
-	%coef.row = mul i32 %pos, %top_k
-	%coef.index = add i32 %coef.row, %slot.index
-	%coef.ptr = getelementptr float, ptr addrspace(1) %coefficients, i32 %coef.index
-"#,
-	);
-	ir.push_str(&expert_split_load("%coef", "f32", "%coef.ptr", 0));
-	ir.push_str(
-		r#"	%route.index = add i32 %coef.row, %compact
-	%route.ptr = getelementptr float, ptr addrspace(1) %routing, i32 %route.index
-	store volatile float %coef, ptr addrspace(1) %route.ptr, align 4
-	br label %owned.count
-owned.count:
-	%counted = add i32 %compact, 1
-	br label %slot.latch
-slot.latch:
-	%compact.next = phi i32 [%compact, %owner], [%counted, %owned.count]
-	%slot.next = add i32 %slot.index, 1
-	br label %slot, !llvm.loop !0
-slot.done:
-	br i1 %thread0, label %count.write, label %count.done
-count.write:
-	%count.ptr = getelementptr i32, ptr addrspace(1) %records, i32 %record
-	store volatile i32 %compact, ptr addrspace(1) %count.ptr, align 4
-	br label %count.done
-count.done:
-	%empty = icmp eq i32 %compact, 0
-	br i1 %empty, label %position.done, label %copy
-copy:
-	br label %copy.loop
-copy.loop:
-	%k = phi i32 [%first, %copy], [%k.next, %copy.body]
-	%k.more = icmp ult i32 %k, %packet_rows
-	br i1 %k.more, label %copy.body, label %position.done
-copy.body:
-	%k.in = icmp ult i32 %k, %rows
-	%src.row = mul i32 %pos, %rows
-	%src.index = add i32 %src.row, %k
-	%src.pick = select i1 %k.in, i32 %src.index, i32 0
-	%src.ptr = getelementptr float, ptr addrspace(1) %hidden, i32 %src.pick
-"#,
-	);
-	ir.push_str(&expert_split_load("%loaded", "f32", "%src.ptr", 0));
-	ir.push_str(
-		r#"	%value = select i1 %k.in, float %loaded, float 0.0
-	%dst.row = mul i32 %pos, %packet_rows
-	%dst.index = add i32 %dst.row, %k
-	%dst.ptr = getelementptr float, ptr addrspace(1) %request, i32 %dst.index
-	store volatile float %value, ptr addrspace(1) %dst.ptr, align 4
-	%k.next = add i32 %k, %stride
-	br label %copy.loop, !llvm.loop !0
-position.done:
-	%pos.next = add i32 %pos, 1
-	%pos.more = icmp ult i32 %pos.next, %positions
-	br i1 %pos.more, label %position, label %publish, !llvm.loop !0
-publish:
-	%ok = call i32 @p2p_publish(i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline)
-	ret i32 %ok
-reject:
-	ret i32 0
-}
-
-"#,
-	);
-	ir
 }
 
 /// Sums each expert CTA's planes for its token positions on the worker die.
@@ -25749,119 +25616,10 @@ reject:
 	ir
 }
 
-/// Writes each worker's rows of the returned positions into its response packet,
-/// zero-filled past the rows, then publishes them under the return tag.
-fn expert_split_return_ir() -> String {
-	let mut ir = format!(
-		r#"define external i32 @split_return(ptr addrspace(1) %partial, ptr addrspace(1) %response, i64 %slots, i64 %remote_sequence, i32 %sequence, i64 %deadline, i32 %rows, i32 %positions, i32 %packet_rows) {{
-entry:
-{EXPERT_SPLIT_GRID}	%total = mul i32 %positions, %packet_rows
-	%tag.scaled = mul i32 %sequence, {EXPERT_SPLIT_RETURN_TAG_STRIDE}
-	%tag = add i32 %tag.scaled, {EXPERT_SPLIT_RETURN_TAG_OFFSET}
-	br label %return.loop
-return.loop:
-	%idx = phi i32 [%first, %entry], [%idx.next, %return.body]
-	%idx.more = icmp ult i32 %idx, %total
-	br i1 %idx.more, label %return.body, label %return.publish
-return.body:
-	%pos = udiv i32 %idx, %packet_rows
-	%col = urem i32 %idx, %packet_rows
-	%col.in = icmp ult i32 %col, %rows
-	%src.row = mul i32 %pos, %rows
-	%src.index = add i32 %src.row, %col
-	%src.pick = select i1 %col.in, i32 %src.index, i32 0
-	%src.ptr = getelementptr float, ptr addrspace(1) %partial, i32 %src.pick
-"#
-	);
-	ir.push_str(&expert_split_load("%loaded", "f32", "%src.ptr", 0));
-	ir.push_str(
-		r#"	%value = select i1 %col.in, float %loaded, float 0.0
-	%dst.ptr = getelementptr float, ptr addrspace(1) %response, i32 %idx
-	store volatile float %value, ptr addrspace(1) %dst.ptr, align 4
-	%idx.next = add i32 %idx, %stride
-	br label %return.loop, !llvm.loop !0
-return.publish:
-	%ok = call i32 @p2p_publish_tagged(i64 %slots, i64 %remote_sequence, i32 %tag, i32 %sequence, i64 %deadline)
-	ret i32 %ok
-}
-
-"#,
-	);
-	ir
-}
-
-/// Waits for every worker's response, then sums the worker payloads in die order.
-fn expert_split_combine_ir() -> String {
-	let mut ir = format!(
-		r#"define external i32 @split_combine(ptr addrspace(1) %responses, ptr addrspace(1) %output, i32 %sequence, i64 %deadline, i32 %rows, i32 %workers, i32 %positions, i32 %packet_rows) {{
-entry:
-{EXPERT_SPLIT_GRID}	%total = mul i32 %rows, %positions
-	br label %wait.loop
-wait.loop:
-	%w = phi i32 [0, %entry], [%w.next, %wait.ok]
-	%w.more = icmp ult i32 %w, %workers
-	br i1 %w.more, label %wait.body, label %row
-wait.body:
-	%entry.offset = mul i32 %w, {EXPERT_SPLIT_RESPONSE_BYTES}
-	%entry.ptr = getelementptr i8, ptr addrspace(1) %responses, i32 %entry.offset
-"#
-	);
-	ir.push_str(&expert_split_load("%wait.payload", "u64", "%entry.ptr", 0));
-	ir.push_str(&expert_split_load("%flag", "u64", "%entry.ptr", 8));
-	ir.push_str(
-		r#"	%waited = call i32 @p2p_wait(i64 %flag, i32 %sequence, i64 %deadline)
-	%failed = icmp eq i32 %waited, 0
-	br i1 %failed, label %reject, label %wait.ok
-wait.ok:
-	%w.next = add i32 %w, 1
-	br label %wait.loop, !llvm.loop !0
-row:
-	%idx = phi i32 [%first, %wait.loop], [%idx.next, %row.store]
-	%idx.more = icmp ult i32 %idx, %total
-	br i1 %idx.more, label %row.body, label %done
-row.body:
-	%pos = udiv i32 %idx, %rows
-	%col = urem i32 %idx, %rows
-	%plane = mul i32 %pos, %packet_rows
-	%plane.index = add i32 %plane, %col
-	br label %sum
-sum:
-	%sum.w = phi i32 [0, %row.body], [%sum.next, %sum.body]
-	%acc = phi float [0.0, %row.body], [%acc.next, %sum.body]
-	%sum.more = icmp ult i32 %sum.w, %workers
-	br i1 %sum.more, label %sum.body, label %row.store
-sum.body:
-"#,
-	);
-	ir.push_str(&format!("\t%record.offset = mul i32 %sum.w, {EXPERT_SPLIT_RESPONSE_BYTES}\n\t%record.ptr = getelementptr i8, ptr addrspace(1) %responses, i32 %record.offset\n"));
-	ir.push_str(&expert_split_load("%payload", "u64", "%record.ptr", 0));
-	ir.push_str(
-		r#"	%payload.ptr = inttoptr i64 %payload to ptr addrspace(1)
-	%value.ptr = getelementptr float, ptr addrspace(1) %payload.ptr, i32 %plane.index
-	%value = load volatile float, ptr addrspace(1) %value.ptr, align 4
-	%acc.next = fadd float %acc, %value
-	%sum.next = add i32 %sum.w, 1
-	br label %sum, !llvm.loop !0
-row.store:
-	%out.ptr = getelementptr float, ptr addrspace(1) %output, i32 %idx
-	store float %acc, ptr addrspace(1) %out.ptr, align 4
-	%idx.next = add i32 %idx, %stride
-	br label %row, !llvm.loop !0
-done:
-	ret i32 1
-reject:
-	ret i32 0
-}
-"#,
-	);
-	ir
-}
-
-/// The LLVM module for the four expert split transport functions. Loops keep their
-/// textual shape: LLVM must not unroll a loop, since its cache loads and peer
-/// operations appear once per function in the transport contract.
+/// The LLVM module of the expert split local combine. Its loops keep their textual
+/// shape: LLVM must not unroll a loop, since its cache loads appear once in it.
 fn expert_split_ir() -> String {
-	[EXPERT_SPLIT_DECLARATIONS.to_owned(), expert_split_send_ir(), expert_split_local_combine_ir(), expert_split_return_ir(), expert_split_combine_ir(), "!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.disable\"}\n".to_owned()].concat()
+	[EXPERT_SPLIT_DECLARATIONS.to_owned(), expert_split_local_combine_ir(), "!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.disable\"}\n".to_owned()].concat()
 }
 
 /// Append callable expert transport functions after p2p_functions() in the
@@ -41334,7 +41092,7 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 /// Owned worker module text for preassembly without allocating model weights.
 pub fn expert_worker_ptx() -> Result<String> { ExpertExecution::worker_source(&span_split_ptx(&[], &[], &BackendTarget::Nvidia { architecture: "sm_52".to_owned() })?) }
 mod expert_forward {
-use super::{EXPERT_SPLIT_MIN_PACKET_ROWS, EXPERT_SPLIT_RETURN_TAG_OFFSET, EXPERT_SPLIT_RETURN_TAG_STRIDE};
+use super::{EXPERT_SPLIT_RESPONSE_BYTES, EXPERT_SPLIT_RETURN_TAG_OFFSET, EXPERT_SPLIT_RETURN_TAG_STRIDE};
 
 /// The first local completion tag of a sequence: each sequence owns a stride of tags, and its return tag is the last.
 fn sequence_base(ir: &mut Ir) -> String {
@@ -41790,6 +41548,230 @@ fn grid(ir: &mut Ir, sl: &str, fl: &str, sequence: &str, deadline: &str) -> Stri
 	ir.value(format!("call i32 @split_grid(ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline})"))
 }
 
+/// The wire form of `cols` positions of `width` floats at `scratch` (position-major): per position, its int8 values (scale =
+/// largest magnitude / 127 per 32 values, rounded half away from zero) then one float scale per 32 values, `width * 9 / 8` bytes,
+/// written `DENSE_WIRE_AT` bytes past `scratch`. Every thread of the grid takes 32-value blocks `gid`, `gid + stride`, ...; the
+/// caller's grid barrier publishes it. Returns the wire's address and its length in 4-byte words.
+fn wire_encode(ir: &mut Ir, scratch: &str, width: &str, cols: &str, gid: &str, stride: &str) -> (String, String) {
+	let wire = gep(ir, scratch, &crate::DENSE_WIRE_AT.to_string());
+	let blocks = ir.value(format!("lshr i32 {width}, 5"));
+	let eighth = ir.value(format!("lshr i32 {width}, 3"));
+	let wire_stride = ir.value(format!("add i32 {width}, {eighth}"));
+	let total = ir.value(format!("mul i32 {blocks}, {cols}"));
+	ir.set("wire.block", I32, gid);
+	while_loop(
+		ir,
+		|ir| {
+			let block = ir.get("wire.block", I32);
+			ir.value(format!("icmp ult i32 {block}, {total}"))
+		},
+		|ir| {
+			let block = ir.get("wire.block", I32);
+			let position = ir.value(format!("udiv i32 {block}, {blocks}"));
+			let within = ir.value(format!("urem i32 {block}, {blocks}"));
+			let first_row = ir.value(format!("mul i32 {position}, {width}"));
+			let first_lane = ir.value(format!("shl i32 {within}, 5"));
+			let first = ir.value(format!("add i32 {first_row}, {first_lane}"));
+			let values: Vec<String> = (0..32).map(|lane| {
+				let index = ir.value(format!("add i32 {first}, {lane}"));
+				let at = element(ir, scratch, &index, 4);
+				ld(ir, F32, &at, false)
+			}).collect();
+			let mut top = "0.0".to_owned();
+			for value in &values {
+				let magnitude = ir.value(format!("call float @llvm.fabs.f32(float {value})"));
+				top = ir.value(format!("call float @llvm.maxnum.f32(float {top}, float {magnitude})"));
+			}
+			let zero = ir.value(format!("fcmp oeq float {top}, 0.0"));
+			let safe = ir.value(format!("select i1 {zero}, float 1.0, float {top}"));
+			let inverse_any = ir.value(format!("fdiv float 127.0, {safe}"));
+			let inverse = ir.value(format!("select i1 {zero}, float 0.0, float {inverse_any}"));
+			let scale = ir.value(format!("fdiv float {top}, 127.0"));
+			let row_bytes = ir.value(format!("mul i32 {position}, {wire_stride}"));
+			let mut words = Vec::new();
+			for word in 0..8 {
+				let mut packed = "0".to_owned();
+				for byte in 0..4 {
+					let scaled = ir.value(format!("fmul float {}, {inverse}", values[4 * word + byte]));
+					let half = ir.value(format!("call float @llvm.copysign.f32(float 0.5, float {scaled})"));
+					let rounded = ir.value(format!("fadd float {scaled}, {half}"));
+					let integer = ir.value(format!("fptosi float {rounded} to i32"));
+					let low = ir.value(format!("and i32 {integer}, 255"));
+					let placed = ir.value(format!("shl i32 {low}, {}", 8 * byte));
+					packed = ir.value(format!("or i32 {packed}, {placed}"));
+				}
+				words.push(packed);
+			}
+			let values_at = ir.value(format!("add i32 {row_bytes}, {first_lane}"));
+			for half in 0..2 {
+				let mut vector = "undef".to_owned();
+				for lane in 0..4 { vector = ir.value(format!("insertelement {V4I32} {vector}, i32 {}, i32 {lane}", words[4 * half + lane])); }
+				let offset = ir.value(format!("add i32 {values_at}, {}", 16 * half));
+				let offset = ir.value(format!("zext i32 {offset} to i64"));
+				let at = gep(ir, &wire, &offset);
+				ir.inst(format!("store {V4I32} {vector}, ptr addrspace(1) {at}, align 16"));
+			}
+			let scale_lane = ir.value(format!("shl i32 {within}, 2"));
+			let scale_base = ir.value(format!("add i32 {row_bytes}, {width}"));
+			let scale_offset = ir.value(format!("add i32 {scale_base}, {scale_lane}"));
+			let scale_offset = ir.value(format!("zext i32 {scale_offset} to i64"));
+			let scale_at = gep(ir, &wire, &scale_offset);
+			st(ir, F32, &scale, &scale_at, false);
+			let next = ir.value(format!("add i32 {block}, {stride}"));
+			ir.set("wire.block", I32, &next);
+		},
+	);
+	let wire_bytes = ir.value(format!("mul i32 {wire_stride}, {cols}"));
+	let wire_words = ir.value(format!("lshr i32 {wire_bytes}, 2"));
+	(wire, wire_words)
+}
+
+/// Writes one request as 8-byte low-latency words (see `LL_READ`) at `request`: `header_count` words `header(index)` computes,
+/// then the `wire_words` words of the wire form, each beside `sequence`. Every thread of the grid writes, word `gid` then every
+/// `stride`-th: the root complex accepts peer writes faster from many SMs than from one. Nothing else publishes the request.
+fn ll_send(ir: &mut Ir, request: &str, header_count: &str, header: &dyn Fn(&mut Ir, &str) -> String, wire: &str, wire_words: &str, sequence: &str, gid: &str, stride: &str) {
+	let bound = ir.value(format!("add i32 {wire_words}, {header_count}"));
+	ir.set("ll.word", I32, gid);
+	while_loop(
+		ir,
+		|ir| {
+			let index = ir.get("ll.word", I32);
+			ir.value(format!("icmp ult i32 {index}, {bound}"))
+		},
+		|ir| {
+			let index = ir.get("ll.word", I32);
+			let is_header = ir.value(format!("icmp ult i32 {index}, {header_count}"));
+			let header_block = ir.fresh("ll.header");
+			let wire_block = format!("{header_block}.wire");
+			let joined = format!("{header_block}.joined");
+			ir.inst(format!("br i1 {is_header}, label %{header_block}, label %{wire_block}"));
+			ir.label(&header_block);
+			let word = header(ir, &index);
+			ir.set("ll.payload", I32, &word);
+			ir.inst(format!("br label %{joined}"));
+			ir.label(&wire_block);
+			let wire_index = ir.value(format!("sub i32 {index}, {header_count}"));
+			let wire_at = element(ir, wire, &wire_index, 4);
+			let wire_word = ld(ir, I32, &wire_at, false);
+			ir.set("ll.payload", I32, &wire_word);
+			ir.inst(format!("br label %{joined}"));
+			ir.label(&joined);
+			let payload = ir.get("ll.payload", I32);
+			let pair = ir.value(format!("insertelement <2 x i32> undef, i32 {payload}, i32 0"));
+			let pair = ir.value(format!("insertelement <2 x i32> {pair}, i32 {sequence}, i32 1"));
+			let pair_at = byte_offset(ir, &index, 8);
+			let write_at = gep(ir, request, &pair_at);
+			ir.inst(format!("store volatile <2 x i32> {pair}, ptr addrspace(1) {write_at}, align 8"));
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("ll.word", I32, &next);
+		},
+	);
+}
+
+/// Decodes the wire form (see `wire_encode`) that starts at low-latency word `first` of `request` into `cols` positions of
+/// `width` floats at `dest` (position-major), reading each word once `sequence` arrives beside it.
+fn wire_decode(ir: &mut Ir, request: &str, first: &str, dest: &str, width: &str, cols: &str, sequence: &str, deadline: &str, gid: &str, stride: &str) {
+	let bound = ir.value(format!("mul i32 {width}, {cols}"));
+	let eighth = ir.value(format!("lshr i32 {width}, 3"));
+	let wire_stride = ir.value(format!("add i32 {width}, {eighth}"));
+	ir.set("wire.index", I32, gid);
+	while_loop(
+		ir,
+		|ir| {
+			let index = ir.get("wire.index", I32);
+			ir.value(format!("icmp ult i32 {index}, {bound}"))
+		},
+		|ir| {
+			let index = ir.get("wire.index", I32);
+			let row = ir.value(format!("udiv i32 {index}, {width}"));
+			let column = ir.value(format!("urem i32 {index}, {width}"));
+			// Wire byte b travels in low-latency word first + b / 4, at byte b % 4 of its payload.
+			let row_bytes = ir.value(format!("mul i32 {row}, {wire_stride}"));
+			let value_byte = ir.value(format!("add i32 {row_bytes}, {column}"));
+			let value_word0 = ir.value(format!("lshr i32 {value_byte}, 2"));
+			let value_word = ir.value(format!("add i32 {value_word0}, {first}"));
+			let packed = ir.value(format!("call i32 @ll_read(ptr addrspace(1) {request}, i32 {value_word}, i32 {sequence}, i64 {deadline})"));
+			let lane = ir.value(format!("and i32 {value_byte}, 3"));
+			let lane_bits = ir.value(format!("shl i32 {lane}, 3"));
+			let shifted = ir.value(format!("lshr i32 {packed}, {lane_bits}"));
+			let code = ir.value(format!("trunc i32 {shifted} to i8"));
+			let code = ir.value(format!("sitofp i8 {code} to float"));
+			let block = ir.value(format!("lshr i32 {column}, 5"));
+			let scales_at = ir.value(format!("add i32 {row_bytes}, {width}"));
+			let scales_word = ir.value(format!("lshr i32 {scales_at}, 2"));
+			let scale_word0 = ir.value(format!("add i32 {scales_word}, {block}"));
+			let scale_word = ir.value(format!("add i32 {scale_word0}, {first}"));
+			let scale_bits = ir.value(format!("call i32 @ll_read(ptr addrspace(1) {request}, i32 {scale_word}, i32 {sequence}, i64 {deadline})"));
+			let scale = ir.value(format!("bitcast i32 {scale_bits} to float"));
+			let value = ir.value(format!("fmul float {code}, {scale}"));
+			let to = element(ir, dest, &index, 4);
+			st(ir, F32, &value, &to, false);
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("wire.index", I32, &next);
+		},
+	);
+}
+
+/// Header word `index` of an expert request for the peer on die `die` (see `split_main_forward`): with `stride` = 1 + 2 * `top`
+/// words per position, word 0 of a position is how many of its selected experts the peer owns, words 1..=top their ids and words
+/// top+1..2*top their coefficients, in selection order (zero past the owned ones). `ids` holds each position's selection as
+/// [count, ids...] of top + 1 words, `coefficients` top floats per position, and `owners` the owning die of every expert.
+fn expert_header_word(ir: &mut Ir, index: &str, stride: &str, top: &str, ids: &str, coefficients: &str, owners: &str, die: &str) -> String {
+	let position = ir.value(format!("udiv i32 {index}, {stride}"));
+	let word = ir.value(format!("urem i32 {index}, {stride}"));
+	let row_width = ir.value(format!("add i32 {top}, 1"));
+	let record = ir.value(format!("mul i32 {position}, {row_width}"));
+	let count_at = element(ir, ids, &record, 4);
+	let count = ld(ir, I32, &count_at, false);
+	let is_id = ir.value(format!("icmp ule i32 {word}, {top}"));
+	let id_want = ir.value(format!("sub i32 {word}, 1"));
+	let coefficient_want = ir.value(format!("sub i32 {id_want}, {top}"));
+	let want = ir.value(format!("select i1 {is_id}, i32 {id_want}, i32 {coefficient_want}"));
+	ir.set("eh.slot", I32, "0");
+	ir.set("eh.seen", I32, "0");
+	ir.set("eh.id", I32, "0");
+	ir.set("eh.coefficient", I32, "0");
+	while_loop(
+		ir,
+		|ir| {
+			let slot = ir.get("eh.slot", I32);
+			ir.value(format!("icmp ult i32 {slot}, {count}"))
+		},
+		|ir| {
+			let slot = ir.get("eh.slot", I32);
+			let id_index0 = ir.value(format!("add i32 {record}, 1"));
+			let id_index = ir.value(format!("add i32 {id_index0}, {slot}"));
+			let id_at = element(ir, ids, &id_index, 4);
+			let expert = ld(ir, I32, &id_at, false);
+			let owner_at = element(ir, owners, &expert, 4);
+			let owner = ld(ir, I32, &owner_at, false);
+			let mine = ir.value(format!("icmp eq i32 {owner}, {die}"));
+			when(ir, &mine, |ir| {
+				let seen = ir.get("eh.seen", I32);
+				let wanted = ir.value(format!("icmp eq i32 {seen}, {want}"));
+				when(ir, &wanted, |ir| {
+					ir.set("eh.id", I32, &expert);
+					let coefficient_row = ir.value(format!("mul i32 {position}, {top}"));
+					let coefficient_index = ir.value(format!("add i32 {coefficient_row}, {slot}"));
+					let coefficient_at = element(ir, coefficients, &coefficient_index, 4);
+					let coefficient = ld(ir, I32, &coefficient_at, false);
+					ir.set("eh.coefficient", I32, &coefficient);
+				});
+				let seen_next = ir.value(format!("add i32 {seen}, 1"));
+				ir.set("eh.seen", I32, &seen_next);
+			});
+			let next = ir.value(format!("add i32 {slot}, 1"));
+			ir.set("eh.slot", I32, &next);
+		},
+	);
+	let seen = ir.get("eh.seen", I32);
+	let id = ir.get("eh.id", I32);
+	let coefficient = ir.get("eh.coefficient", I32);
+	let is_count = ir.value(format!("icmp eq i32 {word}, 0"));
+	let entry = ir.value(format!("select i1 {is_id}, i32 {id}, i32 {coefficient}"));
+	ir.value(format!("select i1 {is_count}, i32 {seen}, i32 {entry}"))
+}
+
 /// Byte offset of a dense-layer slice record in the route table (40 bytes each).
 const DENSE_SLICE_BYTES: usize = 40;
 
@@ -41886,47 +41868,8 @@ fn split_dense_layer() -> String {
 	ir.set("a16", GLOBAL, &route_table);
 	ir.set("r13", I32, &header[2]);
 	ir.set("r14", I32, &header[3]);
-	ir.set("r15", I32, &gid);
-	let copy_bound = ir.value(format!("mul i32 {r2}, %cols"));
-	while_loop(
-		&mut ir,
-		|ir| {
-			let index = ir.get("r15", I32);
-			ir.value(format!("icmp ult i32 {index}, {copy_bound}"))
-		},
-		|ir| {
-			// The request holds the input's wire form (see `split_dense_forward`): per position, int8 values then a float
-			// scale per 32 values, `width * 9 / 8` bytes.
-			let index = ir.get("r15", I32);
-			let row = ir.value(format!("udiv i32 {index}, {r2}"));
-			let column = ir.value(format!("urem i32 {index}, {r2}"));
-			let eighth = ir.value(format!("lshr i32 {r2}, 3"));
-			let wire_stride = ir.value(format!("add i32 {r2}, {eighth}"));
-			// Wire byte b travels in low-latency word 4 + b / 4, at byte b % 4 of its payload.
-			let row_bytes = ir.value(format!("mul i32 {row}, {wire_stride}"));
-			let value_byte = ir.value(format!("add i32 {row_bytes}, {column}"));
-			let value_word0 = ir.value(format!("lshr i32 {value_byte}, 2"));
-			let value_word = ir.value(format!("add i32 {value_word0}, 4"));
-			let packed = ir.value(format!("call i32 @ll_read(ptr addrspace(1) {a3}, i32 {value_word}, i32 %seq, i64 {deadline})"));
-			let lane = ir.value(format!("and i32 {value_byte}, 3"));
-			let lane_bits = ir.value(format!("shl i32 {lane}, 3"));
-			let shifted = ir.value(format!("lshr i32 {packed}, {lane_bits}"));
-			let code = ir.value(format!("trunc i32 {shifted} to i8"));
-			let code = ir.value(format!("sitofp i8 {code} to float"));
-			let block = ir.value(format!("lshr i32 {column}, 5"));
-			let scales_at = ir.value(format!("add i32 {row_bytes}, {r2}"));
-			let scales_word = ir.value(format!("lshr i32 {scales_at}, 2"));
-			let scale_word0 = ir.value(format!("add i32 {scales_word}, {block}"));
-			let scale_word = ir.value(format!("add i32 {scale_word0}, 4"));
-			let scale_bits = ir.value(format!("call i32 @ll_read(ptr addrspace(1) {a3}, i32 {scale_word}, i32 %seq, i64 {deadline})"));
-			let scale = ir.value(format!("bitcast i32 {scale_bits} to float"));
-			let value = ir.value(format!("fmul float {code}, {scale}"));
-			let to = element(ir, &a6, &index, 4);
-			st(ir, F32, &value, &to, false);
-			let next = ir.value(format!("add i32 {index}, {stride}"));
-			ir.set("r15", I32, &next);
-		},
-	);
+	// The request holds the input's wire form (see `split_dense_forward`) after its four header words.
+	wire_decode(&mut ir, &a3, "4", &a6, &r2, "%cols", "%seq", &deadline, &gid, &stride);
 	let grid_seq = sequence_base(&mut ir);
 	ir.set("r20", I32, &grid_seq);
 	let published = grid(&mut ir, &a11, &a12, &grid_seq, &deadline);
@@ -42325,76 +42268,8 @@ fn split_dense_forward() -> String {
 	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
 	let ready = grid(&mut ir, &a8, &a9, &ready_seq, &deadline);
 	leave_unless(&mut ir, &ready, 411, "r26", "df.failed");
-	// The wire form of the input: per position, its int8 values (one per input, scale = largest magnitude / 127 per 32 values,
-	// rounded half away from zero) then one float scale per 32 values, `width * 9 / 8` bytes; peers decode it back to floats.
-	let wire = gep(&mut ir, &scratch, &crate::DENSE_WIRE_AT.to_string());
-	let wire_blocks = ir.value(format!("lshr i32 {r6}, 5"));
-	let wire_eighth = ir.value(format!("lshr i32 {r6}, 3"));
-	let wire_stride = ir.value(format!("add i32 {r6}, {wire_eighth}"));
-	let wire_total = ir.value(format!("mul i32 {wire_blocks}, %cols"));
-	ir.set("r20", I32, &gid);
-	while_loop(
-		&mut ir,
-		|ir| {
-			let block = ir.get("r20", I32);
-			ir.value(format!("icmp ult i32 {block}, {wire_total}"))
-		},
-		|ir| {
-			let block = ir.get("r20", I32);
-			let position = ir.value(format!("udiv i32 {block}, {wire_blocks}"));
-			let within = ir.value(format!("urem i32 {block}, {wire_blocks}"));
-			let first_row = ir.value(format!("mul i32 {position}, {r6}"));
-			let first_lane = ir.value(format!("shl i32 {within}, 5"));
-			let first = ir.value(format!("add i32 {first_row}, {first_lane}"));
-			let values: Vec<String> = (0..32).map(|lane| {
-				let index = ir.value(format!("add i32 {first}, {lane}"));
-				let at = element(ir, &scratch, &index, 4);
-				ld(ir, F32, &at, false)
-			}).collect();
-			let mut top = "0.0".to_owned();
-			for value in &values {
-				let magnitude = ir.value(format!("call float @llvm.fabs.f32(float {value})"));
-				top = ir.value(format!("call float @llvm.maxnum.f32(float {top}, float {magnitude})"));
-			}
-			let zero = ir.value(format!("fcmp oeq float {top}, 0.0"));
-			let safe = ir.value(format!("select i1 {zero}, float 1.0, float {top}"));
-			let inverse_any = ir.value(format!("fdiv float 127.0, {safe}"));
-			let inverse = ir.value(format!("select i1 {zero}, float 0.0, float {inverse_any}"));
-			let scale = ir.value(format!("fdiv float {top}, 127.0"));
-			let row_bytes = ir.value(format!("mul i32 {position}, {wire_stride}"));
-			let mut words = Vec::new();
-			for word in 0..8 {
-				let mut packed = "0".to_owned();
-				for byte in 0..4 {
-					let scaled = ir.value(format!("fmul float {}, {inverse}", values[4 * word + byte]));
-					let half = ir.value(format!("call float @llvm.copysign.f32(float 0.5, float {scaled})"));
-					let rounded = ir.value(format!("fadd float {scaled}, {half}"));
-					let integer = ir.value(format!("fptosi float {rounded} to i32"));
-					let low = ir.value(format!("and i32 {integer}, 255"));
-					let placed = ir.value(format!("shl i32 {low}, {}", 8 * byte));
-					packed = ir.value(format!("or i32 {packed}, {placed}"));
-				}
-				words.push(packed);
-			}
-			let values_at = ir.value(format!("add i32 {row_bytes}, {first_lane}"));
-			for half in 0..2 {
-				let mut vector = "undef".to_owned();
-				for lane in 0..4 { vector = ir.value(format!("insertelement {V4I32} {vector}, i32 {}, i32 {lane}", words[4 * half + lane])); }
-				let offset = ir.value(format!("add i32 {values_at}, {}", 16 * half));
-				let offset = ir.value(format!("zext i32 {offset} to i64"));
-				let at = gep(ir, &wire, &offset);
-				ir.inst(format!("store {V4I32} {vector}, ptr addrspace(1) {at}, align 16"));
-			}
-			let scale_lane = ir.value(format!("shl i32 {within}, 2"));
-			let scale_base = ir.value(format!("add i32 {row_bytes}, {r6}"));
-			let scale_offset = ir.value(format!("add i32 {scale_base}, {scale_lane}"));
-			let scale_offset = ir.value(format!("zext i32 {scale_offset} to i64"));
-			let scale_at = gep(ir, &wire, &scale_offset);
-			st(ir, F32, &scale, &scale_at, false);
-			let next = ir.value(format!("add i32 {block}, {stride}"));
-			ir.set("r20", I32, &next);
-		},
-	);
+	// The wire form of the input, which peers decode back to floats (see `wire_encode`).
+	let (wire, wire_words) = wire_encode(&mut ir, &scratch, &r6, "%cols", &gid, &stride);
 	let wired_seq = ir.value(format!("add i32 {ready_seq}, 2"));
 	let wired = grid(&mut ir, &a8, &a9, &wired_seq, &deadline);
 	leave_unless(&mut ir, &wired, 414, "r26", "df.failed");
@@ -42409,49 +42284,20 @@ fn split_dense_forward() -> String {
 	let peer_wide = byte_offset(&mut ir, &peer, 48);
 	let entry = gep(&mut ir, &channels, &peer_wide);
 	let request = word_address(&mut ir, &entry, 0, false);
-	// The request is a stream of 8-byte low-latency words (see `LL_READ`): a header of the output address (two words), its
-	// length and begin, then the wire form four bytes at a time, each beside this operation's sequence.
+	// The request: a header of the output address (two words), its length and begin, then the wire form four bytes at a time.
 	let output_bits = ir.value("ptrtoint ptr addrspace(1) %output to i64");
 	let output_low = ir.value(format!("trunc i64 {output_bits} to i32"));
 	let output_shifted = ir.value(format!("lshr i64 {output_bits}, 32"));
 	let output_high = ir.value(format!("trunc i64 {output_shifted} to i32"));
-	let wire_bytes = ir.value(format!("mul i32 {wire_stride}, %cols"));
-	let wire_words = ir.value(format!("lshr i32 {wire_bytes}, 2"));
-	let quad_bound = ir.value(format!("add i32 {wire_words}, 4"));
-	// Every workgroup writes: the root complex accepts peer writes faster from many SMs than from one.
-	ir.set("r21", I32, &gid);
-	ir.set("r22", I32, &quad_bound);
-	let quad_head = ir.fresh("df.quad.head");
-	ir.inst(format!("br label %{quad_head}"));
-	ir.label(&quad_head);
-	let quad_index = ir.get("r21", I32);
-	let quad_end = ir.get("r22", I32);
-	let quad_more = ir.value(format!("icmp ult i32 {quad_index}, {quad_end}"));
-	let quad_body = format!("{quad_head}.body");
-	let quad_exit = format!("{quad_head}.exit");
-	ir.inst(format!("br i1 {quad_more}, label %{quad_body}, label %{quad_exit}"));
-	ir.label(&quad_body);
-	let is_header = ir.value(format!("icmp ult i32 {quad_index}, 4"));
-	let wire_index = ir.value(format!("sub i32 {quad_index}, 4"));
-	let wire_clamped = ir.value(format!("select i1 {is_header}, i32 0, i32 {wire_index}"));
-	let wire_at = element(&mut ir, &wire, &wire_clamped, 4);
-	let wire_word = ld(&mut ir, I32, &wire_at, false);
-	let first_pick = ir.value(format!("icmp eq i32 {quad_index}, 0"));
-	let second_pick = ir.value(format!("icmp eq i32 {quad_index}, 1"));
-	let third_pick = ir.value(format!("icmp eq i32 {quad_index}, 2"));
-	let header_late = ir.value(format!("select i1 {third_pick}, i32 %length, i32 %begin"));
-	let header_mid = ir.value(format!("select i1 {second_pick}, i32 {output_high}, i32 {header_late}"));
-	let header_word = ir.value(format!("select i1 {first_pick}, i32 {output_low}, i32 {header_mid}"));
-	let payload = ir.value(format!("select i1 {is_header}, i32 {header_word}, i32 {wire_word}"));
-	let pair = ir.value(format!("insertelement <2 x i32> undef, i32 {payload}, i32 0"));
-	let pair = ir.value(format!("insertelement <2 x i32> {pair}, i32 {sequence}, i32 1"));
-	let pair_at = byte_offset(&mut ir, &quad_index, 8);
-	let write_at = gep(&mut ir, &request, &pair_at);
-	ir.inst(format!("store volatile <2 x i32> {pair}, ptr addrspace(1) {write_at}, align 8"));
-	let quad_next = ir.value(format!("add i32 {quad_index}, {stride}"));
-	ir.set("r21", I32, &quad_next);
-	ir.inst(format!("br label %{quad_head}"));
-	ir.label(&quad_exit);
+	let header = |ir: &mut Ir, index: &str| {
+		let first_pick = ir.value(format!("icmp eq i32 {index}, 0"));
+		let second_pick = ir.value(format!("icmp eq i32 {index}, 1"));
+		let third_pick = ir.value(format!("icmp eq i32 {index}, 2"));
+		let late = ir.value(format!("select i1 {third_pick}, i32 %length, i32 %begin"));
+		let mid = ir.value(format!("select i1 {second_pick}, i32 {output_high}, i32 {late}"));
+		ir.value(format!("select i1 {first_pick}, i32 {output_low}, i32 {mid}"))
+	};
+	ll_send(&mut ir, &request, "4", &header, &wire, &wire_words, &sequence, &gid, &stride);
 	let peer_next = ir.get("r20", I32);
 	let advanced = ir.value(format!("add i32 {peer_next}, 1"));
 	ir.set("r20", I32, &advanced);
@@ -42687,7 +42533,6 @@ fn split_main_forward() -> String {
 	let x = word_address(&mut ir, "%desc", SCRATCH_A, false);
 	let co = word_address(&mut ir, "%desc", SCRATCH_B, false);
 	let ids = word_address(&mut ir, "%desc", SCRATCH_C, false);
-	let table = word_address(&mut ir, "%desc", SCRATCH_D, false);
 	let local = word_address(&mut ir, "%desc", LOCAL_JOB, false);
 	let pick = word_address(&mut ir, "%desc", PICK_COUNTS, false);
 	let r4 = field(&mut ir, "%desc", GLOBAL, I32);
@@ -42726,6 +42571,17 @@ fn split_main_forward() -> String {
 	let leader = ir.value(format!("icmp eq i32 {gid}, 0"));
 	let started = timer(&mut ir);
 	let deadline = ir.value(format!("add i64 {started}, 5000000000"));
+	// Phase stamps of this expert operation: entry, routed, wired, sent, own experts done, combined, scattered.
+	let trace = word_address(&mut ir, "%desc", TRACE, false);
+	let trace_row = element(&mut ir, &trace, &layer, 64);
+	let stamp = |ir: &mut Ir, slot: usize| {
+		when(ir, &leader, |ir| {
+			let now = timer(ir);
+			let at = gep(ir, &trace_row, &(8 * slot).to_string());
+			st(ir, I64, &now, &at, false);
+		});
+	};
+	stamp(&mut ir, 0);
 	let width_plus = ir.value(format!("add i32 {r8}, 1"));
 	let gather_bound = ir.value(format!("mul i32 {r6}, %cols"));
 	let route_bound = ir.value(format!("mul i32 {width_plus}, %cols"));
@@ -42836,7 +42692,19 @@ fn split_main_forward() -> String {
 	let ready_seq = ir.value(format!("mul i32 {sequence}, 64"));
 	let ready = grid(&mut ir, &completion, &sequence_word, &ready_seq, &deadline);
 	leave_unless(&mut ir, &ready, 301, "r30", "main.failed");
-	// Send every peer its request; a peer that cannot take the request fails the layer.
+	stamp(&mut ir, 1);
+	// The wire form of the hidden rows (see `wire_encode`).
+	let (wire, wire_words) = wire_encode(&mut ir, &x, &r6, "%cols", &gid, &stride);
+	let wired_seq = ir.value(format!("add i32 {ready_seq}, 2"));
+	let wired = grid(&mut ir, &completion, &sequence_word, &wired_seq, &deadline);
+	leave_unless(&mut ir, &wired, 302, "r30", "main.failed");
+	stamp(&mut ir, 2);
+	// Every peer's request is a stream of low-latency words (see `LL_READ`): per position a header of 1 + 2 * top_k words (how
+	// many of the position's selected experts the peer owns, their ids, then their coefficients, in selection order), then the
+	// wire form. No fence or flag publishes it.
+	let header_twice = ir.value(format!("shl i32 {r8}, 1"));
+	let header_stride = ir.value(format!("add i32 {header_twice}, 1"));
+	let header_count = ir.value(format!("mul i32 {header_stride}, %cols"));
 	ir.set("r22", I32, "0");
 	while_loop(
 		&mut ir,
@@ -42849,19 +42717,14 @@ fn split_main_forward() -> String {
 			let peer_bytes = byte_offset(ir, &peer, 48);
 			let entry = gep(ir, &channels, &peer_bytes);
 			let request = word_address(ir, &entry, 0, false);
-			let rec = word_address(ir, &entry, 8, false);
-			let routing = word_address(ir, &entry, 16, false);
-			let sl = word_address(ir, &entry, 24, false);
-			let fl = word_address(ir, &entry, 32, false);
 			let die = field(ir, &entry, 40, I32);
-			let sent = ir.value(format!(
-				"call i32 @split_send(ptr addrspace(1) {x}, ptr addrspace(1) {ids}, ptr addrspace(1) {co}, ptr addrspace(1) {owner}, ptr addrspace(1) {request}, ptr addrspace(1) {rec}, ptr addrspace(1) {routing}, ptr addrspace(1) {sl}, ptr addrspace(1) {fl}, i32 {sequence}, i64 {deadline}, i32 {die}, i32 {r7}, i32 {r8}, i32 {r6}, i32 %cols, i32 {EXPERT_SPLIT_MIN_PACKET_ROWS})"
-			));
-			leave_unless(ir, &sent, 302, "r30", "main.failed");
+			let header = |ir: &mut Ir, index: &str| expert_header_word(ir, index, &header_stride, &r8, &ids, &co, &owner, &die);
+			ll_send(ir, &request, &header_count, &header, &wire, &wire_words, &sequence, &gid, &stride);
 			let next = ir.value(format!("add i32 {peer}, 1"));
 			ir.set("r22", I32, &next);
 		},
 	);
+	stamp(&mut ir, 3);
 	// Local expert layer on this die, then combine every peer's product.
 	let local_at_layer = word_address(&mut ir, &local, 120, false);
 	let layer_index = ir.get("r14", I32);
@@ -42871,34 +42734,54 @@ fn split_main_forward() -> String {
 	ir.set("r30", I32, &local_status);
 	let local_bad = ir.value(format!("icmp ne i32 {local_status}, 1"));
 	jump_if(&mut ir, &local_bad, "main.failed");
+	stamp(&mut ir, 4);
+	// Each peer returns its partial sums as low-latency words; sum them in die order as each word's sequence arrives.
 	let combine_seq = ir.get("r15", I32);
-	let combined = ir.value(format!(
-		"call i32 @split_combine(ptr addrspace(1) {responses}, ptr addrspace(1) {table}, i32 {combine_seq}, i64 {deadline}, i32 {r6}, i32 {r5}, i32 %cols, i32 {EXPERT_SPLIT_MIN_PACKET_ROWS})"
-	));
-	leave_unless(&mut ir, &combined, 303, "r30", "main.failed");
-	// Scatter the combined rows to the output.
+	let combine_total = ir.value(format!("mul i32 {r6}, %cols"));
 	ir.set("r22", I32, &gid);
 	while_loop(
 		&mut ir,
 		|ir| {
 			let index = ir.get("r22", I32);
-			ir.value(format!("icmp ult i32 {index}, {gather_bound}"))
+			ir.value(format!("icmp ult i32 {index}, {combine_total}"))
 		},
 		|ir| {
 			let index = ir.get("r22", I32);
-			let row = ir.value(format!("udiv i32 {index}, {r6}"));
-			let column = ir.value(format!("urem i32 {index}, {r6}"));
-			let out_row = ir.value(format!("mul i32 {column}, %length"));
+			ir.set("f1", F32, "0.0");
+			ir.set("r26", I32, "0");
+			while_loop(
+				ir,
+				|ir| {
+					let worker = ir.get("r26", I32);
+					ir.value(format!("icmp ult i32 {worker}, {r5}"))
+				},
+				|ir| {
+					let worker = ir.get("r26", I32);
+					let record = element(ir, &responses, &worker, EXPERT_SPLIT_RESPONSE_BYTES);
+					let payload = word_address(ir, &record, 0, false);
+					let bits = ir.value(format!("call i32 @ll_read(ptr addrspace(1) {payload}, i32 {index}, i32 {combine_seq}, i64 {deadline})"));
+					let value = ir.value(format!("bitcast i32 {bits} to float"));
+					let sum = ir.get("f1", F32);
+					let sum = ir.value(format!("fadd float {sum}, {value}"));
+					ir.set("f1", F32, &sum);
+					let next = ir.value(format!("add i32 {worker}, 1"));
+					ir.set("r26", I32, &next);
+				},
+			);
+			// The sum goes straight to the output activation, row `position` of column `input`.
+			let sum = ir.get("f1", F32);
+			let position = ir.value(format!("udiv i32 {index}, {r6}"));
+			let input = ir.value(format!("urem i32 {index}, {r6}"));
+			let out_row = ir.value(format!("mul i32 {input}, %length"));
 			let out_begin = ir.value(format!("add i32 {out_row}, %begin"));
-			let out_index = ir.value(format!("add i32 {out_begin}, {row}"));
-			let from = element(ir, &table, &index, 4);
-			let value = ld_cg(ir, F32, &from, 0);
+			let out_index = ir.value(format!("add i32 {out_begin}, {position}"));
 			let to = element(ir, "%output", &out_index, 4);
-			st(ir, F32, &value, &to, false);
+			st(ir, F32, &sum, &to, false);
 			let next = ir.value(format!("add i32 {index}, {stride}"));
 			ir.set("r22", I32, &next);
 		},
 	);
+	stamp(&mut ir, 5);
 	ir.set("r30", I32, "1");
 	ir.inst("br label %main.done");
 	ir.label("main.failed");
@@ -42977,7 +42860,6 @@ fn split_expert_layer() -> String {
 	use expert_job::*;
 	let mut ir = Ir::new();
 	let a3 = word_address(&mut ir, "%desc", pointer(P_REQUEST), false);
-	let a4 = word_address(&mut ir, "%desc", pointer(P_REQUEST_SEQUENCE), false);
 	let a5 = word_address(&mut ir, "%desc", pointer(P_ROUTE), false);
 	let a6 = word_address(&mut ir, "%desc", pointer(P_ROUTE_RESPONSE), false);
 	let a7 = word_address(&mut ir, "%desc", pointer(P_SCRATCH_A), false);
@@ -42990,7 +42872,6 @@ fn split_expert_layer() -> String {
 	let a14 = word_address(&mut ir, "%desc", pointer(P_REQUEST_COMPLETION), false);
 	let a15 = word_address(&mut ir, "%desc", pointer(P_REQUEST_SEQUENCE_NEXT), false);
 	let a16 = word_address(&mut ir, "%desc", pointer(P_RESPONSE), false);
-	let a17 = word_address(&mut ir, "%desc", pointer(P_RESPONSE_SEQUENCE), false);
 	let r2 = field(&mut ir, "%desc", dimension(D_INPUT_WIDTH), I32);
 	let r3 = field(&mut ir, "%desc", dimension(D_HIDDEN), I32);
 	let r5 = field(&mut ir, "%desc", dimension(D_TEN), I32);
@@ -43016,46 +42897,40 @@ fn split_expert_layer() -> String {
 		st(ir, I32, "0", &at, false);
 	});
 	preset_receipt(&mut ir, &leader);
-	let receipt = ir.value(format!("call i32 @p2p_wait(ptr addrspace(1) {a4}, i32 %seq, i64 {deadline})"));
-	leave_unless(&mut ir, &receipt, 101, "r12", "split.done");
+	// The request is the main die's low-latency stream (see `split_main_forward`): per position a header of 1 + 2 * top_k words,
+	// then the hidden rows' wire form. Workgroup 0 copies the headers into the routing tables (each position's owned count and
+	// expert ids in a5, top_k + 1 words a position; their coefficients in a6, top_k a position); the leader lists them below.
+	let header_twice = ir.value(format!("shl i32 {r5}, 1"));
+	let header_stride = ir.value(format!("add i32 {header_twice}, 1"));
+	let header_count = ir.value(format!("mul i32 {header_stride}, %cols"));
+	let first_workgroup = ir.value(format!("icmp eq i32 {ctaid}, 0"));
+	let header_thread = ir.value(format!("icmp ult i32 {tid}, {header_count}"));
+	let header_reader = ir.value(format!("and i1 {first_workgroup}, {header_thread}"));
+	when(&mut ir, &header_reader, |ir| {
+		let word = ir.value(format!("call i32 @ll_read(ptr addrspace(1) {a3}, i32 {tid}, i32 %seq, i64 {deadline})"));
+		let position = ir.value(format!("udiv i32 {tid}, {header_stride}"));
+		let within = ir.value(format!("urem i32 {tid}, {header_stride}"));
+		let record = ir.value(format!("icmp ule i32 {within}, {r5}"));
+		let record_width = ir.value(format!("add i32 {r5}, 1"));
+		let record_row = ir.value(format!("mul i32 {position}, {record_width}"));
+		let record_index = ir.value(format!("add i32 {record_row}, {within}"));
+		let coefficient_row = ir.value(format!("mul i32 {position}, {r5}"));
+		let coefficient_skip = ir.value(format!("add i32 {r5}, 1"));
+		let coefficient_within = ir.value(format!("sub i32 {within}, {coefficient_skip}"));
+		let coefficient_index = ir.value(format!("add i32 {coefficient_row}, {coefficient_within}"));
+		let record_at = element(ir, &a5, &record_index, 4);
+		let coefficient_at = element(ir, &a6, &coefficient_index, 4);
+		let at = ir.value(format!("select i1 {record}, ptr addrspace(1) {record_at}, ptr addrspace(1) {coefficient_at}"));
+		st(ir, I32, &word, &at, true);
+	});
+	ir.inst("call void @llvm.nvvm.barrier0()");
 	let copied = timer(&mut ir);
 	when(&mut ir, &leader, |ir| {
 		let at = gep(ir, "%report", "8");
 		st(ir, I64, &copied, &at, false);
 	});
-	// Compact the padded packet to k-float columns; the flag table says which positions hold data.
 	let copy_bound = ir.value(format!("mul i32 {r2}, %cols"));
-	ir.set("r15", I32, &gid);
-	while_loop(
-		&mut ir,
-		|ir| {
-			let index = ir.get("r15", I32);
-			ir.value(format!("icmp ult i32 {index}, {copy_bound}"))
-		},
-		|ir| {
-			let index = ir.get("r15", I32);
-			let row = ir.value(format!("udiv i32 {index}, {r2}"));
-			let column = ir.value(format!("urem i32 {index}, {r2}"));
-			let padded_row = ir.value(format!("mul i32 {row}, {EXPERT_SPLIT_MIN_PACKET_ROWS}"));
-			let padded = ir.value(format!("add i32 {padded_row}, {column}"));
-			let from = element(ir, &a3, &padded, 4);
-			let flag_row = ir.value(format!("add i32 {r5}, 1"));
-			let flag_index = ir.value(format!("mul i32 {flag_row}, {row}"));
-			let flag_at = element(ir, &a5, &flag_index, 4);
-			let flag = ld(ir, I32, &flag_at, true);
-			ir.set("f0", F32, "0.0");
-			let loaded = ir.value(format!("icmp ne i32 {flag}, 0"));
-			when(ir, &loaded, |ir| {
-				let value = ld(ir, F32, &from, true);
-				ir.set("f0", F32, &value);
-			});
-			let value = ir.get("f0", F32);
-			let to = element(ir, &a7, &index, 4);
-			st(ir, F32, &value, &to, false);
-			let next = ir.value(format!("add i32 {index}, {stride}"));
-			ir.set("r15", I32, &next);
-		},
-	);
+	wire_decode(&mut ir, &a3, &header_count, &a7, &r2, "%cols", "%seq", &deadline, &gid, &stride);
 	let zero_bound = ir.value(format!("mul i32 {copy_bound}, {r5}"));
 	ir.set("r15", I32, &gid);
 	while_loop(
@@ -43430,9 +43305,27 @@ fn split_expert_layer() -> String {
 	ir.set("r22", I32, &reduce_tag);
 	let reduced = grid(&mut ir, &a14, &a15, &reduce_tag, &deadline);
 	leave_unless(&mut ir, &reduced, 113, "r12", "split.done");
-	let returned = ir.value(format!("call i32 @split_return(ptr addrspace(1) {a12}, ptr addrspace(1) {a16}, ptr addrspace(1) {a14}, ptr addrspace(1) {a17}, i32 %seq, i64 {deadline}, i32 {r2}, i32 %cols, i32 {EXPERT_SPLIT_MIN_PACKET_ROWS})"));
-	let returned_zero = is_zero(&mut ir, &returned);
-	note_status(&mut ir, &returned_zero, 114);
+	// Return the partial sums ([position][row]) to the main die's response as low-latency words beside this phase's sequence;
+	// the main die sums them as they arrive, so nothing more publishes them.
+	ir.set("r15", I32, &gid);
+	while_loop(
+		&mut ir,
+		|ir| {
+			let index = ir.get("r15", I32);
+			ir.value(format!("icmp ult i32 {index}, {copy_bound}"))
+		},
+		|ir| {
+			let index = ir.get("r15", I32);
+			let from = element(ir, &a12, &index, 4);
+			let bits = ld(ir, I32, &from, false);
+			let pair = ir.value(format!("insertelement <2 x i32> undef, i32 {bits}, i32 0"));
+			let pair = ir.value(format!("insertelement <2 x i32> {pair}, i32 %seq, i32 1"));
+			let to = element(ir, &a16, &index, 8);
+			ir.inst(format!("store volatile <2 x i32> {pair}, ptr addrspace(1) {to}, align 8"));
+			let next = ir.value(format!("add i32 {index}, {stride}"));
+			ir.set("r15", I32, &next);
+		},
+	);
 	ir.inst("br label %split.done");
 	ir.label("split.done");
 	let finished = timer(&mut ir);
@@ -43502,9 +43395,6 @@ fn expert_forward_declarations() -> String {
 		"declare i64 @mtp_group_cta(ptr addrspace(1), i32, i32, i32)",
 		"declare i32 @mtp_column_word(i32)",
 		"declare i32 @split_local_combine(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32)",
-		"declare i32 @split_return(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i64, i32, i32, i32)",
-		"declare i32 @split_send(ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i64, i32, i32, i32, i32, i32, i32)",
-		"declare i32 @split_combine(ptr addrspace(1), ptr addrspace(1), i32, i64, i32, i32, i32, i32)",
 	]
 	.iter()
 	.map(|line| format!("{line}\n"))
