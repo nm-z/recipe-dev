@@ -1763,12 +1763,44 @@ fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, b
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
+/// Byte ranges of the value buffer that one node's kernel reads and writes. The planner chose these slots from the same
+/// lifetimes it reuses storage by, so two kernels that share no range need no grid barrier between them.
+#[derive(Clone, Default)]
+pub(crate) struct ValueAccess {
+	reads: Vec<(usize, usize)>,
+	writes: Vec<(usize, usize)>,
+}
+
+impl ValueAccess {
+	fn range(begin: usize, bytes: usize) -> Option<(usize, usize)> {
+		(bytes != 0).then_some((begin, begin + bytes))
+	}
+	fn overlap(left: &[(usize, usize)], right: &[(usize, usize)]) -> bool {
+		left.iter().any(|(begin, end)| right.iter().any(|(other_begin, other_end)| begin < other_end && other_begin < end))
+	}
+	/// Whether a kernel with access `next` must wait for every outstanding access in `self`: it may not write what an
+	/// outstanding kernel reads or writes, nor read what one writes.
+	fn conflicts(&self, next: &Self) -> bool {
+		Self::overlap(&next.reads, &self.writes) || Self::overlap(&next.writes, &self.reads) || Self::overlap(&next.writes, &self.writes)
+	}
+	fn join(&mut self, next: &Self) {
+		self.reads.extend_from_slice(&next.reads);
+		self.writes.extend_from_slice(&next.writes);
+	}
+	fn is_empty(&self) -> bool {
+		self.reads.is_empty() && self.writes.is_empty()
+	}
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeLayout {
 	pub window_positions: usize,
 	pub input_window: Option<usize>,
 	pub request_control: Option<usize>,
 	pub values: Vec<usize>,
+	/// At inference, the value buffer ranges each elementwise node reads and writes; every other node is `None` and keeps
+	/// its barrier.
+	pub barrier_access: Vec<Option<ValueAccess>>,
 	pub contexts: Vec<usize>,
 	pub contexts_in_values: Vec<bool>,
 	pub context_resets: Vec<(usize, usize)>,
@@ -2403,6 +2435,8 @@ impl NativeLayout {
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
+		let mut value_bytes = Vec::with_capacity(graph.nodes.len());
+		let mut barrier_access = Vec::with_capacity(graph.nodes.len());
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
 		let input_window = if window_positions < graph.input.length && graph.nodes.first().is_some_and(|node| !node.token_input()) {
@@ -2434,6 +2468,16 @@ impl NativeLayout {
 				trace(&format!("layout node {index} slot {slot} bytes {bytes} last {} retained {} source {} second {}", last.get(index).copied().unwrap_or(0), retained.get(index).copied().unwrap_or(false), node.source, node.second))?;
 			}
 			values.push(slot);
+			value_bytes.push(bytes);
+			// An inference elementwise node touches only its operands' values (it converts none), its weights, which nothing
+			// writes, and its own value: two such nodes that share no range need no grid barrier between them.
+			barrier_access.push((inference && node.op == Primitive::Elementwise).then(|| {
+				let operands = [node.source, node.second].into_iter().filter_map(|operand| usize::try_from(operand).ok());
+				ValueAccess {
+					reads: operands.filter_map(|operand| ValueAccess::range(values[operand], value_bytes[operand])).collect(),
+					writes: ValueAccess::range(slot, bytes).into_iter().collect(),
+				}
+			}));
 			// An operand computed in another arithmetic is converted into this
 			// node's type first; the converted copy and, in training, the adjoint
 			// contribution on its way back each take a slot of their own.
@@ -2556,7 +2600,7 @@ impl NativeLayout {
 			context_plan.allocate(&[(bytes, BufferLifetime::Retained)], 8, 0, false).map(Some)
 		}).collect::<Result<Vec<_>>>()?;
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_inputs, packed_routes, span_scratch, fingerprints, cache_channel_fingerprints })
+		Ok(Self { window_positions, input_window, request_control, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, barrier_access, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, packed_scratch, packed_inputs, packed_routes, span_scratch, fingerprints, cache_channel_fingerprints })
 	}
 }
 
@@ -5766,6 +5810,10 @@ impl NativeModelIr {
 			self.plans.iter().enumerate().collect::<Vec<_>>()
 		};
 		let fusion = self.plan_fusion(reverse, training)?;
+		// The grid barrier after an elementwise node is deferred to the next node: it stays when that node is of another
+		// kind, sits in another block, or conflicts with an outstanding read or write (`ValueAccess::conflicts`).
+		let mut outstanding = ValueAccess::default();
+		let mut deferred_block = None;
 		for (index, plan) in order {
 			// Recurrent body nodes are emitted by the scan's uniform position loop.
 			// They are still plans so their parameters, storage, and adjoints remain
@@ -5773,6 +5821,22 @@ impl NativeModelIr {
 			// outside the recurrence and race the position-local tape.
 			if plan.node.block_kind == "recur_body" {
 				continue;
+			}
+			// A producer's loop also reads and writes what its absorbed consumers do.
+			let access = self.layout.barrier_access[index].as_ref().filter(|_| !reverse && !training).map(|own| {
+				let mut combined = own.clone();
+				for tail in &fusion.tails[index] {
+					if let Some(tail) = &self.layout.barrier_access[*tail] { combined.join(tail); }
+				}
+				combined
+			});
+			let skipped = !reverse && external_expert(&plan.node) && plan.node.argument[8] < 0.0;
+			if !skipped && !fusion.absorbed[index] && !outstanding.is_empty() {
+				let independent = access.as_ref().is_some_and(|next| !outstanding.conflicts(next)) && deferred_block == Some(plan.node.block_index);
+				if !independent {
+					ir.push_str(barrier(backend));
+					outstanding = ValueAccess::default();
+				}
 			}
 			let state_projection = !reverse && !training && index + 1 == self.plans.len()
 				&& plan.node.op == Primitive::Contraction && self.graph.nodes.iter().any(|node| node.retain_output);
@@ -6384,7 +6448,7 @@ impl NativeModelIr {
 						));
 					})?;
 					fused?;
-					ir.push_str(barrier(backend));
+					if access.is_none() { ir.push_str(barrier(backend)); }
 				}
 				(false, Primitive::Predictor) => {
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
@@ -7124,7 +7188,12 @@ impl NativeModelIr {
 				ir.push_str(&format!("call void @recipe_operation_n{index}({arguments})\n"));
 			}
 			if state_projection { ir.push_str("br label %state.projection.done\nstate.projection.done:\n"); }
+			if let Some(access) = &access {
+				outstanding.join(access);
+				deferred_block = Some(plan.node.block_index);
+			}
 		}
+		if !outstanding.is_empty() { ir.push_str(barrier(backend)); }
 		Ok(ir)
 	}
 
