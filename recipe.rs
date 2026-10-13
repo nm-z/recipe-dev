@@ -2726,13 +2726,17 @@ impl SpanSpec {
 	fn whole(&self, positions: usize) -> bool { positions * self.data(self.tasks() * self.weight.task()).next_multiple_of(4) <= SPAN_TILE_FLOATS }
 	fn plan(&self, positions: usize) -> SpanPlan {
 		let (w, tasks) = (self.weight, self.tasks());
-		if self.rows == 0 {
-			// Run-time rows: one chunk; the groups divide the rows among the workgroups as it runs.
-			return SpanPlan { lanes: span_lanes(tasks), chunk: tasks, chunks: 1, last: tasks, group: 0, groups: 0, stride: self.data(tasks * w.task()).next_multiple_of(4), pass: w.pass(true) };
-		}
 		let granule = w.granule();
 		let mut most = tasks;
 		while most > granule && positions * self.data(most * w.task()).next_multiple_of(4) > SPAN_TILE_FLOATS { most -= granule; }
+		if self.rows == 0 {
+			// Run-time rows: the groups divide the rows among the workgroups as it runs, one group a workgroup. An input too wide
+			// to stage at `positions` splits into chunks; each workgroup walks its group's chunks in order and adds each chunk's
+			// sums into the outputs the first chunk stored, so no other workgroup touches them.
+			let chunk = tasks.div_ceil(tasks.div_ceil(most)).next_multiple_of(granule);
+			let chunks = tasks.div_ceil(chunk);
+			return SpanPlan { lanes: span_lanes(chunk), chunk, chunks, last: tasks - (chunks - 1) * chunk, group: 0, groups: 0, stride: self.data(chunk * w.task()).next_multiple_of(4), pass: w.pass(true) };
+		}
 		let needed = tasks.div_ceil(most);
 		let slots = SPAN_WARPS * 32 / span_lanes(tasks.div_ceil(needed));
 		// Few rows: every group holds them all and chunks spread the input across the
@@ -2842,7 +2846,7 @@ const SPAN_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 2
 fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 	let mut functions = String::new();
 	let mut names = std::collections::HashSet::new();
-	let mut cases = |widths: &[usize], functions: &mut String| -> Vec<(u32, usize, usize, String, usize)> {
+	let mut cases = |widths: &[usize], chunked: bool, functions: &mut String| -> Vec<(u32, usize, usize, String, usize)> {
 		let mut cases = Vec::new();
 		for &k in widths {
 			for (code, weight) in SPAN_SPLIT_FORMATS {
@@ -2854,7 +2858,8 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 				let span_stages = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false }.whole(3);
 				// Q6_K is the exception: its 210-byte blocks leave the XMAD kernel's records only word-aligned, and a 512-row k6144
 				// slice took 160 us at one position and 204 us at three (16 GB/s, span-bench 2026-10-13), so it takes the span matvec
-				// one position per grid group.
+				// in two input chunks (85.2 us for the slowest workgroup, against 90.3 us one position per grid group;
+				// 20261013T110249-gputest-1).
 				let xmad_faster = k == 640 || !span_stages && weight != SpanWeight::Q6K;
 				if let Some(function) = xmad_faster.then(|| width_split_function(code, k, &name, shared)).flatten() {
 					if names.insert(name.clone()) { functions.push_str(&function); }
@@ -2864,7 +2869,8 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 					continue;
 				}
 				let spec = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
-				let Some(widest) = (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last().filter(|_| spec.valid()) else { continue };
+				// A dense slice chunks an input too wide to stage at its columns; an expert call stages only what fits whole.
+				let Some(widest) = (if chunked { Some(SPAN_POSITIONS) } else { (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last() }).filter(|_| spec.valid()) else { continue };
 				let name = format!("span_split.{}", spec.key());
 				if names.insert(name.clone()) { functions.push_str(&span_matvec_function(&spec, &name, shared)); }
 				cases.push((code, k, widest, name, widest));
@@ -2872,7 +2878,7 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 		}
 		cases
 	};
-	let (dense, experts) = (cases(dense, &mut functions), cases(experts, &mut functions));
+	let (dense, experts) = (cases(dense, true, &mut functions), cases(experts, false, &mut functions));
 	// The fewest columns any expert case stages at once: a window that wide never leaves an expert call to another kernel.
 	let stages = experts.iter().map(|(_, _, widest, _, _)| *widest).min().unwrap_or(0);
 	let mut ir = format!("define i32 @span_split_expert_stages() #3 {{\nentry:\nret i32 {stages}\n}}\n");
@@ -2927,7 +2933,6 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 	let (e, l, u) = (w.task(), plan.lanes, (w.unroll() / plan.pass).max(1));
 	let p = format!("s{s}");
 	// A plane sized at run time takes the whole input, so widths it cannot stage do nothing.
-	if spec.rows == 0 && !spec.whole(s) { emit!("{p}:\nbr label %exit"); return; }
 	let invariant = format!("!invariant.load {SPAN_INVARIANT}");
 	emit!("{p}:");
 	emit!("%{p}.lane = and i32 %lane, {}\n%{p}.slot.in = lshr i32 %lane, {}\n%{p}.slot.base = mul i32 %warp, {}\n%{p}.slot = add i32 %{p}.slot.base, %{p}.slot.in\n%{p}.slots = mul i32 %warps, {}",
@@ -2941,16 +2946,21 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 	}
 	let (rows, group, groups, units) = if spec.rows == 0 {
 		emit!("%{p}.group0 = add i32 %rows, %ncta\n%{p}.group1 = sub i32 %{p}.group0, 1\n%{p}.group2 = udiv i32 %{p}.group1, %ncta\n%{p}.group.none = icmp eq i32 %{p}.group2, 0\n%{p}.group = select i1 %{p}.group.none, i32 1, i32 %{p}.group2");
-		emit!("%{p}.groups0 = add i32 %rows, %{p}.group\n%{p}.groups1 = sub i32 %{p}.groups0, 1\n%{p}.groups = udiv i32 %{p}.groups1, %{p}.group");
-		("%rows".to_owned(), format!("%{p}.group"), format!("%{p}.groups"), format!("%{p}.groups"))
+		emit!("%{p}.groups0 = add i32 %rows, %{p}.group\n%{p}.groups1 = sub i32 %{p}.groups0, 1\n%{p}.groups = udiv i32 %{p}.groups1, %{p}.group\n%{p}.units = mul i32 %ncta, {}", plan.chunks);
+		("%rows".to_owned(), format!("%{p}.group"), format!("%{p}.groups"), format!("%{p}.units"))
 	} else {
 		(spec.rows.to_string(), plan.group.to_string(), plan.groups.to_string(), (plan.chunks * plan.groups).to_string())
 	};
 	emit!("br label %{p}.unit\n{p}.unit:");
 	emit!("%{p}.u = phi i32 [ %cta, %{p} ], [ %{p}.u.next, %{p}.unit.next ]\n%{p}.staged = phi i32 [ -1, %{p} ], [ %{p}.c, %{p}.unit.next ]");
 	emit!("%{p}.u.more = icmp ult i32 %{p}.u, {units}\nbr i1 %{p}.u.more, label %{p}.unit.body, label %exit\n{p}.unit.body:");
-	emit!("%{p}.c = udiv i32 %{p}.u, {groups}\n%{p}.g = urem i32 %{p}.u, {groups}\n%{p}.c.last = icmp eq i32 %{p}.c, {}\n%{p}.ctasks = select i1 %{p}.c.last, i32 {}, i32 {}",
-		plan.chunks - 1, plan.last, plan.chunk);
+	if spec.rows == 0 {
+		// Workgroup `cta` keeps group `cta` through every chunk; one past the groups has no rows.
+		emit!("%{p}.c = udiv i32 %{p}.u, %ncta\n%{p}.g = urem i32 %{p}.u, %ncta\n%{p}.g.idle = icmp uge i32 %{p}.g, {groups}\nbr i1 %{p}.g.idle, label %{p}.unit.next, label %{p}.unit.work\n{p}.unit.work:");
+	} else {
+		emit!("%{p}.c = udiv i32 %{p}.u, {groups}\n%{p}.g = urem i32 %{p}.u, {groups}");
+	}
+	emit!("%{p}.c.last = icmp eq i32 %{p}.c, {}\n%{p}.ctasks = select i1 %{p}.c.last, i32 {}, i32 {}", plan.chunks - 1, plan.last, plan.chunk);
 	emit!("%{p}.cbase = mul i32 %{p}.c, {}\n%{p}.restage = icmp ne i32 %{p}.c, %{p}.staged\nbr i1 %{p}.restage, label %{p}.stage, label %{p}.compute", plan.chunk);
 	// Stage the chunk's activations: position-major, padded, eight loads in flight per thread.
 	emit!("{p}.stage:\ncall void @llvm.nvvm.barrier0()\n%{p}.celems = mul i32 %{p}.ctasks, {e}\n%{p}.items = mul i32 %{p}.celems, {s}\n%{p}.k0 = mul i32 %{p}.cbase, {e}\nbr label %{p}.stage.loop\n{p}.stage.loop:");
@@ -3040,8 +3050,10 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 	emit!("%{p}.lead = icmp eq i32 %{p}.lane, 0\nbr i1 %{p}.lead, label %{p}.write0, label %{p}.row.next");
 	for (i, row) in sums.iter().enumerate() {
 		emit!("{p}.write{i}:");
-		if plan.chunks == 1 {
-			for (q, sum) in row.iter().enumerate() { span_store(o, spec, &format!("%{p}.out{i}.{q}"), sum, &format!("%{p}.r{i}"), &q.to_string()); }
+		if plan.chunks == 1 || spec.rows == 0 {
+			// A run-time-row plane's later chunks add into what its first chunk stored.
+			let added = (plan.chunks > 1).then(|| format!("%{p}.c"));
+			for (q, sum) in row.iter().enumerate() { span_store(o, spec, &format!("%{p}.out{i}.{q}"), sum, &format!("%{p}.r{i}"), &q.to_string(), added.as_deref()); }
 		} else {
 			for (q, sum) in row.iter().enumerate() {
 				let part = format!("%{p}.part{i}.{q}");
@@ -3052,7 +3064,7 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 		if i + 1 < pass { emit!("br i1 %{p}.ok{}, label %{p}.write{}, label %{p}.row.next", i + 1, i + 1); } else { emit!("br label %{p}.row.next"); }
 	}
 	emit!("{p}.row.next:\n%{p}.rl.next = add i32 %{p}.rl, %{p}.advance\nbr label %{p}.row\n{p}.rows.done:");
-	if plan.chunks == 1 {
+	if plan.chunks == 1 || spec.rows == 0 {
 		emit!("br label %{p}.unit.next");
 	} else {
 		// The group's last workgroup to finish a chunk adds the chunks in order.
@@ -3068,16 +3080,18 @@ fn span_matvec_path(o: &mut String, spec: &SpanSpec, s: usize, shared: &str) {
 		}
 		emit!("%{p}.ps0 = fadd float %{p}.pv0, 0.0");
 		for c in 1..plan.chunks { emit!("%{p}.ps{c} = fadd float %{p}.ps{}, %{p}.pv{c}", c - 1); }
-		span_store(o, spec, &format!("%{p}.fin"), &format!("%{p}.ps{}", plan.chunks - 1), &format!("%{p}.rrow"), &format!("%{p}.rp"));
+		span_store(o, spec, &format!("%{p}.fin"), &format!("%{p}.ps{}", plan.chunks - 1), &format!("%{p}.rrow"), &format!("%{p}.rp"), None);
 		emit!("%{p}.ri.next = add i32 %{p}.ri, %ntid\nbr label %{p}.red\n{p}.red.done:\nbr i1 %first, label %{p}.reset, label %{p}.unit.next\n{p}.reset:");
 		emit!("%{p}.counter.reset = getelementptr i32, ptr addrspace(1) %scratch, i32 %{p}.g\nstore atomic i32 0, ptr addrspace(1) %{p}.counter.reset syncscope(\"device\") monotonic, align 4\nbr label %{p}.unit.next");
 	}
 	emit!("{p}.unit.next:\n%{p}.u.next = add i32 %{p}.u, %ncta\nbr label %{p}.unit");
 }
 
-/// Add the bias, apply the ReLU and store one output value at row `row`, position offset `position`.
-fn span_store(o: &mut String, spec: &SpanSpec, q: &str, value: &str, row: &str, position: &str) {
+/// Add the bias, apply the ReLU and store one output value at row `row`, position offset `position`. With `chunk`, a chunk
+/// index past zero adds the value to the one stored there (a run-time-row plane's chunks; such planes carry no bias or ReLU).
+fn span_store(o: &mut String, spec: &SpanSpec, q: &str, value: &str, row: &str, position: &str, chunk: Option<&str>) {
 	macro_rules! emit { ($($arg:tt)*) => {{ o.push_str(&format!($($arg)*)); o.push('\n'); }} }
+	assert!(chunk.is_none() || !spec.bias && !spec.relu, "a chunked run-time-row plane has no bias or ReLU");
 	let mut value = value.to_owned();
 	if spec.bias {
 		emit!("{q}.bias.row = zext i32 {row} to i64\n{q}.bias.at = add i64 {q}.bias.row, {}\n{q}.bias.from = getelementptr float, ptr addrspace(1) %w, i64 {q}.bias.at\n{q}.bias = load float, ptr addrspace(1) {q}.bias.from, align 4, !invariant.load {SPAN_INVARIANT}\n{q}.biased = fadd float {value}, {q}.bias", spec.rows * spec.k);
@@ -3093,7 +3107,13 @@ fn span_store(o: &mut String, spec: &SpanSpec, q: &str, value: &str, row: &str, 
 		SpanLayout::Columns => ("1".to_owned(), spec.rows.to_string()),
 	};
 	emit!("{q}.row = zext i32 {row} to i64\n{q}.base = mul i64 {q}.row, {row_stride}\n{q}.offset = zext i32 {position} to i64\n{q}.position = add i64 %begin.wide, {q}.offset\n{q}.column = mul i64 {q}.position, {position_stride}\n{q}.at = add i64 {q}.base, {q}.column");
-	emit!("{q}.to = getelementptr float, ptr addrspace(1) %y, i64 {q}.at\nstore float {value}, ptr addrspace(1) {q}.to, align 4");
+	emit!("{q}.to = getelementptr float, ptr addrspace(1) %y, i64 {q}.at");
+	if let Some(chunk) = chunk {
+		// The same lane stored this output at the chunk before, so it reads its own store.
+		emit!("{q}.first = icmp eq i32 {chunk}, 0\n{q}.prior = load float, ptr addrspace(1) {q}.to, align 4\n{q}.added = fadd float {q}.prior, {value}\n{q}.chunked = select i1 {q}.first, float {value}, float {q}.added");
+		value = format!("{q}.chunked");
+	}
+	emit!("store float {value}, ptr addrspace(1) {q}.to, align 4");
 }
 
 /// Words of `count` bytes starting at an even address: the aligned words that cover them,
