@@ -10,6 +10,31 @@ recipe run train.rs --cfg recipe --device amd0.cpu.archy:nv7.nv8 --ctx 4096 -p "
 
 The AMD backend supports discrete GPUs only and requires gfx8 or newer. AMD APUs and integrated GPUs are unsupported.
 
+## Script dependencies
+
+```rust
+//! ```cargo
+//! [dependencies]
+//! serde_json = "1"
+//! ```
+use recipe::*;
+
+fn main() {
+	let config: serde_json::Value = serde_json::from_str(r#"{"width":32}"#).unwrap();
+	let model = recipe.model().layer(config["width"].as_u64().unwrap() as usize);
+}
+```
+
+```bash
+recipe run model.rs --device archy:cpu
+```
+
+The leading `cargo` doc block contains Cargo dependency tables. Recipe links the
+installed `recipe` library; no `recipe` dependency is needed in the block. Cargo
+stores dependencies and a per-script lockfile under `$CARGO_HOME/recipe-scripts`
+(`~/.cargo/recipe-scripts` by default). Path dependencies use absolute paths.
+Scripts without a dependency block compile directly with `rustc`.
+
 ## **Data**
 
 ```rust
