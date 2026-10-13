@@ -12304,8 +12304,8 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,v4,{},{},{},{},{},{},{},{},{},{},{},{}",
-				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
+				"delta,v5,{},{},{},{},{},{},{},{},{},{},{}",
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width,
 				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
 				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
 				delta.decay_gate.map_or("-".to_owned(), |decay| decay.code().to_string()),
@@ -12494,10 +12494,10 @@ mod bundle {
 				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
 			)),
 			"delta" => {
-				require(fields.next() == Some("v4"), "saved delta record is not current format")?;
+				require(fields.next() == Some("v5"), "saved delta record is not current format")?;
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
 				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
-				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
+				let value_width = value_at(fields.next(), "delta value width")?;
 				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let decay_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
@@ -12505,7 +12505,7 @@ mod bundle {
 				let qk_norm = normalization(fields.next(), "delta query/key normalization")?;
 				let value_norm = normalization(fields.next(), "delta value normalization")?;
 				require(fields.next().is_none(), "delta record has extra fields")?;
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, decay_gate, write_gate, qk_norm, value_norm }))
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, conv_activation, output_activation, decay_gate, write_gate, qk_norm, value_norm }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -13776,7 +13776,6 @@ struct DeltaBlock {
 	key_heads: usize,
 	key_width: usize,
 	value_width: usize,
-	output: usize,
 	/// Activation applied after the causal convolution, named by the model.
 	conv_activation: Option<Activation>,
 	/// Activation applied to the output gate, named by the model.
@@ -13790,7 +13789,7 @@ struct DeltaBlock {
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, output_activation: None, decay_gate: None, write_gate: None, qk_norm: None, value_norm: None }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, conv_activation: None, output_activation: None, decay_gate: None, write_gate: None, qk_norm: None, value_norm: None }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -13806,7 +13805,7 @@ impl DeltaBlock {
 		let keys = if self.key_heads == 0 { self.heads } else { self.key_heads };
 		let key = if self.key_width == 0 { value } else { self.key_width };
 		require(keys != 0 && self.heads % keys == 0, "delta key head partition is invalid")?;
-		Ok((keys, key, value, if self.output == 0 { channels } else { self.output }))
+		Ok((keys, key, value, channels))
 	}
 }
 /// One per-layer embedding block: every token gathers `heads` rows of `width`
@@ -14841,10 +14840,6 @@ impl Model {
 	/// Decay and write gates of the preceding delta block, named by the model.
 	pub fn delta_gates(&self, decay: Activation, write: Activation) -> Self {
 		self.delta_block("delta_gates", |delta| (delta.decay_gate, delta.write_gate) = (Some(decay), Some(write)))
-	}
-	/// Output width of the preceding `delta` block's closing projection.
-	pub fn out(&self, width: usize) -> Self {
-		self.delta_block("out", |delta| delta.output = width)
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
@@ -18178,7 +18173,7 @@ impl<'a> Builder<'a> {
 		let (conv_activation, output_activation) = self.delta_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta activations", self.architecture)))?;
 		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
 		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
-		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
 		self.delta_planes(layer, &delta, dimensions.width, None)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}

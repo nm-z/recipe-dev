@@ -34,7 +34,7 @@ pub fn model() -> Model {
 			recipe.model().block(heads * gate).layer(width)
 		} else {
 			recipe.model().delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
-				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
+				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size)
 				.delta_norms(l2, rms)
 				.delta_activations(Activation::Silu, Activation::Sigmoid)
 				.delta_gates(Activation::Softplus, Activation::Sigmoid)
