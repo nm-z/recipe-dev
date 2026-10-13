@@ -2859,7 +2859,9 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 		cases
 	};
 	let (dense, experts) = (cases(dense, &mut functions), cases(experts, &mut functions));
-	let mut ir = String::new();
+	// The fewest columns any expert case stages at once: a window that wide never leaves an expert call to another kernel.
+	let stages = experts.iter().map(|(_, _, widest, _, _)| *widest).min().unwrap_or(0);
+	let mut ir = format!("define i32 @span_split_expert_stages() #3 {{\nentry:\nret i32 {stages}\n}}\n");
 	for (entry, cases, extra) in [("dense", dense, ""), ("expert", experts, ", i32 %mask, i32 %rank, i32 %count")] {
 		ir.push_str(&format!("define i32 @span_split_{entry}(i32 %type, i32 %k, i32 %rows, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %columns{extra}) #3 {{\nentry:\n%some = icmp ne i32 %columns, 0\nbr label %case0\n"));
 		for (n, (code, k, widest, name, stage)) in cases.iter().enumerate() {
@@ -3460,7 +3462,7 @@ fn span_split_ptx(dense: &[usize], experts: &[usize], target: &BackendTarget) ->
 	if dense.is_empty() && experts.is_empty() {
 		let decline = |name: &str, parameters: &str| format!(".visible .func (.param .b32 result) {name}({parameters})\n{{\n\t.reg .b32 none;\n\tmov.u32 none,0;\n\tst.param.b32 [result],none;\n\tret;\n}}\n");
 		let common = ".param .b32 t,.param .b32 k,.param .b32 m,.param .b64 w,.param .b64 x,.param .b64 y,.param .b32 c";
-		return Ok(decline("span_split_dense", common) + &decline("span_split_expert", &format!("{common},.param .b32 mask,.param .b32 rank,.param .b32 count")));
+		return Ok(decline("span_split_dense", common) + &decline("span_split_expert", &format!("{common},.param .b32 mask,.param .b32 rank,.param .b32 count")) + &decline("span_split_expert_stages", ""));
 	}
 	let BackendTarget::Nvidia { architecture } = target else { return Err(RecipeError::new("the dense split entry is NVIDIA PTX")) };
 	let feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
@@ -42895,8 +42897,6 @@ fn split_expert_layer() -> String {
 	let r3 = field(&mut ir, "%desc", dimension(D_HIDDEN), I32);
 	let r5 = field(&mut ir, "%desc", dimension(D_TEN), I32);
 	let a18 = word_address(&mut ir, "%desc", scratch(S_SCRATCH_G), false);
-	let a19 = word_address(&mut ir, "%desc", scratch(S_SCRATCH_H), false);
-	let a20 = word_address(&mut ir, "%desc", scratch(S_SCRATCH_I), false);
 	let tid = sreg(&mut ir, "tid.x");
 	let ctaid = sreg(&mut ir, "ctaid.x");
 	let ntid = sreg(&mut ir, "ntid.x");
@@ -43051,10 +43051,16 @@ fn split_expert_layer() -> String {
 	ir.set("r22", I32, &prepare_seq);
 	let first_grid = grid(&mut ir, &a14, &a15, &prepare_seq, &deadline);
 	leave_unless(&mut ir, &first_grid, 102, "r12", "split.done");
-	packed_prepare(&mut ir, &a7, &a8, &a9, &r2, "%cols", &ctaid, &nctaid);
-	let prepared_seq = bump(&mut ir, "r22", "1");
-	let prepared = grid(&mut ir, &a14, &a15, &prepared_seq, &deadline);
-	leave_unless(&mut ir, &prepared, 103, "r12", "split.done");
+	// The packed gate and up kernels take the windows wider than the span matvec stages at once (prefill); only those need
+	// the packed operand, so a decode window skips its preparation and the barrier after it.
+	let stages = ir.value("call i32 @span_split_expert_stages()");
+	let packed_window = ir.value(format!("icmp ugt i32 %cols, {stages}"));
+	when(&mut ir, &packed_window, |ir| {
+		packed_prepare(ir, &a7, &a8, &a9, &r2, "%cols", &ctaid, &nctaid);
+		let prepared_seq = bump(ir, "r22", "1");
+		let prepared = grid(ir, &a14, &a15, &prepared_seq, &deadline);
+		leave_unless(ir, &prepared, 103, "r12", "split.done");
+	});
 	// Word 13 of the receipt: nanoseconds from the request to the first expert wave.
 	when(&mut ir, &leader, |ir| {
 		let now = timer(ir);
@@ -43237,33 +43243,14 @@ fn split_expert_layer() -> String {
 			let product_seq = bump(ir, "r22", "1");
 			let product_grid = grid(ir, &a14, &a15, &product_seq, &deadline);
 			leave_unless(ir, &product_grid, 107, "r12", "split.done");
-			let prepare_cols = ir.value(format!("mul i32 {fan}, 8"));
-			packed_prepare(ir, &a18, &a19, &a20, &r3, &prepare_cols, &ctaid, &nctaid);
-			let prepared_seq = bump(ir, "r22", "1");
-			let prepared_grid = grid(ir, &a14, &a15, &prepared_seq, &deadline);
-			leave_unless(ir, &prepared_grid, 108, "r12", "split.done");
-			// The down matrix reads the group's compact fp32 product directly when it has a batched matvec.
+			// The down matrix reads the group's compact fp32 product directly. Its matvec stages every column of a window, so a
+			// declined call is a failure.
 			let compact_row = ir.value(format!("mul i32 {within}, {product_bound}"));
 			let compact_in = element(ir, &a18, &compact_row, 4);
 			let down_span = span_split_expert(ir, &ty_down, &r3, &r2, &w_down, &compact_in, &down_scratch, &active, "0", &rank, &rounds);
-			let down_missed = ir.value(format!("icmp eq i32 {down_span}, 0"));
-			let down_spanned = ir.fresh("wave.down_spanned");
-			let down_mv = format!("{down_spanned}.mv");
-			let down_done = format!("{down_spanned}.done");
-			ir.inst(format!("br i1 {down_missed}, label %{down_mv}, label %{down_spanned}, !prof !{MILD_BRANCH}"));
-			ir.label(&down_mv);
-			let down_row = ir.value(format!("mul i32 {within}, {r3}"));
-			let down_in = element(ir, &a19, &down_row, 16);
-			let down_scale = element(ir, &a20, &down_row, 2);
-			let down_receipt = split_mv_call(ir, &w_down, &ty_down, &down_in, &down_scale, &down_scratch, &r3, &r2, &cap, &active, "0", &rank, &rounds);
-			route_count(ir, &rank, 0, &down_receipt);
-			let down_zero = is_zero(ir, &down_receipt);
-			note_status(ir, &down_zero, 209);
-			ir.inst(format!("br label %{down_done}"));
-			ir.label(&down_spanned);
 			route_count(ir, &rank, 2, "1");
-			ir.inst(format!("br label %{down_done}"));
-			ir.label(&down_done);
+			let down_missed = is_zero(ir, &down_span);
+			note_status(ir, &down_missed, 209);
 			let scatter_seq = bump(ir, "r22", "1");
 			let scatter_grid = grid(ir, &a14, &a15, &scatter_seq, &deadline);
 			leave_unless(ir, &scatter_grid, 110, "r12", "split.done");
@@ -43410,6 +43397,7 @@ fn expert_forward_declarations() -> String {
 		"declare i32 @packed_matvec(i32, i32, i32, i32, i32, i32, ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32, i32)",
 		"declare i32 @span_split_dense(i32, i32, i32, ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32)",
 		"declare i32 @span_split_expert(i32, i32, i32, ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32, i32)",
+		"declare i32 @span_split_expert_stages()",
 		"declare i32 @packed_gate_up(i32, i32, i32, i32, i32, ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), ptr addrspace(1), i32, i32, i32, i32)",
 		"declare i64 @mtp_group_cta(ptr addrspace(1), i32, i32, i32)",
 		"declare i32 @mtp_column_word(i32)",
