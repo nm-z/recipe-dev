@@ -25244,6 +25244,10 @@ impl ExpertExecution {
 				// The same receipt also times the wait for the main die's request and the setup before the matvec.
 				let name=if layer.dense(){"Dense"}else{"Expert"};
 				let mut phases=vec![("Wait",clock(2).saturating_sub(clock(0))),("Setup",clock(4).saturating_sub(clock(2)))];
+				// The main die's own dense slice: its trace stamps 2 and 3 bracket the call, the receipt's clocks 0 and 6 the callee.
+				if layer.dense() && worker.die==self.weights.plan.main_die && let Some(stamps)=trace.chunks_exact(8).nth(phase) && stamps[2]!=0 {
+					phases.extend([("CallIn",clock(0).saturating_sub(stamps[2])),("CallOut",stamps[3].saturating_sub(clock(6)))]);
+				}
 				// Words 48-79: each workgroup's own matvec; the slowest and fastest show how even the row split is.
 				let own=report[48..80].iter().copied().filter(|ticks|*ticks!=0).map(u64::from).collect::<Vec<_>>();
 				if layer.dense() {phases.extend([("Matvec",u64::from(report[13])),("Return",u64::from(report[15])),("MatvecSlowest",own.iter().copied().max().unwrap_or(0)),("MatvecFastest",own.iter().copied().min().unwrap_or(0))]);}
@@ -43445,8 +43449,10 @@ pub fn expert_forward_ir() -> String {
 		module += &function;
 	}
 	module += &expert_split_worker();
-	// The reference keeps each stage as its own device function, so none may be inlined into another.
-	module += "attributes #0 = { noinline nounwind }\nattributes #2 = { alwaysinline nounwind }\n";
+	// Every stage inlines into its caller: an ABI call saves the callee's registers to local memory on every thread of the grid,
+	// and after a slice's weight stream those lines come back from DRAM (the main die's dense slice paid 6.5 us entering and
+	// 9.7 us leaving `split_dense_layer`, 43 registers x 8192 threads; 20261013T094834-gputest-1).
+	module += "attributes #0 = { alwaysinline nounwind }\nattributes #2 = { alwaysinline nounwind }\n";
 	module += &format!("!{PREFERRED_BRANCH} = !{{!\"branch_weights\", i32 2000, i32 1}}\n");
 	module += &format!("!{MILD_BRANCH} = !{{!\"branch_weights\", i32 3, i32 2}}\n");
 	module += &format!("!{MODERATE_BRANCH} = !{{!\"branch_weights\", i32 3, i32 1}}\n");
