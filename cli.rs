@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe widths <file.gguf> [--picks <picks.tsv>] [--mtp <mtp.gguf>]";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -87,7 +87,20 @@ fn child_status(command: &mut Command) -> std::io::Result<std::process::ExitStat
 	command.status()
 }
 
+/// `model.sym.rs` names GGUF keys; recipe writes `model.rs` beside it with every
+/// key replaced by its value, so the model Rust compiles is plain numbers.
+fn numeric_sibling(source: &Path) -> PathBuf {
+	let text = fs::read_to_string(source).unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
+	let numeric = recipe::numeric_source(&text).unwrap_or_else(|error| invalid(&error.to_string()));
+	let file = source.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+	let target = source.with_file_name(format!("{}.rs", file.strip_suffix(".sym.rs").unwrap_or(file)));
+	fs::write(&target, numeric).unwrap_or_else(|error| panic!("cannot write {}: {error}", target.display()));
+	target
+}
+
 fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
+	let numeric = source.to_string_lossy().ends_with(".sym.rs").then(|| numeric_sibling(source));
+	let source = numeric.as_deref().unwrap_or(source);
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -164,6 +177,20 @@ fn main() {
 			if settings.iter().any(|(name, _)| name == key) { invalid("run option repeated"); }
 			settings.push((key.to_owned(), value));
 			continue;
+		}
+		if source.is_none() && argument == "widths" {
+			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			let (mut picks, mut mtp) = (None, None);
+			while let Some(option) = arguments.next() {
+				let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
+				match option.as_str() {
+					"--picks" => picks = Some(PathBuf::from(value)),
+					"--mtp" => mtp = Some(PathBuf::from(value)),
+					_ => invalid(USAGE),
+				}
+			}
+			recipe::widths(&path, mtp.as_deref(), picks.as_deref()).unwrap_or_else(|error| invalid(&error.to_string()));
+			return;
 		}
 		if source.is_none() && (argument == "stats" || argument == "keys") {
 			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));

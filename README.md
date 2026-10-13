@@ -151,6 +151,8 @@ prec:
 	.ensemble([blocks])
 	.moe(topk, [blocks])
 	.hyper(lanes, rank, [blocks])
+	.hyper_gated(lanes, norm, [read gate], [write gate], [blocks])
+	.collapse(norm, [read gate])
 ```
 
 ```rust

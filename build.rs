@@ -269,22 +269,22 @@ define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_g
 // them before flipping the phase. Each waiter acquires after the flip.
 // The counters and cooperating blocks belong to one GPU. Driver synchronization
 // orders transfers outside the invocation; this barrier needs no system fence.
-// Every thread reads the phase before the block barrier; then one lane per warp spins
-// on it and the warp reconverges behind that lane (bar.warp.sync), so no bar.sync
-// follows a divergent spin (bar.sync is per warp before sm_70 and would count the
-// leader's warp as arrived on the lanes that skipped the spin) and only one lane in
-// thirty-two loads the phase while the grid drains. The acquire fence is the spinner's
-// alone: before sm_70 a device fence is membar.gl;
-// the warp's other lanes issue their loads after the spinner's fence by program order.
+// Every thread reads the phase before the block barrier; then the leader alone spins on
+// it. The leader's branch reconverges before the closing bar.sync, so its warp arrives
+// whole (bar.sync is per warp before sm_70 and would otherwise count the leader's warp as
+// arrived on the lanes that skipped the spin). Every thread still fences acquire after
+// the closing bar.sync: before sm_70 a device fence is membar.gl.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
 define internal void @grid_barrier(i32 %threads) #1 { entry:
-; Every writer releases its own global-memory operations before the block arrives.
+; Every writer releases its own global-memory operations before the block arrives. Only the leader spins on the phase; the
+; rest wait at the block barrier, and the leader's warp reconverges behind its spin before reaching it. One spinning lane
+; per warp kept 128 lanes polling the phase word and cost 1.5 us per barrier at 8 warps a block, 3.7 us at 16 (span-bench
+; gb, die 03, 100000 rounds with every thread checking a peer's write: 3.62 -> 2.15 us and 6.32 -> 2.61 us, no stale reads).
 fence syncscope("device") release
 %phase = load atomic i32, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4
 call void @llvm.amdgcn.s.barrier() %tid = call i32 @llvm.amdgcn.workitem.id.x()
-%lane = and i32 %tid, 31 %spinner = icmp eq i32 %lane, 0
-%leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %check arrive:
+%leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %waited arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
 fence syncscope("device") release
 %prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 syncscope("device") monotonic %limit = sub i32 %groups, 1
@@ -292,8 +292,7 @@ fence syncscope("device") release
 fence syncscope("device") acquire
 store atomic i32 0, ptr addrspace(1) @grid.count syncscope("device") monotonic, align 4 %next = xor i32 %phase, 1
 fence syncscope("device") release
-store atomic i32 %next, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4 br label %wait check:
-br i1 %spinner, label %wait, label %waited wait:
+store atomic i32 %next, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4 br label %wait wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase syncscope("device") monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %acquired, label %wait acquired:
 fence syncscope("device") acquire br label %waited waited:
@@ -1735,12 +1734,13 @@ fn platform(manifest: &str, key: &str, os: &str) -> BuildResult<String> {
 struct NvidiaToolkit {
 	device_library: PathBuf,
 	assembler: PathBuf,
+	disassembler: PathBuf,
 	required: bool,
 }
 fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
 	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
 	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
-	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(platform(manifest, "nvidia-assembler", os)?), required: entry.starts_with('$') }))
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(platform(manifest, "nvidia-assembler", os)?), disassembler: root.join(platform(manifest, "nvidia-disassembler", os)?), required: entry.starts_with('$') }))
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(
@@ -2012,6 +2012,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	let toolkit = nvidia_toolkit(manifest, os)?.ok_or_else(|| io::Error::other(format!("nvidia-toolkit is not configured for {os}")))?;
 	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", toolkit.device_library.display());
 	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assembler.display());
+	println!("cargo:rustc-env=RECIPE_NV_DISASSEMBLER={}", toolkit.disassembler.display());
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
 	Ok(())
 }
