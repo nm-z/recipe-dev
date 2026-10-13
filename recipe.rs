@@ -18532,6 +18532,392 @@ pub fn stats(path: impl AsRef<Path>) -> Result<()> {
 	}
 	Ok(())
 }
+/// The widest value width tracked, in bits.
+const WIDTH_BINS: usize = 34;
+/// Weights by value width, with the integer sub-scales and sub-offsets of K-quant blocks.
+#[derive(Clone)]
+struct WidthCount {
+	weights: [u64; WIDTH_BINS],
+	scales: [u64; WIDTH_BINS],
+	offsets: [u64; WIDTH_BINS],
+	floats: u64,
+}
+impl WidthCount {
+	fn new() -> Self {
+		Self { weights: [0; WIDTH_BINS], scales: [0; WIDTH_BINS], offsets: [0; WIDTH_BINS], floats: 0 }
+	}
+	fn add(&mut self, other: &Self) {
+		for bin in 0..WIDTH_BINS {
+			self.weights[bin] += other.weights[bin];
+			self.scales[bin] += other.scales[bin];
+			self.offsets[bin] += other.offsets[bin];
+		}
+		self.floats += other.floats;
+	}
+}
+/// One scale group of a stored block: the float factored out for block scaling, the K-quant
+/// offset term, and the integers that remain with the integer sub-scale and sub-offset.
+struct WidthGroup<'a> {
+	scale: f64,
+	offset: f64,
+	values: &'a [i32],
+	sub_scale: i32,
+	sub_offset: i32,
+}
+/// The bits that hold the integers: their largest magnitude, plus one for the sign when any is negative.
+fn width_bits(values: &[i32]) -> usize {
+	let (mut largest, mut negative) = (0_u32, false);
+	for value in values {
+		largest = largest.max(value.unsigned_abs());
+		negative |= *value < 0;
+	}
+	(32 - largest.leading_zeros()) as usize + usize::from(negative)
+}
+/// A block format's name, elements per block, bytes per block, values per scale group, stored bits per weight,
+/// one-position thread-instructions per multiply-add of the current kernels (measured from the span PTX loops),
+/// extraction ops per weight and scale ops per group of the all-XMAD design (estimates).
+fn width_format(kind: u32) -> Option<(&'static str, usize, usize, usize, f64, f64, f64, f64)> {
+	Some(match kind {
+		8 => ("Q8_0", 32, 34, 32, 8.5, 6.69, 0.5, 3.0),
+		12 => ("Q4_K", 256, 144, 32, 4.5, 6.12, 0.875, 4.0),
+		13 => ("Q5_K", 256, 176, 32, 5.5, 7.53, 1.5, 4.0),
+		14 => ("Q6_K", 256, 210, 16, 6.5625, 9.56, 1.5, 3.0),
+		17 => ("IQ2_XS", 256, 74, 16, 2.3125, 11.83, 1.25, 3.0),
+		18 => ("IQ3_XXS", 256, 98, 32, 3.0625, 11.42, 1.25, 3.0),
+		20 => ("IQ4_NL", 32, 18, 32, 4.5, 20.04, 1.5, 3.0),
+		_ => return None,
+	})
+}
+/// A floating-point weight's name, bits and one-position thread-instructions per multiply-add.
+fn width_float(kind: u32) -> Option<(&'static str, f64, f64)> {
+	Some(match kind {
+		0 => ("F32", 32.0, 1.88),
+		1 => ("F16", 16.0, 2.75),
+		30 => ("BF16", 16.0, 2.75),
+		_ => return None,
+	})
+}
+/// Splits one stored block into the scale groups its decoder factors, with the integers the scale multiplies.
+fn width_block(kind: u32, bytes: &[u8], emit: &mut impl FnMut(&WidthGroup)) {
+	match kind {
+		8 => {
+			let mut values = [0_i32; 32];
+			for lane in 0..32 {
+				values[lane] = i32::from(bytes[2 + lane] as i8);
+			}
+			emit(&WidthGroup { scale: f64::from(half(bytes)), offset: 0.0, values: &values, sub_scale: 0, sub_offset: 0 });
+		}
+		12 | 13 => {
+			let (d, dmin) = (f64::from(half(bytes)), f64::from(half(&bytes[2..])));
+			let scales = &bytes[4..16];
+			let (high, codes) = if kind == 13 { (&bytes[16..48], &bytes[48..176]) } else { (&bytes[0..0], &bytes[16..144]) };
+			for group in 0..8 {
+				let (scale, minimum) = if group < 4 { (scales[group] & 63, scales[group + 4] & 63) } else { ((scales[group + 4] & 15) | (scales[group - 4] >> 6) << 4, (scales[group + 4] >> 4) | (scales[group] >> 6) << 4) };
+				let mut values = [0_i32; 32];
+				for lane in 0..32 {
+					let byte = codes[32 * (group / 2) + lane];
+					let low = if group % 2 == 0 { byte & 15 } else { byte >> 4 };
+					values[lane] = i32::from(low) + if kind == 13 { 16 * i32::from(high[lane] >> group & 1) } else { 0 };
+				}
+				emit(&WidthGroup { scale: d * f64::from(scale), offset: -dmin * f64::from(minimum), values: &values, sub_scale: i32::from(scale), sub_offset: i32::from(minimum) });
+			}
+		}
+		14 => {
+			let (low, high, scales, d) = (&bytes[0..128], &bytes[128..192], &bytes[192..208], f64::from(half(&bytes[208..])));
+			let mut values = [[0_i32; 16]; 16];
+			for section in 0..2 {
+				for lane in 0..32 {
+					let (l, h) = (&low[64 * section..], high[32 * section + lane]);
+					let parts = [(l[lane] & 15, h & 3), (l[lane + 32] & 15, h >> 2 & 3), (l[lane] >> 4, h >> 4 & 3), (l[lane + 32] >> 4, h >> 6 & 3)];
+					for (quarter, (nibble, top)) in parts.iter().enumerate() {
+						values[8 * section + lane / 16 + 2 * quarter][lane % 16] = i32::from(nibble | top << 4) - 32;
+					}
+				}
+			}
+			for group in 0..16 {
+				let scale = i32::from(scales[group] as i8);
+				emit(&WidthGroup { scale: d * f64::from(scale), offset: 0.0, values: &values[group], sub_scale: scale, sub_offset: 0 });
+			}
+		}
+		20 => {
+			let mut values = [0_i32; 32];
+			for lane in 0..16 {
+				values[lane] = i32::from(IQ4[(bytes[2 + lane] & 15) as usize]);
+				values[lane + 16] = i32::from(IQ4[(bytes[2 + lane] >> 4) as usize]);
+			}
+			emit(&WidthGroup { scale: f64::from(half(bytes)), offset: 0.0, values: &values, sub_scale: 0, sub_offset: 0 });
+		}
+		17 => {
+			let d = f64::from(half(bytes));
+			for group in 0..16 {
+				let (block, section) = (group / 2, group % 2);
+				let nibble = if section == 0 { bytes[66 + block] & 15 } else { bytes[66 + block] >> 4 };
+				let mut values = [0_i32; 16];
+				for run in 0..2 {
+					let at = 2 + 2 * (4 * block + 2 * section + run);
+					let word = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+					let codes = IQ2_XS[(word & 511) as usize];
+					let signs = u32::from(word >> 9);
+					let signs = signs | (signs.count_ones() & 1) << 7;
+					for lane in 0..8 {
+						let magnitude = [8, 25, 43][(codes >> (2 * lane) & 3) as usize];
+						values[8 * run + lane] = if signs >> lane & 1 == 1 { -magnitude } else { magnitude };
+					}
+				}
+				emit(&WidthGroup { scale: d * (0.5 + f64::from(nibble)) * 0.25, offset: 0.0, values: &values, sub_scale: i32::from(nibble), sub_offset: 0 });
+			}
+		}
+		18 => {
+			let d = f64::from(half(bytes));
+			for block in 0..8 {
+				let aux = u32::from_le_bytes([bytes[66 + 4 * block], bytes[67 + 4 * block], bytes[68 + 4 * block], bytes[69 + 4 * block]]);
+				let mut values = [0_i32; 32];
+				for run in 0..4 {
+					let signs = (aux >> (7 * run)) & 127;
+					let signs = signs | (signs.count_ones() & 1) << 7;
+					for part in 0..2 {
+						let codes = IQ3_XXS[bytes[2 + 8 * block + 2 * run + part] as usize];
+						for lane in 0..4 {
+							let magnitude = [4, 12, 20, 28, 36, 44, 52, 62][(codes >> (3 * lane) & 7) as usize];
+							values[8 * run + 4 * part + lane] = if signs >> (4 * part + lane) & 1 == 1 { -magnitude } else { magnitude };
+						}
+					}
+				}
+				emit(&WidthGroup { scale: d * (0.5 + f64::from(aux >> 28)) * 0.5, offset: 0.0, values: &values, sub_scale: (aux >> 28) as i32, sub_offset: 0 });
+			}
+		}
+		_ => unreachable!(),
+	}
+}
+/// The expected picks of every expert of every layer per routed position, from a `layer expert picks router_positions` table.
+fn width_picks(path: &Path) -> Result<std::collections::BTreeMap<usize, Vec<f64>>> {
+	let text = std::fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	let mut layers = std::collections::BTreeMap::<usize, Vec<f64>>::new();
+	for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+		let fields = line.split('\t').map(|field| field.trim().parse::<f64>()).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| RecipeError::new(format!("{} holds a line that is not numeric: {line}", path.display())))?;
+		require(fields.len() >= 4 && fields[3] > 0.0, format!("{} holds a line without layer, expert, picks and router_positions: {line}", path.display()))?;
+		let experts = layers.entry(fields[0] as usize).or_default();
+		if experts.len() <= fields[1] as usize {
+			experts.resize(fields[1] as usize + 1, 0.0);
+		}
+		experts[fields[1] as usize] += fields[2] / fields[3];
+	}
+	Ok(layers)
+}
+/// Terms per XMAD and their spacing: the largest n with a spacing s such that n products of `weight` x `activation`
+/// bits fit one field, the packed operands fit 16 bits and the fields fit 32.
+fn width_xmad(weight: u32, activation: u32) -> (u32, u32) {
+	if weight == 0 {
+		return (0, 0);
+	}
+	let product = ((1_u64 << weight) - 1) * ((1_u64 << activation) - 1);
+	for n in (1..=32_u32).rev() {
+		for s in 1..=32_u32 {
+			if u64::from(n) * product < (1_u64 << s) && (n - 1) * s + weight.max(activation) <= 16 && n * s <= 32 {
+				return (n, s);
+			}
+		}
+	}
+	(0, 0)
+}
+/// One scanned weight tensor.
+struct WidthTensor {
+	name: String,
+	kind: u32,
+	row: usize,
+	experts: usize,
+	layer: Option<usize>,
+	counts: Vec<WidthCount>,
+	check: String,
+}
+/// Reads every block of every weight tensor of a file, factoring each block's scales out and recording the width of the integers.
+fn width_scan(file: &Gguf) -> Result<Vec<WidthTensor>> {
+	const PIECE: usize = 4096;
+	let mut scanned = Vec::new();
+	for tensor in file.tensors() {
+		let routed = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().any(|name| tensor.name.ends_with(&format!("{name}.weight")));
+		if !tensor.name.ends_with(".weight") || tensor.shape.len() < 2 || tensor.name.contains("norm") || tensor.name.starts_with("token_embd") || tensor.name.starts_with("per_layer_token_embd") {
+			continue;
+		}
+		let units = if routed { *tensor.shape.last().unwrap() as usize } else { 1 };
+		let layer = tensor.name.strip_prefix("blk.").and_then(|rest| rest.split('.').next()).and_then(|number| number.parse::<usize>().ok());
+		let mut counts = vec![WidthCount::new(); units];
+		let mut check = String::from("float");
+		if let Some((_, block, stride, _, ..)) = width_format(tensor.kind) {
+			let per_unit = tensor.elements() / units / block;
+			require(tensor.elements() % (units * block) == 0 && tensor.bytes == units * per_unit * stride, format!("tensor {} is not whole {block}-element blocks", tensor.name))?;
+			let data = file.data(tensor);
+			let pieces = per_unit.div_ceil(PIECE);
+			let found = parallel_map(units * pieces, |task| {
+				let (unit, piece) = (task / pieces, task % pieces);
+				let mut count = WidthCount::new();
+				let first = piece * PIECE;
+				for at in first..(first + PIECE).min(per_unit) {
+					let start = (unit * per_unit + at) * stride;
+					width_block(tensor.kind, &data[start..start + stride], &mut |group| {
+						count.weights[width_bits(group.values).min(WIDTH_BINS - 1)] += group.values.len() as u64;
+						if group.sub_scale != 0 || group.sub_offset != 0 {
+							count.scales[width_bits(&[group.sub_scale]).min(WIDTH_BINS - 1)] += 1;
+							count.offsets[width_bits(&[group.sub_offset]).min(WIDTH_BINS - 1)] += 1;
+						}
+					});
+				}
+				count
+			})?;
+			for (task, count) in found.iter().enumerate() {
+				counts[task / pieces].add(count);
+			}
+			// The first block, rebuilt from its factored scale, offset and integers, must equal the recipe decoder's values.
+			let mut rebuilt = Vec::new();
+			width_block(tensor.kind, &data[..stride], &mut |group| rebuilt.extend(group.values.iter().map(|value| group.scale * f64::from(*value) + group.offset)));
+			let decoded = file.row(tensor, 0)?;
+			let scale = decoded[..block].iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+			let error = rebuilt.iter().zip(&decoded[..block]).fold(0.0_f64, |largest, (left, right)| largest.max((left - right).abs()));
+			check = if error <= 1e-6 * scale.max(1e-30) { "ok".to_owned() } else { format!("MISMATCH {:.2e}", error / scale.max(1e-30)) };
+		} else if width_float(tensor.kind).is_some() {
+			for count in counts.iter_mut() {
+				count.floats = (tensor.elements() / units) as u64;
+			}
+		} else {
+			return Err(RecipeError::new(format!("tensor {} has GGML type {}, which has no width derivation", tensor.name, tensor.kind)));
+		}
+		scanned.push(WidthTensor { name: tensor.name.clone(), kind: tensor.kind, row: tensor.shape[0] as usize, experts: units, layer, counts, check });
+	}
+	Ok(scanned)
+}
+/// Derives, from a GGUF file's own blocks, the integer width of every weight and what packing them into XMAD saves.
+pub fn widths(path: impl AsRef<Path>, mtp: Option<&Path>, picks: Option<&Path>, activation: u32) -> Result<()> {
+	require((1..=16).contains(&activation), "activation width must be 1 to 16 bits")?;
+	let frequency = picks.map(width_picks).transpose()?;
+	let mut sections = vec![(path.as_ref().to_path_buf(), "target")];
+	if let Some(mtp) = mtp {
+		sections.push((mtp.to_path_buf(), "mtp head"));
+	}
+	println!("# Weight widths\n");
+	println!("Method: every block of every weight tensor is read from the file; the block's float scale and any K-quant minimum are factored out and the remaining integers are measured (largest magnitude in bits, plus one when any is negative). Tensors named token_embd and per_layer_token_embd are lookups, not weighted sums, and are skipped. IQ grids are the GGML grid magnitudes (IQ2_XS 8/25/43, IQ3_XXS 4..62) with the block's sign bits. A signed block counts its largest magnitude plus a sign bit, so a Q6_K block holding -32 is 7 bits. The recipe decoder check rebuilds the first block from its scale, offset and integers and compares it with the host decoder's values; a MISMATCH marks a tensor whose factorization differs from the host decoder.\n");
+	println!("Activation width: {activation} bits (signed). Accumulator: s32 for the XMAD design, f32 for the current kernels.\n");
+	for (file_path, label) in sections {
+		let file = Gguf::open(&resolve_path(&file_path)?)?;
+		let scanned = width_scan(&file)?;
+		println!("## {label}: {}\n", file_path.display());
+		println!("### Weights by block value width, per tensor (routed expert tensors summed over their experts)\n");
+		println!("| tensor | format | weights | value width: weights | sub-scale width: groups | sub-offset width: groups | recipe decoder check |");
+		println!("|---|---|---|---|---|---|---|");
+		let histogram = |bins: &[u64; WIDTH_BINS]| bins.iter().enumerate().filter(|(_, count)| **count != 0).map(|(bits, count)| format!("{bits}:{count}")).collect::<Vec<_>>().join(" ");
+		for tensor in &scanned {
+			let mut total = WidthCount::new();
+			tensor.counts.iter().for_each(|count| total.add(count));
+			let name = width_format(tensor.kind).map(|format| format.0).or(width_float(tensor.kind).map(|format| format.0)).unwrap();
+			let weights = total.weights.iter().sum::<u64>() + total.floats;
+			println!("| {} | {name} | {weights} | {} | {} | {} | {} |", tensor.name, if total.floats != 0 { "float".to_owned() } else { histogram(&total.weights) }, histogram(&total.scales), histogram(&total.offsets), tensor.check);
+		}
+		println!();
+		// Per decoded token: every dense weight once per position, routed experts by how often each is picked.
+		let (mut uniform, mut measured) = (Vec::new(), Vec::new());
+		#[derive(Default)]
+		struct Type {
+			products: f64,
+			today: f64,
+			unpack: f64,
+			loads: f64,
+			scale: f64,
+			formats: std::collections::BTreeSet<&'static str>,
+		}
+		let mut by_width = std::collections::BTreeMap::<(&'static str, usize), f64>::new();
+		let mut types = std::collections::BTreeMap::<(usize, usize), Type>::new();
+		for tensor in &scanned {
+			let usage = (0..tensor.experts)
+				.map(|expert| {
+					if tensor.experts == 1 {
+						return 1.0;
+					}
+					let layer = tensor.layer.unwrap_or(usize::MAX);
+					match frequency.as_ref().and_then(|layers| layers.get(&layer)).and_then(|experts| experts.get(expert)) {
+						Some(picked) => *picked,
+						None => 10.0 / tensor.experts as f64,
+					}
+				})
+				.collect::<Vec<_>>();
+			if tensor.experts > 1 {
+				if frequency.as_ref().is_some_and(|layers| layers.contains_key(&tensor.layer.unwrap_or(usize::MAX))) { measured.push(tensor.name.clone()) } else { uniform.push(tensor.name.clone()) }
+			}
+			for (expert, count) in tensor.counts.iter().enumerate() {
+				if let Some((name, _, _, group, stored, today, unpack, scale)) = width_format(tensor.kind) {
+					for bits in 0..WIDTH_BINS {
+						let products = usage[expert] * count.weights[bits] as f64;
+						if products == 0.0 {
+							continue;
+						}
+						*by_width.entry((name, bits)).or_default() += products;
+						let entry = types.entry((bits, group)).or_default();
+						entry.products += products;
+						entry.today += products * today;
+						entry.unpack += products * unpack;
+						entry.loads += products * stored / 128.0 + products / 8.0;
+						entry.scale += products / group as f64 * scale;
+						entry.formats.insert(name);
+					}
+				} else if let Some((name, bits, today)) = width_float(tensor.kind) {
+					let products = usage[expert] * count.floats as f64;
+					*by_width.entry((name, usize::MAX)).or_default() += products;
+					let entry = types.entry((1000 + bits as usize, tensor.row)).or_default();
+					entry.products += products;
+					entry.today += products * today;
+					entry.formats.insert(name);
+				}
+			}
+		}
+		let routing = match &frequency {
+			Some(layers) => format!("routed experts weighted by the picks file ({} layers measured, sum of expected picks per layer {:.3}; {} expert tensors without a measured layer use 10/experts)", layers.len(), layers.values().map(|experts| experts.iter().sum::<f64>()).sum::<f64>() / layers.len().max(1) as f64, uniform.len()),
+			None => "routed experts: no picks file, assuming 10 of the experts picked uniformly".to_owned(),
+		};
+		println!("### Multiply-adds per decoded token by weight value width\n");
+		println!("One position; dense tensors count every weight once; {routing}; {} expert tensors measured.\n", measured.len());
+		println!("| format | value width (bits) | multiply-adds | share |");
+		println!("|---|---|---|---|");
+		let total = by_width.values().sum::<f64>();
+		for ((name, bits), products) in &by_width {
+			println!("| {name} | {} | {:.0} | {:.2}% |", if *bits == usize::MAX { "float".to_owned() } else { bits.to_string() }, products, 100.0 * products / total);
+		}
+		println!("| **total** | | **{total:.0}** | 100% |\n");
+		// Types: (weight width, activation width, accumulator width, sum length).
+		println!("### Weighted-sum types per decoded token\n");
+		println!("A type is (weight value width, activation width, accumulator width, sum length). Current ops = measured thread-instructions of today's kernels per multiply-add (decode, loads and scale included). XMAD ops = XMADs per sum at the packing n + extraction + loads + scale ops (estimated per-format extraction and scale costs). Accumulator minimum = weight + activation + log2(length) bits; both designs accumulate in 32.\n");
+		println!("| weight bits | activation bits | accumulator bits (min/used) | sum length | formats | weighted sums | multiply-adds | n terms/XMAD (spacing) | current ops | XMAD instructions | extraction | loads | scale ops | XMAD-design ops | reduction |");
+		println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+		let (mut sums, mut total_products, mut total_today, mut total_xmad, mut count) = (0.0, 0.0, 0.0, 0.0, 0);
+		for ((bits, length), entry) in &types {
+			count += 1;
+			let float = *bits >= 1000;
+			let (terms, spacing) = if float { (1, 0) } else { width_xmad(*bits as u32, activation) };
+			let weighted = entry.products / *length as f64;
+			let xmad = if float || terms == 0 { 0.0 } else { weighted * (*length as f64 / f64::from(terms)).ceil() };
+			let design = if float { entry.today } else { xmad + entry.unpack + entry.loads + entry.scale };
+			let minimum = if float { 32 } else { *bits + activation as usize + (*length as f64).log2().ceil() as usize };
+			sums += weighted;
+			total_products += entry.products;
+			total_today += entry.today;
+			total_xmad += design;
+			println!(
+				"| {} | {} | {minimum}/{} | {length} | {} | {weighted:.0} | {:.0} | {terms} ({spacing}) | {:.0} | {xmad:.0} | {:.0} | {:.0} | {:.0} | {design:.0} | {:.1}% |",
+				if float { format!("f{}", bits - 1000) } else { bits.to_string() },
+				if float { "f32".to_owned() } else { activation.to_string() },
+				if float { "f32" } else { "s32" },
+				entry.formats.iter().copied().collect::<Vec<_>>().join("+"),
+				entry.products,
+				entry.today,
+				if float { 0.0 } else { entry.unpack },
+				if float { 0.0 } else { entry.loads },
+				if float { 0.0 } else { entry.scale },
+				100.0 * (1.0 - design / entry.today)
+			);
+		}
+		println!("| **{count} types** | | | | | **{sums:.0}** | **{total_products:.0}** | | **{total_today:.0}** | | | | | **{total_xmad:.0}** | **{:.1}%** |\n", 100.0 * (1.0 - total_xmad / total_today));
+		println!("Weighted sums per token: {sums:.0}; ops without XMAD {total_today:.0}; ops with all-XMAD {total_xmad:.0}; reduction {:.1}%.\n", 100.0 * (1.0 - total_xmad / total_today));
+	}
+	Ok(())
+}
+
 impl Gguf {
 	/// Contracts `input` through the named tensor into `width` outputs: the
 	/// one-node plan of `infer`, so the tensor's mapped bytes are the

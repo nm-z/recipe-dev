@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe widths <file.gguf> [--picks <picks.tsv>] [--mtp <mtp.gguf>] [--act <bits>]";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -177,6 +177,21 @@ fn main() {
 			if settings.iter().any(|(name, _)| name == key) { invalid("run option repeated"); }
 			settings.push((key.to_owned(), value));
 			continue;
+		}
+		if source.is_none() && argument == "widths" {
+			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			let (mut picks, mut mtp, mut activation) = (None, None, 8_u32);
+			while let Some(option) = arguments.next() {
+				let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
+				match option.as_str() {
+					"--picks" => picks = Some(PathBuf::from(value)),
+					"--mtp" => mtp = Some(PathBuf::from(value)),
+					"--act" => activation = value.parse().unwrap_or_else(|_| invalid("activation width must be an integer")),
+					_ => invalid(USAGE),
+				}
+			}
+			recipe::widths(&path, mtp.as_deref(), picks.as_deref(), activation).unwrap_or_else(|error| invalid(&error.to_string()));
+			return;
 		}
 		if source.is_none() && (argument == "stats" || argument == "keys") {
 			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
