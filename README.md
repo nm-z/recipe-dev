@@ -323,6 +323,17 @@ PleTensors { key, norm_key, norm_query, value, norm_conv, conv }
 recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128 "Hello"
 ```
 
+```bash
+recipe run rnj-1.rs --device nv0 --ctx 128 --ttl 30 -p "Hello"
+```
+
+`--ttl` retains inference weights for that many minutes after the last runner exits.
+NVIDIA runners attach to a separate weight holder through CUDA IPC and load PTX at run time.
+Compatible runs share weights and keep separate KV state. Overlapping leases retain
+the weights until every runner exits, then use the longest requested TTL. Unexpired
+weights remain resident when another placement cannot fit. `--ttl 0` releases weights
+when the last active runner exits; it does not shorten an existing lease.
+
 ## GGUF statistics
 
 ```bash
@@ -441,6 +452,8 @@ train().run().*
 	tile()[]
 	rows
 infer().run().*
+	residency[].(device|outcome|identity|address|bytes|read_bytes|converted_bytes|uploaded_bytes|expires)
+	residency[].(holder_pid|attach_seconds|cache_reused|artifact|kernel_identity)
 	gguf.*
 		metadata[] (key, value)
 		tensors[].(name|shape|kind|offset|bytes)

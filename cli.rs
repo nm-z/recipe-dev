@@ -38,6 +38,7 @@ fn export(source: &Path, selected: Option<&str>) {
 
 fn library_path(directory: &Path) -> PathBuf {
 	let direct = directory.join("librecipe.rlib");
+	if direct.is_file() { return direct; }
 	let dependencies = directory.join("deps");
 	let mut selected = direct.clone();
 	let mut selected_time = direct.metadata().and_then(|metadata| metadata.modified()).ok();
@@ -147,6 +148,11 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 }
 
 fn main() {
+	if std::env::args().nth(1).as_deref() == Some("--weight-holder") {
+		let device = std::env::args().nth(2).unwrap_or_else(|| invalid("weight holder requires a device"));
+		recipe::weight_holder(&device).unwrap_or_else(|error| invalid(&error.to_string()));
+		return;
+	}
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut device, mut config) = (None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
