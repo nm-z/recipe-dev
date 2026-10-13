@@ -270,6 +270,21 @@ place(path, &[blocks])
 
 ## GGUF tensors
 
+An ordered plan supplies every weighted node directly, including transformed planes. `infer`, `decode`, and `place_bound` use the supplied graph and plan.
+
+```rust
+let file = recipe.gguf(path);
+let decay = file.tensor("blk.0.ssm_a").unwrap();
+let plan = file.plan()
+	.table(file.tensor("token_embd.weight").unwrap())
+	.node(&[query, key, value])
+	.node(&[]).values(decay, file.values(decay).unwrap().iter().map(|a| (-a).ln()).collect());
+let prediction = file.infer(&model, &plan, &input, channels);
+let placed = file.place_bound(&model, &plan, positions, &[]);
+```
+
+`table` binds a mapped embedding by path. `tensor.rows(first, count).every(period)` selects periodic row views. `attention_from` names rotary factors; `attn(heads).window(positions)` selects the sliding window. `node(&[])` starts a node whose planes are all transformed; `values` appends a transformed plane to that node.
+
 A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, a hyper-connection block its gate projections and head mixer, a per-layer embedding block its projections, scales and taps, and a normalization its scale.
 
 ```rust
@@ -333,7 +348,7 @@ recipe conventions model.gguf
 
 GGUF tensor pairing, feed-forward and expert activations, expert routing, delta math, and per-layer embedding math come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`). Models with feed-forward or expert blocks name `feed-forward-activation` or `expert-activation`. An expert model also names `expert-scoring` (`softmax` or `sigmoid`) and `expert-renormalize`; declared GGUF metadata overrides those two manifest choices. Gated-delta models name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`; per-layer embedding models name their three `ple-*-norm` fields, convolution activation, gate, floor, and width scaling. Unknown names fail instead of taking another architecture's defaults.
 
-A row also declares the tensor conventions of its blocks: `attention-gate`, `qk-norm`, `rope-factors`, `attention-bias`, `values-from-keys`, `attn-pre-norm`, `attn-post-norm`, `ffn-pre-norm`, `ffn-post-norm`, `output`, `output-norm`, `selection-bias`, `decay-bias` and `indexer-score-norm`. `-` means the architecture has no such block, and `optional` (for `rope-factors` and `output`) means files of the architecture differ, as llama.cpp's optional tensors do. `recipe conventions model.gguf` prints each declaration beside what the file's tensors say, and exits 1 when any differ.
+A row also declares the tensor conventions of its blocks: `attention-gate`, `qk-norm`, `rope-factors`, `attention-bias`, `values-from-keys`, `attn-pre-norm`, `attn-post-norm`, `ffn-pre-norm`, `ffn-post-norm`, `output`, `output-norm`, `selection-bias`, `decay-bias` and `indexer-score-norm`. `-` means the architecture has no such block, and `optional` (for `rope-factors` and `output`) means files of the architecture differ, as llama.cpp's optional tensors do. `recipe conventions model.gguf` prints each declaration beside what the file's tensors say, and exits 1 when any differ. The model a file builds into follows these declarations: a tensor a declaration says a block reads must exist, and a file that holds a different layout stops with an error naming the declaration.
 
 ## Dataset schema
 

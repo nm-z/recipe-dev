@@ -225,6 +225,8 @@ step = 256
 
 [architecture.llama]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "none"
 rope-factors = "optional"
 attention-bias = "none"
@@ -242,15 +244,17 @@ rope-pairs = "neighbours"
 feed-forward-activation = "silu"
 
 [architecture.phi3]
-attention-gate = "-"
-qk-norm = "-"
-rope-factors = "-"
-attention-bias = "-"
+attention-gate = "none"
+attention-projection = "fused"
+ffn-projection = "fused"
+qk-norm = "none"
+rope-factors = "short-long"
+attention-bias = "none"
 values-from-keys = "-"
-attn-pre-norm = "-"
-attn-post-norm = "-"
-ffn-pre-norm = "-"
-ffn-post-norm = "-"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
 output = "untied"
 output-norm = "output_norm"
 selection-bias = "-"
@@ -261,6 +265,8 @@ feed-forward-activation = "silu"
 
 [architecture.gemma3]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
@@ -286,6 +292,8 @@ ple-width-scaled = "true"
 
 [architecture.gemma4]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "rms"
 rope-factors = "tensor"
 attention-bias = "none"
@@ -311,6 +319,8 @@ ple-width-scaled = "true"
 
 [architecture.lfm2]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
@@ -329,6 +339,8 @@ feed-forward-activation = "silu"
 
 [architecture.qwen2]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "none"
 rope-factors = "none"
 attention-bias = "qkv"
@@ -347,6 +359,8 @@ feed-forward-activation = "silu"
 
 [architecture.qwen3]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
@@ -372,6 +386,8 @@ ple-width-scaled = "true"
 
 [architecture.qwen2moe]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "-"
 qk-norm = "none"
 rope-factors = "none"
 attention-bias = "qkv"
@@ -396,6 +412,8 @@ expert-shared-gate = "sigmoid"
 
 [architecture.qwen3moe]
 attention-gate = "none"
+attention-projection = "split"
+ffn-projection = "-"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
@@ -419,6 +437,8 @@ expert-shared = "none"
 
 [architecture.qwen35]
 attention-gate = "interleaved"
+attention-projection = "split"
+ffn-projection = "split"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
@@ -443,6 +463,8 @@ delta-value-norm = "rms"
 
 [architecture.qwen3next]
 attention-gate = "interleaved"
+attention-projection = "split"
+ffn-projection = "-"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
@@ -467,6 +489,8 @@ delta-value-norm = "rms"
 
 [architecture.qwen4exp]
 attention-gate = "interleaved"
+attention-projection = "split"
+ffn-projection = "-"
 qk-norm = "rms"
 rope-factors = "none"
 attention-bias = "none"
