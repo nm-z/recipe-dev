@@ -62,6 +62,7 @@ nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
 nvidia-assembler = { linux = "/opt/cuda-11.4/bin/ptxas", windows = "bin/ptxas" }
+nvidia-disassembler = { linux = "/opt/cuda/bin/cuobjdump", windows = "bin/cuobjdump" }
 
 [package.metadata.mtp]
 tokens = 3

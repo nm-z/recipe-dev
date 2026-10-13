@@ -2813,9 +2813,9 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 	ir.push_str(&functions);
 	ir
 }
-/// The IQ2_XS and IQ3_XXS grids the matvecs look up, as module constants, taken from
-/// the packed PTX's own tables so both decode the same levels; `None` when `ptx` lacks them.
-fn span_grids_ir(ptx: &str) -> Option<String> {
+/// The IQ2_XS and IQ3_XXS grids as bytes, entry after entry (eight bytes and four bytes), taken from the packed PTX's own tables so
+/// every decode uses the same levels; `None` when `ptx` lacks them.
+fn span_grid_tables(ptx: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 	let table = |name: &str| -> Option<Vec<u8>> {
 		let at = ptx.find(&format!(" {name}["))?;
 		let open = at + ptx[at..].find('{')? + 1;
@@ -2823,7 +2823,11 @@ fn span_grids_ir(ptx: &str) -> Option<String> {
 		ptx[open..close].split(',').map(|value| value.trim().parse::<u8>().ok()).collect()
 	};
 	let (two, three) = (table("iq2xs_grid")?, table("iq3xxs_grid")?);
-	if two.len() != 4096 || three.len() != 1024 { return None; }
+	(two.len() == 4096 && three.len() == 1024).then_some((two, three))
+}
+/// The IQ2_XS and IQ3_XXS grids the matvecs look up, as module constants; `None` when `ptx` lacks them.
+fn span_grids_ir(ptx: &str) -> Option<String> {
+	let (two, three) = span_grid_tables(ptx)?;
 	let words = |bytes: &[u8], width: usize, ty: &str| bytes.chunks(width).map(|chunk| format!("{ty} {}", chunk.iter().rev().fold(0u64, |word, byte| word << 8 | u64::from(*byte)))).collect::<Vec<_>>().join(", ");
 	Some(format!("@span.iq2xs.grid = internal addrspace(1) constant [512 x i64] [{}], align 8\n@span.iq3xxs.grid = internal addrspace(1) constant [256 x i32] [{}], align 4\n", words(&two, 8, "i64"), words(&three, 4, "i32")))
 }
@@ -18815,6 +18819,1373 @@ pub fn stats(path: impl AsRef<Path>) -> Result<()> {
 	}
 	Ok(())
 }
+/// The widest value width tracked, in bits.
+const WIDTH_BINS: usize = 34;
+/// Weights by value width, with the integer sub-scales and sub-offsets of K-quant blocks.
+#[derive(Clone)]
+struct WidthCount {
+	weights: [u64; WIDTH_BINS],
+	scales: [u64; WIDTH_BINS],
+	offsets: [u64; WIDTH_BINS],
+	floats: u64,
+}
+impl WidthCount {
+	fn new() -> Self {
+		Self { weights: [0; WIDTH_BINS], scales: [0; WIDTH_BINS], offsets: [0; WIDTH_BINS], floats: 0 }
+	}
+	fn add(&mut self, other: &Self) {
+		for bin in 0..WIDTH_BINS {
+			self.weights[bin] += other.weights[bin];
+			self.scales[bin] += other.scales[bin];
+			self.offsets[bin] += other.offsets[bin];
+		}
+		self.floats += other.floats;
+	}
+}
+/// One scale group of a stored block: the float factored out for block scaling, the K-quant
+/// offset term, and the integers that remain with the integer sub-scale and sub-offset.
+struct WidthGroup<'a> {
+	scale: f64,
+	offset: f64,
+	values: &'a [i32],
+	sub_scale: i32,
+	sub_offset: i32,
+}
+/// The bits that hold the integers: their largest magnitude, plus one for the sign when any is negative.
+fn width_bits(values: &[i32]) -> usize {
+	let (mut largest, mut negative) = (0_u32, false);
+	for value in values {
+		largest = largest.max(value.unsigned_abs());
+		negative |= *value < 0;
+	}
+	(32 - largest.leading_zeros()) as usize + usize::from(negative)
+}
+/// A block format's name, elements per block, bytes per block, values per scale group and stored bits per weight.
+fn width_format(kind: u32) -> Option<(&'static str, usize, usize, usize, f64)> {
+	Some(match kind {
+		8 => ("Q8_0", 32, 34, 32, 8.5),
+		12 => ("Q4_K", 256, 144, 32, 4.5),
+		13 => ("Q5_K", 256, 176, 32, 5.5),
+		14 => ("Q6_K", 256, 210, 16, 6.5625),
+		17 => ("IQ2_XS", 256, 74, 16, 2.3125),
+		18 => ("IQ3_XXS", 256, 98, 32, 3.0625),
+		20 => ("IQ4_NL", 32, 18, 32, 4.5),
+		_ => return None,
+	})
+}
+/// A floating-point weight's name and bits.
+fn width_float(kind: u32) -> Option<(&'static str, f64)> {
+	Some(match kind {
+		0 => ("F32", 32.0),
+		1 => ("F16", 16.0),
+		30 => ("BF16", 16.0),
+		_ => return None,
+	})
+}
+/// Splits one stored block into the scale groups its decoder factors, with the integers the scale multiplies.
+fn width_block(kind: u32, bytes: &[u8], emit: &mut impl FnMut(&WidthGroup)) {
+	match kind {
+		8 => {
+			let mut values = [0_i32; 32];
+			for lane in 0..32 {
+				values[lane] = i32::from(bytes[2 + lane] as i8);
+			}
+			emit(&WidthGroup { scale: f64::from(half(bytes)), offset: 0.0, values: &values, sub_scale: 0, sub_offset: 0 });
+		}
+		12 | 13 => {
+			let (d, dmin) = (f64::from(half(bytes)), f64::from(half(&bytes[2..])));
+			let scales = &bytes[4..16];
+			let (high, codes) = if kind == 13 { (&bytes[16..48], &bytes[48..176]) } else { (&bytes[0..0], &bytes[16..144]) };
+			for group in 0..8 {
+				let (scale, minimum) = if group < 4 { (scales[group] & 63, scales[group + 4] & 63) } else { ((scales[group + 4] & 15) | (scales[group - 4] >> 6) << 4, (scales[group + 4] >> 4) | (scales[group] >> 6) << 4) };
+				let mut values = [0_i32; 32];
+				for lane in 0..32 {
+					let byte = codes[32 * (group / 2) + lane];
+					let low = if group % 2 == 0 { byte & 15 } else { byte >> 4 };
+					values[lane] = i32::from(low) + if kind == 13 { 16 * i32::from(high[lane] >> group & 1) } else { 0 };
+				}
+				emit(&WidthGroup { scale: d * f64::from(scale), offset: -dmin * f64::from(minimum), values: &values, sub_scale: i32::from(scale), sub_offset: i32::from(minimum) });
+			}
+		}
+		14 => {
+			let (low, high, scales, d) = (&bytes[0..128], &bytes[128..192], &bytes[192..208], f64::from(half(&bytes[208..])));
+			let mut values = [[0_i32; 16]; 16];
+			for section in 0..2 {
+				for lane in 0..32 {
+					let (l, h) = (&low[64 * section..], high[32 * section + lane]);
+					let parts = [(l[lane] & 15, h & 3), (l[lane + 32] & 15, h >> 2 & 3), (l[lane] >> 4, h >> 4 & 3), (l[lane + 32] >> 4, h >> 6 & 3)];
+					for (quarter, (nibble, top)) in parts.iter().enumerate() {
+						values[8 * section + lane / 16 + 2 * quarter][lane % 16] = i32::from(nibble | top << 4) - 32;
+					}
+				}
+			}
+			for group in 0..16 {
+				let scale = i32::from(scales[group] as i8);
+				emit(&WidthGroup { scale: d * f64::from(scale), offset: 0.0, values: &values[group], sub_scale: scale, sub_offset: 0 });
+			}
+		}
+		20 => {
+			let mut values = [0_i32; 32];
+			for lane in 0..16 {
+				values[lane] = i32::from(IQ4[(bytes[2 + lane] & 15) as usize]);
+				values[lane + 16] = i32::from(IQ4[(bytes[2 + lane] >> 4) as usize]);
+			}
+			emit(&WidthGroup { scale: f64::from(half(bytes)), offset: 0.0, values: &values, sub_scale: 0, sub_offset: 0 });
+		}
+		17 => {
+			let d = f64::from(half(bytes));
+			for group in 0..16 {
+				let (block, section) = (group / 2, group % 2);
+				let nibble = if section == 0 { bytes[66 + block] & 15 } else { bytes[66 + block] >> 4 };
+				let mut values = [0_i32; 16];
+				for run in 0..2 {
+					let at = 2 + 2 * (4 * block + 2 * section + run);
+					let word = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+					let codes = IQ2_XS[(word & 511) as usize];
+					let signs = u32::from(word >> 9);
+					let signs = signs | (signs.count_ones() & 1) << 7;
+					for lane in 0..8 {
+						let magnitude = [8, 25, 43][(codes >> (2 * lane) & 3) as usize];
+						values[8 * run + lane] = if signs >> lane & 1 == 1 { -magnitude } else { magnitude };
+					}
+				}
+				emit(&WidthGroup { scale: d * (0.5 + f64::from(nibble)) * 0.25, offset: 0.0, values: &values, sub_scale: i32::from(nibble), sub_offset: 0 });
+			}
+		}
+		18 => {
+			let d = f64::from(half(bytes));
+			for block in 0..8 {
+				let aux = u32::from_le_bytes([bytes[66 + 4 * block], bytes[67 + 4 * block], bytes[68 + 4 * block], bytes[69 + 4 * block]]);
+				let mut values = [0_i32; 32];
+				for run in 0..4 {
+					let signs = (aux >> (7 * run)) & 127;
+					let signs = signs | (signs.count_ones() & 1) << 7;
+					for part in 0..2 {
+						let codes = IQ3_XXS[bytes[2 + 8 * block + 2 * run + part] as usize];
+						for lane in 0..4 {
+							let magnitude = [4, 12, 20, 28, 36, 44, 52, 62][(codes >> (3 * lane) & 7) as usize];
+							values[8 * run + 4 * part + lane] = if signs >> (4 * part + lane) & 1 == 1 { -magnitude } else { magnitude };
+						}
+					}
+				}
+				emit(&WidthGroup { scale: d * (0.5 + f64::from(aux >> 28)) * 0.5, offset: 0.0, values: &values, sub_scale: (aux >> 28) as i32, sub_offset: 0 });
+			}
+		}
+		_ => unreachable!(),
+	}
+}
+/// The expected picks of every expert of every layer per routed position, from a `layer expert picks router_positions` table.
+fn width_picks(path: &Path) -> Result<std::collections::BTreeMap<usize, Vec<f64>>> {
+	let text = std::fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	let mut layers = std::collections::BTreeMap::<usize, Vec<f64>>::new();
+	for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+		let fields = line.split('\t').map(|field| field.trim().parse::<f64>()).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| RecipeError::new(format!("{} holds a line that is not numeric: {line}", path.display())))?;
+		require(fields.len() >= 4 && fields[3] > 0.0, format!("{} holds a line without layer, expert, picks and router_positions: {line}", path.display()))?;
+		let experts = layers.entry(fields[0] as usize).or_default();
+		if experts.len() <= fields[1] as usize {
+			experts.resize(fields[1] as usize + 1, 0.0);
+		}
+		experts[fields[1] as usize] += fields[2] / fields[3];
+	}
+	Ok(layers)
+}
+/// Terms per XMAD and their spacing: the largest n with a spacing s such that n products of `weight` x `activation`
+/// bits fit one field, the packed operands fit 16 bits and the fields fit 32.
+fn width_xmad(weight: u32, activation: u32) -> (u32, u32) {
+	if weight == 0 {
+		return (0, 0);
+	}
+	let product = ((1_u64 << weight) - 1) * ((1_u64 << activation) - 1);
+	for n in (1..=32_u32).rev() {
+		for s in 1..=32_u32 {
+			if u64::from(n) * product < (1_u64 << s) && (n - 1) * s + weight.max(activation) <= 16 && n * s <= 32 {
+				return (n, s);
+			}
+		}
+	}
+	(0, 0)
+}
+/// One scanned weight tensor.
+struct WidthTensor {
+	name: String,
+	kind: u32,
+	row: usize,
+	experts: usize,
+	layer: Option<usize>,
+	counts: Vec<WidthCount>,
+	check: String,
+}
+/// Reads every block of every weight tensor of a file, factoring each block's scales out and recording the width of the integers.
+fn width_scan(file: &Gguf) -> Result<Vec<WidthTensor>> {
+	const PIECE: usize = 4096;
+	let mut scanned = Vec::new();
+	for tensor in file.tensors() {
+		let routed = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().any(|name| tensor.name.ends_with(&format!("{name}.weight")));
+		if !tensor.name.ends_with(".weight") || tensor.shape.len() < 2 || tensor.name.contains("norm") || tensor.name.starts_with("token_embd") || tensor.name.starts_with("per_layer_token_embd") {
+			continue;
+		}
+		let units = if routed { *tensor.shape.last().unwrap() as usize } else { 1 };
+		let layer = tensor.name.strip_prefix("blk.").and_then(|rest| rest.split('.').next()).and_then(|number| number.parse::<usize>().ok());
+		let mut counts = vec![WidthCount::new(); units];
+		let mut check = String::from("float");
+		if let Some((_, block, stride, _, ..)) = width_format(tensor.kind) {
+			let per_unit = tensor.elements() / units / block;
+			require(tensor.elements() % (units * block) == 0 && tensor.bytes == units * per_unit * stride, format!("tensor {} is not whole {block}-element blocks", tensor.name))?;
+			let data = file.data(tensor);
+			let pieces = per_unit.div_ceil(PIECE);
+			let found = parallel_map(units * pieces, |task| {
+				let (unit, piece) = (task / pieces, task % pieces);
+				let mut count = WidthCount::new();
+				let first = piece * PIECE;
+				for at in first..(first + PIECE).min(per_unit) {
+					let start = (unit * per_unit + at) * stride;
+					width_block(tensor.kind, &data[start..start + stride], &mut |group| {
+						count.weights[width_bits(group.values).min(WIDTH_BINS - 1)] += group.values.len() as u64;
+						if group.sub_scale != 0 || group.sub_offset != 0 {
+							count.scales[width_bits(&[group.sub_scale]).min(WIDTH_BINS - 1)] += 1;
+							count.offsets[width_bits(&[group.sub_offset]).min(WIDTH_BINS - 1)] += 1;
+						}
+					});
+				}
+				count
+			})?;
+			for (task, count) in found.iter().enumerate() {
+				counts[task / pieces].add(count);
+			}
+			// The first block, rebuilt from its factored scale, offset and integers, must equal the recipe decoder's values.
+			let mut rebuilt = Vec::new();
+			width_block(tensor.kind, &data[..stride], &mut |group| rebuilt.extend(group.values.iter().map(|value| group.scale * f64::from(*value) + group.offset)));
+			let decoded = file.row(tensor, 0)?;
+			let scale = decoded[..block].iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+			let error = rebuilt.iter().zip(&decoded[..block]).fold(0.0_f64, |largest, (left, right)| largest.max((left - right).abs()));
+			check = if error <= 1e-6 * scale.max(1e-30) { "ok".to_owned() } else { format!("MISMATCH {:.2e}", error / scale.max(1e-30)) };
+		} else if width_float(tensor.kind).is_some() {
+			for count in counts.iter_mut() {
+				count.floats = (tensor.elements() / units) as u64;
+			}
+		} else {
+			return Err(RecipeError::new(format!("tensor {} has GGML type {}, which has no width derivation", tensor.name, tensor.kind)));
+		}
+		scanned.push(WidthTensor { name: tensor.name.clone(), kind: tensor.kind, row: tensor.shape[0] as usize, experts: units, layer, counts, check });
+	}
+	Ok(scanned)
+}
+/// Which compiler the width kernels are written for: the NVIDIA PTX path (shared and global address spaces, byte
+/// permutes) or the host CPU (flat pointers, a software byte permute) that checks the same IR against the decoder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WidthTarget {
+	Ptx,
+	Cpu,
+}
+/// A straight-line LLVM IR builder: every method appends one instruction and returns the name of its result.
+struct WidthIr {
+	text: String,
+	count: usize,
+	target: WidthTarget,
+}
+fn width_k(value: u32) -> String {
+	(value as i32).to_string()
+}
+fn width_f(value: f32) -> String {
+	format!("0x{:016X}", f64::from(value).to_bits())
+}
+impl WidthIr {
+	fn new(target: WidthTarget) -> Self {
+		Self { text: String::new(), count: 0, target }
+	}
+	fn global(&self) -> &'static str {
+		if self.target == WidthTarget::Ptx { "ptr addrspace(1)" } else { "ptr" }
+	}
+	fn shared(&self) -> &'static str {
+		if self.target == WidthTarget::Ptx { "ptr addrspace(3)" } else { "ptr" }
+	}
+	fn line(&mut self, line: &str) {
+		self.text.push_str(line);
+		self.text.push('\n');
+	}
+	fn value(&mut self, expression: String) -> String {
+		self.count += 1;
+		let name = format!("%v{}", self.count);
+		self.text.push_str(&format!("{name} = {expression}\n"));
+		name
+	}
+	fn bin(&mut self, op: &str, a: &str, b: &str) -> String {
+		self.value(format!("{op} i32 {a}, {b}"))
+	}
+	fn and(&mut self, a: &str, mask: u32) -> String {
+		self.bin("and", a, &width_k(mask))
+	}
+	fn or(&mut self, a: &str, b: &str) -> String {
+		self.bin("or", a, b)
+	}
+	fn xor(&mut self, a: &str, b: &str) -> String {
+		self.bin("xor", a, b)
+	}
+	/// The bits of `low` where `mask` is set and of `high` elsewhere.
+	fn merge(&mut self, low: &str, high: &str, mask: &str) -> String {
+		let difference = self.xor(low, high);
+		let picked = self.bin("and", &difference, mask);
+		self.xor(&picked, high)
+	}
+	fn add(&mut self, a: &str, b: &str) -> String {
+		self.bin("add", a, b)
+	}
+	fn shl(&mut self, a: &str, bits: u32) -> String {
+		self.bin("shl", a, &bits.to_string())
+	}
+	fn shr(&mut self, a: &str, bits: u32) -> String {
+		self.bin("lshr", a, &bits.to_string())
+	}
+	/// The four selected bytes of the eight bytes of `a` (low) and `b` (high); a selector nibble with its high bit set repeats the selected byte's sign.
+	/// `selector` is a register name or a constant.
+	fn permute(&mut self, a: &str, b: &str, selector: &str) -> String {
+		let callee = if self.target == WidthTarget::Ptx { "@llvm.nvvm.prmt" } else { "@recipe.prmt" };
+		self.value(format!("call i32 {callee}(i32 {a}, i32 {b}, i32 {selector})"))
+	}
+	fn prmt(&mut self, a: &str, b: &str, selector: u32) -> String {
+		self.permute(a, b, &width_k(selector))
+	}
+	/// One 16-bit lane of a packed word, widened to 32 bits.
+	fn lane(&mut self, word: &str, high: bool, signed: bool) -> String {
+		let pair = self.value(format!("bitcast i32 {word} to <2 x i16>"));
+		let half = self.value(format!("extractelement <2 x i16> {pair}, i32 {}", u32::from(high)));
+		self.value(format!("{} i16 {half} to i32", if signed { "sext" } else { "zext" }))
+	}
+	/// Adds the two 16-bit products of the lanes of `a` and `b` to `acc`: two 16x16 multiply-adds.
+	fn mac(&mut self, acc: &str, a: &str, a_signed: bool, b: &str, b_signed: bool) -> String {
+		let mut acc = acc.to_owned();
+		for high in [false, true] {
+			let left = self.lane(a, high, a_signed);
+			let right = self.lane(b, high, b_signed);
+			let product = self.value(format!("mul i32 {left}, {right}"));
+			acc = self.add(&acc, &product);
+		}
+		acc
+	}
+	fn load_global(&mut self, base: &str, offset: usize, ty: &str, align: usize) -> String {
+		let global = self.global();
+		let at = self.value(format!("getelementptr i8, {global} {base}, i32 {offset}"));
+		self.value(format!("load {ty}, {global} {at}, align {align}, !invariant.load !0"))
+	}
+	fn load_shared(&mut self, base: &str, offset: usize, ty: &str, align: usize) -> String {
+		let shared = self.shared();
+		let at = self.value(format!("getelementptr i8, {shared} {base}, i32 {offset}"));
+		self.value(format!("load {ty}, {shared} {at}, align {align}"))
+	}
+	fn load_shared_at(&mut self, base: &str, offset: &str, ty: &str, align: usize) -> String {
+		let shared = self.shared();
+		let at = self.value(format!("getelementptr i8, {shared} {base}, i32 {offset}"));
+		self.value(format!("load {ty}, {shared} {at}, align {align}"))
+	}
+	fn element(&mut self, vector: &str, count: usize, index: usize) -> String {
+		self.value(format!("extractelement <{count} x i32> {vector}, i32 {index}"))
+	}
+	/// Four staged words starting at word `word` of the staged activations.
+	fn staged(&mut self, x: &str, word: usize) -> Vec<String> {
+		let vector = self.load_shared(x, 4 * word, "<4 x i32>", 16);
+		(0..4).map(|index| self.element(&vector, 4, index)).collect()
+	}
+	fn staged_float(&mut self, x: &str, word: usize) -> String {
+		self.load_shared(x, 4 * word, "float", 4)
+	}
+	/// Words of the weight chunk at `base`, four to a 16-byte load.
+	fn words_wide(&mut self, base: &str, lines: usize) -> Vec<String> {
+		let mut words = Vec::new();
+		for line in 0..lines {
+			let vector = self.load_global(base, 16 * line, "<4 x i32>", 16);
+			for index in 0..4 {
+				words.push(self.element(&vector, 4, index));
+			}
+		}
+		words
+	}
+	/// Words of the weight chunk at `base`, two to an 8-byte load.
+	fn words_double(&mut self, base: &str, lines: usize) -> Vec<String> {
+		let mut words = Vec::new();
+		for line in 0..lines {
+			let vector = self.load_global(base, 8 * line, "<2 x i32>", 8);
+			for index in 0..2 {
+				words.push(self.element(&vector, 2, index));
+			}
+		}
+		words
+	}
+	/// Words of the weight chunk at `base`, one load each.
+	fn words_narrow(&mut self, base: &str, count: usize) -> Vec<String> {
+		(0..count).map(|index| self.load_global(base, 4 * index, "i32", 4)).collect()
+	}
+	/// The word at even byte address `address` of the loaded words `raw`: a funnel of two when the address is not word aligned.
+	fn view(&mut self, raw: &[String], address: usize) -> String {
+		assert!(address % 2 == 0);
+		if address % 4 == 0 { raw[address / 4].clone() } else { self.prmt(&raw[address / 4], &raw[address / 4 + 1], 0x5432) }
+	}
+	/// The half-precision value at even byte address `address`, as a float.
+	fn half_at(&mut self, raw: &[String], address: usize) -> String {
+		let word = &raw[address / 4];
+		let bits = if address % 4 == 0 { word.clone() } else { self.shr(word, 16) };
+		let low = self.value(format!("trunc i32 {bits} to i16"));
+		let half = self.value(format!("bitcast i16 {low} to half"));
+		self.value(format!("fpext half {half} to float"))
+	}
+	fn byte_float(&mut self, word: &str, byte: usize, signed: bool) -> String {
+		let shifted = if byte == 0 { word.to_owned() } else { self.shr(word, 8 * byte as u32) };
+		let small = self.value(format!("trunc i32 {shifted} to i8"));
+		self.value(format!("{} i8 {small} to float", if signed { "sitofp" } else { "uitofp" }))
+	}
+	fn float_of(&mut self, value: &str) -> String {
+		self.value(format!("sitofp i32 {value} to float"))
+	}
+	fn fmul(&mut self, a: &str, b: &str) -> String {
+		self.value(format!("fmul float {a}, {b}"))
+	}
+	fn fma(&mut self, a: &str, b: &str, c: &str) -> String {
+		self.value(format!("call float @llvm.fmuladd.f32(float {a}, float {b}, float {c})"))
+	}
+}
+/// A format's loop: the staged records one iteration covers and the bytes of weights and staged activations they take.
+struct WidthLoop {
+	records: usize,
+	weight_bytes: usize,
+	staged_bytes: usize,
+}
+/// The kernel id of Q8_0 for rows that are whole passes of two blocks but not of four (the hyper-connection up matrices of 320 inputs):
+/// loads by words, two blocks per pass. Every other kernel is named by its GGML type.
+const WIDTH_Q8_0_NARROW: u32 = 1008;
+/// The GGML type a kernel decodes.
+fn width_ggml(kernel: u32) -> u32 {
+	if kernel == WIDTH_Q8_0_NARROW { 8 } else { kernel }
+}
+/// The kernel for a row of `inputs`: the widest pass of the format the row holds a whole number of.
+fn width_kernel_for(kind: u32, inputs: usize) -> Option<u32> {
+	let shape = width_loop(kind)?;
+	if inputs % (shape.records * width_record_values(kind)) == 0 {
+		Some(kind)
+	} else if kind == 8 && inputs % 64 == 0 {
+		Some(WIDTH_Q8_0_NARROW)
+	} else {
+		None
+	}
+}
+/// Values one staged record covers: four blocks of Q8_0 or IQ4_NL (whose rows of 640 inputs are not whole chunks), two blocks of the
+/// narrow Q8_0 kernel, else a 256-value chunk.
+fn width_record_values(kind: u32) -> usize {
+	match kind {
+		WIDTH_Q8_0_NARROW => 64,
+		8 | 20 => 128,
+		_ => 256,
+	}
+}
+/// Words of one staged record: a header of scales and sums, then the activation lanes the format's decode pairs with its weights.
+fn width_staged_words(kind: u32) -> usize {
+	match kind {
+		WIDTH_Q8_0_NARROW => 36,
+		8 | 20 => 68,
+		12 | 13 => 136,
+		14 => 144,
+		17 | 18 => 132,
+		_ => unreachable!(),
+	}
+}
+fn width_loop(kind: u32) -> Option<WidthLoop> {
+	let (records, weight_bytes) = match kind {
+		WIDTH_Q8_0_NARROW => (1, 68),
+		8 => (1, 136),
+		12 => (1, 144),
+		13 => (1, 176),
+		14 => (2, 420),
+		17 => (2, 148),
+		18 => (2, 196),
+		20 => (1, 72),
+		_ => return None,
+	};
+	Some(WidthLoop { records, weight_bytes, staged_bytes: 4 * width_staged_words(kind) * records })
+}
+/// The IQ4_NL levels, four to a word.
+fn width_levels() -> [u32; 4] {
+	std::array::from_fn(|word| u32::from_le_bytes(std::array::from_fn(|byte| IQ4[4 * word + byte] as u8)))
+}
+/// Q8_0: four blocks of 34 bytes (two for the narrow kernel, which loads by words) whose two-byte scale leaves the data on alternate
+/// two-byte offsets; one signed byte-permute aligns and sign-extends four weights into two 16-bit lane operands.
+fn width_body_q8_0(b: &mut WidthIr, narrow: bool, w: &str, x: &str, facc: &str) -> String {
+	let raw = if narrow { b.words_narrow(w, 17) } else { b.words_double(w, 17) };
+	let blocks = if narrow { 2 } else { 4 };
+	let mut total = facc.to_owned();
+	for block in 0..blocks {
+		let (pair, odd) = (17 * (block / 2), block % 2 == 1);
+		let mut acc = "0".to_owned();
+		for line in 0..4 {
+			let staged = b.staged(x, 16 * block + 4 * line);
+			for half in 0..2 {
+				let m = 2 * line + half;
+				let (even, odd_lanes) = if odd {
+					(b.prmt(&raw[pair + 9 + m], "0", 0xA280), b.prmt(&raw[pair + 9 + m], "0", 0xB391))
+				} else {
+					(b.prmt(&raw[pair + m], &raw[pair + m + 1], 0xC4A2), b.prmt(&raw[pair + m], &raw[pair + m + 1], 0xD5B3))
+				};
+				acc = b.mac(&acc, &even, true, &staged[2 * half], true);
+				acc = b.mac(&acc, &odd_lanes, true, &staged[2 * half + 1], true);
+			}
+		}
+		let d = b.half_at(&raw, 34 * block);
+		let ds = b.staged_float(x, 16 * blocks + block);
+		let scale = b.fmul(&d, &ds);
+		let sum = b.float_of(&acc);
+		total = b.fma(&sum, &scale, &total);
+	}
+	total
+}
+/// IQ4_NL: four blocks of 18 bytes. Each nibble selects one of sixteen levels with two byte-permute lookups into eight levels each
+/// (the nibbles' low three bits as the selector, four nibbles per permute), chosen between by the nibbles' top bits.
+fn width_body_iq4nl(b: &mut WidthIr, w: &str, x: &str, facc: &str) -> String {
+	let raw = b.words_double(w, 9);
+	let levels = width_levels().map(width_k);
+	let mut total = facc.to_owned();
+	for block in 0..4 {
+		let (pair, odd) = (9 * (block / 2), block % 2 == 1);
+		let mut acc = "0".to_owned();
+		for m in 0..4 {
+			let q = if odd { raw[pair + 5 + m].clone() } else { b.prmt(&raw[pair + m], &raw[pair + m + 1], 0x5432) };
+			let indices = b.and(&q, 0x77777777);
+			let upper = b.shr(&indices, 16);
+			let shifted = b.shl(&q, 4);
+			let staged = b.staged(x, 16 * block + 4 * m);
+			for (half, selector, flags) in [(0, &indices, 0xD9C8), (1, &upper, 0xFBEA)] {
+				let low = b.permute(&levels[0], &levels[1], selector);
+				let high = b.permute(&levels[2], &levels[3], selector);
+				let mask = b.prmt(&shifted, &q, flags);
+				let difference = b.xor(&low, &high);
+				let chosen = b.bin("and", &difference, &mask);
+				let level = b.xor(&low, &chosen);
+				let first = b.prmt(&level, "0", 0xA280);
+				let second = b.prmt(&level, "0", 0xB391);
+				acc = b.mac(&acc, &first, true, &staged[2 * half], true);
+				acc = b.mac(&acc, &second, true, &staged[2 * half + 1], true);
+			}
+		}
+		let d = b.half_at(&raw, 18 * block);
+		let ds = b.staged_float(x, 64 + block);
+		let scale = b.fmul(&d, &ds);
+		let sum = b.float_of(&acc);
+		total = b.fma(&sum, &scale, &total);
+	}
+	total
+}
+/// Q4_K and Q5_K: a chunk is eight groups of 32 whose nibbles, masked in place, make 16-bit lane operands scaled by 1, 256, 16 or 4096
+/// (Q5_K gathers the fifth bit into each lane instead). The activations of the unscaled lanes carry 256, so each group sums into one
+/// integer at a common scale and is converted to float once, times its 6-bit scale; the minimums multiply the activation sums of
+/// their groups in integers.
+fn width_body_k(b: &mut WidthIr, kind: u32, w: &str, x: &str, facc: &str) -> String {
+	let five = kind == 13;
+	let raw = b.words_wide(w, if five { 11 } else { 9 });
+	let qs_at = if five { 12 } else { 4 };
+	let (sc0, sc1, m0, m1) = {
+		let sc0 = b.and(&raw[1], 0x3F3F3F3F);
+		let m0 = b.and(&raw[2], 0x3F3F3F3F);
+		let low = b.and(&raw[3], 0x0F0F0F0F);
+		let top = b.shr(&raw[1], 2);
+		let top = b.and(&top, 0x30303030);
+		let sc1 = b.or(&low, &top);
+		let high = b.shr(&raw[3], 4);
+		let high = b.and(&high, 0x0F0F0F0F);
+		let top = b.shr(&raw[2], 2);
+		let top = b.and(&top, 0x30303030);
+		let m1 = b.or(&high, &top);
+		(sc0, sc1, m0, m1)
+	};
+	// The minimum term: minimum x sum of the activations of the group, in pairs of groups.
+	let (first, second) = (b.staged(x, 0), b.staged(x, 4));
+	let sums = [first[1].clone(), first[2].clone(), first[3].clone(), second[0].clone()];
+	let mut minimum = "0".to_owned();
+	for (index, (word, odd)) in [(&m0, false), (&m0, true), (&m1, false), (&m1, true)].into_iter().enumerate() {
+		let lanes = b.prmt(word, "0", if odd { 0x4341 } else { 0x4240 });
+		minimum = b.mac(&minimum, &lanes, false, &sums[index], true);
+	}
+	let mut totals = ["0.0".to_owned(), "0.0".to_owned()];
+	for run in 0..4 {
+		let mut accs = ["0".to_owned(), "0".to_owned()];
+		for m in 0..8 {
+			let word = raw[qs_at + 8 * run + m].clone();
+			let lanes = if five {
+				let bits = raw[4 + m].clone();
+				let y = if run < 3 { b.shl(&bits, 4 - 2 * run as u32) } else { b.shr(&bits, 2) };
+				let y1 = b.shr(&y, 1);
+				let w4 = b.shr(&word, 4);
+				let mut lanes = Vec::new();
+				for (source, plane) in [(&word, &y), (&w4, &y1)] {
+					// Five-bit bytes (the junk above bit 4 is masked off with the lanes).
+					let bytes = b.merge(source, plane, "%k0");
+					lanes.push(b.and(&bytes, 0x001F001F));
+					lanes.push(b.and(&bytes, 0x1F001F00));
+				}
+				lanes
+			} else {
+				vec![b.and(&word, 0x000F000F), b.and(&word, 0x0F000F00), b.and(&word, 0x00F000F0), b.and(&word, 0xF000F000)]
+			};
+			for group in 0..2 {
+				let staged = b.staged(x, 8 + 16 * (2 * run + group) + 4 * (m / 2));
+				let (even, odd) = (&staged[2 * (m % 2)], &staged[2 * (m % 2) + 1]);
+				accs[group] = b.mac(&accs[group], &lanes[2 * group], false, even, true);
+				accs[group] = b.mac(&accs[group], &lanes[2 * group + 1], false, odd, true);
+			}
+		}
+		for group in 0..2 {
+			let index = 2 * run + group;
+			let scale = b.byte_float(if index < 4 { &sc0 } else { &sc1 }, index % 4, false);
+			let sum = b.float_of(&accs[group]);
+			totals[group] = b.fma(&sum, &scale, &totals[group]);
+		}
+	}
+	let d = b.half_at(&raw, 0);
+	let dmin = b.half_at(&raw, 2);
+	let ds = b.staged_float(x, 0);
+	let d_low = b.fmul(&d, &width_f(1.0 / 256.0));
+	let d_high = b.fmul(&d, &width_f(if five { 1.0 / 256.0 } else { 1.0 / 4096.0 }));
+	let minimum = b.float_of(&minimum);
+	let negative = b.value(format!("fneg float {dmin}"));
+	let t = b.fmul(&totals[0], &d_low);
+	let t = b.fma(&totals[1], &d_high, &t);
+	let t = b.fma(&negative, &minimum, &t);
+	b.fma(&t, &ds, facc)
+}
+/// Q6_K: two chunks of 210 bytes. Each 16-weight group's integer sum (unsigned 6-bit lanes, the offset of 32 taken out through the
+/// activation sums) is converted once and multiplied by its signed scale.
+fn width_body_q6k(b: &mut WidthIr, w: &str, x: &str, facc: &str) -> String {
+	let raw = b.words_narrow(w, 105);
+	let mut total = facc.to_owned();
+	for chunk in 0..2 {
+		let base = 210 * chunk;
+		let record = 144 * chunk;
+		let head = [b.staged(x, record), b.staged(x, record + 4), b.staged(x, record + 8)];
+		let sums: Vec<String> = (1..9).map(|index| head[index / 4][index % 4].clone()).collect();
+		let scales: Vec<String> = (0..4).map(|index| b.view(&raw, base + 192 + 4 * index)).collect();
+		let mut accs: Vec<String> = vec!["0".to_owned(); 16];
+		for n in 0..2 {
+			for m in 0..8 {
+				let a = b.view(&raw, base + 64 * n + 4 * m);
+				let c = b.view(&raw, base + 64 * n + 32 + 4 * m);
+				let h = b.view(&raw, base + 128 + 32 * n + 4 * m);
+				let (a4, c4) = (b.shr(&a, 4), b.shr(&c, 4));
+				let planes = [b.shl(&h, 4), b.shl(&h, 2), h.clone(), b.shr(&h, 2)];
+				let sources = [&a, &c, &a4, &c4];
+				let staged = [b.staged(x, record + 16 + 8 * (8 * n + m)), b.staged(x, record + 16 + 8 * (8 * n + m) + 4)];
+				for quarter in 0..4 {
+					let bytes = b.merge(sources[quarter], &planes[quarter], "%k0");
+					let (field_e, field_o) = (b.and(&bytes, 0x003F003F), b.and(&bytes, 0x3F003F00));
+					let group = 8 * n + 2 * quarter + m / 4;
+					let words = &staged[quarter / 2];
+					accs[group] = b.mac(&accs[group], &field_e, false, &words[2 * (quarter % 2)], true);
+					accs[group] = b.mac(&accs[group], &field_o, false, &words[2 * (quarter % 2) + 1], true);
+				}
+			}
+		}
+		let mut sum = "0.0".to_owned();
+		for group in 0..16 {
+			let scale = b.byte_float(&scales[group / 4], group % 4, true);
+			let part = b.float_of(&accs[group]);
+			sum = b.fma(&part, &scale, &sum);
+		}
+		let mut offsets = "0".to_owned();
+		for k in 0..4 {
+			let (even, odd) = (b.prmt(&scales[k], "0", 0xA280), b.prmt(&scales[k], "0", 0xB391));
+			offsets = b.mac(&offsets, &even, true, &sums[2 * k], true);
+			offsets = b.mac(&offsets, &odd, true, &sums[2 * k + 1], true);
+		}
+		let d = b.half_at(&raw, base + 208);
+		let ds = b.staged_float(x, record);
+		let offsets = b.float_of(&offsets);
+		let scaled = b.fmul(&sum, &width_f(1.0 / 256.0));
+		let t = b.fma(&offsets, &width_f(-32.0), &scaled);
+		let factor = b.fmul(&d, &ds);
+		total = b.fma(&t, &factor, &total);
+	}
+	total
+}
+/// Applies the sign bits of eight weights to their eight magnitude bytes in two words, one table entry of negation masks and carries
+/// per sign pattern, and splits each word into the sign-extended even and odd lane operands.
+fn width_signed_lanes(b: &mut WidthIr, magnitudes: [&str; 2], signs: &[String]) -> [String; 4] {
+	let mut lanes = Vec::new();
+	for half in 0..2 {
+		let flipped = b.xor(magnitudes[half], &signs[half]);
+		let word = b.add(&flipped, &signs[2 + half]);
+		lanes.push(b.prmt(&word, "0", 0xA280));
+		lanes.push(b.prmt(&word, "0", 0xB391));
+	}
+	[lanes[0].clone(), lanes[1].clone(), lanes[2].clone(), lanes[3].clone()]
+}
+/// IQ2_XS: two chunks of 74 bytes. Each 16-bit code is a 9-bit index into the grid of eight magnitudes and a 7-bit index into the
+/// sign table; the grid and sign tables sit in shared memory. Each group of 16 sums in integers and is scaled by its 4-bit scale.
+fn width_body_iq2xs(b: &mut WidthIr, w: &str, x: &str, t: &str, facc: &str) -> String {
+	let raw = b.words_narrow(w, 37);
+	let signs_at = b.shared();
+	let signs_base = b.value(format!("getelementptr i8, {signs_at} {t}, i32 4096"));
+	let mut total = facc.to_owned();
+	for chunk in 0..2 {
+		let (base, record) = (74 * chunk, 132 * chunk);
+		let codes: Vec<String> = (0..16).map(|index| b.view(&raw, base + 2 + 4 * index)).collect();
+		let scales: Vec<String> = (0..2).map(|index| b.view(&raw, base + 66 + 4 * index)).collect();
+		let (mut weighted, mut plain) = ("0.0".to_owned(), "0".to_owned());
+		for block in 0..8 {
+			for half in 0..2 {
+				let mut acc = "0".to_owned();
+				for run in 0..2 {
+					let code = 4 * block + 2 * half + run;
+					let (word, high) = (&codes[code / 2], code % 2 == 1);
+					let (grid_at, sign_at) = if high {
+						let g = b.shr(word, 13);
+						let s = b.shr(word, 21);
+						(b.and(&g, 0xFF8), b.and(&s, 0x7F0))
+					} else {
+						let g = b.shl(word, 3);
+						let s = b.shr(word, 5);
+						(b.and(&g, 0xFF8), b.and(&s, 0x7F0))
+					};
+					let grid = b.load_shared_at(t, &grid_at, "<2 x i32>", 8);
+					let magnitudes = [b.element(&grid, 2, 0), b.element(&grid, 2, 1)];
+					let signs = b.load_shared_at(&signs_base, &sign_at, "<4 x i32>", 16);
+					let signs: Vec<String> = (0..4).map(|index| b.element(&signs, 4, index)).collect();
+					let lanes = width_signed_lanes(b, [&magnitudes[0], &magnitudes[1]], &signs);
+					let staged = b.staged(x, record + 4 + 4 * code);
+					for (lane, word) in lanes.iter().zip(&staged) {
+						acc = b.mac(&acc, lane, true, word, true);
+					}
+				}
+				let scale_byte = &scales[block / 4];
+				let shifted = if block % 4 == 0 && half == 0 { scale_byte.clone() } else { b.shr(scale_byte, (8 * (block % 4) + 4 * half) as u32) };
+				let scale = b.and(&shifted, 15);
+				let scale = b.float_of(&scale);
+				let sum = b.float_of(&acc);
+				weighted = b.fma(&sum, &scale, &weighted);
+				plain = b.add(&plain, &acc);
+			}
+		}
+		let d = b.half_at(&raw, base);
+		let ds = b.staged_float(x, record);
+		let plain = b.float_of(&plain);
+		let sum = b.fma(&plain, &width_f(0.5), &weighted);
+		let factor = b.fmul(&d, &ds);
+		let factor = b.fmul(&factor, &width_f(0.25));
+		total = b.fma(&sum, &factor, &total);
+	}
+	total
+}
+/// IQ3_XXS: two chunks of 98 bytes. Each byte of the 64 grid indices selects four magnitudes from a 256-entry shared table; the
+/// 4-bit scale and four 7-bit sign indices of each group of 32 share one word.
+fn width_body_iq3xxs(b: &mut WidthIr, w: &str, x: &str, t: &str, facc: &str) -> String {
+	let raw = b.words_narrow(w, 49);
+	let signs_at = b.shared();
+	let signs_base = b.value(format!("getelementptr i8, {signs_at} {t}, i32 1024"));
+	let mut total = facc.to_owned();
+	for chunk in 0..2 {
+		let (base, record) = (98 * chunk, 132 * chunk);
+		let indices: Vec<String> = (0..16).map(|index| b.view(&raw, base + 2 + 4 * index)).collect();
+		let auxiliary: Vec<String> = (0..8).map(|index| b.view(&raw, base + 66 + 4 * index)).collect();
+		let (mut weighted, mut plain) = ("0.0".to_owned(), "0".to_owned());
+		for block in 0..8 {
+			let mut acc = "0".to_owned();
+			for run in 0..4 {
+				let mut grids = Vec::new();
+				for part in 0..2 {
+					let byte = 2 * run + part;
+					let word = &indices[2 * block + byte / 4];
+					let at = match byte % 4 {
+						0 => {
+							let s = b.shl(word, 2);
+							b.and(&s, 0x3FC)
+						}
+						index => {
+							let s = b.shr(word, 8 * index as u32 - 2);
+							b.and(&s, 0x3FC)
+						}
+					};
+					grids.push(b.load_shared_at(t, &at, "i32", 4));
+				}
+				let sign_at = if run == 0 {
+					let s = b.shl(&auxiliary[block], 4);
+					b.and(&s, 0x7F0)
+				} else {
+					let s = b.shr(&auxiliary[block], 7 * run as u32 - 4);
+					b.and(&s, 0x7F0)
+				};
+				let signs = b.load_shared_at(&signs_base, &sign_at, "<4 x i32>", 16);
+				let signs: Vec<String> = (0..4).map(|index| b.element(&signs, 4, index)).collect();
+				let lanes = width_signed_lanes(b, [&grids[0], &grids[1]], &signs);
+				let staged = b.staged(x, record + 4 + 4 * (4 * block + run));
+				for (lane, word) in lanes.iter().zip(&staged) {
+					acc = b.mac(&acc, lane, true, word, true);
+				}
+			}
+			let scale = b.shr(&auxiliary[block], 28);
+			let scale = b.float_of(&scale);
+			let sum = b.float_of(&acc);
+			weighted = b.fma(&sum, &scale, &weighted);
+			plain = b.add(&plain, &acc);
+		}
+		let d = b.half_at(&raw, base);
+		let ds = b.staged_float(x, record);
+		let plain = b.float_of(&plain);
+		let sum = b.fma(&plain, &width_f(0.5), &weighted);
+		let factor = b.fmul(&d, &ds);
+		let factor = b.fmul(&factor, &width_f(0.5));
+		total = b.fma(&sum, &factor, &total);
+	}
+	total
+}
+/// The kernel of one weight format as a module: `@width_dot(w, x, t, n)` sums `n` loop iterations of one row against the staged
+/// activations, `x`, with the lookup tables `t` in shared memory. For the PTX target a kernel entry runs it over shared memory;
+/// for the CPU target the entry takes flat pointers.
+fn width_module(kind: u32, target: WidthTarget) -> Option<String> {
+	let shape = width_loop(kind)?;
+	let mut b = WidthIr::new(target);
+	let (global, shared) = (b.global(), b.shared());
+	let facc = "%facc";
+	let result = match kind {
+		8 | WIDTH_Q8_0_NARROW => width_body_q8_0(&mut b, kind == WIDTH_Q8_0_NARROW, "%wp", "%xp", facc),
+		12 | 13 => width_body_k(&mut b, kind, "%wp", "%xp", facc),
+		14 => width_body_q6k(&mut b, "%wp", "%xp", facc),
+		17 => width_body_iq2xs(&mut b, "%wp", "%xp", "%t", facc),
+		18 => width_body_iq3xxs(&mut b, "%wp", "%xp", "%t", facc),
+		20 => width_body_iq4nl(&mut b, "%wp", "%xp", facc),
+		_ => return None,
+	};
+	let mut module = String::new();
+	if target == WidthTarget::Ptx {
+		module.push_str("target triple = \"nvptx64-nvidia-cuda\"\n@widthshared = external addrspace(3) global [0 x i32], align 16\ndeclare i32 @llvm.nvvm.prmt(i32, i32, i32)\n");
+	} else {
+		module.push_str(WIDTH_CPU_PRMT);
+	}
+	module.push_str("declare float @llvm.fmuladd.f32(float, float, float)\n!0 = !{}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.disable\"}\n");
+	module.push_str(&format!(
+		"define internal float @width_dot({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0) alwaysinline {{\nentry:\nbr label %loop\nloop:\n%i = phi i32 [ 0, %entry ], [ %i.next, %loop ]\n%facc = phi float [ 0.0, %entry ], [ {result}, %loop ]\n%wp = phi {global} [ %w, %entry ], [ %wp.next, %loop ]\n%xp = phi {shared} [ %x, %entry ], [ %xp.next, %loop ]\n"
+	));
+	// The body was built before the header so its names are fresh; it belongs after the phis.
+	module.push_str(&b.text);
+	module.push_str(&format!(
+		"%i.next = add i32 %i, 1\n%wp.next = getelementptr i8, {global} %wp, i32 {}\n%xp.next = getelementptr i8, {shared} %xp, i32 {}\n%more = icmp ult i32 %i.next, %n\nbr i1 %more, label %loop, label %done, !llvm.loop !1\ndone:\nret float {result}\n}}\n",
+		shape.weight_bytes, shape.staged_bytes
+	));
+	if target == WidthTarget::Ptx {
+		module.push_str(&format!(
+			"define ptx_kernel void @width_kernel({global} %w, {global} %out, i32 %n, i32 %k0) {{\nentry:\n%x = getelementptr i8, {shared} @widthshared, i32 0\n%t = getelementptr i8, {shared} @widthshared, i32 16384\n%r = call float @width_dot({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0)\nstore float %r, {global} %out, align 4\nret void\n}}\n!nvvm.annotations = !{{!3}}\n!3 = !{{ptr @width_kernel, !\"kernel\", i32 1}}\n"
+		));
+	} else {
+		module.push_str(&format!("define float @width_entry({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0) {{\nentry:\n%r = call float @width_dot({global} %w, {shared} %x, {shared} %t, i32 %n, i32 %k0)\nret float %r\n}}\n"));
+	}
+	Some(module)
+}
+/// The host stand-in for the byte permute: bytes of the eight bytes of its first two operands picked by the nibbles of the third,
+/// repeating the picked byte's sign where a nibble's high bit is set.
+const WIDTH_CPU_PRMT: &str = "define internal i32 @recipe.prmt(i32 %a, i32 %b, i32 %s) alwaysinline {\nentry:\n%low = zext i32 %a to i64\n%high.wide = zext i32 %b to i64\n%high = shl i64 %high.wide, 32\n%pair = or i64 %low, %high\n%p0 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 0)\n%p1 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 1)\n%p2 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 2)\n%p3 = call i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 3)\n%q1 = shl i32 %p1, 8\n%q2 = shl i32 %p2, 16\n%q3 = shl i32 %p3, 24\n%r0 = or i32 %p0, %q1\n%r1 = or i32 %r0, %q2\n%r2 = or i32 %r1, %q3\nret i32 %r2\n}\ndefine internal i32 @recipe.prmt.byte(i64 %pair, i32 %s, i32 %slot) alwaysinline {\nentry:\n%shift = mul i32 %slot, 4\n%nibble.all = lshr i32 %s, %shift\n%nibble = and i32 %nibble.all, 15\n%index = and i32 %nibble, 7\n%bits = mul i32 %index, 8\n%bits.wide = zext i32 %bits to i64\n%moved = lshr i64 %pair, %bits.wide\n%byte = trunc i64 %moved to i8\n%sign = ashr i8 %byte, 7\n%flag = and i32 %nibble, 8\n%repeat = icmp ne i32 %flag, 0\n%chosen = select i1 %repeat, i8 %sign, i8 %byte\n%result = zext i8 %chosen to i32\nret i32 %result\n}\n";
+/// One chunk's staged activations in the layout the format's kernel reads: int8 values in 16-bit lanes, paired as its decode
+/// pairs weights, with the scales and group sums of the header.
+fn width_pack(a: i32, b: i32) -> u32 {
+	u32::from(a as i16 as u16) | u32::from(b as i16 as u16) << 16
+}
+fn width_stage(kind: u32, q: &[i8], scales: &[f32]) -> Vec<u32> {
+	let at = |index: usize| i32::from(q[index]);
+	let mut words = vec![0_u32; width_staged_words(kind)];
+	match kind {
+		8 | WIDTH_Q8_0_NARROW => {
+			let blocks = width_record_values(kind) / 32;
+			for block in 0..blocks {
+				for m in 0..8 {
+					let p = 32 * block + 4 * m;
+					words[16 * block + 2 * m] = width_pack(at(p), at(p + 2));
+					words[16 * block + 2 * m + 1] = width_pack(at(p + 1), at(p + 3));
+				}
+				words[16 * blocks + block] = scales[block].to_bits();
+			}
+		}
+		20 => {
+			for block in 0..4 {
+				for m in 0..4 {
+					let p = 32 * block + 4 * m;
+					let base = 16 * block + 4 * m;
+					words[base] = width_pack(at(p), at(p + 1));
+					words[base + 1] = width_pack(at(p + 16), at(p + 17));
+					words[base + 2] = width_pack(at(p + 2), at(p + 3));
+					words[base + 3] = width_pack(at(p + 18), at(p + 19));
+				}
+				words[64 + block] = scales[block].to_bits();
+			}
+		}
+		12 | 13 => {
+			words[0] = scales[0].to_bits();
+			let sums: Vec<i32> = (0..8).map(|group| (0..32).map(|lane| at(32 * group + lane)).sum()).collect();
+			words[1] = width_pack(sums[0], sums[2]);
+			words[2] = width_pack(sums[1], sums[3]);
+			words[3] = width_pack(sums[4], sums[6]);
+			words[4] = width_pack(sums[5], sums[7]);
+			for group in 0..8 {
+				for m in 0..8 {
+					let p = 32 * group + 4 * m;
+					words[8 + 16 * group + 2 * m] = width_pack(256 * at(p), 256 * at(p + 2));
+					words[8 + 16 * group + 2 * m + 1] = width_pack(at(p + 1), at(p + 3));
+				}
+			}
+		}
+		14 => {
+			words[0] = scales[0].to_bits();
+			let sums: Vec<i32> = (0..16).map(|group| (0..16).map(|lane| at(16 * group + lane)).sum()).collect();
+			for k in 0..4 {
+				words[1 + 2 * k] = width_pack(sums[4 * k], sums[4 * k + 2]);
+				words[2 + 2 * k] = width_pack(sums[4 * k + 1], sums[4 * k + 3]);
+			}
+			for n in 0..2 {
+				for m in 0..8 {
+					for quarter in 0..4 {
+						let p = 128 * n + 32 * quarter + 4 * m;
+						let base = 16 + 8 * (8 * n + m) + 2 * quarter;
+						words[base] = width_pack(256 * at(p), 256 * at(p + 2));
+						words[base + 1] = width_pack(at(p + 1), at(p + 3));
+					}
+				}
+			}
+		}
+		17 | 18 => {
+			words[0] = scales[0].to_bits();
+			for run in 0..32 {
+				let p = 8 * run;
+				words[4 + 4 * run] = width_pack(at(p), at(p + 2));
+				words[4 + 4 * run + 1] = width_pack(at(p + 1), at(p + 3));
+				words[4 + 4 * run + 2] = width_pack(at(p + 4), at(p + 6));
+				words[4 + 4 * run + 3] = width_pack(at(p + 5), at(p + 7));
+			}
+		}
+		_ => unreachable!(),
+	}
+	words
+}
+/// The shared-memory tables of the IQ kernels: the GGML grid of magnitude bytes, then per sign pattern the negation masks and carries.
+fn width_tables(kind: u32) -> Result<Vec<u8>> {
+	if kind != 17 && kind != 18 {
+		return Ok(vec![0; 16]);
+	}
+	let (two, three) = span_grid_tables(PackedMatvec::ptx()).ok_or_else(|| RecipeError::new("packed PTX lacks the IQ grids"))?;
+	let mut table = if kind == 17 { two } else { three };
+	for pattern in 0..128_u32 {
+		let signs = pattern | (pattern.count_ones() & 1) << 7;
+		let masks: Vec<u32> = (0..2).map(|half| (0..4).map(|lane| if signs >> (4 * half + lane) & 1 == 1 { 0xFF_u32 << (8 * lane) } else { 0 }).sum()).collect();
+		for word in [masks[0], masks[1], masks[0] & 0x01010101, masks[1] & 0x01010101] {
+			table.extend(word.to_le_bytes());
+		}
+	}
+	Ok(table)
+}
+/// The ptxas options of the modules that carry the matvecs.
+const WIDTH_PTXAS: [&str; 3] = ["-c", "--disable-optimizer-constants", "-O1"];
+/// The SASS of an LLVM IR module compiled by Recipe's NVIDIA path for sm_52: the clang and llc stages, ptxas, and the disassembler.
+/// The text is cached beside the native artifacts, keyed by the module and the tools.
+fn width_sass(name: &str, ir: &str) -> Result<String> {
+	let ptx = native_nvidia_functions(name, ir)?;
+	let assembler = option_env!("RECIPE_NV_ASSEMBLER").ok_or_else(|| RecipeError::new("the NVIDIA PTX assembler is unavailable"))?;
+	let disassembler = option_env!("RECIPE_NV_DISASSEMBLER").ok_or_else(|| RecipeError::new("the NVIDIA SASS disassembler is unavailable"))?;
+	let version = native_nvidia_ptx_version("sm_52")?;
+	let module = format!(".version {}.{}\n.target sm_52\n.address_size 64\n{ptx}", version / 10, version % 10);
+	let options = WIDTH_PTXAS.join(" ");
+	let key = format!("recipe-{name}-sass-{:016x}", native_fnv1a(&[module.as_bytes(), assembler.as_bytes(), disassembler.as_bytes(), options.as_bytes()]));
+	let directory = native_artifact_directory(&key)?;
+	let path = directory.join(format!("{name}.sass"));
+	if let Ok(text) = fs::read_to_string(&path) {
+		return Ok(text);
+	}
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create {name} SASS directory {}: {error}", directory.display())))?;
+	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+	let stem = format!(".recipe-{name}-sass-{}-{serial}", std::process::id());
+	let source = directory.join(format!("{stem}.ptx"));
+	let object = directory.join(format!("{stem}.cubin"));
+	let staged = directory.join(format!("{stem}.cache"));
+	let _temporary = NativeTemporaryFiles { paths: vec![source.clone(), object.clone(), staged.clone()] };
+	fs::write(&source, &module).map_err(|error| RecipeError::new(format!("cannot write {name} PTX module: {error}")))?;
+	let mut command = Command::new(assembler);
+	command.args(WIDTH_PTXAS).arg("-arch=sm_52").arg("-o").arg(&object).arg(&source);
+	native_command(command, &format!("{name} PTX assembler"), &key)?;
+	let mut command = Command::new(disassembler);
+	command.arg("-sass").arg(&object);
+	let text = native_command(command, &format!("{name} SASS disassembler"), &key)?;
+	fs::write(&staged, &text).map_err(|error| RecipeError::new(format!("cannot write {name} SASS: {error}")))?;
+	fs::rename(&staged, &path).map_err(|error| RecipeError::new(format!("cannot publish {name} SASS {}: {error}", path.display())))?;
+	Ok(text)
+}
+/// The instructions of one pass of a compiled inner loop, by opcode with its modifiers, and the multiply-adds the pass covers.
+#[derive(Clone)]
+struct WidthLoopCount {
+	terms: usize,
+	opcodes: std::collections::BTreeMap<String, usize>,
+}
+impl WidthLoopCount {
+	fn total(&self) -> usize {
+		self.opcodes.values().sum()
+	}
+	/// Instructions per multiply-add by mnemonic, the opcode without its modifiers.
+	fn mnemonics(&self) -> std::collections::BTreeMap<String, f64> {
+		let mut counts = std::collections::BTreeMap::<String, f64>::new();
+		for (opcode, count) in &self.opcodes {
+			*counts.entry(opcode.split('.').next().unwrap_or_default().to_owned()).or_default() += *count as f64 / self.terms as f64;
+		}
+		counts
+	}
+}
+/// The multiply-add loop of disassembled SASS: of the loops that contain no other loop (the ranges of backward branches), the one
+/// with the most FFMA and XMAD. Every instruction of its range counts except the NOP padding.
+fn width_sass_loop(sass: &str, terms: usize) -> Result<WidthLoopCount> {
+	let mut instructions = Vec::new();
+	for line in sass.lines() {
+		let Some((address, rest)) = line.trim().strip_prefix("/*").and_then(|rest| rest.split_once("*/")) else { continue };
+		let (Ok(address), Some((text, _))) = (usize::from_str_radix(address, 16), rest.split_once(';')) else { continue };
+		let mut text = text.trim();
+		if text.starts_with('@') {
+			text = text.split_once(' ').map_or("", |(_, rest)| rest.trim());
+		}
+		if let Some(opcode) = text.split_whitespace().next() {
+			instructions.push((address, opcode.to_owned(), text.to_owned()));
+		}
+	}
+	let mut loops = Vec::new();
+	for (address, opcode, text) in &instructions {
+		if opcode == "BRA"
+			&& let Some(target) = text.split_whitespace().nth(1).and_then(|target| usize::from_str_radix(target.trim_start_matches("0x"), 16).ok())
+			&& target < *address
+		{
+			loops.push((target, *address));
+		}
+	}
+	let multiply_adds = |range: &(usize, usize)| instructions.iter().filter(|(address, opcode, _)| (range.0..=range.1).contains(address) && (opcode.starts_with("FFMA") || opcode.starts_with("XMAD"))).count();
+	let inner = loops.iter().filter(|range| !loops.iter().any(|other| other != *range && other.0 >= range.0 && other.1 <= range.1)).max_by_key(|range| multiply_adds(range));
+	let range = inner.filter(|range| multiply_adds(range) != 0).ok_or_else(|| RecipeError::new("the compiled kernel has no multiply-add loop"))?;
+	let mut opcodes = std::collections::BTreeMap::<String, usize>::new();
+	for (address, opcode, _) in &instructions {
+		if (range.0..=range.1).contains(address) && opcode != "NOP" {
+			*opcodes.entry(opcode.clone()).or_default() += 1;
+		}
+	}
+	Ok(WidthLoopCount { terms, opcodes })
+}
+/// The task loop of today's position-batched matvec for one stored layout at one position, from the generated kernel the model
+/// compiles (`span_matvec_function`) with run-time rows: its instructions per pass, which covers `unroll` tasks of `task` values.
+fn width_today(weight: SpanWeight) -> Result<WidthLoopCount> {
+	let spec = SpanSpec { weight, k: 2560, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
+	require(spec.valid(), format!("the {} matvec has no plane at 2560 inputs", weight.name()))?;
+	let name = format!("span_split.{}", spec.key());
+	let function = span_matvec_function(&spec, &name, "scratch");
+	let grids = if matches!(weight, SpanWeight::IQ2XS | SpanWeight::IQ3XXS) { span_grids_ir(PackedMatvec::ptx()).ok_or_else(|| RecipeError::new("packed PTX lacks the IQ grids"))? } else { String::new() };
+	let entry = format!(
+		"define ptx_kernel void @entry(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, i32 %rows) {{\nentry:\n%cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()\n%ncta = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()\ncall void @{name}.group(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 1, i32 %cta, i32 %ncta, i32 0)\nret void\n}}\n!nvvm.annotations = !{{!8190}}\n!8190 = !{{ptr @entry, !\"kernel\", i32 1}}\n"
+	);
+	let ir = format!(
+		"target triple = \"nvptx64-nvidia-cuda\"\n@scratch = external addrspace(3) global [0 x float], align 16\nattributes #1 = {{ alwaysinline nounwind }}\nattributes #3 = {{ noinline nounwind }}\n{}{grids}{function}{entry}{SPAN_INVARIANT} = !{{}}\n",
+		span_matvec_declarations("")
+	);
+	let sass = width_sass(&format!("widths-today-{}", weight.name()), &ir)?;
+	width_sass_loop(&sass, weight.unroll() * weight.task())
+}
+/// The inner loop of the int8-activation XMAD kernel of one block format.
+fn width_xmad_count(kind: u32) -> Result<WidthLoopCount> {
+	let shape = width_loop(kind).ok_or_else(|| RecipeError::new(format!("GGML type {kind} has no XMAD kernel")))?;
+	let ir = width_module(kind, WidthTarget::Ptx).ok_or_else(|| RecipeError::new(format!("GGML type {kind} has no XMAD kernel")))?;
+	let sass = width_sass(&format!("widths-xmad-{}{}", width_format(width_ggml(kind)).map_or("", |format| format.0), if kind == WIDTH_Q8_0_NARROW { "-narrow" } else { "" }), &ir)?;
+	width_sass_loop(&sass, shape.records * width_record_values(kind))
+}
+/// The span matvec layout of a GGML type, for the kernels of today.
+fn width_span_weight(kind: u32) -> Option<SpanWeight> {
+	Some(match kind {
+		0 => SpanWeight::F32,
+		1 => SpanWeight::F16,
+		30 => SpanWeight::BF16,
+		8 => SpanWeight::Q8_0,
+		12 => SpanWeight::Q4K,
+		13 => SpanWeight::Q5K,
+		14 => SpanWeight::Q6K,
+		17 => SpanWeight::IQ2XS,
+		18 => SpanWeight::IQ3XXS,
+		20 => SpanWeight::IQ4NL,
+		_ => return None,
+	})
+}
+/// Bytes copied into 16-byte aligned storage, as the shared memory the kernels read is.
+fn width_aligned(bytes: &[u8]) -> Vec<u128> {
+	bytes
+		.chunks(16)
+		.map(|chunk| {
+			let mut word = [0_u8; 16];
+			word[..chunk.len()].copy_from_slice(chunk);
+			u128::from_le_bytes(word)
+		})
+		.collect()
+}
+/// Runs the CPU build of each XMAD kernel on real rows of the file against the staged int8 activations, and compares the result
+/// with the dot product of the decoded row: the GGML decode of the blocks (`width_block`) and the recipe host decoder.
+fn width_check(file: &Gguf) -> Result<Vec<String>> {
+	let mut lines = Vec::new();
+	let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+	let mut random = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+	for kind in [8, WIDTH_Q8_0_NARROW, 12, 13, 14, 17, 18, 20] {
+		let shape = width_loop(kind).ok_or_else(|| RecipeError::new("width kernel shape is absent"))?;
+		let (_, block, stride, ..) = width_format(width_ggml(kind)).ok_or_else(|| RecipeError::new("width format is absent"))?;
+		let name = width_kind_name(kind);
+		let values = shape.records * width_record_values(kind);
+		let mut found = None;
+		for tensor in file.tensors() {
+			if found.is_none() && tensor.kind == width_ggml(kind) && tensor.name.ends_with(".weight") && !tensor.name.contains("token_embd") && width_kernel_for(tensor.kind, tensor.shape[0] as usize) == Some(kind) {
+				found = Some(tensor);
+			}
+		}
+		let Some(tensor) = found else {
+			lines.push(format!("| {name} | no weighted-sum tensor of this format has rows of whole {values}-value passes | | | | | | | | |"));
+			continue;
+		};
+		let ir = width_module(kind, WidthTarget::Cpu).ok_or_else(|| RecipeError::new("width kernel is absent"))?;
+		let target = native_cpu_target()?;
+		let key = native_artifact_key(&target, &ir)?;
+		let directory = native_artifact_directory(&key)?;
+		let library = directory.join(format!("widths-{kind}.{}", target.artifact_extension()));
+		if !library.is_file() {
+			fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create {name} check directory: {error}")))?;
+			let source = directory.join(format!(".widths-{kind}-{}.ll", std::process::id()));
+			let staged = directory.join(format!(".widths-{kind}-{}.{}", std::process::id(), target.artifact_extension()));
+			let _temporary = NativeTemporaryFiles { paths: vec![source.clone(), staged.clone()] };
+			fs::write(&source, &ir).map_err(|error| RecipeError::new(format!("cannot write {name} check module: {error}")))?;
+			compile_native_artifact(&target, &source, &staged, &key)?;
+			fs::rename(&staged, &library).map_err(|error| RecipeError::new(format!("cannot publish {name} check library: {error}")))?;
+		}
+		let library = Library::open(&library)?;
+		let entry: unsafe extern "C" fn(*const u8, *const u32, *const u8, i32, i32) -> f32 = library.function(b"width_entry\0")?;
+		let tables = width_aligned(&width_tables(kind)?);
+		let k = tensor.shape[0] as usize;
+		let rows = tensor.elements() / k;
+		let row_bytes = k / block * stride;
+		let data = file.data(tensor);
+		let mut picked = vec![0, rows / 2, rows - 1];
+		picked.dedup();
+		for row in picked {
+			let bytes = &data[row * row_bytes..(row + 1) * row_bytes];
+			let q: Vec<i8> = (0..k).map(|_| (random() % 255) as i32 as i8 - 127).collect();
+			let scales: Vec<f32> = (0..k / block).map(|_| 0.004 + (random() % 1000) as f32 * 1e-5).collect();
+			let record = width_record_values(kind);
+			let mut staged = Vec::new();
+			for piece in 0..k / record {
+				staged.extend(width_stage(kind, &q[record * piece..record * (piece + 1)], &scales[piece * (record / block)..(piece + 1) * (record / block)]));
+			}
+			let staged = width_aligned(&staged.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<u8>>());
+			let got = f64::from(unsafe { entry(bytes.as_ptr(), staged.as_ptr().cast(), tables.as_ptr().cast(), (k / values) as i32, 0x0F0F0F0F) });
+			let (mut ggml, mut magnitude, mut position) = (0.0_f64, 0.0_f64, 0);
+			for (index, block_bytes) in bytes.chunks(stride).enumerate() {
+				width_block(width_ggml(kind), block_bytes, &mut |group| {
+					for &value in group.values {
+						let term = (group.scale * f64::from(value) + group.offset) * f64::from(scales[index]) * f64::from(q[position]);
+						ggml += term;
+						magnitude += term.abs();
+						position += 1;
+					}
+				});
+			}
+			let host_row = file.row(tensor, row)?;
+			let host: f64 = host_row.iter().enumerate().map(|(index, value)| value * f64::from(scales[index / block]) * f64::from(q[index])).sum();
+			let bound = 1e-4 * magnitude;
+			let verdict = match ((got - ggml).abs() <= bound, (host - ggml).abs() <= bound) {
+				(true, true) => "ok",
+				(true, false) if kind == 17 || kind == 18 => "kernel matches the GGML decode; the host decoder differs (recipe-dev#1110)",
+				(true, false) => "kernel matches the GGML decode; the host decoder differs",
+				(false, _) => "MISMATCH",
+			};
+			lines.push(format!("| {name} | {} | {row} | {k} | {got:.6} | {ggml:.6} | {:.2e} | {host:.6} | {:.2e} | {verdict} |", tensor.name, (got - ggml).abs() / magnitude.max(1e-30), (host - ggml).abs() / magnitude.max(1e-30)));
+		}
+	}
+	Ok(lines)
+}
+/// The activation width of the XMAD design the kernels implement, in bits.
+const WIDTH_ACTIVATION: u32 = 8;
+/// Prints a table and the per-multiply-add opcode lists of the measured inner loops of one design.
+fn width_print_loops(counts: &std::collections::BTreeMap<u32, WidthLoopCount>) {
+	println!("| format | SASS instructions per pass | multiply-adds per pass | instructions per multiply-add |");
+	println!("|---|---|---|---|");
+	for (kind, count) in counts {
+		println!("| {} | {} | {} | {:.3} |", width_kind_name(*kind), count.total(), count.terms, count.total() as f64 / count.terms as f64);
+	}
+	println!();
+	println!("Instructions per multiply-add by opcode and modifiers:\n");
+	for (kind, count) in counts {
+		let mut opcodes = count.opcodes.iter().collect::<Vec<_>>();
+		opcodes.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+		println!("- {}: {}", width_kind_name(*kind), opcodes.iter().map(|(opcode, number)| format!("{opcode} {:.4}", **number as f64 / count.terms as f64)).collect::<Vec<_>>().join(", "));
+	}
+	println!();
+}
+fn width_kind_name(kind: u32) -> &'static str {
+	if kind == WIDTH_Q8_0_NARROW {
+		return "Q8_0 (64-value pass)";
+	}
+	width_format(kind).map(|format| format.0).or(width_float(kind).map(|format| format.0)).unwrap_or("unknown")
+}
+/// Derives, from a GGUF file's own blocks, the integer width of every weight, and the instructions per decoded token of the weighted
+/// sums: today's kernels and the int8-activation XMAD kernels, both counted in the SASS Recipe's NVIDIA path produces.
+pub fn widths(path: impl AsRef<Path>, mtp: Option<&Path>, picks: Option<&Path>) -> Result<()> {
+	let frequency = picks.map(width_picks).transpose()?;
+	let mut sections = vec![(path.as_ref().to_path_buf(), "target")];
+	if let Some(mtp) = mtp {
+		sections.push((mtp.to_path_buf(), "mtp head"));
+	}
+	let mut files = Vec::new();
+	for (file_path, _) in &sections {
+		files.push(Gguf::open(&resolve_path(file_path)?)?);
+	}
+	let activation = WIDTH_ACTIVATION;
+	println!("# Weight widths\n");
+	println!("Method: every block of every weight tensor is read from the file; the block's float scale and any K-quant minimum are factored out and the remaining integers are measured (largest magnitude in bits, plus one when any is negative). Tensors named token_embd and per_layer_token_embd are lookups, not weighted sums, and are skipped. IQ grids are the GGML grid magnitudes (IQ2_XS 8/25/43, IQ3_XXS 4..62) with the block's sign bits. A signed block counts its largest magnitude plus a sign bit, so a Q6_K block holding -32 is 7 bits. The recipe decoder check rebuilds the first block from its scale, offset and integers and compares it with the host decoder's values; a MISMATCH marks a tensor whose factorization differs from the host decoder.\n");
+	println!("Activation width: {activation} bits (signed). Accumulator: s32 for the XMAD design, f32 for the current kernels.\n");
+	println!("Provenance: widths, multiply-add counts, sum lengths and the router picks are derived from the files. Instruction counts per multiply-add are measured from compiled code (the sections below); every instruction count in the tables is a derived count times a measured one. No estimate remains.\n");
+	// Instructions per multiply-add, measured from the SASS of compiled kernels.
+	let mut today = std::collections::BTreeMap::new();
+	for kind in [0, 1, 30, 8, 12, 13, 14, 17, 18, 20] {
+		today.insert(kind, width_today(width_span_weight(kind).ok_or_else(|| RecipeError::new("GGML type has no matvec layout"))?)?);
+	}
+	let mut xmad = std::collections::BTreeMap::new();
+	for kind in [8, WIDTH_Q8_0_NARROW, 12, 13, 14, 17, 18, 20] {
+		xmad.insert(kind, width_xmad_count(kind)?);
+	}
+	println!("## Compiled inner loops\n");
+	println!("Each kernel is LLVM IR that Recipe generates, compiled by its NVIDIA path (clang and llc to PTX for sm_52, then ptxas {}), and disassembled with cuobjdump -sass. The counted loop is the innermost loop with the multiply-adds; every instruction of its range counts, NOP padding excluded, so loads, address arithmetic, the loop branch and the scoreboard waits (DEPBAR) are in. Per-row work outside that loop (staging the activations, the cross-lane reduction, the output store) is amortized over the row and not counted. Instructions are per thread; the loop runs one position.\n", WIDTH_PTXAS.join(" "));
+	println!("### Today: position-batched matvec (fp32 FFMA, `span_matvec_function`, one position)\n");
+	println!("The task loop of the generated kernel at 2560 inputs with run-time rows; one pass is `unroll` tasks of `task` values. Float formats use the same kernels in both designs.\n");
+	width_print_loops(&today);
+	println!("### Least-instruction XMAD kernels (int8 activations in 16-bit lanes, s32 accumulators, one 16x16 multiply-add per term)\n");
+	println!("Each kernel decodes a block's weights into 16-bit lane operands with byte permutes and masks (grid and sign tables in shared memory for IQ2_XS and IQ3_XXS), multiplies lane pairs against the staged activations with 16x16 multiply-adds (XMAD), and applies each group's scale and the block scale in fp32 once per group and block. The activations are staged in the layout the decode pairs them in (int8 values in 16-bit lanes; 256 times the value where the weight lane is unscaled; group sums for K-quant minimums and the Q6_K offset). One pass is four blocks (128 values) of Q8_0 or IQ4_NL, whose rows of 640 inputs are not whole chunks; two blocks (64 values) for the Q8_0 rows of 320 inputs, loaded by words; one 256-value chunk of Q4_K or Q5_K; two chunks of Q6_K, IQ2_XS or IQ3_XXS, whose odd chunks start two bytes off a word. A kernel needs the inputs of a row to be a whole number of passes, and rows to start on 8 bytes (Q8_0 and IQ4_NL by four blocks), 16 bytes (Q4_K, Q5_K) or a word (the rest); a weight tensor that does not fit keeps today's kernel in the XMAD design and is listed.\n");
+	width_print_loops(&xmad);
+	println!("### Kernel correctness\n");
+	println!("The CPU build of each kernel's IR (byte permutes in software) runs real rows of the target file against random int8 activations (first, middle and last row of the first tensor of the format) and is compared with the dot product of the decoded row: the GGML decode of the blocks, and the recipe host decoder. Errors are relative to the sum of absolute terms; the kernel passes within 1e-4.\n");
+	println!("| format | tensor | row | inputs | kernel | GGML decode | kernel error | host decoder | host error | result |");
+	println!("|---|---|---|---|---|---|---|---|---|---|");
+	for line in width_check(&files[0])? {
+		println!("{line}");
+	}
+	println!();
+	let per_multiply_add = |kind: u32, kernel: Option<u32>| -> &WidthLoopCount { kernel.map_or(&today[&kind], |kernel| &xmad[&kernel]) };
+	for ((file_path, label), file) in sections.iter().zip(&files) {
+		let scanned = width_scan(file)?;
+		println!("## {label}: {}\n", file_path.display());
+		println!("### Weights by block value width, per tensor (routed expert tensors summed over their experts)\n");
+		println!("| tensor | format | weights | value width: weights | sub-scale width: groups | sub-offset width: groups | recipe decoder check |");
+		println!("|---|---|---|---|---|---|---|");
+		let histogram = |bins: &[u64; WIDTH_BINS]| bins.iter().enumerate().filter(|(_, count)| **count != 0).map(|(bits, count)| format!("{bits}:{count}")).collect::<Vec<_>>().join(" ");
+		for tensor in &scanned {
+			let mut total = WidthCount::new();
+			tensor.counts.iter().for_each(|count| total.add(count));
+			let weights = total.weights.iter().sum::<u64>() + total.floats;
+			println!("| {} | {} | {weights} | {} | {} | {} | {} |", tensor.name, width_kind_name(tensor.kind), if total.floats != 0 { "float".to_owned() } else { histogram(&total.weights) }, histogram(&total.scales), histogram(&total.offsets), tensor.check);
+		}
+		println!();
+		// Per decoded token: every dense weight once per position, routed experts by how often each is picked.
+		let (mut uniform, mut measured) = (Vec::new(), Vec::new());
+		let mut by_width = std::collections::BTreeMap::<(&'static str, usize), f64>::new();
+		let mut types = std::collections::BTreeMap::<(u32, usize, usize, Option<u32>), f64>::new();
+		let mut uncovered = Vec::new();
+		for tensor in &scanned {
+			let usage = (0..tensor.experts)
+				.map(|expert| {
+					if tensor.experts == 1 {
+						return 1.0;
+					}
+					let layer = tensor.layer.unwrap_or(usize::MAX);
+					match frequency.as_ref().and_then(|layers| layers.get(&layer)).and_then(|experts| experts.get(expert)) {
+						Some(picked) => *picked,
+						None => 10.0 / tensor.experts as f64,
+					}
+				})
+				.collect::<Vec<_>>();
+			if tensor.experts > 1 {
+				if frequency.as_ref().is_some_and(|layers| layers.contains_key(&tensor.layer.unwrap_or(usize::MAX))) { measured.push(tensor.name.clone()) } else { uniform.push(tensor.name.clone()) }
+			}
+			for (expert, count) in tensor.counts.iter().enumerate() {
+				if let Some((name, _, _, group, _)) = width_format(tensor.kind) {
+					let kernel = width_kernel_for(tensor.kind, tensor.row);
+					if kernel.is_none() && expert == 0 {
+						uncovered.push(format!("{} ({name}, {} inputs)", tensor.name, tensor.row));
+					}
+					for bits in 0..WIDTH_BINS {
+						let products = usage[expert] * count.weights[bits] as f64;
+						if products == 0.0 {
+							continue;
+						}
+						*by_width.entry((name, bits)).or_default() += products;
+						*types.entry((tensor.kind, bits, group, kernel)).or_default() += products;
+					}
+				} else if let Some((name, _)) = width_float(tensor.kind) {
+					let products = usage[expert] * count.floats as f64;
+					*by_width.entry((name, usize::MAX)).or_default() += products;
+					*types.entry((tensor.kind, usize::MAX, tensor.row, None)).or_default() += products;
+				}
+			}
+		}
+		let routing = match &frequency {
+			Some(layers) => format!("routed experts weighted by the picks file ({} layers measured, sum of expected picks per layer {:.3}; {} expert tensors without a measured layer use 10/experts)", layers.len(), layers.values().map(|experts| experts.iter().sum::<f64>()).sum::<f64>() / layers.len().max(1) as f64, uniform.len()),
+			None => "routed experts: no picks file, assuming 10 of the experts picked uniformly".to_owned(),
+		};
+		println!("### Multiply-adds per decoded token by weight value width\n");
+		println!("One position; dense tensors count every weight once; {routing}; {} expert tensors measured. Derived from the file.\n", measured.len());
+		println!("| format | value width (bits) | multiply-adds | share |");
+		println!("|---|---|---|---|");
+		let total = by_width.values().sum::<f64>();
+		for ((name, bits), products) in &by_width {
+			println!("| {name} | {} | {:.0} | {:.2}% |", if *bits == usize::MAX { "float".to_owned() } else { bits.to_string() }, products, 100.0 * products / total);
+		}
+		println!("| **total** | | **{total:.0}** | 100% |\n");
+		// Types: (format, weight width, activation width, accumulator width, sum length).
+		println!("### Weighted-sum types per decoded token\n");
+		println!("A type is (format, weight value width, activation width, accumulator width, sum length). Weighted sums, multiply-adds, widths and sum lengths are derived from the file; instructions per multiply-add are measured from the SASS above (today: the task loop of the span matvec; XMAD design: the inner loop of the kernel of the format, or today's loop for float formats). Accumulator minimum = weight + activation + log2(length) bits; both designs accumulate in 32. n terms/XMAD is the most products of the two widths one 16x16 multiply can sum (derived); the kernels use one term per XMAD at every width.\n");
+		println!("| format | weight bits | activation bits | accumulator bits (min/used) | sum length | weighted sums | multiply-adds | n terms/XMAD (spacing) | today instructions per multiply-add | XMAD-design instructions per multiply-add | today instructions | XMAD-design instructions | reduction |");
+		println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+		let (mut sums, mut total_products, mut total_today, mut total_xmad) = (0.0, 0.0, 0.0, 0.0);
+		let (mut histogram_today, mut histogram_xmad) = (std::collections::BTreeMap::<String, f64>::new(), std::collections::BTreeMap::<String, f64>::new());
+		for ((kind, bits, length, kernel), products) in &types {
+			let float = *bits == usize::MAX;
+			let (terms, spacing) = if float { (1, 0) } else { width_xmad(*bits as u32, activation) };
+			let weighted = products / *length as f64;
+			let (current, design) = (per_multiply_add(*kind, None), per_multiply_add(*kind, *kernel));
+			let (current_rate, design_rate) = (current.total() as f64 / current.terms as f64, design.total() as f64 / design.terms as f64);
+			let minimum = if float { 32 } else { *bits + activation as usize + (*length as f64).log2().ceil() as usize };
+			sums += weighted;
+			total_products += products;
+			total_today += products * current_rate;
+			total_xmad += products * design_rate;
+			for (mnemonic, rate) in current.mnemonics() {
+				*histogram_today.entry(mnemonic).or_default() += products * rate;
+			}
+			for (mnemonic, rate) in design.mnemonics() {
+				*histogram_xmad.entry(mnemonic).or_default() += products * rate;
+			}
+			println!(
+				"| {} | {} | {} | {minimum}/{} | {length} | {weighted:.0} | {products:.0} | {terms} ({spacing}) | {current_rate:.3} | {design_rate:.3} | {:.0} | {:.0} | {:.1}% |",
+				width_kind_name(kernel.unwrap_or(*kind)),
+				if float { "float".to_owned() } else { bits.to_string() },
+				if float { "f32".to_owned() } else { activation.to_string() },
+				if float { "f32" } else { "s32" },
+				products * current_rate,
+				products * design_rate,
+				100.0 * (1.0 - design_rate / current_rate)
+			);
+		}
+		println!("| **{} types** | | | | | **{sums:.0}** | **{total_products:.0}** | | **{:.3}** | **{:.3}** | **{total_today:.0}** | **{total_xmad:.0}** | **{:.1}%** |\n", types.len(), total_today / total_products, total_xmad / total_products, 100.0 * (1.0 - total_xmad / total_today));
+		println!("XMAD kernel coverage: {}.\n", if uncovered.is_empty() { "every quantized weight tensor has rows of whole passes".to_owned() } else { format!("tensors on today's kernel in the XMAD design: {}", uncovered.join(", ")) });
+		println!("### Instructions per decoded token, weighted sums\n");
+		println!("Thread-instructions of one decoded position by SASS mnemonic: each type's multiply-adds times the measured instructions per multiply-add of its format. Derived multiply-adds times measured loop counts; the activation staging, cross-lane reductions and output stores outside the loops are not counted here.\n");
+		for (design, histogram, total) in [("today (fp32 FFMA kernels, sm_52)", &histogram_today, total_today), ("least-instruction XMAD (int8 activations, sm_52)", &histogram_xmad, total_xmad)] {
+			println!("```\ndesign: {design}");
+			let mut rows = histogram.iter().collect::<Vec<_>>();
+			rows.sort_by(|left, right| right.1.total_cmp(left.1).then(left.0.cmp(right.0)));
+			for (mnemonic, count) in rows {
+				println!("\t{mnemonic}\t{:.3} G", count / 1e9);
+			}
+			println!("\ttotal\t{:.3} G\n```\n", total / 1e9);
+		}
+		println!("Weighted sums per token: {sums:.0}; instructions today {total_today:.0}; instructions with the XMAD kernels {total_xmad:.0}; reduction {:.1}%.\n", 100.0 * (1.0 - total_xmad / total_today));
+	}
+	Ok(())
+}
+
 impl Gguf {
 	/// Contracts `input` through the named tensor into `width` outputs: the
 	/// one-node plan of `infer`, so the tensor's mapped bytes are the
