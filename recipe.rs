@@ -28719,15 +28719,16 @@ fn devices() -> Result<&'static [&'static Gpu]> {
 		.map(Vec::as_slice)
 		.map_err(Clone::clone)
 }
+fn available_devices(found: &[&Gpu]) -> String { found.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ") }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	if name == Some("cpu") {
 		return shared_cpu_device();
 	}
 	let found = devices()?;
 	if let Some(name) = name {
-		return found.iter().copied().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
+		return found.iter().copied().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent, this host has {}", available_devices(found))));
 	}
-	require(found.iter().filter(|gpu| !matches!(gpu.backend, Backend::Cpu)).count() <= 1, "multiple GPUs require named selection")?;
+	require(found.iter().filter(|gpu| !matches!(gpu.backend, Backend::Cpu)).count() <= 1, format!("multiple GPUs require named selection from {}", available_devices(found)))?;
 	Ok(&found[0])
 }
 #[cfg(unix)]
@@ -28782,7 +28783,7 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 						Some(gpu) => gpu,
 						None => match name.split_once(':') {
 							Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
-							_ => return Err(RecipeError::new(format!("device {name:?} is absent"))),
+							_ => return Err(RecipeError::new(format!("device {name:?} is absent, this host has {}", available_devices(devices()?)))),
 						},
 					}
 				};
