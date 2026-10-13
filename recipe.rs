@@ -28330,7 +28330,7 @@ impl Gpu {
 		// State-width gradient spans precede scratch rows on a boundary that
 		// every supported accumulator width divides.
 		let scratch_base = if loss.is_none() { 0 } else { narrow(native_gradient_arena(graph)?.1.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES * 8), "native gradient scratch base")? };
-		trace(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
+		trace(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} matrix={matrix} contractions={contractions:?} attention={attention:?}"))?;
 		let schedule = NativeSchedule {
 			element,
 			matrix,
