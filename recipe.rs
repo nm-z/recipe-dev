@@ -2783,7 +2783,7 @@ const SPAN_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 2
 fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 	let mut functions = String::new();
 	let mut names = std::collections::HashSet::new();
-	let mut cases = |widths: &[usize], functions: &mut String| -> Vec<(u32, usize, usize, String)> {
+	let mut cases = |widths: &[usize], functions: &mut String| -> Vec<(u32, usize, usize, String, usize)> {
 		let mut cases = Vec::new();
 		for &k in widths {
 			for (code, weight) in SPAN_SPLIT_FORMATS {
@@ -2796,14 +2796,16 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 				let xmad_faster = k == 640 || !span_stages;
 				if let Some(function) = xmad_faster.then(|| width_split_function(code, k, &name, shared)).flatten() {
 					if names.insert(name.clone()) { functions.push_str(&function); }
-					cases.push((code, k, SPECULATIVE_POSITIONS, name));
+					// The positions it stages at once; a dense call with more columns splits the grid by position group.
+					let stage = width_split_fit(code, k).unwrap_or(SPECULATIVE_POSITIONS);
+					cases.push((code, k, SPECULATIVE_POSITIONS, name, stage));
 					continue;
 				}
 				let spec = SpanSpec { weight, k, rows: 0, layout: SpanLayout::Columns, bias: false, relu: false };
 				let Some(widest) = (1..=SPAN_POSITIONS).take_while(|&positions| spec.whole(positions)).last().filter(|_| spec.valid()) else { continue };
 				let name = format!("span_split.{}", spec.key());
 				if names.insert(name.clone()) { functions.push_str(&span_matvec_function(&spec, &name, shared)); }
-				cases.push((code, k, widest, name));
+				cases.push((code, k, widest, name, widest));
 			}
 		}
 		cases
@@ -2812,9 +2814,16 @@ fn span_split_ir(dense: &[usize], experts: &[usize], shared: &str) -> String {
 	let mut ir = String::new();
 	for (entry, cases, extra) in [("dense", dense, ""), ("expert", experts, ", i32 %mask, i32 %rank, i32 %count")] {
 		ir.push_str(&format!("define i32 @span_split_{entry}(i32 %type, i32 %k, i32 %rows, ptr addrspace(1) %w, ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %columns{extra}) #3 {{\nentry:\n%some = icmp ne i32 %columns, 0\nbr label %case0\n"));
-		for (n, (code, k, widest, name)) in cases.iter().enumerate() {
+		for (n, (code, k, widest, name, stage)) in cases.iter().enumerate() {
 			ir.push_str(&format!("case{n}:\n%case{n}.type = icmp eq i32 %type, {code}\n%case{n}.k = icmp eq i32 %k, {k}\n%case{n}.fits = icmp ule i32 %columns, {widest}\n%case{n}.a = and i1 %case{n}.type, %case{n}.k\n%case{n}.b = and i1 %case{n}.a, %case{n}.fits\n%case{n}.run = and i1 %case{n}.b, %some\nbr i1 %case{n}.run, label %case{n}.call, label %case{}\ncase{n}.call:\n", n + 1));
-			if extra.is_empty() {
+			if extra.is_empty() && *stage < SPECULATIVE_POSITIONS {
+				// The kernel stages `stage` positions at once, so each group of `stage` columns takes its own share of the grid at
+				// the same time: the groups read the same rows together and the repeat reads hit L2, instead of the whole grid
+				// re-reading every row once per group in turn. Workgroups past the last whole group stay idle.
+				let c = format!("%case{n}");
+				ir.push_str(&format!("{c}.groups0 = add i32 %columns, {}\n{c}.groups = udiv i32 {c}.groups0, {stage}\n{c}.cta = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()\n{c}.ncta = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()\n{c}.per = udiv i32 {c}.ncta, {c}.groups\n{c}.g = udiv i32 {c}.cta, {c}.per\n{c}.idle = icmp uge i32 {c}.g, {c}.groups\nbr i1 {c}.idle, label %case{n}.done, label %case{n}.work\ncase{n}.work:\n", stage - 1));
+				ir.push_str(&format!("{c}.first = mul i32 {c}.g, {stage}\n{c}.left = sub i32 %columns, {c}.first\n{c}.few = icmp ult i32 {c}.left, {stage}\n{c}.count = select i1 {c}.few, i32 {c}.left, i32 {stage}\n{c}.rank = urem i32 {c}.cta, {c}.per\ncall void @{name}.group(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 {c}.first, i32 %rows, i32 {c}.count, i32 {c}.rank, i32 {c}.per, i32 0)\nbr label %case{n}.done\ncase{n}.done:\nret i32 1\n"));
+			} else if extra.is_empty() {
 				ir.push_str(&format!("call void @{name}(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 %columns)\nret i32 1\n"));
 			} else {
 				ir.push_str(&format!("call void @{name}.group(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, ptr addrspace(1) null, i32 0, i32 %rows, i32 %columns, i32 %rank, i32 %count, i32 %mask)\nret i32 1\n"));
@@ -19859,6 +19868,18 @@ const WIDTH_SPLIT_SHARED: usize = 40960;
 /// (int8 activations in 16-bit lanes: one scale per 256 values for K and IQ formats, per 32 for Q8_0 and IQ4_NL, and the group
 /// sums the K formats need), then each thread computes whole rows; further positions repeat. `None` when `k` is not a whole number
 /// of the format's passes or one position does not fit the tile.
+/// Positions of `kind` over `k` inputs the split matvec stages at once in its shared tile (`width_split_function`); `None` when
+/// the format has no such kernel or one position does not fit.
+fn width_split_fit(kind: u32, k: usize) -> Option<usize> {
+	let kid = width_kernel_for(kind, k)?;
+	let (rv, words) = (width_record_values(kid), width_staged_words(kid));
+	let table_bytes = width_tables(kid).ok()?.len().next_multiple_of(16);
+	let blocks = k / 32;
+	// Per staged position: its records, its int8 values, two floats per 32-value block, and one sum per 16 values.
+	let per_position = k / rv * words * 4 + k.next_multiple_of(16) + 8 * blocks + 4 * (k / 16);
+	let fit = ((WIDTH_SPLIT_SHARED - table_bytes) / per_position).min(SPECULATIVE_POSITIONS);
+	(fit != 0).then_some(fit)
+}
 fn width_split_function(kind: u32, k: usize, name: &str, shared: &str) -> Option<String> {
 	let kid = width_kernel_for(kind, k)?;
 	let shape = width_loop(kid)?;
@@ -19871,10 +19892,7 @@ fn width_split_function(kind: u32, k: usize, name: &str, shared: &str) -> Option
 	let table_bytes = tables.len().next_multiple_of(16);
 	let blocks = k / 32;
 	let position_bytes = records * words * 4;
-	// Per staged position: its records, its int8 values, two floats per 32-value block, and one sum per 16 values.
-	let per_position = position_bytes + k.next_multiple_of(16) + 8 * blocks + 4 * (k / 16);
-	let fit = ((WIDTH_SPLIT_SHARED - table_bytes) / per_position).min(SPECULATIVE_POSITIONS);
-	if fit == 0 { return None; }
+	let fit = width_split_fit(kind, k)?;
 	let (stage_at, q_at) = (table_bytes, table_bytes + fit * position_bytes);
 	let max_at = q_at + fit * k.next_multiple_of(16);
 	let scale_at = max_at + 4 * fit * blocks;
@@ -24871,7 +24889,7 @@ impl ExpertExecution {
 		for die in (0..DIES).filter(|die|value.weights.plan.budgets[*die].free_bytes!=0) {
 			let gpu = device(Some(&die_name(die)))?;
 			let jobs = Buffer::zeroed(gpu,value.layers.len()*expert_job::BYTES)?;
-			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*128)?;
+			let reports = Buffer::zeroed(gpu,sequence*value.layers.len()*expert_job::REPORT_WORDS*4)?;
 			let dense_rows=value.weights.plan.placements.iter().filter(|item|item.die==die && item.row_start.is_some()).map(|item|item.tensor.shape[1] as usize).max().unwrap_or(0).max(10240);
 			let scratch = [EXPERT_SPLIT_PAYLOAD_BYTES, 8*10240*2, 8*10240/32*8, SPECULATIVE_POSITIONS*EXPERT_SPLIT_MAX_TOP_K*EXPERT_SPLIT_PACKET_ROWS*4, SPECULATIVE_POSITIONS*dense_rows*4, 32*expert_grid::GROUP_SCRATCH_BYTES,32*8*640*4,32*8*640*2,32*8*640/32*8].into_iter().map(|bytes| Buffer::zeroed(gpu,bytes)).collect::<Result<Vec<_>>>()?;
 			let mut module = None;
@@ -25015,10 +25033,10 @@ impl ExpertExecution {
 		let mut receipts=Vec::new();
 		for worker in &self.workers {
 			worker.gpu.synchronize()?;
-			let reports=worker.reports.download_range::<u32>(0,phases*32)?;
+			let reports=worker.reports.download_range::<u32>(0,phases*expert_job::REPORT_WORDS)?;
 			receipts.push((worker,reports));
 		}
-		if status[0]!=0 || receipts.iter().any(|(_,reports)|reports.chunks_exact(32).any(|report|report[16..32].iter().any(|status|*status!=1))) {
+		if status[0]!=0 || receipts.iter().any(|(_,reports)|reports.chunks_exact(expert_job::REPORT_WORDS).any(|report|report[16..48].iter().any(|status|*status!=1))) {
 			let control=self.control.download::<u8>(self.control.bytes)?;
 			let path=self.pick_path.with_extension("failure-control.bin");
 			if let Err(error)=fs::write(&path,&control) {eprintln!("cannot write expert failure receipt {}: {error}",path.display());}
@@ -25031,8 +25049,8 @@ impl ExpertExecution {
 		}
 		if status[0]!=0 {return Err(RecipeError::new(format!("expert main dispatch failed: status {} layer {}; worker receipts use {}",status[0],status[1],self.pick_path.display())));}
 		for (worker,reports) in &receipts {
-			for (phase,report) in reports.chunks_exact(32).enumerate() {
-				if let Some((cta,status))=report[16..32].iter().enumerate().find(|(_,status)|**status!=1) {
+			for (phase,report) in reports.chunks_exact(expert_job::REPORT_WORDS).enumerate() {
+				if let Some((cta,status))=report[16..48].iter().enumerate().find(|(_,status)|**status!=1) {
 					return Err(RecipeError::new(format!("expert forward die {} layer {} phase {phase} CTA {cta} status {status}; request/compute/return trace {:?}",worker.die,self.layers[first+phase%layers].layer,&report[..16])));
 				}
 			}
@@ -25060,7 +25078,7 @@ impl ExpertExecution {
 		for (index,reports) in receipts {
 			let worker=&self.workers[index];
 			let device=device_label(worker.gpu)?;
-			for (phase,report) in reports.chunks_exact(32).enumerate() {
+			for (phase,report) in reports.chunks_exact(expert_job::REPORT_WORDS).enumerate() {
 				let clock=|index|u64::from(report[index]) | u64::from(report[index+1])<<32;
 				let ticks=clock(6).saturating_sub(clock(2));
 				let layer=&self.layers[first+phase%layers]; let experts=report[14] as usize;
@@ -25072,7 +25090,9 @@ impl ExpertExecution {
 				// The same receipt also times the wait for the main die's request and the setup before the matvec.
 				let name=if layer.dense(){"Dense"}else{"Expert"};
 				let mut phases=vec![("Wait",clock(2).saturating_sub(clock(0))),("Setup",clock(4).saturating_sub(clock(2)))];
-				if layer.dense() {phases.extend([("Matvec",u64::from(report[13])),("Return",u64::from(report[15]))]);}
+				// Words 48-79: each workgroup's own matvec; the slowest and fastest show how even the row split is.
+				let own=report[48..80].iter().copied().filter(|ticks|*ticks!=0).map(u64::from).collect::<Vec<_>>();
+				if layer.dense() {phases.extend([("Matvec",u64::from(report[13])),("Return",u64::from(report[15])),("MatvecSlowest",own.iter().copied().max().unwrap_or(0)),("MatvecFastest",own.iter().copied().min().unwrap_or(0))]);}
 				else {phases.extend([("Prewave",u64::from(report[13])),("GateUp",u64::from(report[15]))]);}
 				for (suffix,ticks) in phases {
 					observations.push(OperationReport { selected_experts:0,weight_bytes:0,packed_calls:0,packed_fallbacks:[0;4],span_calls:0,
@@ -41349,6 +41369,9 @@ pub mod expert_job {
 	pub const STAGING: usize = 192;
 	/// One u32: nonzero for the main die's own job, whose dense return needs only a device-scope publish.
 	pub const LOCAL: usize = 200;
+	/// u32 words of one phase's receipt: 0-15 the phase's fields, 16 + workgroup its status (32 workgroups), 48 + workgroup
+	/// its dense matvec nanoseconds.
+	pub const REPORT_WORDS: usize = 96;
 	pub const P_REQUEST: usize = 0;
 	pub const P_REQUEST_SEQUENCE: usize = 1;
 	pub const P_ROUTE: usize = 2;
@@ -41823,8 +41846,9 @@ fn split_dense_layer() -> String {
 		let at = gep(ir, "%report", "60");
 		st(ir, I32, "0", &at, false);
 	});
+	preset_receipt(&mut ir, &leader);
 	// Workgroup 0's ticks per slice add up in report word 13 (its matvec) and word 15 (the barrier after it, the return and
-	// the barrier after that).
+	// the barrier after that); every workgroup's own matvec ticks add up in word 48 + workgroup.
 	let add_ticks = |ir: &mut Ir, offset: &str, from: &str, to: &str| {
 		when(ir, &leader, |ir| {
 			let ticks = ir.value(format!("sub i64 {to}, {from}"));
@@ -41991,6 +42015,18 @@ fn split_dense_layer() -> String {
 			ir.label(&joined);
 			let slice_computed = timer(ir);
 			add_ticks(ir, "52", &slice_started, &slice_computed);
+			let first_thread = ir.value(format!("icmp eq i32 {r5}, 0"));
+			let counted = ir.value(format!("icmp ult i32 {r6}, 32"));
+			let own = ir.value(format!("and i1 {first_thread}, {counted}"));
+			when(ir, &own, |ir| {
+				let ticks = ir.value(format!("sub i64 {slice_computed}, {slice_started}"));
+				let ticks = ir.value(format!("trunc i64 {ticks} to i32"));
+				let word = ir.value(format!("add i32 {r6}, 48"));
+				let at = element(ir, "%report", &word, 4);
+				let sum = ld(ir, I32, &at, false);
+				let sum = ir.value(format!("add i32 {sum}, {ticks}"));
+				st(ir, I32, &sum, &at, false);
+			});
 			let computed_seq = advance(ir);
 			let computed = grid(ir, &a11, &a12, &computed_seq, &deadline);
 			leave_unless(ir, &computed, 405, "r11", "dl.done");
@@ -42167,12 +42203,7 @@ fn split_dense_layer() -> String {
 		st(ir, I32, &r3, &rows, false);
 	});
 	let status = ir.get("r11", I32);
-	let first_thread = ir.value(format!("icmp eq i32 {r5}, 0"));
-	when(&mut ir, &first_thread, |ir| {
-		let slot = element(ir, "%report", &r6, 4);
-		let at = gep(ir, &slot, "64");
-		st(ir, I32, &status, &at, false);
-	});
+	record_status(&mut ir, &r5, &r6, &status);
 	ir.inst(format!("ret i32 {status}"));
 	ir.function("define i32 @split_dense_layer(ptr addrspace(1) %desc, i32 %seq, i32 %cols, ptr %sh, ptr addrspace(1) %report)")
 }
@@ -42434,7 +42465,7 @@ fn split_dense_forward() -> String {
 	stamp(&mut ir, 2);
 	let report_at_layer = word_address(&mut ir, &local_job, 120, false);
 	let layer_index = ir.get("r18", I32);
-	let report = element(&mut ir, &report_at_layer, &layer_index, 128);
+	let report = element(&mut ir, &report_at_layer, &layer_index, expert_job::REPORT_WORDS * 4);
 	let sequence_local = ir.get("r19", I32);
 	let local = ir.value(format!("call i32 @split_dense_layer(ptr addrspace(1) {local_job}, i32 {sequence_local}, i32 %cols, ptr %sh, ptr addrspace(1) {report})"));
 	ir.set("r26", I32, &local);
@@ -42589,7 +42620,7 @@ fn expert_split_worker() -> String {
 	let desc = desc_at;
 	let reports = word_address(&mut ir, &desc, pointer(P_REPORTS), false);
 	let phase = ir.get("r6", I32);
-	let report = element(&mut ir, &reports, &phase, 128);
+	let report = element(&mut ir, &reports, &phase, REPORT_WORDS * 4);
 	let phase_seq = ir.value(format!("add i32 %base, {phase}"));
 	let seq = ir.value(format!("add i32 {phase_seq}, 1"));
 	let last_only = field(&mut ir, &desc, flag(F_LAST_ONLY), I32);
@@ -42834,7 +42865,7 @@ fn split_main_forward() -> String {
 	// Local expert layer on this die, then combine every peer's product.
 	let local_at_layer = word_address(&mut ir, &local, 120, false);
 	let layer_index = ir.get("r14", I32);
-	let report = element(&mut ir, &local_at_layer, &layer_index, 128);
+	let report = element(&mut ir, &local_at_layer, &layer_index, expert_job::REPORT_WORDS * 4);
 	let local_seq = ir.get("r15", I32);
 	let local_status = ir.value(format!("call i32 @split_expert_layer(ptr addrspace(1) {local}, i32 {local_seq}, i32 %cols, ptr %sh, ptr addrspace(1) {report})"));
 	ir.set("r30", I32, &local_status);
@@ -42984,6 +43015,7 @@ fn split_expert_layer() -> String {
 		let at = gep(ir, "%report", "48");
 		st(ir, I32, "0", &at, false);
 	});
+	preset_receipt(&mut ir, &leader);
 	let receipt = ir.value(format!("call i32 @p2p_wait(ptr addrspace(1) {a4}, i32 %seq, i64 {deadline})"));
 	leave_unless(&mut ir, &receipt, 101, "r12", "split.done");
 	let copied = timer(&mut ir);
@@ -43409,14 +43441,37 @@ fn split_expert_layer() -> String {
 		st(ir, I64, &finished, &at, false);
 	});
 	let status = ir.get("r12", I32);
-	let first_thread = ir.value(format!("icmp eq i32 {tid}, 0"));
-	when(&mut ir, &first_thread, |ir| {
-		let slot = element(ir, "%report", &ctaid, 4);
-		let at = gep(ir, &slot, "64");
-		st(ir, I32, &status, &at, false);
-	});
+	record_status(&mut ir, &tid, &ctaid, &status);
 	ir.inst(format!("ret i32 {status}"));
 	ir.function("define i32 @split_expert_layer(ptr addrspace(1) %desc, i32 %seq, i32 %cols, ptr %sh, ptr addrspace(1) %report)")
+}
+
+/// Workgroup 0's first thread presets the receipt's 32 status words (16-47) to success and zeroes the 32 matvec words
+/// (48-79), before any grid barrier of the phase.
+fn preset_receipt(ir: &mut Ir, leader: &str) {
+	when(ir, leader, |ir| {
+		for word in (16..48).step_by(4) {
+			let at = gep(ir, "%report", &(4 * word).to_string());
+			ir.inst(format!("store {V4I32} <i32 1, i32 1, i32 1, i32 1>, ptr addrspace(1) {at}, align 16"));
+		}
+		for word in (48..80).step_by(4) {
+			let at = gep(ir, "%report", &(4 * word).to_string());
+			ir.inst(format!("store {V4I32} zeroinitializer, ptr addrspace(1) {at}, align 16"));
+		}
+	});
+}
+
+/// A workgroup that failed writes its status into word 16 + workgroup % 32; success leaves the preset 1, so any grid size fits.
+fn record_status(ir: &mut Ir, tid: &str, ctaid: &str, status: &str) {
+	let first_thread = ir.value(format!("icmp eq i32 {tid}, 0"));
+	let failed = ir.value(format!("icmp ne i32 {status}, 1"));
+	let write = ir.value(format!("and i1 {first_thread}, {failed}"));
+	when(ir, &write, |ir| {
+		let slot = ir.value(format!("and i32 {ctaid}, 31"));
+		let word = ir.value(format!("add i32 {slot}, 16"));
+		let at = element(ir, "%report", &word, 4);
+		st(ir, I32, status, &at, false);
+	});
 }
 
 /// LLVM declarations of the device functions this block calls; their bodies come from other blocks.
